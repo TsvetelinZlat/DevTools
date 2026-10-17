@@ -10592,6 +10592,8 @@ function Show-ApiTester([string]$Text = '') {
     $chainBtn.Dock = 'Top'; $chainBtn.AutoSize = $false; $chainBtn.Height = $FontButton.Height + (Px 14)
     $exBtn = New-Button 'Examples...' 'Load an example request: GET, POST JSON, form, headers, Bearer / Basic auth, log in, cookies, status codes' { param($src, $e) Show-ApiExampleMenu $src } $left.Panel1 $Glyph.Lightning 2
     $exBtn.Dock = 'Top'; $exBtn.AutoSize = $false; $exBtn.Height = $FontButton.Height + (Px 14)
+    $ApiUI.TestApiBtn = New-Button 'Test API' 'A practice API on this PC: log in, token, cookie, CSRF, items. No internet needed.' { param($src, $e) Show-TestApiMenu $src } $left.Panel1 $Glyph.Network 2
+    $ApiUI.TestApiBtn.Dock = 'Top'; $ApiUI.TestApiBtn.AutoSize = $false; $ApiUI.TestApiBtn.Height = $FontButton.Height + (Px 14)
     $hl = New-Object System.Windows.Forms.ListBox
     $hl.Dock = 'Fill'; $hl.BorderStyle = 'None'; $hl.BackColor = $C.Panel; $hl.ForeColor = $C.Fore
     $hl.DrawMode = 'OwnerDrawFixed'; $hl.ItemHeight = Px 40; $hl.IntegralHeight = $false
@@ -10978,6 +10980,21 @@ function Get-ChainExamples {
             )
             Links = @('1>2', '1>3', '1>4')
         }
+        'Local test API (offline)' = @{
+            LocalApi = $true
+            Note = "Runs against the Test API on this PC (started for you; no internet needed). Users: demo / demo.`n1. Log in: POST JSON, saves {{token}} and {{userId}}; the response also sets a session cookie.`n2. Who am I: Authorization: Bearer {{token}}.`n3. List items: no header at all - the session cookie is sent along by itself.`n4. Create an item: POST JSON with {{name}}; the new id is saved as {{newId}} (201 Created).`n5. Get a CSRF token: a Header rule reads X-CSRF-Token, a Regex rule finds the same token in the HTML.`n6. Delete it: DELETE needs both the Bearer token and X-CSRF-Token: {{csrf}} (204 No Content).`n7. Check it's gone: GET answers 404; 'Stop the chain here if it fails' is off, so that counts as fine.`nWatch the server side: Test API > Requests it received."
+            Vars = [ordered]@{ baseUrl = 'http://127.0.0.1:8799'; user = 'demo'; password = 'demo' }
+            Steps = @(
+                @{ Model = (New-ExampleModel 'Log in' 'POST' '{{baseUrl}}/login' @{ BodyType = 'JSON'; Body = "{`r`n  `"username`": `"{{user}}`",`r`n  `"password`": `"{{password}}`"`r`n}" }); Extract = @((New-ExampleRule 'token' 'JSON path' '$.token'), (New-ExampleRule 'userId' 'JSON path' '$.userId')) }
+                @{ Model = (New-ExampleModel 'Who am I (Bearer)' 'GET' '{{baseUrl}}/me' @{ Headers = (New-ExampleKv ([ordered]@{ Authorization = 'Bearer {{token}}' })) }); Extract = @((New-ExampleRule 'name' 'JSON path' '$.name')) }
+                @{ Model = (New-ExampleModel 'List items (cookie only)' 'GET' '{{baseUrl}}/items'); Extract = @((New-ExampleRule 'count' 'JSON path' '$.count')) }
+                @{ Model = (New-ExampleModel 'Create an item' 'POST' '{{baseUrl}}/items' @{ Headers = (New-ExampleKv ([ordered]@{ Authorization = 'Bearer {{token}}' })); BodyType = 'JSON'; Body = "{`r`n  `"name`": `"Lamp for {{name}}`",`r`n  `"price`": 25`r`n}" }); Extract = @((New-ExampleRule 'newId' 'JSON path' '$.id')) }
+                @{ Model = (New-ExampleModel 'Get a CSRF token' 'GET' '{{baseUrl}}/csrf'); Extract = @((New-ExampleRule 'csrf' 'Header' 'X-CSRF-Token'), (New-ExampleRule 'csrfFromHtml' 'Regex' 'name="csrf" value="([^"]+)"')) }
+                @{ Model = (New-ExampleModel 'Delete it (token + CSRF)' 'DELETE' '{{baseUrl}}/items/{{newId}}' @{ Headers = (New-ExampleKv ([ordered]@{ Authorization = 'Bearer {{token}}'; 'X-CSRF-Token' = '{{csrf}}' })) }); Extract = @() }
+                @{ Model = (New-ExampleModel 'Check it is gone (404)' 'GET' '{{baseUrl}}/items/{{newId}}' @{ Headers = (New-ExampleKv ([ordered]@{ Authorization = 'Bearer {{token}}' })) }); Extract = @((New-ExampleRule 'status' 'Status' '')); NoStop = $true }
+            )
+            Links = @('1>2', '2>3', '3>4', '4>5', '5>6', '6>7')
+        }
         'Headers, regex and status' = @{
             Note = "1. Get an id: a Regex rule takes the uuid out of the response (its first group) - handy when the answer isn't JSON.`n2. Send it as a header: X-Demo-Id: {{requestId}}. httpbin sends it back (saved with the JSON path `$.headers['X-Demo-Id'] - brackets because of the dashes), and a Header rule saves the Content-Type.`n3. Expect 418: a 4xx normally stops the chain, but here 'Stop the chain here if it fails' is unticked; a Status rule saves 418 as {{status}}.`n4. Runs anyway and uses {{status}}."
             Vars = [ordered]@{ baseUrl = 'https://httpbin.org' }
@@ -10992,10 +11009,88 @@ function Get-ChainExamples {
     }
 }
 
+# ---- Test API: a practice server on this PC (see DevTestApi). Start / stop from the API tester, API chains or the palette.
+$TestApi = $null
+$TestApiUI = @{ Form = $null; Timer = $null }
+
+function Get-TestApiUrl { if ($TestApi -and $TestApi.Running) { "http://127.0.0.1:$($TestApi.Port)" } else { '' } }
+
+# Starts it (once) and puts a "Local test API" environment in place; returns the base URL, or '' if it couldn't start.
+function Start-TestApi {
+    if (-not $script:TestApi) { $script:TestApi = New-Object DevTestApi }
+    if (-not $TestApi.Running) {
+        $port = $TestApi.Start(8799)
+        if ($port -lt 0) { [void][System.Windows.Forms.MessageBox]::Show('The test API could not start: no free port between 8799 and 8818.', 'Test API'); return '' }
+    }
+    $url = Get-TestApiUrl
+    # the environment (load the saved ones first, so nothing is overwritten)
+    if ($ApiUI.Collections.Count -eq 0 -and $ApiUI.History.Count -eq 0 -and $ApiUI.Environments.Count -eq 0) { try { Import-ApiData } catch { } }
+    $env = $null; foreach ($e in $ApiUI.Environments) { if ($e.Name -eq 'Local test API') { $env = $e } }
+    $vars = @([pscustomobject]@{ On = $true; Key = 'baseUrl'; Value = $url }, [pscustomobject]@{ On = $true; Key = 'user'; Value = 'demo' }, [pscustomobject]@{ On = $true; Key = 'password'; Value = 'demo' })
+    if ($env) { $env.Vars = $vars } else { $ApiUI.Environments.Add([pscustomobject]@{ Name = 'Local test API'; Vars = $vars }) }
+    Save-ApiData 'Environments'
+    if ($ApiUI.Form -and $ApiUI.EnvBox -and -not $ApiUI.EnvBox.IsDisposed) { Update-ApiEnvCombo }
+    if ($ChainUI.Form -and $ChainUI.EnvBox) {
+        $sel = [string]$ChainUI.EnvBox.SelectedItem
+        $ChainUI.EnvBox.Items.Clear(); [void]$ChainUI.EnvBox.Items.Add('(none)')
+        foreach ($e in $ApiUI.Environments) { [void]$ChainUI.EnvBox.Items.Add([string]$e.Name) }
+        $ChainUI.EnvBox.SelectedItem = if ($sel) { $sel } else { '(none)' }
+    }
+    Update-TestApiButtons
+    $url
+}
+
+function Stop-TestApi {
+    if ($TestApi) { $TestApi.Stop() }
+    Update-TestApiButtons
+}
+
+function Update-TestApiButtons {
+    $on = $TestApi -and $TestApi.Running
+    foreach ($b in @($ApiUI.TestApiBtn, $ChainUI.TestApiBtn)) {
+        if ($b -and -not $b.IsDisposed) { $b.Text = if ($on) { "Test API: on (:$($TestApi.Port))" } else { 'Test API' }; $b.Invalidate() }
+    }
+}
+
+function Show-TestApiMenu($Button) {
+    $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $on = $TestApi -and $TestApi.Running
+    if ($on) {
+        [void](Add-MenuItem $m "Running at $(Get-TestApiUrl)  (copy)" { Copy-TbText (Get-TestApiUrl) } $Glyph.Copy)
+        [void](Add-MenuItem $m 'What it can do (opens in the browser)' { Start-Process (Get-TestApiUrl) } $Glyph.Globe)
+        [void](Add-MenuItem $m 'Requests it received...' { Show-TestApiLog } $Glyph.History)
+        [void](Add-MenuItem $m 'Open the example chain' { Show-ApiChains; New-ChainFromExample 'Local test API (offline)' } $Glyph.Apps)
+        [void]$m.Items.Add('-')
+        [void](Add-MenuItem $m 'Stop it' { Stop-TestApi } $Glyph.Pause)
+    } else {
+        [void](Add-MenuItem $m 'Start the test API on this PC' { $u = Start-TestApi; if ($u) { $tray.ShowBalloonTip(3000, 'Test API running', "$u  -  log in with demo / demo. Pick the environment 'Local test API'.", 'Info') } } $Glyph.Play)
+        [void](Add-MenuItem $m 'Start it and open the example chain' { if (Start-TestApi) { Show-ApiChains; New-ChainFromExample 'Local test API (offline)' } } $Glyph.Apps)
+    }
+    $m.Show($Button, (New-Object System.Drawing.Point(0, $Button.Height)))
+}
+
+function Show-TestApiLog {
+    if ($TestApiUI.Form) { $TestApiUI.Form.Activate(); return }
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'Test API - requests received'; $f.Size = New-Object System.Drawing.Size((Px 720), (Px 420)); $f.StartPosition = 'CenterScreen'
+    $f.BackColor = $C.Panel; $f.ForeColor = $C.Fore; $f.Font = $FontMain; $f.Icon = $IconActive
+    $box = New-TbRtb -ReadOnly; $box.Dock = 'Fill'
+    $f.Controls.Add($box)
+    $TestApiUI.Form = $f; $TestApiUI.Box = $box
+    $t = New-Object System.Windows.Forms.Timer; $t.Interval = 400
+    $t.add_Tick({ if ($TestApi -and $TestApiUI.Box -and -not $TestApiUI.Box.IsDisposed) { foreach ($l in $TestApi.TakeLog()) { $TestApiUI.Box.AppendText($l + "`n") } } })
+    $TestApiUI.Timer = $t; $t.Start()
+    $f.add_FormClosed({ param($src, $e) $TestApiUI.Timer.Dispose(); $TestApiUI.Form = $null; $src.Dispose() })
+    Register-ThemedWindow $f
+    $box.Text = "Status  Request  (time)   -  new requests appear here`n"
+    $f.Show()
+}
+
 # Opens a copy of an example as a new chain, so you can change it freely.
 function New-ChainFromExample([string]$Name) {
     $ex = (Get-ChainExamples)[$Name]
     if (-not $ex) { return }
+    if ($ex.LocalApi) { $u = Start-TestApi; if (-not $u) { return }; $ex.Vars['baseUrl'] = $u }
     Save-ChainEditor; Save-Chains
     $ch = New-ChainRecord "Example - $Name"
     $ch.Vars = @(foreach ($k in $ex.Vars.Keys) { [pscustomobject]@{ Key = $k; Value = $ex.Vars[$k] } })
@@ -11626,6 +11721,7 @@ function Show-ApiChains {
     [void](New-Button 'Arrange' 'Line the cards up in run order (drag on empty space to scroll the canvas)' { Invoke-ChainArrange } $top $Glyph.Apps 2)
     [void](New-Button 'Examples' 'Ready-made chains to learn from: log in -> token, session cookie, create and read, headers / regex / status' { param($src, $e) Show-ChainExampleMenu $src } $top $Glyph.Lightning 2)
     [void](New-Button 'Share' 'Export this chain for a colleague, or import one' { param($src, $e) Show-ChainShareMenu $src } $top $Glyph.Send 2)
+    $ChainUI.TestApiBtn = New-Button 'Test API' 'A practice API on this PC: log in, token, cookie, CSRF, items. No internet needed.' { param($src, $e) Show-TestApiMenu $src } $top $Glyph.Network 2
     $f.Controls.Add($top)
 
     $status = New-Object System.Windows.Forms.Label
@@ -13755,6 +13851,7 @@ Register-PaletteCommand 'Transform text' 'Ctrl+T' $Glyph.Code { [void](Show-Tran
 Register-PaletteCommand 'Network tools' 'Ctrl+Shift+N' $Glyph.Network { [void](Show-Network) } 'ping tcp nslookup dns traceroute'
 Register-PaletteCommand 'API tester' 'Ctrl+Shift+A' $Glyph.Globe { Show-ApiTester } 'http rest postman curl'
 Register-PaletteCommand 'Git' '' $Glyph.Code { Show-Git } 'git repository commit branch merge push pull graph history log stash rebase'
+Register-PaletteCommand 'Test API: start / stop' '' $Glyph.Network { if ($TestApi -and $TestApi.Running) { Stop-TestApi; $tray.ShowBalloonTip(2000, 'Test API', 'Stopped.', 'Info') } else { $u = Start-TestApi; if ($u) { $tray.ShowBalloonTip(3000, 'Test API running', "$u  -  demo / demo", 'Info') } } } 'mock server local practice login token cookie csrf'
 Register-PaletteCommand 'API chains' '' $Glyph.Apps { Show-ApiChains } 'chain flow login cookie token sequence workflow requests http'
 Register-PaletteCommand 'Edit the picture on the clipboard' '' $Glyph.Photo { Edit-ClipboardImage } 'image screenshot annotate draw arrow crop blur'
 Register-PaletteCommand 'Paste stack: collect what I copy next' '' $Glyph.Paste { Start-PasteStack } 'queue paste one after another multiple sequence'
@@ -15054,6 +15151,272 @@ public class DevGitGraph : System.Windows.Forms.Panel {
                 }
             }
         }
+    }
+}
+
+// ---- Test API: a tiny HTTP server on 127.0.0.1 to practise requests and chains (log in, token, cookie,
+//      CSRF, CRUD). Plain TcpListener, so it needs no admin rights or URL reservation. Data is in memory.
+public class DevTestApi {
+    System.Net.Sockets.TcpListener listener;
+    volatile bool running;
+    public int Port { get; private set; }
+    public bool Running { get { return running; } }
+    readonly object gate = new object();
+    readonly List<string> log = new List<string>();
+    readonly Dictionary<string, int> tokens = new Dictionary<string, int>(), sessions = new Dictionary<string, int>();
+    readonly HashSet<string> csrf = new HashSet<string>();
+    SortedDictionary<int, string> items;    // id -> JSON object text
+    int nextId;
+    static readonly string[][] Users = { new[] { "1", "demo", "demo", "Demo User", "demo@example.com" }, new[] { "2", "ann", "secret", "Ann Smith", "ann@example.com" } };
+
+    void Seed() {
+        items = new SortedDictionary<int, string>();
+        items[1] = "{\"id\":1,\"name\":\"Keyboard\",\"price\":49.9,\"owner\":1}";
+        items[2] = "{\"id\":2,\"name\":\"Mouse\",\"price\":19.5,\"owner\":1}";
+        items[3] = "{\"id\":3,\"name\":\"Monitor\",\"price\":199,\"owner\":2}";
+        nextId = 4;
+    }
+
+    // Returns the port it listens on (tries a few), or -1.
+    public int Start(int port) {
+        if (running) return Port;
+        lock (gate) { tokens.Clear(); sessions.Clear(); csrf.Clear(); Seed(); }
+        for (int p = port; p < port + 20; p++) {
+            try {
+                listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, p);
+                listener.Start();
+                Port = p; running = true;
+                var t = new System.Threading.Thread(Accept); t.IsBackground = true; t.Start();
+                return p;
+            } catch { listener = null; }
+        }
+        return -1;
+    }
+
+    public void Stop() {
+        running = false;
+        try { if (listener != null) listener.Stop(); } catch { }
+        listener = null;
+    }
+
+    public string[] TakeLog() { lock (log) { var a = log.ToArray(); log.Clear(); return a; } }
+
+    void Accept() {
+        while (running) {
+            System.Net.Sockets.TcpClient c;
+            try { c = listener.AcceptTcpClient(); } catch { break; }
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate { Serve(c); });
+        }
+    }
+
+    class Req { public string Method, Path, Query = "", Body = ""; public Dictionary<string, string> Headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); public Dictionary<string, string> Cookies = new Dictionary<string, string>(); }
+    class Resp { public int Status = 200; public string Type = "application/json"; public string Body = ""; public List<string[]> Headers = new List<string[]>(); }
+
+    void Serve(System.Net.Sockets.TcpClient c) {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        string line = "";
+        try {
+            using (c) {
+                c.ReceiveTimeout = 10000; c.SendTimeout = 10000;
+                var s = c.GetStream();
+                var buf = new List<byte>(); var one = new byte[4096]; int headEnd = -1;
+                while (headEnd < 0) {
+                    int n = s.Read(one, 0, one.Length); if (n <= 0) return;
+                    for (int i = 0; i < n; i++) buf.Add(one[i]);
+                    for (int i = Math.Max(0, buf.Count - n - 3); i + 3 < buf.Count; i++) if (buf[i] == 13 && buf[i + 1] == 10 && buf[i + 2] == 13 && buf[i + 3] == 10) { headEnd = i; break; }
+                    if (buf.Count > 1 << 20) return;
+                }
+                var head = Encoding.ASCII.GetString(buf.ToArray(), 0, headEnd).Split(new[] { "\r\n" }, StringSplitOptions.None);
+                var r = new Req();
+                var first = head[0].Split(' ');
+                if (first.Length < 2) return;
+                r.Method = first[0].ToUpperInvariant();
+                var target = first[1];
+                int q = target.IndexOf('?');
+                r.Path = Uri.UnescapeDataString(q >= 0 ? target.Substring(0, q) : target).TrimEnd('/');
+                if (r.Path == "") r.Path = "/";
+                if (q >= 0) r.Query = target.Substring(q + 1);
+                for (int i = 1; i < head.Length; i++) { int k = head[i].IndexOf(':'); if (k > 0) r.Headers[head[i].Substring(0, k).Trim()] = head[i].Substring(k + 1).Trim(); }
+                int len = 0; string cl; if (r.Headers.TryGetValue("Content-Length", out cl)) int.TryParse(cl, out len);
+                var body = new List<byte>(); for (int i = headEnd + 4; i < buf.Count; i++) body.Add(buf[i]);
+                while (body.Count < len) { int n = s.Read(one, 0, Math.Min(one.Length, len - body.Count)); if (n <= 0) break; for (int i = 0; i < n; i++) body.Add(one[i]); }
+                r.Body = Encoding.UTF8.GetString(body.ToArray());
+                string ck; if (r.Headers.TryGetValue("Cookie", out ck)) foreach (var part in ck.Split(';')) { int k = part.IndexOf('='); if (k > 0) r.Cookies[part.Substring(0, k).Trim()] = part.Substring(k + 1).Trim(); }
+                line = r.Method + " " + target;
+                Resp res;
+                try { res = Handle(r); } catch (Exception ex) { res = Err(500, "server error: " + ex.Message); }
+                var bytes = Encoding.UTF8.GetBytes(res.Body);
+                var sb = new StringBuilder();
+                sb.Append("HTTP/1.1 ").Append(res.Status).Append(' ').Append(Reason(res.Status)).Append("\r\n");
+                sb.Append("Content-Type: ").Append(res.Type).Append("; charset=utf-8\r\n");
+                sb.Append("Content-Length: ").Append(bytes.Length).Append("\r\n");
+                sb.Append("Connection: close\r\nServer: DevTools-TestAPI\r\n");
+                foreach (var h in res.Headers) sb.Append(h[0]).Append(": ").Append(h[1]).Append("\r\n");
+                sb.Append("\r\n");
+                var hb = Encoding.ASCII.GetBytes(sb.ToString());
+                s.Write(hb, 0, hb.Length); s.Write(bytes, 0, bytes.Length); s.Flush();
+                lock (log) { log.Add(DateTime.Now.ToString("HH:mm:ss") + "  " + res.Status + "  " + line + "  (" + sw.ElapsedMilliseconds + " ms)"); if (log.Count > 500) log.RemoveAt(0); }
+            }
+        } catch { }
+    }
+
+    static string Reason(int s) {
+        switch (s) {
+            case 200: return "OK"; case 201: return "Created"; case 204: return "No Content"; case 400: return "Bad Request"; case 401: return "Unauthorized";
+            case 403: return "Forbidden"; case 404: return "Not Found"; case 405: return "Method Not Allowed"; case 418: return "I'm a teapot"; case 500: return "Internal Server Error";
+            case 503: return "Service Unavailable"; default: return s >= 500 ? "Server Error" : s >= 400 ? "Client Error" : s >= 300 ? "Redirect" : "OK";
+        }
+    }
+
+    static string J(string s) {
+        var sb = new StringBuilder("\"");
+        foreach (char ch in s ?? "") {
+            if (ch == '"' || ch == '\\') sb.Append('\\').Append(ch);
+            else if (ch == '\n') sb.Append("\\n"); else if (ch == '\r') sb.Append("\\r"); else if (ch == '\t') sb.Append("\\t");
+            else if (ch < 32) sb.Append("\\u").Append(((int)ch).ToString("x4")); else sb.Append(ch);
+        }
+        return sb.Append('"').ToString();
+    }
+
+    static Resp Json(int status, string body) { return new Resp { Status = status, Body = body }; }
+    static Resp Err(int status, string msg) { return Json(status, "{\"error\":" + J(msg) + ",\"status\":" + status + "}"); }
+
+    static string Field(string json, string name) {
+        var m = System.Text.RegularExpressions.Regex.Match(json ?? "", "\"" + System.Text.RegularExpressions.Regex.Escape(name) + "\"\\s*:\\s*(\"((?:\\\\.|[^\"\\\\])*)\"|(-?[\\d.]+|true|false|null))");
+        if (!m.Success) return null;
+        return m.Groups[2].Success && m.Groups[1].Value.StartsWith("\"") ? System.Text.RegularExpressions.Regex.Unescape(m.Groups[2].Value) : m.Groups[3].Value;
+    }
+
+    static string FormField(string body, string name) {
+        foreach (var p in (body ?? "").Split('&')) { int k = p.IndexOf('='); if (k > 0 && Uri.UnescapeDataString(p.Substring(0, k).Replace('+', ' ')) == name) return Uri.UnescapeDataString(p.Substring(k + 1).Replace('+', ' ')); }
+        return null;
+    }
+
+    static string[] FindUser(string user, string pass) { foreach (var u in Users) if (u[1] == user && u[2] == pass) return u; return null; }
+    static string[] UserById(int id) { foreach (var u in Users) if (u[0] == id.ToString()) return u; return null; }
+    static string UserJson(string[] u) { return "{\"id\":" + u[0] + ",\"username\":" + J(u[1]) + ",\"name\":" + J(u[3]) + ",\"email\":" + J(u[4]) + "}"; }
+
+    // who is calling: a Bearer token or the session cookie; 0 = nobody
+    int Caller(Req r, bool allowCookie) {
+        string a; int id;
+        if (r.Headers.TryGetValue("Authorization", out a) && a.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) && tokens.TryGetValue(a.Substring(7).Trim(), out id)) return id;
+        string s;
+        if (allowCookie && r.Cookies.TryGetValue("session", out s) && sessions.TryGetValue(s, out id)) return id;
+        return 0;
+    }
+
+    Resp LogIn(string user, string pass, bool giveToken) {
+        var u = FindUser(user, pass);
+        if (u == null) return Err(401, "wrong username or password (try demo / demo)");
+        string tok = Guid.NewGuid().ToString("N"), ses = Guid.NewGuid().ToString("N").Substring(0, 16);
+        lock (gate) { tokens[tok] = int.Parse(u[0]); sessions[ses] = int.Parse(u[0]); }
+        var res = Json(200, giveToken ? "{\"token\":" + J(tok) + ",\"userId\":" + u[0] + ",\"name\":" + J(u[3]) + ",\"expiresIn\":3600}" : "{\"ok\":true,\"userId\":" + u[0] + ",\"name\":" + J(u[3]) + "}");
+        res.Headers.Add(new[] { "Set-Cookie", "session=" + ses + "; Path=/; HttpOnly" });
+        return res;
+    }
+
+    Resp Handle(Req r) {
+        string p = r.Path, m = r.Method;
+        if (p == "/" && m == "GET") return new Resp { Type = "text/plain", Body = Help() };
+        if (p == "/login") {
+            if (m != "POST") return Err(405, "use POST");
+            return LogIn(Field(r.Body, "username"), Field(r.Body, "password"), true);
+        }
+        if (p == "/login-form") {
+            if (m != "POST") return Err(405, "use POST");
+            return LogIn(FormField(r.Body, "username"), FormField(r.Body, "password"), false);
+        }
+        if (p == "/logout") { string s; if (r.Cookies.TryGetValue("session", out s)) lock (gate) sessions.Remove(s); var res = Json(200, "{\"ok\":true}"); res.Headers.Add(new[] { "Set-Cookie", "session=; Path=/; Max-Age=0" }); return res; }
+        if (p == "/me") {
+            int id = Caller(r, true);
+            if (id == 0) return Err(401, "send Authorization: Bearer <token> (from POST /login) or the session cookie");
+            return Json(200, UserJson(UserById(id)));
+        }
+        if (p == "/csrf" && m == "GET") {
+            var t = Guid.NewGuid().ToString("N").Substring(0, 20);
+            lock (gate) csrf.Add(t);
+            var res = new Resp { Type = "text/html", Body = "<html><body><form method=\"post\" action=\"/items\">\n  <input type=\"hidden\" name=\"csrf\" value=\"" + t + "\">\n</form></body></html>" };
+            res.Headers.Add(new[] { "X-CSRF-Token", t });
+            return res;
+        }
+        if (p.StartsWith("/status/")) { int code; if (!int.TryParse(p.Substring(8), out code) || code < 100 || code > 599) code = 400; return Json(code, "{\"status\":" + code + "}"); }
+        if (p == "/slow") {
+            int ms = 2000; foreach (var kv in r.Query.Split('&')) if (kv.StartsWith("ms=")) int.TryParse(kv.Substring(3), out ms);
+            ms = Math.Max(0, Math.Min(ms, 15000));
+            System.Threading.Thread.Sleep(ms);
+            return Json(200, "{\"waited\":" + ms + "}");
+        }
+        if (p == "/echo") {
+            var sb = new StringBuilder("{\"method\":" + J(m) + ",\"path\":" + J(p) + ",\"query\":" + J(r.Query) + ",\"headers\":{");
+            bool f = true; foreach (var kv in r.Headers) { if (!f) sb.Append(','); f = false; sb.Append(J(kv.Key)).Append(':').Append(J(kv.Value)); }
+            sb.Append("},\"cookies\":{"); f = true; foreach (var kv in r.Cookies) { if (!f) sb.Append(','); f = false; sb.Append(J(kv.Key)).Append(':').Append(J(kv.Value)); }
+            sb.Append("},\"body\":").Append(J(r.Body)).Append('}');
+            return Json(200, sb.ToString());
+        }
+        if (p == "/items" || p.StartsWith("/items/")) return Items(r);
+        return Err(404, "no such endpoint: " + m + " " + p + " - GET / lists them");
+    }
+
+    Resp Items(Req r) {
+        int who = Caller(r, true);
+        if (who == 0) return Err(401, "log in first: send the session cookie or Authorization: Bearer <token>");
+        string m = r.Method;
+        lock (gate) {
+            if (r.Path == "/items") {
+                if (m == "GET") return Json(200, "{\"count\":" + items.Count + ",\"items\":[" + string.Join(",", items.Values.ToArray()) + "]}");
+                if (m == "POST") {
+                    var b = (r.Body ?? "").Trim();
+                    if (!b.StartsWith("{") || !b.EndsWith("}")) return Err(400, "send a JSON object, e.g. {\"name\":\"Lamp\",\"price\":25}");
+                    if (Field(b, "name") == null) return Err(400, "\"name\" is required");
+                    int id = nextId++;
+                    var inner = b.Substring(1, b.Length - 2).Trim();
+                    inner = System.Text.RegularExpressions.Regex.Replace(inner, "\"(id|owner)\"\\s*:\\s*[^,}]+,?", "").Trim().TrimEnd(',');
+                    items[id] = "{\"id\":" + id + (inner.Length > 0 ? "," + inner : "") + ",\"owner\":" + who + "}";
+                    var res = Json(201, items[id]);
+                    res.Headers.Add(new[] { "Location", "/items/" + id });
+                    return res;
+                }
+                return Err(405, "use GET or POST");
+            }
+            int iid;
+            if (!int.TryParse(r.Path.Substring(7), out iid)) return Err(400, "the id must be a number");
+            if (!items.ContainsKey(iid)) return Err(404, "item " + iid + " not found");
+            if (m == "GET") return Json(200, items[iid]);
+            if (m == "PUT" || m == "PATCH") {
+                var b = (r.Body ?? "").Trim();
+                if (!b.StartsWith("{")) return Err(400, "send a JSON object");
+                var name = Field(b, "name") ?? Field(items[iid], "name");
+                var price = Field(b, "price") ?? Field(items[iid], "price") ?? "0";
+                items[iid] = "{\"id\":" + iid + ",\"name\":" + J(name) + ",\"price\":" + price + ",\"owner\":" + who + "}";
+                return Json(200, items[iid]);
+            }
+            if (m == "DELETE") {
+                string t;
+                if (!r.Headers.TryGetValue("X-CSRF-Token", out t) || !csrf.Contains(t)) return Err(403, "deleting needs the header X-CSRF-Token with a token from GET /csrf");
+                csrf.Remove(t);
+                items.Remove(iid);
+                return new Resp { Status = 204, Body = "" };
+            }
+            return Err(405, "use GET, PUT, PATCH or DELETE");
+        }
+    }
+
+    string Help() {
+        return "DevTools Test API  -  http://127.0.0.1:" + Port + "\n\n" +
+            "Users: demo / demo   and   ann / secret\n\n" +
+            "POST /login        JSON {\"username\":\"demo\",\"password\":\"demo\"} -> {\"token\":...,\"userId\":1}  + cookie session=...\n" +
+            "POST /login-form   form username=demo&password=demo -> cookie session=... (no token)\n" +
+            "POST /logout       clears the session cookie\n" +
+            "GET  /me           who you are (Bearer token or session cookie)\n" +
+            "GET  /items        the list (needs the token or the cookie)\n" +
+            "POST /items        JSON {\"name\":\"Lamp\",\"price\":25} -> 201 with the new id\n" +
+            "GET  /items/{id}   one item (404 if missing)\n" +
+            "PUT  /items/{id}   change it\n" +
+            "DELETE /items/{id} needs header X-CSRF-Token from GET /csrf -> 204\n" +
+            "GET  /csrf         a token in the X-CSRF-Token header and in the HTML (value=\"...\")\n" +
+            "GET  /status/{code} answers with that status\n" +
+            "GET  /slow?ms=2000 answers after a delay\n" +
+            "ANY  /echo         sends back what you sent: method, query, headers, cookies, body\n";
     }
 }
 

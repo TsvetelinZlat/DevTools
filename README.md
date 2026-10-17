@@ -318,6 +318,21 @@ Build a flow of requests on a canvas, for example: log in, then use the cookie o
 - **Share** exports the chain to a `.devchain.json` file, or copies it as text to paste into a chat or email; you choose whether variable values (passwords, tokens) go along. Your colleague uses **Share > Import from a file / from the clipboard**; it comes in as a new chain and tells them which variables to fill in.
 - Chains are saved in `datapi\chains.json`.
 
+**Test API** (button in the API tester and in API chains, or *Test API: start / stop* in the palette)
+
+A small practice API that runs inside DevTools on this PC only (`http://127.0.0.1:8799`) - no internet, nothing installed, fresh data every start. Starting it also creates the environment **Local test API** (`baseUrl`, `user` = demo, `password` = demo). Users: `demo / demo` and `ann / secret`.
+
+| Endpoint | What it does |
+|---|---|
+| `POST /login` | JSON `{"username":"demo","password":"demo"}` -> `{"token":...,"userId":1}` and a `session` cookie; wrong password -> 401 |
+| `POST /login-form` | the same as a form (`username=demo&password=demo`) -> only the cookie |
+| `GET /me` | who you are - needs `Authorization: Bearer <token>` or the cookie, else 401 |
+| `GET /items`, `POST /items`, `GET/PUT/DELETE /items/{id}` | a list you can change; POST answers 201 with the new id, a missing id 404 |
+| `GET /csrf` | a token in the `X-CSRF-Token` header and in the HTML; **DELETE** needs it (else 403) |
+| `GET /status/{code}`, `GET /slow?ms=2000`, `ANY /echo` | any status, a slow answer, and your request sent back |
+
+The menu also opens the full list in the browser, shows the **requests it received**, and opens the example chain **Local test API (offline)**: log in, Bearer token, cookie-only call, create, CSRF via Header and Regex rules, delete, check for 404.
+
 **Collections, history and environments**
 
 - **Save** (Ctrl+S) stores the request in a collection folder; Ctrl+Shift+S saves a copy. Click a saved request to open it; right-click to rename / move, duplicate or delete it (or a whole folder).
