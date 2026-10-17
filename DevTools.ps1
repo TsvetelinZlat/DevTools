@@ -11620,7 +11620,7 @@ function Reset-ChainVars {
 function Start-ChainRunSelected {
     $cv = $ChainUI.Canvas
     $ids = @($cv.Selection | ForEach-Object { $_.Id })
-    if (-not $ids) { Set-ChainStatus 'Select the cards to run first (click, Ctrl+click or Ctrl+drag a box).' $C.Dim; return }
+    if (-not $ids) { Set-ChainStatus 'Select the cards to run first (click, Ctrl+click, or double-click empty space and drag a box).' $C.Dim; return }
     Start-ChainRun '' $ids
 }
 
@@ -12504,7 +12504,7 @@ function Show-ApiChains {
     $ChainUI.Editor = $ed
     $hint = New-Object System.Windows.Forms.Label
     $hint.Dock = 'Fill'; $hint.TextAlign = 'MiddleCenter'; $hint.ForeColor = $C.Dim; $hint.BackColor = $C.Bg
-    $hint.Text = "Click a card to edit it.`n`nDrag requests from the left onto the canvas.`nDrag from a card's blue dot to another card to run it after.`nCtrl+click, or Ctrl+drag a box on empty space, to select several cards;`nthen Del deletes them, Ctrl+C / Ctrl+V copies them, dragging moves them.`nDrag empty space to move around (or the mouse wheel, Shift = sideways)."
+    $hint.Text = "Click a card to edit it.`n`nDrag requests from the left onto the canvas.`nDrag from a card's blue dot to another card to run it after.`nCtrl+click, or double-click empty space and drag a box, to select several cards;`nthen Del deletes them, Ctrl+C / Ctrl+V copies them, dragging moves them.`nDrag empty space to move around (or the mouse wheel, Shift = sideways)."
     $right.Panel1.Controls.Add($hint)
     $ChainUI.EditorHint = $hint
 
@@ -12743,7 +12743,7 @@ function Show-ApiChains {
         Show-ChainStep $src.SelectedNode
         $k = $src.Selection.Count
         if ($k -gt 1) { Set-ChainStatus "$k cards selected  -  Shift+F5 runs only these, drag one to move them together, Del deletes them, Ctrl+C copies them." $C.Accent }
-        elseif ($ChainUI.Status -and $ChainUI.Status.Text -match '^\d+ cards selected') { Set-ChainStatus 'Ctrl+click, or Ctrl+drag a box on empty space, to select several cards.' $C.Dim }
+        elseif ($ChainUI.Status -and $ChainUI.Status.Text -match '^\d+ cards selected') { Set-ChainStatus 'Ctrl+click, or double-click empty space and drag a box, to select several cards.' $C.Dim }
     })
     $cv.add_Changed({ param($src, $e) Update-ChainOrder; Save-Chains })
     $cv.add_NodeOpen({ Select-ApiTab $ChainUI.ETabs 'Request'; [void]$ChainUI.EUrl.Focus() })
@@ -15742,7 +15742,7 @@ public class ChainNode {
 }
 public class ChainLink { public string From, To; }
 
-// API chains canvas: cards joined by arrows. Click / Ctrl+click / Ctrl+drag a box on empty space to select;
+// API chains canvas: cards joined by arrows. Click / Ctrl+click / double-click empty space and drag a box to select;
 // drag selected cards together; drag from a card's right dot to another card to link; drag empty space (or wheel) scrolls.
 public class DevChainCanvas : System.Windows.Forms.Panel {
     public List<ChainNode> Nodes = new List<ChainNode>();
@@ -15891,9 +15891,10 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
         }
         var l = LinkAt(p);
         if (l != null) { Selection.Clear(); primary = null; SelectedLink = l; Fire(); return; }
-        if (e.Button == System.Windows.Forms.MouseButtons.Left && (ctrl || shift)) {
-            // Ctrl / Shift + drag on empty space: a box that adds the cards it touches to the selection
-            mode = Mode.Box; boxStart = p; boxAdd = true;
+        if (e.Button == System.Windows.Forms.MouseButtons.Left && (ctrl || shift || e.Clicks >= 2)) {
+            // double-click and drag on empty space: a selection box (with Ctrl / Shift: adds to the selection)
+            mode = Mode.Box; boxStart = p; boxAdd = ctrl || shift; Cursor = System.Windows.Forms.Cursors.Cross;
+            if (!boxAdd && (Selection.Count > 0 || SelectedLink != null)) { Selection.Clear(); primary = null; SelectedLink = null; Fire(); }
         } else if (e.Button == System.Windows.Forms.MouseButtons.Left) {
             // plain drag on empty space moves the view; a plain click there clears the selection (on mouse up)
             mode = Mode.Pan; panStart = new System.Drawing.PointF(e.X - Pan.X, e.Y - Pan.Y); Cursor = System.Windows.Forms.Cursors.SizeAll;
