@@ -10557,6 +10557,8 @@ function Show-ApiTester([string]$Text = '') {
     $left.Panel1.Controls.Add($h1)
     $chainBtn = New-Button 'Request chains...' 'Chain requests on a canvas: log in, take the cookie / token, use it in the next requests' { Show-ApiChains } $left.Panel1 $Glyph.Apps 2
     $chainBtn.Dock = 'Top'; $chainBtn.AutoSize = $false; $chainBtn.Height = $FontButton.Height + (Px 14)
+    $exBtn = New-Button 'Examples...' 'Load an example request: GET, POST JSON, form, headers, Bearer / Basic auth, log in, cookies, status codes' { param($src, $e) Show-ApiExampleMenu $src } $left.Panel1 $Glyph.Lightning 2
+    $exBtn.Dock = 'Top'; $exBtn.AutoSize = $false; $exBtn.Height = $FontButton.Height + (Px 14)
     $hl = New-Object System.Windows.Forms.ListBox
     $hl.Dock = 'Fill'; $hl.BorderStyle = 'None'; $hl.BackColor = $C.Panel; $hl.ForeColor = $C.Fore
     $hl.DrawMode = 'OwnerDrawFixed'; $hl.ItemHeight = Px 40; $hl.IntegralHeight = $false
@@ -10810,9 +10812,15 @@ function Invoke-ChainArrange {
         $depth[$n.Id] = $d
     }
     $rows = @{}
+    foreach ($n in @(Get-ChainOrder)) { $c = $depth[$n.Id]; $rows[$c] = [int]$rows[$c] + 1 }
+    $tallest = [math]::Max(1, ($rows.Values | Measure-Object -Maximum).Maximum)
+    # as many columns as fit across, then the next ones continue in a band below
+    $fit = [math]::Max(1, [math]::Floor(($cv.Width - (Px 60)) / ($cv.NodeW + (Px 70))))
+    $band = $tallest * ($cv.NodeH + (Px 40)) + (Px 40)
+    $used = @{}
     foreach ($n in @(Get-ChainOrder)) {
-        $c = $depth[$n.Id]; $r = [int]$rows[$c]; $rows[$c] = $r + 1
-        $n.X = (Px 40) + $c * ($cv.NodeW + (Px 70)); $n.Y = (Px 50) + $r * ($cv.NodeH + (Px 40))
+        $c = $depth[$n.Id]; $r = [int]$used[$c]; $used[$c] = $r + 1
+        $n.X = (Px 40) + ($c % $fit) * ($cv.NodeW + (Px 70)); $n.Y = (Px 50) + [math]::Floor($c / $fit) * $band + $r * ($cv.NodeH + (Px 40))
     }
     $cv.Pan = New-Object System.Drawing.PointF(0, 0)
     $cv.Invalidate()
@@ -10863,9 +10871,231 @@ function Get-ChainTemplates {
     }
 }
 
+# ---- Built-in examples (always there, never saved over): single requests and whole chains, against free
+#      public test services - dummyjson.com, jsonplaceholder.typicode.com and httpbin.org.
+function New-ExampleModel([string]$Name, [string]$Method, [string]$Url, [hashtable]$More = @{}) {
+    $m = New-ApiModel
+    $m.Name = $Name; $m.Folder = 'Examples'; $m.Method = $Method; $m.Url = $Url
+    foreach ($k in $More.Keys) { $m.$k = $More[$k] }
+    $m
+}
+function New-ExampleKv([hashtable]$Pairs) { @(foreach ($k in $Pairs.Keys) { [pscustomobject]@{ On = $true; Key = $k; Value = [string]$Pairs[$k] } }) }
+
+function Get-ApiExampleRequests {
+    [ordered]@{
+        'GET - read JSON' = @{ Note = 'The simplest request: GET a URL and read the JSON it returns.'
+            Model = (New-ExampleModel 'Get a user' 'GET' 'https://jsonplaceholder.typicode.com/users/1') }
+        'GET - query parameters' = @{ Note = 'Query parameters: type them after ? in the URL, or on the Params tab (they stay in sync).'
+            Model = (New-ExampleModel 'Posts of user 1' 'GET' 'https://jsonplaceholder.typicode.com/posts?userId=1') }
+        'POST - send JSON' = @{ Note = 'Send JSON: Body tab, type JSON. The Content-Type header is added for you.'
+            Model = (New-ExampleModel 'Create a post' 'POST' 'https://jsonplaceholder.typicode.com/posts' @{ BodyType = 'JSON'; Body = "{`r`n  `"title`": `"Hello`",`r`n  `"body`": `"Sent from DevTools`",`r`n  `"userId`": 1`r`n}" }) }
+        'PUT - replace' = @{ Note = 'PUT replaces a resource; PATCH changes part of it.'
+            Model = (New-ExampleModel 'Update a post' 'PUT' 'https://jsonplaceholder.typicode.com/posts/1' @{ BodyType = 'JSON'; Body = "{`r`n  `"id`": 1,`r`n  `"title`": `"New title`",`r`n  `"body`": `"New text`",`r`n  `"userId`": 1`r`n}" }) }
+        'DELETE' = @{ Note = 'DELETE usually has no body; the status code tells you whether it worked.'
+            Model = (New-ExampleModel 'Delete a post' 'DELETE' 'https://jsonplaceholder.typicode.com/posts/1') }
+        'POST - form fields' = @{ Note = 'An HTML-style form: Body tab, Form URL-encoded, one row per field. httpbin echoes what it received.'
+            Model = (New-ExampleModel 'Send a form' 'POST' 'https://httpbin.org/post' @{ BodyType = 'Form URL-encoded'; Form = (New-ExampleKv ([ordered]@{ name = 'Ann'; city = 'Sofia' })) }) }
+        'Headers' = @{ Note = 'Custom headers on the Headers tab. httpbin shows the headers it got.'
+            Model = (New-ExampleModel 'Send headers' 'GET' 'https://httpbin.org/headers' @{ Headers = (New-ExampleKv ([ordered]@{ 'X-Demo-Id' = 'demo-123'; 'Accept-Language' = 'en' })) }) }
+        'Auth - Bearer token' = @{ Note = 'Auth tab, Bearer token: sends "Authorization: Bearer <token>".'
+            Model = (New-ExampleModel 'Bearer token' 'GET' 'https://httpbin.org/bearer' @{ AuthType = 'Bearer token'; Token = 'my-secret-token' }) }
+        'Auth - Basic' = @{ Note = 'Auth tab, Basic auth with a username and password (here user / passwd).'
+            Model = (New-ExampleModel 'Basic auth' 'GET' 'https://httpbin.org/basic-auth/user/passwd' @{ AuthType = 'Basic auth'; User = 'user'; Password = 'passwd' }) }
+        'Log in - get a token' = @{ Note = 'A real log-in: the response has accessToken. In a chain you would save it as {{token}} (see the chain examples).'
+            Model = (New-ExampleModel 'Log in' 'POST' 'https://dummyjson.com/auth/login' @{ BodyType = 'JSON'; Body = "{`r`n  `"username`": `"emilys`",`r`n  `"password`": `"emilyspass`"`r`n}" }) }
+        'Cookies - a server sets one' = @{ Note = 'The response sets a cookie (see the Cookies tab). Follow redirects is off on the Settings tab, so you see the Set-Cookie itself.'
+            Model = (New-ExampleModel 'Set a cookie' 'GET' 'https://httpbin.org/cookies/set?flavor=chocolate' @{ Follow = $false }) }
+        'Status codes' = @{ Note = 'Any status you want to test against: 404 here, try 500 or 201.'
+            Model = (New-ExampleModel 'Get a 404' 'GET' 'https://httpbin.org/status/404') }
+    }
+}
+
+function New-ExampleRule([string]$Var, [string]$From, [string]$Expr) { [pscustomobject]@{ Var = $Var; From = $From; Expr = $Expr } }
+
+# Each chain: Note (what it shows), Vars, Steps (Model + Extract), Links as "from>to" step numbers (1-based).
+function Get-ChainExamples {
+    [ordered]@{
+        'Log in, then use the token' = @{
+            Note = "1. Log in posts {{user}} / {{password}} (see Variables...) and saves accessToken from the response as {{token}} and id as {{userId}} - look at its 'Take from response' tab.`n2. Who am I sends the header Authorization: Bearer {{token}}.`n3. My carts uses {{userId}} in the URL.`nPress F5 to run it, then click each card to see what was sent and received."
+            Vars = [ordered]@{ baseUrl = 'https://dummyjson.com'; user = 'emilys'; password = 'emilyspass' }
+            Steps = @(
+                @{ Model = (New-ExampleModel 'Log in' 'POST' '{{baseUrl}}/auth/login' @{ BodyType = 'JSON'; Body = "{`r`n  `"username`": `"{{user}}`",`r`n  `"password`": `"{{password}}`"`r`n}" }); Extract = @((New-ExampleRule 'token' 'JSON path' '$.accessToken'), (New-ExampleRule 'userId' 'JSON path' '$.id')) }
+                @{ Model = (New-ExampleModel 'Who am I (Bearer token)' 'GET' '{{baseUrl}}/auth/me' @{ Headers = (New-ExampleKv ([ordered]@{ Authorization = 'Bearer {{token}}' })) }); Extract = @((New-ExampleRule 'email' 'JSON path' '$.email')) }
+                @{ Model = (New-ExampleModel 'My carts' 'GET' '{{baseUrl}}/carts/user/{{userId}}' @{ Headers = (New-ExampleKv ([ordered]@{ Authorization = 'Bearer {{token}}' })) }); Extract = @((New-ExampleRule 'cartCount' 'JSON path' '$.total')) }
+            )
+            Links = @('1>2', '2>3')
+        }
+        'Session cookie' = @{
+            Note = "1. Set cookie: the server answers with Set-Cookie: session=... (Follow redirects is off for this step, so the cookie isn't lost on the redirect).`n2. Read cookies: nothing is set by hand - 'Send cookies along' (top bar) sends the cookie by itself, and httpbin shows it came back. Its 'Take from response' saves it as {{session}}.`nThis is how a log-in that uses a cookie instead of a token works."
+            Vars = [ordered]@{ baseUrl = 'https://httpbin.org' }
+            Steps = @(
+                @{ Model = (New-ExampleModel 'Set cookie (log in)' 'GET' '{{baseUrl}}/cookies/set?session=abc123' @{ Follow = $false }); Extract = @((New-ExampleRule 'sessionCookie' 'Cookie' 'session')) }
+                @{ Model = (New-ExampleModel 'Read cookies (sent along)' 'GET' '{{baseUrl}}/cookies'); Extract = @((New-ExampleRule 'session' 'JSON path' '$.cookies.session')) }
+            )
+            Links = @('1>2')
+        }
+        'Read, then create and change' = @{
+            Note = "1. Get a user and save its id and name.`n2. Create a post for that user: the JSON body uses {{userId}} and {{name}}; the new id is saved as {{postId}}.`n3. and 4. run after step 1 side by side: list the user's posts, and change post 1 with PUT.`nOne card can feed several others - drag more arrows out of its blue dot."
+            Vars = [ordered]@{ baseUrl = 'https://jsonplaceholder.typicode.com' }
+            Steps = @(
+                @{ Model = (New-ExampleModel 'Get user' 'GET' '{{baseUrl}}/users/1'); Extract = @((New-ExampleRule 'userId' 'JSON path' '$.id'), (New-ExampleRule 'name' 'JSON path' '$.name')) }
+                @{ Model = (New-ExampleModel 'Create a post' 'POST' '{{baseUrl}}/posts' @{ BodyType = 'JSON'; Body = "{`r`n  `"userId`": {{userId}},`r`n  `"title`": `"Hello from {{name}}`",`r`n  `"body`": `"Created by a DevTools chain`"`r`n}" }); Extract = @((New-ExampleRule 'postId' 'JSON path' '$.id')) }
+                @{ Model = (New-ExampleModel 'List their posts' 'GET' '{{baseUrl}}/posts?userId={{userId}}'); Extract = @((New-ExampleRule 'firstTitle' 'JSON path' '$[0].title')) }
+                @{ Model = (New-ExampleModel 'Change post 1' 'PUT' '{{baseUrl}}/posts/1' @{ BodyType = 'JSON'; Body = "{`r`n  `"id`": 1,`r`n  `"userId`": {{userId}},`r`n  `"title`": `"Changed`",`r`n  `"body`": `"by {{name}}`"`r`n}" }); Extract = @() }
+            )
+            Links = @('1>2', '1>3', '1>4')
+        }
+        'Headers, regex and status' = @{
+            Note = "1. Get an id: a Regex rule takes the uuid out of the response (its first group) - handy when the answer isn't JSON.`n2. Send it as a header: X-Demo-Id: {{requestId}}. httpbin sends it back (saved with the JSON path `$.headers['X-Demo-Id'] - brackets because of the dashes), and a Header rule saves the Content-Type.`n3. Expect 418: a 4xx normally stops the chain, but here 'Stop the chain here if it fails' is unticked; a Status rule saves 418 as {{status}}.`n4. Runs anyway and uses {{status}}."
+            Vars = [ordered]@{ baseUrl = 'https://httpbin.org' }
+            Steps = @(
+                @{ Model = (New-ExampleModel 'Get an id (regex)' 'GET' '{{baseUrl}}/uuid'); Extract = @((New-ExampleRule 'requestId' 'Regex' '"uuid":\s*"([^"]+)"')) }
+                @{ Model = (New-ExampleModel 'Send it as a header' 'GET' '{{baseUrl}}/headers' @{ Headers = (New-ExampleKv ([ordered]@{ 'X-Demo-Id' = '{{requestId}}' })) }); Extract = @((New-ExampleRule 'echoed' 'JSON path' "`$.headers['X-Demo-Id']"), (New-ExampleRule 'contentType' 'Header' 'Content-Type')) }
+                @{ Model = (New-ExampleModel 'Expect 418 (keeps going)' 'GET' '{{baseUrl}}/status/418'); Extract = @((New-ExampleRule 'status' 'Status' '')); NoStop = $true }
+                @{ Model = (New-ExampleModel 'Runs anyway' 'GET' '{{baseUrl}}/get?status={{status}}'); Extract = @() }
+            )
+            Links = @('1>2', '2>3', '3>4')
+        }
+    }
+}
+
+# Opens a copy of an example as a new chain, so you can change it freely.
+function New-ChainFromExample([string]$Name) {
+    $ex = (Get-ChainExamples)[$Name]
+    if (-not $ex) { return }
+    Save-ChainEditor; Save-Chains
+    $ch = New-ChainRecord "Example - $Name"
+    $ch.Vars = @(foreach ($k in $ex.Vars.Keys) { [pscustomobject]@{ Key = $k; Value = $ex.Vars[$k] } })
+    $ids = @()
+    $nodes = @()
+    $x = 40
+    foreach ($s in $ex.Steps) {
+        $id = [guid]::NewGuid().ToString('N'); $ids += $id
+        $nodes += [pscustomobject]@{ Id = $id; X = $x; Y = 60; Request = $s.Model; StopOnFail = -not $s.NoStop
+            Extract = @($s.Extract | ForEach-Object { [pscustomobject]@{ Var = $_.Var; From = $_.From; Expr = $_.Expr } }) }
+        $x += 320
+    }
+    $ch.Nodes = $nodes
+    $ch.Links = @(foreach ($l in $ex.Links) { $p = $l -split '>'; [pscustomobject]@{ From = $ids[[int]$p[0] - 1]; To = $ids[[int]$p[1] - 1] } })
+    $ChainUI.Chains.Add($ch)
+    $ChainUI.EditId = $null
+    Open-Chain $ch
+    Update-ChainCombo
+    Invoke-ChainArrange
+    $ChainUI.Result.Text = "Example: $Name`r`n`r`n$($ex.Note -replace "`n", "`r`n")`r`n`r`nThis is your copy - change it as you like. The original stays under Examples."
+    Set-ChainStatus "Example opened as a copy. Press F5 to run it." $C.Accent
+}
+
+# API tester: load an example request into the editor (not saved anywhere until you press Save).
+function Show-ApiExampleMenu($Button) {
+    $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $ex = Get-ApiExampleRequests
+    foreach ($k in $ex.Keys) {
+        $it = Add-MenuItem $m $k { param($src, $e) $x = (Get-ApiExampleRequests)[$src.Tag]; Set-ApiModel $x.Model; Set-ApiStatus "Example: $($x.Note)  Press Send (Ctrl+Enter)." $C.Accent }
+        $it.Tag = $k
+        $it.ToolTipText = $ex[$k].Note
+    }
+    [void]$m.Items.Add('-')
+    [void](Add-MenuItem $m 'Chain examples (log in -> token, cookies ...)' { Show-ApiChains; Show-ChainExampleMenu $null } $Glyph.Apps)
+    $m.Show($Button, (New-Object System.Drawing.Point(0, $Button.Height)))
+}
+
+function Show-ChainExampleMenu($Button) {
+    $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    foreach ($k in (Get-ChainExamples).Keys) {
+        $it = Add-MenuItem $m $k { param($src, $e) New-ChainFromExample $src.Tag } $Glyph.Apps
+        $it.Tag = $k
+    }
+    if ($Button) { $m.Show($Button, (New-Object System.Drawing.Point(0, $Button.Height))) }
+    else { $m.Show([System.Windows.Forms.Cursor]::Position) }
+}
+
+# ---- Sharing chains: export to a .devchain.json file (or the clipboard), import on another PC.
+function ConvertTo-ChainExport($Chain, [bool]$WithValues) {
+    Save-ChainEditor; Save-Chains
+    $vars = @(foreach ($v in @($Chain.Vars)) { if ($v -and $v.Key) { [ordered]@{ Key = $v.Key; Value = $(if ($WithValues) { $v.Value } else { '' }) } } })
+    $doc = [ordered]@{ DevToolsChain = 1; Name = $Chain.Name; AutoCookies = ($Chain.AutoCookies -ne $false); Vars = $vars; Nodes = @($Chain.Nodes); Links = @($Chain.Links) }
+    ConvertTo-Json -InputObject $doc -Depth 10
+}
+
+function Export-Chain([switch]$Clipboard) {
+    $ch = $ChainUI.Current
+    if (-not $ch) { return }
+    $with = $true
+    if (@($ch.Vars | Where-Object { $_ -and $_.Value }).Count) {
+        $a = [System.Windows.Forms.MessageBox]::Show($ChainUI.Form, "Include the values of the variables (for example passwords or tokens)?`n`nYes: your colleague can run it straight away.`nNo: only the names are shared; they fill in their own values (Variables...).", 'Export chain', 'YesNoCancel', 'Question')
+        if ($a -eq 'Cancel') { return }
+        $with = $a -eq 'Yes'
+    }
+    $json = ConvertTo-ChainExport $ch $with
+    if ($Clipboard) {
+        try { [System.Windows.Forms.Clipboard]::SetText($json) } catch { }
+        Set-ChainStatus 'Chain copied as text. Your colleague copies it and chooses Import... > From the clipboard.' $C.Green
+        return
+    }
+    $d = New-Object System.Windows.Forms.SaveFileDialog
+    $d.Filter = 'DevTools chain (*.devchain.json)|*.devchain.json|JSON (*.json)|*.json'
+    $d.FileName = (($ch.Name -replace '[\\/:*?"<>|]', '_').Trim()) + '.devchain.json'
+    $script:Modal = $true
+    try {
+        if ($d.ShowDialog($ChainUI.Form) -ne 'OK') { return }
+        [IO.File]::WriteAllText($d.FileName, $json, (New-Object System.Text.UTF8Encoding $false))
+        Set-ChainStatus "Exported to $($d.FileName)" $C.Green
+        Start-Process explorer.exe "/select,`"$($d.FileName)`""
+    } finally { $script:Modal = $false; $d.Dispose() }
+}
+
+# Adds a chain from exported JSON, with fresh ids so it never clashes with what is already there.
+function Import-ChainJson([string]$Json) {
+    try { $x = $Json | ConvertFrom-Json } catch { Set-ChainStatus "That isn't a DevTools chain: $($_.Exception.Message)" $C.Red; return $false }
+    if (-not $x -or -not ($x.Nodes -or $x.DevToolsChain)) { Set-ChainStatus "That isn't a DevTools chain (no steps found)." $C.Red; return $false }
+    Save-ChainEditor; Save-Chains
+    $name = if ($x.Name) { [string]$x.Name } else { 'Imported chain' }
+    $taken = @($ChainUI.Chains | ForEach-Object { $_.Name })
+    $n = $name; $i = 2; while ($taken -contains $n) { $n = "$name ($i)"; $i++ }
+    $ch = New-ChainRecord $n
+    $ch.AutoCookies = $x.AutoCookies -ne $false
+    $ch.Vars = @(foreach ($v in @($x.Vars)) { if ($v -and $v.Key) { [pscustomobject]@{ Key = [string]$v.Key; Value = [string]$v.Value } } })
+    $map = @{}
+    $ch.Nodes = @(foreach ($s in @($x.Nodes)) {
+        if (-not $s) { continue }
+        $id = [guid]::NewGuid().ToString('N'); $map[[string]$s.Id] = $id
+        [pscustomobject]@{ Id = $id; X = $s.X; Y = $s.Y; Request = $s.Request; StopOnFail = ($s.StopOnFail -ne $false); Extract = @($s.Extract) }
+    })
+    $ch.Links = @(foreach ($l in @($x.Links)) { if ($l -and $map[[string]$l.From] -and $map[[string]$l.To]) { [pscustomobject]@{ From = $map[[string]$l.From]; To = $map[[string]$l.To] } } })
+    $ChainUI.Chains.Add($ch)
+    $ChainUI.EditId = $null
+    Open-Chain $ch
+    Update-ChainCombo
+    Save-Chains
+    $empty = @($ch.Vars | Where-Object { -not $_.Value } | ForEach-Object { $_.Key })
+    Set-ChainStatus "Imported $n ($(@($ch.Nodes).Count) steps).$(if ($empty) { " Fill in: $($empty -join ', ') (Variables...)." })" $(if ($empty) { $C.Yellow } else { $C.Green })
+    $true
+}
+
+function Show-ChainShareMenu($Button) {
+    $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    [void](Add-MenuItem $m 'Export to a file...' { Export-Chain } $Glyph.Save)
+    [void](Add-MenuItem $m 'Copy as text (to paste in a chat or email)' { Export-Chain -Clipboard } $Glyph.Copy)
+    [void]$m.Items.Add('-')
+    [void](Add-MenuItem $m 'Import from a file...' {
+        $d = New-Object System.Windows.Forms.OpenFileDialog
+        $d.Filter = 'DevTools chain (*.devchain.json;*.json)|*.devchain.json;*.json|All files|*.*'; $d.Multiselect = $true
+        $script:Modal = $true
+        try { if ($d.ShowDialog($ChainUI.Form) -eq 'OK') { foreach ($f in $d.FileNames) { [void](Import-ChainJson ([IO.File]::ReadAllText($f))) } } } finally { $script:Modal = $false; $d.Dispose() }
+    } $Glyph.Open)
+    [void](Add-MenuItem $m 'Import from the clipboard' { $t = ''; try { $t = [System.Windows.Forms.Clipboard]::GetText() } catch { }; if ($t) { [void](Import-ChainJson $t) } else { Set-ChainStatus 'The clipboard has no text.' $C.Red } } $Glyph.Paste)
+    $m.Show($Button, (New-Object System.Drawing.Point(0, $Button.Height)))
+}
+
 function Update-ChainPalette {
     $tv = $ChainUI.Palette
     $tv.BeginUpdate(); $tv.Nodes.Clear()
+    $x = $tv.Nodes.Add('Example chains (opens a copy)')
+    foreach ($k in (Get-ChainExamples).Keys) { $n = $x.Nodes.Add($k); $n.Tag = "ex:$k" }
+    $x.Expand()
+    $xr = $tv.Nodes.Add('Example requests')
+    foreach ($k in (Get-ApiExampleRequests).Keys) { $n = $xr.Nodes.Add($k); $n.Tag = "exreq:$k" }
     $t = $tv.Nodes.Add('Start from')
     foreach ($k in (Get-ChainTemplates).Keys) { $n = $t.Nodes.Add($k); $n.Tag = "tpl:$k" }
     $t.Expand()
@@ -10883,11 +11113,13 @@ function Update-ChainPalette {
 
 function Get-PaletteModel([string]$Tag) {
     if ($Tag -like 'tpl:*') { $t = (Get-ChainTemplates)[$Tag.Substring(4)]; return $t }
+    if ($Tag -like 'exreq:*') { $t = (Get-ApiExampleRequests)[$Tag.Substring(6)]; if ($t) { return @{ Model = $t.Model; Extract = @() } } }
     if ($Tag -like 'req:*') { $id = $Tag.Substring(4); foreach ($m in $ApiUI.Collections) { if ($m.Id -eq $id) { return @{ Model = $m; Extract = @() } } } }
     $null
 }
 
 function Add-ChainFromPalette([string]$Tag, [float]$X = -1, [float]$Y = -1) {
+    if ($Tag -like 'ex:*') { New-ChainFromExample $Tag.Substring(3); return }
     $t = Get-PaletteModel $Tag
     if (-not $t) { return }
     $n = Add-ChainStep $t.Model $X $Y
@@ -11182,7 +11414,8 @@ function Show-ApiChains {
     if ($ChainUI.Form) { if ($ChainUI.Form.WindowState -eq 'Minimized') { $ChainUI.Form.WindowState = 'Normal' }; $ChainUI.Form.Activate(); return }
     if ($ApiUI.Collections.Count -eq 0 -and $ApiUI.Environments.Count -eq 0) { try { Import-ApiData } catch { } }
     Import-Chains
-    if (-not $ChainUI.Chains.Count) { $ChainUI.Chains.Add((New-ChainRecord 'My first chain')) }
+    $firstTime = -not $ChainUI.Chains.Count
+    if ($firstTime) { $ChainUI.Chains.Add((New-ChainRecord 'My first chain')) }
 
     $f = New-Object System.Windows.Forms.Form
     $f.Text = 'API chains'; $f.Icon = $IconActive
@@ -11273,7 +11506,7 @@ function Show-ApiChains {
     $rtabs = New-TabSet $right.Panel2
     $pRes = Add-ApiTab $rtabs 'Result'
     $pVars = Add-ApiTab $rtabs 'Variables & cookies'
-    $ChainUI.Result = New-TbRtb -ReadOnly; $ChainUI.Result.Dock = 'Fill'; $pRes.Controls.Add($ChainUI.Result)
+    $ChainUI.Result = New-TbRtb -ReadOnly; $ChainUI.Result.Dock = 'Fill'; $ChainUI.Result.WordWrap = $true; $pRes.Controls.Add($ChainUI.Result)
     $ChainUI.VarsOut = New-TbRtb -ReadOnly; $ChainUI.VarsOut.Dock = 'Fill'; $pVars.Controls.Add($ChainUI.VarsOut)
     Select-ApiTab $rtabs 'Result'
 
@@ -11358,6 +11591,8 @@ function Show-ApiChains {
     $ChainUI.AutoCookies.add_CheckedChanged({ param($src, $e) if ($ChainUI.Current -and -not $ChainUI.Loading) { $ChainUI.Current.AutoCookies = $src.Checked; Save-Chains } })
     [void](New-Button 'Add request' 'Add an empty request after the selected one' { Add-ChainFromPalette 'tpl:New empty request' } $top $Glyph.Add 2)
     [void](New-Button 'Arrange' 'Line the cards up in run order (drag on empty space to scroll the canvas)' { Invoke-ChainArrange } $top $Glyph.Apps 2)
+    [void](New-Button 'Examples' 'Ready-made chains to learn from: log in -> token, session cookie, create and read, headers / regex / status' { param($src, $e) Show-ChainExampleMenu $src } $top $Glyph.Lightning 2)
+    [void](New-Button 'Share' 'Export this chain for a colleague, or import one' { param($src, $e) Show-ChainShareMenu $src } $top $Glyph.Send 2)
     $f.Controls.Add($top)
 
     $status = New-Object System.Windows.Forms.Label
@@ -11396,9 +11631,10 @@ function Show-ApiChains {
     $ChainUI.Current = $ChainUI.Chains[0]
     Update-ChainCombo
     Open-Chain $ChainUI.Current
-    Set-ChainStatus 'F5 runs the chain. Values taken from a response are available to the next steps as {{name}}.' $C.Dim
+    Set-ChainStatus 'F5 runs the chain. Values taken from a response are available to the next steps as {{name}}. Examples (top bar or the list on the left) show how.' $C.Dim
     $f.Show()
     [PowerClipHost]::EnsureShown($f.Handle)
+    if ($firstTime) { New-ChainFromExample 'Log in, then use the token' }
     $f.Activate()
 }
 

@@ -282,6 +282,7 @@ A Postman-style HTTP client. Open it with Ctrl+Shift+A in the picker, the right-
 
 **Request**
 
+- **Examples...** (left, above the collections) loads a ready-made request to learn from: GET JSON, query parameters, POST JSON, PUT, DELETE, form fields, headers, Bearer and Basic auth, a real log-in, cookies, status codes.
 - Method (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS) and URL. Press **Send**, Enter in the URL box, or Ctrl+Enter. While it runs, Send turns into Cancel (or press Esc).
 - Paste a `curl ...` command into the URL box to import it: method, URL, headers, body, form fields, `-u` user, Bearer token, `-k` and `-L`.
 - **Params**: the query string as a table, kept in sync with the URL both ways. Untick a row to leave it out without deleting it.
@@ -309,6 +310,12 @@ Build a flow of requests on a canvas, for example: log in, then use the cookie o
 - **Cookies** a response sets are sent along with the next requests to the same site, like a browser (**Send cookies along**).
 - **Variables...** sets start values (`baseUrl`, `user`, `password` ...); an API tester environment can be used as well.
 - **Run chain** (F5) runs the steps in order; each card turns green or red with the status, time and what it set. Steps after a failed step are skipped. **Run this step** (Shift+F5) re-sends one card with the variables of the last run. The **Result** tab shows the request sent and the full response, **Variables & cookies** the current values.
+- **Examples** (top bar, or *Example chains* in the list on the left) open a ready-made chain as your own copy, with notes on what each step does; the originals are always there. They run against free public test services, so they work straight away:
+  - *Log in, then use the token* - POST a log-in, save `accessToken` as `{{token}}` and `id` as `{{userId}}`, then call with `Authorization: Bearer {{token}}`
+  - *Session cookie* - a step gets a cookie, the next one sends it by itself
+  - *Read, then create and change* - one step feeding three others; a JSON body built from `{{variables}}`
+  - *Headers, regex and status* - Regex, Header and Status rules, a bracket JSON path, and a step that may fail without stopping the chain
+- **Share** exports the chain to a `.devchain.json` file, or copies it as text to paste into a chat or email; you choose whether variable values (passwords, tokens) go along. Your colleague uses **Share > Import from a file / from the clipboard**; it comes in as a new chain and tells them which variables to fill in.
 - Chains are saved in `datapi\chains.json`.
 
 **Collections, history and environments**
