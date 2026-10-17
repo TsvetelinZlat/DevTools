@@ -19557,9 +19557,9 @@ function Update-QrTool($St) {
 }
 
 # ======================================================================================
-# Hide text: a secret message inside a picture, inside normal text (invisible characters) or at the end of any file.
+# Hide secret messages: inside a picture, inside normal text (invisible characters) or at the end of any file.
 # ======================================================================================
-Register-ToolboxPage 'stego' 'Hide text in pictures' $Glyph.Lock 'steganography hide secret message picture image png invisible zero width text file watermark' {
+Register-ToolboxPage 'stego' 'Hide secret messages' $Glyph.Lock 'steganography hide secret message picture image png invisible zero width text file watermark' {
     param($panel, $st)
     foreach ($kv in (@{ Image = $null; ImageName = '' }).GetEnumerator()) { $st[$kv.Key] = $kv.Value }
     $st.Status = New-TbPage $panel
@@ -19583,6 +19583,7 @@ Register-ToolboxPage 'stego' 'Hide text in pictures' $Glyph.Lock 'steganography 
         try { if ($d.ShowDialog($TbUI.Form) -eq 'OK') { Set-StegoImage $TbUI.Pages['stego'].State $d.FileName } } finally { $script:Modal = $false; $d.Dispose() }
     } $pb $Glyph.Open 2)
     [void](New-Button 'Paste picture' 'Use the picture on the clipboard' { Set-StegoImage $TbUI.Pages['stego'].State '' -Clipboard } $pb $Glyph.Paste 2)
+    [void](New-Button 'Close picture' 'Take the picture out of the tool' { Clear-StegoImage $TbUI.Pages['stego'].State } $pb $Glyph.Cancel 2)
     $st.PicInfo = New-TbLabel $pb 'Open or drop a picture.' -Dim
     $kh.Controls.Add($pp); $st.Kinds['picture'] = $pp
     # text
@@ -19670,6 +19671,13 @@ function Set-StegoImage($S, [string]$Path, [switch]$Clipboard) {
     else { Set-TbStatus $S.Status "Picture loaded. It can hold about $($S.Capacity.ToString('N0')) bytes of message." }
 }
 
+function Clear-StegoImage($S) {
+    if ($S.Image) { $S.Picture.Image = $null; $S.Image.Dispose() }
+    $S.Image = $null; $S.ImageName = ''; $S.Capacity = 0
+    Update-StegoInfo $S
+    Set-TbStatus $S.Status 'Picture closed.'
+}
+
 function Update-StegoInfo($S) {
     if (-not $S.PicInfo) { return }
     $need = [Text.Encoding]::UTF8.GetByteCount($S.Secret.Text) + 9 + $(if ($S.Password.Text) { 80 } else { 0 })
@@ -19742,7 +19750,7 @@ function Invoke-StegoRemove($S) {
         'file' {
             $f = $S.FilePath.Text.Trim().Trim('"')
             if (-not $f -or -not (Test-Path -LiteralPath $f -PathType Leaf)) { Set-TbStatus $S.Status 'Pick the file first.' 'error'; return }
-            if ([System.Windows.Forms.MessageBox]::Show($TbUI.Form, "Remove the hidden message from $(Split-Path -Leaf $f)? The file is changed in place.", 'Hide text', 'YesNo', 'Question') -ne 'Yes') { return }
+            if ([System.Windows.Forms.MessageBox]::Show($TbUI.Form, "Remove the hidden message from $(Split-Path -Leaf $f)? The file is changed in place.", 'Hide secret messages', 'YesNo', 'Question') -ne 'Yes') { return }
             try { [DevStego]::RemoveFromFile($f); Set-TbStatus $S.Status 'Removed - the file is back to how it was.' 'ok' } catch { Set-TbStatus $S.Status $_.Exception.Message 'error' }
         }
         default { Set-TbStatus $S.Status 'A picture''s message is part of its pixels - open the original picture instead (or hide a new message over it).' }
