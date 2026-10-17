@@ -5384,6 +5384,71 @@ public class DevFileHash {
 // Data formats: JSON, YAML, CSV and XML into the same tree (DevJsonObject / List<object> / scalars),
 // and back out, so any format converts to any other.
 // ======================================================================================
+// Collects the records of many pages into one file as they arrive (never all in memory): a JSON array,
+// JSON lines (one record a line) or CSV (columns from the first record). Close() finishes the file - the JSON
+// array is closed even when the run stops halfway, so the file is always valid.
+public class DevRecordWriter : IDisposable {
+    System.IO.StreamWriter w;
+    readonly string fmt;
+    bool first = true;
+    List<string> cols;
+    public long Count;
+    public string Path, Note = "";
+
+    public DevRecordWriter(string path, string format) {
+        Path = path; fmt = (format ?? "json").ToLowerInvariant();
+        var dir = System.IO.Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir)) System.IO.Directory.CreateDirectory(dir);
+        w = new System.IO.StreamWriter(path, false, new UTF8Encoding(false), 1 << 16);
+        if (fmt == "json") w.Write("[\n");
+    }
+
+    // The records of one page: the array at itemsPath ('$' = the whole answer; a path with [*] = its hits).
+    // Returns how many were written (0 = an empty page / nothing at that path).
+    public int AddPage(string json, string itemsPath) {
+        var hits = DevJson.Query(json, string.IsNullOrEmpty(itemsPath) ? "$" : itemsPath);
+        if (hits.Count == 0) return 0;
+        List<object> items;
+        if (hits.Count > 1) items = hits.Select(h => h.Value).ToList();
+        else { var v = hits[0].Value; items = v as List<object> ?? (v == null ? new List<object>() : new List<object> { v }); }
+        foreach (var it in items) Write(it);
+        w.Flush();
+        return items.Count;
+    }
+
+    void Write(object it) {
+        if (fmt == "ndjson") { w.Write(DevJson.Write(it, -1, false)); w.Write('\n'); }
+        else if (fmt == "csv") {
+            var o = it as DevJsonObject;
+            if (cols == null) {
+                cols = new List<string>();
+                if (o != null) foreach (var kv in o) cols.Add(kv.Key); else cols.Add("value");
+                w.Write(string.Join(",", cols.Select(Csv)) + "\r\n");
+            }
+            var vals = new List<string>();
+            if (o != null) {
+                var map = new Dictionary<string, object>();
+                foreach (var kv in o) { map[kv.Key] = kv.Value; if (!cols.Contains(kv.Key) && Note == "") Note = "some records have more fields than the first one (\"" + kv.Key + "\"); CSV keeps the first record's columns"; }
+                foreach (var c in cols) { object v; vals.Add(map.TryGetValue(c, out v) ? Cell(v) : ""); }
+            } else vals.Add(Cell(it));
+            w.Write(string.Join(",", vals.Select(Csv)) + "\r\n");
+        } else {
+            if (!first) w.Write(",\n");
+            w.Write("  "); w.Write(DevJson.Write(it, -1, false));
+        }
+        first = false; Count++;
+    }
+    static string Cell(object v) { if (v == null) return ""; var s = v as string; if (s != null) return s; if (v is bool) return (bool)v ? "true" : "false"; return DevJson.Write(v, -1, false); }
+    static string Csv(string s) { if (s == null) return ""; return s.IndexOfAny(new[] { ',', '"', '\n', '\r' }) >= 0 ? "\"" + s.Replace("\"", "\"\"") + "\"" : s; }
+
+    public void Close() {
+        if (w == null) return;
+        if (fmt == "json") w.Write(first ? "]\n" : "\n]\n");
+        w.Dispose(); w = null;
+    }
+    public void Dispose() { Close(); }
+}
+
 public static class DevData {
     public static string Detect(string text) {
         string t = (text ?? "").TrimStart('\uFEFF', ' ', '\r', '\n');
@@ -11302,7 +11367,7 @@ function New-ChainRecord([string]$Name) {
 }
 
 function New-ChainStep($Model) {
-    @{ Request = $Model; Extract = (New-Object System.Collections.Generic.List[object]); StopOnFail = $true; Condition = ''; RunAfterFail = $false; SaveTo = ''; SaveWhat = 'body'; SaveAppend = $false; Jumps = @() }
+    @{ Request = $Model; Extract = (New-Object System.Collections.Generic.List[object]); StopOnFail = $true; Condition = ''; RunAfterFail = $false; SaveTo = ''; SaveWhat = 'body'; SaveAppend = $false; Jumps = @(); Paging = (New-ChainPaging) }
 }
 
 # canvas + step data -> the current chain record, then to disk
@@ -11553,6 +11618,20 @@ function Get-ChainExamples {
             )
             Links = @('1>2', '2>3', '3>4', '4>5', '5>6')
         }
+        'Download all records - paging (offline)' = @{
+            LocalApi = $true
+            Note = "Runs on the Test API, which has a /records list (20,000 records here). Look at each step's Pages tab.`n1. Page numbers: ?page={{page}}&size=500 - {{page}} starts at 1 and goes up; it stops at the first page with fewer than 500 records. All 20,000 records go into one JSON file (Documents\DevTools API results\examples).`n2. Cursor + retries: ?cursor={{cursor}} - each answer's `$.next is the next cursor; it stops when there is none. flaky=1 makes the server answer 429 now and then: those pages are retried after Retry-After and written once. Saved as CSV.`n3. Offset: ?offset={{offset}}&limit=1000, {{offset}} goes 0, 1000, 2000 ... - JSON lines.`nThe cards count pages and records while they run; Stop keeps what was saved."
+            Vars = [ordered]@{ baseUrl = 'http://127.0.0.1:8799' }
+            Steps = @(
+                @{ Model = (New-ExampleModel 'Page numbers -> JSON' 'GET' '{{baseUrl}}/records?page={{page}}&size=500&total=20000'); Extract = @()
+                   Paging = @{ On = $true; Mode = 'number'; Var = 'page'; Start = '1'; Step = '1'; ItemsPath = '$.items'; PageSize = 500; CollectTo = 'examples\records-pages-{{timestamp}}.json'; Format = 'json' } }
+                @{ Model = (New-ExampleModel 'Cursor + retries -> CSV' 'GET' '{{baseUrl}}/records?cursor={{cursor}}&size=1000&total=20000&flaky=1'); Extract = @()
+                   Paging = @{ On = $true; Mode = 'cursor'; Var = 'cursor'; Start = ''; CursorFrom = 'JSON path'; CursorExpr = '$.next'; ItemsPath = '$.items'; Retries = 5; CollectTo = 'examples\records-cursor-{{timestamp}}.csv'; Format = 'csv' } }
+                @{ Model = (New-ExampleModel 'Offset -> JSON lines' 'GET' '{{baseUrl}}/records?offset={{offset}}&limit=1000&total=20000'); Extract = @()
+                   Paging = @{ On = $true; Mode = 'number'; Var = 'offset'; Start = '0'; Step = '1000'; ItemsPath = '$.items'; PageSize = 1000; CollectTo = 'examples\records-offset-{{timestamp}}.jsonl'; Format = 'ndjson' } }
+            )
+            Links = @('1>2', '2>3')
+        }
         'Headers, regex and status' = @{
             Note = "1. Get an id: a Regex rule takes the uuid out of the response (its first group) - handy when the answer isn't JSON.`n2. Send it as a header: X-Demo-Id: {{requestId}}. httpbin sends it back (saved with the JSON path `$.headers['X-Demo-Id'] - brackets because of the dashes), and a Header rule saves the Content-Type.`n3. Expect 418: a 4xx normally stops the chain, but here 'Stop the chain here if it fails' is unticked; a Status rule saves 418 as {{status}}.`n4. Runs anyway and uses {{status}}."
             Vars = [ordered]@{ baseUrl = 'https://httpbin.org' }
@@ -11672,6 +11751,7 @@ function New-ChainFromExample([string]$Name, [switch]$Reset) {
         $nodes += [pscustomobject]@{ Id = $id; X = $x; Y = 60; Request = $s.Model; StopOnFail = -not $s.NoStop
             Extract = @($s.Extract | ForEach-Object { [pscustomobject]@{ Var = $_.Var; From = $_.From; Expr = $_.Expr } })
             Condition = [string]$s.Condition; RunAfterFail = [bool]$s.RunAfterFail; SaveTo = [string]$s.SaveTo; SaveWhat = $(if ($s.SaveWhat) { $s.SaveWhat } else { 'body' }); SaveAppend = [bool]$s.SaveAppend
+            Paging = $(if ($s.Paging) { ConvertTo-ChainPaging $s.Paging } else { $null })
             Jumps = @(foreach ($j in @($s.Jumps)) { if ($j) { [pscustomobject]@{ On = $true; When = [string]$j.When; Goto = $(if ($j.Goto -eq 'end') { 'end' } else { "#$($j.Goto)" }); Wait = [int]$j.Wait } } }) }
         $x += 320
     }
@@ -11880,6 +11960,13 @@ function Show-ChainStep($Node) {
         $ChainUI.EStop.Checked = [bool]$d.StopOnFail
         $ChainUI.ECond.Text = [string]$d.Condition; $ChainUI.EAfterFail.Checked = [bool]$d.RunAfterFail
         $ChainUI.ESave.Text = [string]$d.SaveTo; $ChainUI.ESaveWhat.SelectedIndex = $(if ($d.SaveWhat -eq 'full') { 1 } else { 0 }); $ChainUI.ESaveAppend.Checked = [bool]$d.SaveAppend
+        $pgd = ConvertTo-ChainPaging $d.Paging; $PG = $ChainUI.PG
+        $PG.On.Checked = $pgd.On; $PG.Mode.SelectedIndex = $(if ($pgd.Mode -eq 'cursor') { 1 } else { 0 })
+        $PG.Var.Text = $pgd.Var; $PG.Start.Text = [string]$pgd.Start; $PG.Step.Text = [string]$pgd.Step
+        $PG.CFrom.SelectedIndex = [Math]::Max(0, $PG.CFrom.Items.IndexOf([string]$pgd.CursorFrom)); $PG.CExpr.Text = $pgd.CursorExpr
+        $PG.Items.Text = $pgd.ItemsPath; $PG.Size.Text = $(if ($pgd.PageSize) { [string]$pgd.PageSize } else { '' }); $PG.Stop.Text = $pgd.StopWhen
+        $PG.Max.Text = [string]$pgd.MaxPages; $PG.Delay.Text = [string]$pgd.DelayMs; $PG.Retries.Text = [string]$pgd.Retries
+        $PG.File.Text = $pgd.CollectTo; $PG.Format.SelectedIndex = [Math]::Max(0, @('json', 'ndjson', 'csv').IndexOf([string]$pgd.Format))
         $jg = $ChainUI.EJumps; $jg.Rows.Clear()
         Update-ChainGotoList
         foreach ($j in @($d.Jumps)) { if ($j) { [void]$jg.Rows.Add([bool]($j.On -ne $false), [string]$j.When, [string]$j.Goto, $(if ([int]$j.Wait) { [string]$j.Wait } else { '' })) } }
@@ -11914,6 +12001,13 @@ function Save-ChainEditor {
     $d.StopOnFail = $ChainUI.EStop.Checked
     $d.Condition = $ChainUI.ECond.Text.Trim(); $d.RunAfterFail = $ChainUI.EAfterFail.Checked
     $d.SaveTo = $ChainUI.ESave.Text.Trim(); $d.SaveWhat = $(if ($ChainUI.ESaveWhat.SelectedIndex -eq 1) { 'full' } else { 'body' }); $d.SaveAppend = $ChainUI.ESaveAppend.Checked
+    $PG = $ChainUI.PG
+    $num = { param($t, $def) $v = 0; if ([int]::TryParse(([string]$t).Trim(), [ref]$v)) { $v } else { $def } }
+    $d.Paging = ConvertTo-ChainPaging ([pscustomobject]@{ On = $PG.On.Checked; Mode = $(if ($PG.Mode.SelectedIndex -eq 1) { 'cursor' } else { 'number' })
+        Var = $(if ($PG.Var.Text.Trim()) { $PG.Var.Text.Trim().Trim('{', '}') } else { 'page' }); Start = $PG.Start.Text.Trim(); Step = $(if ($PG.Step.Text.Trim()) { $PG.Step.Text.Trim() } else { '1' })
+        CursorFrom = [string]$PG.CFrom.SelectedItem; CursorExpr = $PG.CExpr.Text.Trim(); ItemsPath = $(if ($PG.Items.Text.Trim()) { $PG.Items.Text.Trim() } else { '$' })
+        PageSize = (& $num $PG.Size.Text 0); StopWhen = $PG.Stop.Text.Trim(); MaxPages = (& $num $PG.Max.Text 10000); DelayMs = (& $num $PG.Delay.Text 0); Retries = (& $num $PG.Retries.Text 3)
+        CollectTo = $PG.File.Text.Trim(); Format = @('json', 'ndjson', 'csv')[[Math]::Max(0, $PG.Format.SelectedIndex)] })
     [void]$ChainUI.EJumps.EndEdit()
     $d.Jumps = @(foreach ($row in $ChainUI.EJumps.Rows) {
         if ($row.IsNewRow) { continue }
@@ -12040,6 +12134,11 @@ function Stop-ChainRun([string]$Why = '') {
     if (-not $r) { return }
     if ($r.Http -and -not $r.Http.Done) { $r.Http.Cancel() }
     $ChainUI.Timer.Stop()
+    if ($r.PageState) {                        # stopped while paging: keep (and close) what was collected
+        $pn = $ChainUI.Canvas.Find($r.PageState.NodeId)
+        if ($pn) { $pn.Info = "stopped at page $($r.PageState.Pages + 1)  -  $($r.PageState.Records.ToString('N0')) records kept$(if ($r.PageState.File) { " in $(Split-Path -Leaf $r.PageState.File)" })" }
+        Stop-ChainPaging $r
+    }
     $ChainUI.Run = $null
     if ($ChainUI.Canvas) { $ChainUI.Canvas.RunningId = $null; $ChainUI.Canvas.Invalidate() }
     if ($ChainUI.RunBtn -and -not $ChainUI.RunBtn.IsDisposed) { $ChainUI.RunBtn.Text = 'Run chain'; $ChainUI.RunBtn.Glyph = $Glyph.Play; $ChainUI.RunBtn.Variant = 1; $ChainUI.RunBtn.Invalidate() }
@@ -12065,10 +12164,12 @@ function Invoke-ChainNext {
             if ($bad -and -not $ChainUI.Data[$n.Id].RunAfterFail) { $n.State = 'skip'; $n.Info = "skipped: $($bad[0].Title) $(if ($bad[0].State -eq 'fail') { 'failed' } else { 'was skipped' })"; $r.Skip++; continue }
         }
         $d = $ChainUI.Data[$n.Id]
-        if ($d.Condition) {
+        $paging = $r.PageState -and $r.PageState.NodeId -eq $n.Id
+        if ($d.Condition -and -not $paging) {
             $t = Test-ChainCondition $d.Condition
             if (-not $t.Ok) { $n.State = 'skip'; $n.Info = "skipped - not true: $($t.Text)"; $r.Skip++; continue }
         }
+        if ($d.Paging -and $d.Paging.On -and -not $paging) { if (-not (Start-ChainPaging $r $n $d)) { $r.Fail++; continue } }
         $script:ChainVars = $ChainUI.Vars
         try { $req = ConvertTo-HttpRequest $d.Request } finally { $script:ChainVars = $null }
         $unknown = @($ApiUI.Unknown)
@@ -12093,12 +12194,13 @@ function Invoke-ChainNext {
 }
 
 # ---- Conditions ("Run only if") and saving responses to files, per step.
-$ChainStepExtras = @('Condition', 'RunAfterFail', 'SaveTo', 'SaveWhat', 'SaveAppend', 'Jumps')
+$ChainStepExtras = @('Condition', 'RunAfterFail', 'SaveTo', 'SaveWhat', 'SaveAppend', 'Jumps', 'Paging')
 
 function Set-ChainStepExtras($Data, $From) {
     foreach ($k in $ChainStepExtras) { $v = if ($From -is [hashtable]) { $From[$k] } elseif ($From -and $From.PSObject.Properties[$k]) { $From.$k } else { $null }; if ($null -ne $v) { $Data[$k] = $v } }
     if (-not $Data.Condition) { $Data.Condition = '' }; if (-not $Data.SaveTo) { $Data.SaveTo = '' }; if (-not $Data.SaveWhat) { $Data.SaveWhat = 'body' }
     $Data.RunAfterFail = [bool]$Data.RunAfterFail; $Data.SaveAppend = [bool]$Data.SaveAppend
+    $Data.Paging = ConvertTo-ChainPaging $Data.Paging
     $Data.Jumps = @(foreach ($j in @($Data.Jumps)) { if ($j -and $j.Goto) { [pscustomobject]@{ On = $j.On -ne $false; When = [string]$j.When; Goto = [string]$j.Goto; Wait = [int]$j.Wait } } })
 }
 
@@ -12214,7 +12316,7 @@ function Save-ChainResults {
 # ---- "Go to" rules: after a step ran, the first rule whose If is true sends the chain to another step
 #      (back = repeat / retry / poll, forward = skip the steps in between) or ends it.
 function Set-ChainNodeMarks($Node, $Data) {
-    $Node.Cond = [string]$Data.Condition; $Node.Save = [bool]$Data.SaveTo
+    $Node.Cond = [string]$Data.Condition; $Node.Save = [bool]$Data.SaveTo -or ($Data.Paging -and $Data.Paging.On -and $Data.Paging.CollectTo)
     $Node.Jumps = (@($Data.Jumps) | Where-Object { $_ -and $_.On -and $_.Goto } | ForEach-Object { "$($_.Goto)$([char]31)$($_.When)" }) -join [string][char]30
 }
 
@@ -12261,12 +12363,113 @@ function Invoke-ChainJump($Run, $Node, $Rule) {
     "then: go to $($t.Order). $($t.Title)"
 }
 
+# ---- Paging: one card fetches page after page (a page number / offset that goes up, or the next-page cursor
+#      from each answer) and collects every record into one file, until a page is empty or short, a condition
+#      is true or the page limit is reached. 429 / 5xx answers are retried (Retry-After is honoured).
+function New-ChainPaging {
+    [pscustomobject]@{ On = $false; Mode = 'number'; Var = 'page'; Start = '1'; Step = '1'; CursorFrom = 'JSON path'; CursorExpr = '$.next'
+                       ItemsPath = '$.items'; PageSize = 0; StopWhen = ''; MaxPages = 10000; DelayMs = 0; Retries = 3; CollectTo = ''; Format = 'json' }
+}
+function ConvertTo-ChainPaging($From) {
+    $p = New-ChainPaging
+    if ($From) { foreach ($k in @($p.PSObject.Properties.Name)) { $v = if ($From -is [hashtable]) { $From[$k] } else { $From.$k }; if ($null -ne $v) { $p.$k = $v } } }
+    $p.On = [bool]$p.On; $p.PageSize = [int]$p.PageSize; $p.MaxPages = [Math]::Max(1, [int]$p.MaxPages); $p.DelayMs = [int]$p.DelayMs; $p.Retries = [int]$p.Retries
+    $p
+}
+
+# Before the first page: the page variable, the records file.
+function Start-ChainPaging($Run, $Node, $Data) {
+    $p = $Data.Paging
+    $ps = @{ NodeId = $Node.Id; Pages = 0; Records = 0; Attempt = 0; Writer = $null; Started = Get-Date; File = '' }
+    $ChainUI.Vars[$p.Var] = if ($p.Mode -eq 'cursor') { Expand-ChainText ([string]$p.Start) } else { [string]$p.Start }
+    if ($p.CollectTo) {
+        $path = Resolve-ChainSavePath $p.CollectTo
+        try { $ps.Writer = New-Object DevRecordWriter($path, [string]$p.Format); $ps.File = $path }
+        catch { $Node.State = 'fail'; $Node.Info = "can't write the records file: $($_.Exception.Message)"; return $false }
+    }
+    $Run.PageState = $ps
+    $true
+}
+
+# A relative path goes under Documents\DevTools API results; {{vars}} and {{timestamp}} work.
+function Resolve-ChainSavePath([string]$Path) {
+    $p = [Environment]::ExpandEnvironmentVariables((Expand-ChainText $Path).Trim().Trim('"'))
+    if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path ([Environment]::GetFolderPath('MyDocuments')) (Join-Path 'DevTools API results' $p) }
+    $p
+}
+
+# 'retry' (same page again, after Wait ms), or $null to go on
+function Test-ChainPageRetry($Run, $Data, $Resp) {
+    $ps = $Run.PageState
+    $busy = $Resp.Error -or $Resp.Status -eq 429 -or $Resp.Status -ge 500
+    if (-not $busy -or $ps.Attempt -ge $Data.Paging.Retries) { $ps.Attempt = 0; return $null }
+    $ps.Attempt++
+    $wait = [Math]::Min(30000, 1000 * [Math]::Pow(2, $ps.Attempt - 1))
+    foreach ($h in $Resp.Headers) { if ($h[0] -eq 'Retry-After') { $sec = 0; if ([int]::TryParse([string]$h[1], [ref]$sec)) { $wait = [Math]::Min(120000, $sec * 1000) } } }
+    @{ Wait = [int]$wait; Why = $(if ($Resp.Error) { $Resp.Error } else { "$($Resp.Status) $($Resp.Reason)" }) }
+}
+
+# After a good page: write its records, decide whether there's another. Returns @{ More; Note }.
+function Step-ChainPaging($Run, $Node, $Data, $Resp, [bool]$Failed) {
+    $p = $Data.Paging; $ps = $Run.PageState
+    if ($Failed) { return @{ More = $false; Note = "stopped at page $($ps.Pages + 1)" } }
+    $n = 0
+    try {
+        if ($ps.Writer) { $n = $ps.Writer.AddPage([string]$Resp.Text, [string]$p.ItemsPath) }
+        else { $hits = [DevJson]::Query([string]$Resp.Text, $(if ($p.ItemsPath) { $p.ItemsPath } else { '$' })); $n = if ($hits.Count -gt 1) { $hits.Count } elseif ($hits.Count -eq 1 -and $hits[0].Value -is [System.Collections.IList]) { $hits[0].Value.Count } elseif ($hits.Count) { 1 } else { 0 } }
+    } catch { return @{ More = $false; Note = "page $($ps.Pages + 1) is not JSON: $($_.Exception.Message)"; Bad = $true } }
+    if ($n -gt 0) { $ps.Pages++ }
+    $ps.Records += $n
+    $ChainUI.Vars['pageRecords'] = [string]$n; $ChainUI.Vars['records'] = [string]$ps.Records; $ChainUI.Vars['pages'] = [string]$ps.Pages
+    if ($n -eq 0) { return @{ More = $false; Note = 'the last page was empty' } }
+    if ($p.PageSize -gt 0 -and $n -lt $p.PageSize) { return @{ More = $false; Note = 'the last page was not full' } }
+    if ($p.StopWhen -and (Test-ChainCondition $p.StopWhen).Ok) { return @{ More = $false; Note = "stop: $($p.StopWhen)" } }
+    if ($ps.Pages -ge $p.MaxPages) { return @{ More = $false; Note = "the limit of $($p.MaxPages) pages" } }
+    if ($p.Mode -eq 'cursor') {
+        $next = if ($p.CursorFrom -eq 'Link header (rel=next)') {
+            $v = $null; foreach ($h in $Resp.Headers) { if ($h[0] -eq 'Link' -and $h[1] -match '<([^>]+)>\s*;[^,]*rel="?next"?') { $v = $Matches[1] } }; $v
+        } else { try { Get-ChainExtract ([pscustomobject]@{ Var = $p.Var; From = $p.CursorFrom; Expr = $p.CursorExpr }) $Resp } catch { $null } }
+        if (-not $next -or $next -eq 'null') { return @{ More = $false; Note = 'no next page' } }
+        $ChainUI.Vars[$p.Var] = [string]$next
+    } else {
+        $a = 0.0; $b = 0.0
+        [void][double]::TryParse([string]$ChainUI.Vars[$p.Var], [ref]$a); [void][double]::TryParse([string]$p.Step, [ref]$b)
+        if ($b -eq 0) { $b = 1 }
+        $ChainUI.Vars[$p.Var] = [string]($a + $b)
+    }
+    @{ More = $true; Note = '' }
+}
+
+function Stop-ChainPaging($Run) {
+    $ps = $Run.PageState
+    if (-not $ps) { return }
+    if ($ps.Writer) { try { $ps.Writer.Close() } catch { } }
+    $Run.PageState = $null
+}
+
+# The same card again (next page, or the same page once more), after Wait ms.
+function Resume-ChainPage($Run, $Node, [int]$Wait) {
+    $Run.Index--; $Run.JumpTo = $Node.Id; $Run.Visits[$Node.Id]--
+    $ChainUI.Canvas.Invalidate()
+    if ($Wait -gt 0) { $Run.WaitUntil = (Get-Date).AddMilliseconds($Wait); $ChainUI.Timer.Start() } else { Invoke-ChainNext }
+}
+
 function Complete-ChainStep {
     $r = $ChainUI.Run
     if (-not $r -or -not $r.Http -or -not $r.Http.Done) { return }
     $ChainUI.Timer.Stop()
     $n = $r.Node; $d = $ChainUI.Data[$n.Id]
     $resp = $r.Http.Response
+    $pg = $r.PageState -and $r.PageState.NodeId -eq $n.Id
+    if ($pg) {                                   # busy / server error: the same page again, a bit later
+        $rt = Test-ChainPageRetry $r $d $resp
+        if ($rt) {
+            $n.Info = "page $($r.PageState.Pages + 1): $($rt.Why) - try $($r.PageState.Attempt) of $($d.Paging.Retries) in $([Math]::Round($rt.Wait / 1000, 1)) s  -  $($r.PageState.Records.ToString('N0')) records so far"
+            Set-ChainStatus "Step $($n.Order): $($n.Info)" $C.Yellow
+            Resume-ChainPage $r $n $rt.Wait
+            return
+        }
+    }
     $set = New-Object System.Collections.Specialized.OrderedDictionary
     $missing = @()
     $cookies = @()
@@ -12290,6 +12493,22 @@ function Complete-ChainStep {
     $ChainUI.Vars['lastStatus'] = if ($resp.Error) { '0' } else { [string]$resp.Status }
     $saved = Save-ChainStepResponse $d $resp $r.Req $n.Title
     if ($saved) { $parts += $saved }
+    if ($pg) {
+        $pr = Step-ChainPaging $r $n $d $resp ([bool]$failed)
+        if ($pr.Bad) { $failed = $true; $n.State = 'fail' }
+        $ps = $r.PageState
+        if ($pr.More) {
+            $n.Info = "page $($ps.Pages)  -  $($ps.Records.ToString('N0')) records$(if ($ps.File) { "  ->  $(Split-Path -Leaf $ps.File)" })  -  $($resp.ElapsedMs) ms"
+            Set-ChainStatus "Step $($n.Order) ($($n.Title)): $($n.Info)" $C.Dim
+            $ChainUI.Results[$n.Id] = @{ Request = $r.Req; Response = $resp; Set = $set; Missing = $missing; Unknown = $r.Unknown; CookieSent = $r.CookieNote }
+            Resume-ChainPage $r $n ([int]$d.Paging.DelayMs)
+            return
+        }
+        $parts += "$($ps.Pages) page(s), $($ps.Records.ToString('N0')) records in $([Math]::Round(((Get-Date) - $ps.Started).TotalSeconds, 1)) s ($($pr.Note))"
+        if ($ps.File) { $parts += "saved to $(Split-Path -Leaf $ps.File)"; $ChainUI.LastSaved = $ps.File }
+        if ($ps.Writer -and $ps.Writer.Note) { $parts += $ps.Writer.Note }
+        Stop-ChainPaging $r
+    }
     $wait = 0
     $jump = Get-ChainJump $d
     if ($jump) { $parts += (Invoke-ChainJump $r $n $jump); $wait = [int]$jump.Wait }
@@ -13006,6 +13225,7 @@ function Show-ApiChains {
     $pExt = Add-ApiTab $etabs 'Take from response'
     $pIf = Add-ApiTab $etabs 'If & save'
     $pGo = Add-ApiTab $etabs 'Go to'
+    $pPg = Add-ApiTab $etabs 'Pages'
     $iff = New-Object System.Windows.Forms.FlowLayoutPanel
     $iff.Dock = 'Fill'; $iff.FlowDirection = 'TopDown'; $iff.WrapContents = $false; $iff.AutoScroll = $true; $iff.BackColor = $C.Bg; $iff.Padding = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0)
     $pIf.Controls.Add($iff)
@@ -13109,6 +13329,36 @@ function Show-ApiChains {
     $jh = New-TbBar $pGo 'Bottom'
     $jl = New-TbLabel $jh "After this step has run, the first rule whose If is true decides where the chain goes next: back to a step (repeat, retry, poll until it's done), forward (the steps in between are skipped) or to the end. Same conditions as Run only if: {{lastStatus}} == 401, {{count}} >= 5, {{state}} != done. Wait ms pauses first. A step runs at most 100 times per run." -Dim
     $jl.MaximumSize = New-Object System.Drawing.Size((Px 480), 0)
+    # paging
+    $pgf = New-Object System.Windows.Forms.FlowLayoutPanel
+    $pgf.Dock = 'Fill'; $pgf.FlowDirection = 'TopDown'; $pgf.WrapContents = $false; $pgf.AutoScroll = $true; $pgf.BackColor = $C.Bg; $pgf.Padding = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0)
+    $pPg.Controls.Add($pgf)
+    $PG = @{}
+    $PG.On = New-CheckBox $pgf 'Repeat this request page by page (pagination) and collect the records' $false
+    $pgRow = { $f = New-Object System.Windows.Forms.FlowLayoutPanel; $f.AutoSize = $true; $f.WrapContents = $false; $f.BackColor = $C.Bg; $pgf.Controls.Add($f); $f }
+    $pgBox = { param($Row, [int]$W, [string]$Cue) $b = New-TbBox -Cue $Cue; $b.Width = Px $W; $b.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 6), 0); $Row.Controls.Add($b); $b }
+    $r1 = & $pgRow; New-TbLabel $r1 'Next page by' -Dim | Out-Null
+    $PG.Mode = New-TbCombo $r1 @('a number that goes up (page / offset)', 'a cursor or link from each answer') 280
+    $r2 = & $pgRow; New-TbLabel $r2 'Variable  {{' -Dim | Out-Null; $PG.Var = & $pgBox $r2 80 'page'; New-TbLabel $r2 '}}  starts at' -Dim | Out-Null
+    $PG.Start = & $pgBox $r2 110 '1'; $PG.StepLabel = New-TbLabel $r2 '+ each page' -Dim; $PG.Step = & $pgBox $r2 60 '1'
+    $r3 = & $pgRow; New-TbLabel $r3 'Next page from' -Dim | Out-Null
+    $PG.CFrom = New-TbCombo $r3 @('JSON path', 'Header', 'Link header (rel=next)', 'Regex') 170; $PG.CExpr = & $pgBox $r3 180 '$.next'
+    $r4 = & $pgRow; New-TbLabel $r4 'Records at' -Dim | Out-Null; $PG.Items = & $pgBox $r4 120 '$.items'
+    New-TbLabel $r4 'a full page has' -Dim | Out-Null; $PG.Size = & $pgBox $r4 60 '100'
+    $r5 = & $pgRow; New-TbLabel $r5 'Also stop when' -Dim | Out-Null; $PG.Stop = & $pgBox $r5 260 '{{hasMore}} == false'
+    $r6 = & $pgRow; New-TbLabel $r6 'At most' -Dim | Out-Null; $PG.Max = & $pgBox $r6 70 '10000'; New-TbLabel $r6 'pages,  wait' -Dim | Out-Null
+    $PG.Delay = & $pgBox $r6 60 '0'; New-TbLabel $r6 'ms between pages,  retries on 429 / 5xx' -Dim | Out-Null; $PG.Retries = & $pgBox $r6 40 '3'
+    $pgt = New-TbLabel $pgf 'Collect the records into one file' -Title; $pgt.Margin = New-Object System.Windows.Forms.Padding(0, (Px 10), 0, 0)
+    $r7 = & $pgRow; $PG.File = & $pgBox $r7 300 'records-{{timestamp}}.json   (empty = don''t save)'
+    [void](New-Button 'Browse...' 'Pick the file' {
+        $dd = New-Object System.Windows.Forms.SaveFileDialog; $dd.Filter = 'JSON|*.json|JSON lines|*.jsonl;*.ndjson|CSV|*.csv|All files|*.*'; $dd.OverwritePrompt = $false
+        $script:Modal = $true
+        try { if ($dd.ShowDialog($ChainUI.Form) -eq 'OK') { $ChainUI.PG.File.Text = $dd.FileName } } finally { $script:Modal = $false; $dd.Dispose() }
+    } $r7 $Glyph.Folder 2)
+    $PG.Format = New-TbCombo $r7 @('JSON array', 'JSON lines (a record a line)', 'CSV') 190
+    $pgh = New-TbLabel $pgf "Put the variable in the URL or body, e.g.  {{baseUrl}}/records?page={{page}}&size=100  (an offset: starts at 0, + 100 each page; a cursor: ...?cursor={{cursor}} starting empty). It stops at an empty page, a page with fewer records than a full one, the stop condition or the page limit. Every page goes straight into the file, so 100,000+ records are fine; a page that is retried is written once. {{records}} and {{pages}} hold the totals afterwards; Stop keeps what was collected." -Dim
+    $pgh.MaximumSize = New-Object System.Drawing.Size((Px 480), 0); $pgh.Margin = New-Object System.Windows.Forms.Padding(0, (Px 10), 0, 0)
+    $ChainUI.PG = $PG
     Select-ApiTab $etabs 'Request'
     $ed.Visible = $false
 
@@ -13339,6 +13589,9 @@ function Show-ApiChains {
     $ChainUI.EHeaders.add_CellEndEdit({ Start-ChainEditorSave })
     $ChainUI.EExtract.add_CellEndEdit({ Start-ChainEditorSave })
     $ChainUI.EJumps.add_CellValueChanged({ Start-ChainEditorSave }); $ChainUI.EJumps.add_UserDeletedRow({ Start-ChainEditorSave })
+    foreach ($k in 'Var', 'Start', 'Step', 'CExpr', 'Items', 'Size', 'Stop', 'Max', 'Delay', 'Retries', 'File') { $ChainUI.PG[$k].add_TextChanged({ Start-ChainEditorSave }) }
+    foreach ($k in 'Mode', 'CFrom', 'Format') { $ChainUI.PG[$k].add_SelectedIndexChanged({ Start-ChainEditorSave }) }
+    $ChainUI.PG.On.add_CheckedChanged({ Start-ChainEditorSave })
     $ChainUI.EExtract.add_UserDeletedRow({ Start-ChainEditorSave })
     $ChainUI.EHeaders.add_UserDeletedRow({ Start-ChainEditorSave })
 
@@ -17163,6 +17416,7 @@ public class DevTestApi {
             return res;
         }
         if (p.StartsWith("/status/")) { int code; if (!int.TryParse(p.Substring(8), out code) || code < 100 || code > 599) code = 400; return Json(code, "{\"status\":" + code + "}"); }
+        if (p == "/records" && m == "GET") return Records(r);
         if (p == "/slow") {
             int ms = 2000; foreach (var kv in r.Query.Split('&')) if (kv.StartsWith("ms=")) int.TryParse(kv.Substring(3), out ms);
             ms = Math.Max(0, Math.Min(ms, 15000));
@@ -17224,6 +17478,35 @@ public class DevTestApi {
         }
     }
 
+    // GET /records: many records, one page at a time - page & size, offset & limit, or cursor. total=N sets how many
+    // there are (10,000 by default); flaky=1 answers 429 Too Many Requests now and then (with Retry-After: 1).
+    int recordCalls;
+    Resp Records(Req r) {
+        var q = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in (r.Query ?? "").Split('&')) { int k = kv.IndexOf('='); if (k > 0) q[Uri.UnescapeDataString(kv.Substring(0, k))] = Uri.UnescapeDataString(kv.Substring(k + 1)); }
+        Func<string, int, int> num = (name, def) => { string v; int n; return q.TryGetValue(name, out v) && int.TryParse(v, out n) ? n : def; };
+        int total = Math.Max(0, Math.Min(5000000, num("total", 10000)));
+        int size = Math.Max(1, Math.Min(1000, q.ContainsKey("limit") ? num("limit", 100) : num("size", 100)));
+        int offset;
+        string cur;
+        if (q.TryGetValue("cursor", out cur) && cur.Length > 0) { try { offset = int.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(cur)).Substring(2)); } catch { return Err(400, "bad cursor"); } }
+        else if (q.ContainsKey("offset")) offset = Math.Max(0, num("offset", 0));
+        else offset = (Math.Max(1, num("page", 1)) - 1) * size;
+        if (num("flaky", 0) == 1 && System.Threading.Interlocked.Increment(ref recordCalls) % 5 == 0) { var busy = Err(429, "too many requests - wait and try again"); busy.Headers.Add(new[] { "Retry-After", "1" }); return busy; }
+        var sb = new StringBuilder();
+        int end = Math.Min(total, offset + size);
+        sb.Append("{\"page\":" + (offset / size + 1) + ",\"size\":" + size + ",\"offset\":" + offset + ",\"total\":" + total + ",\"items\":[");
+        for (int i = offset; i < end; i++) {
+            if (i > offset) sb.Append(',');
+            sb.Append("{\"id\":" + (i + 1) + ",\"name\":\"Record " + (i + 1) + "\",\"value\":" + ((i * 37) % 1000) + ",\"created\":\"" + new DateTime(2026, 1, 1).AddMinutes(i).ToString("s") + "Z\"}");
+        }
+        string next = end < total ? Convert.ToBase64String(Encoding.UTF8.GetBytes("o:" + end)) : null;
+        sb.Append("],\"next\":" + (next == null ? "null" : J(next)) + ",\"hasMore\":" + (end < total ? "true" : "false") + "}");
+        var res = Json(200, sb.ToString());
+        res.Headers.Add(new[] { "X-Total-Count", total.ToString() });
+        return res;
+    }
+
     string Help() {
         return "DevTools Test API  -  http://127.0.0.1:" + Port + "\n\n" +
             "Users: demo / demo   and   ann / secret\n\n" +
@@ -17239,6 +17522,8 @@ public class DevTestApi {
             "GET  /csrf         a token in the X-CSRF-Token header and in the HTML (value=\"...\")\n" +
             "GET  /status/{code} answers with that status\n" +
             "GET  /slow?ms=2000 answers after a delay\n" +
+            "GET  /records      10,000 records, a page at a time: ?page=1&size=100, ?offset=0&limit=100 or ?cursor=<next>\n" +
+            "                   (&total=N for another count, &flaky=1 for an occasional 429 with Retry-After)\n" +
             "ANY  /echo         sends back what you sent: method, query, headers, cookies, body\n";
     }
 }
