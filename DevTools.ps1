@@ -23427,6 +23427,10 @@ function Add-SettingsRow($Card, [string]$Text, [string]$Hint, $Control) {
     $Card.Controls.Add($lbl, 0, $Card.RowCount)
     if ($Control) {
         $Control.Anchor = 'Right'
+        # a long row of buttons wraps instead of squeezing the text next to it
+        if ($Control -is [System.Windows.Forms.FlowLayoutPanel] -and $Control.PreferredSize.Width -gt (Px 380)) {
+            $Control.WrapContents = $true; $Control.MaximumSize = New-Object System.Drawing.Size((Px 380), 0)
+        }
         $Card.Controls.Add($Control, 1, $Card.RowCount)
         if ($Hint) { $Card.SetRowSpan($Control, 2) }
     }
