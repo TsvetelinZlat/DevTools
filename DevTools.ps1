@@ -12212,13 +12212,22 @@ function Show-ChainVarsDialog {
     $d.BackColor = $C.Panel; $d.ForeColor = $C.Fore; $d.Font = $FontMain; $d.Size = New-Object System.Drawing.Size((Px 520), (Px 400))
     $l = New-Object System.Windows.Forms.Label; $l.Dock = 'Top'; $l.Height = Px 44; $l.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), 0)
     $l.Text = 'One per line:  name = value.  Use them as {{name}}. They start every run (after the API tester''s environment); steps can change them.'
-    $tb = New-TbBox -Mono -Multi; $tb.Dock = 'Fill'; $tb.Text = $text
+    # the note wraps: its height follows the window width
+    $l.add_Resize({ param($src, $e)
+        $w = $src.ClientSize.Width - $src.Padding.Horizontal
+        if ($w -lt 50) { return }
+        $h = [System.Windows.Forms.TextRenderer]::MeasureText($src.Text, $src.Font, (New-Object System.Drawing.Size($w, 0)), [System.Windows.Forms.TextFormatFlags]'WordBreak').Height + $src.Padding.Vertical + (Px 8)
+        if ($src.Height -ne $h) { $src.Height = $h }
+    })
+    $tb = New-TbBox -Mono -Multi; $tb.Dock = 'Fill'; $tb.Text = $text; $tb.ScrollBars = 'Vertical'; $tb.WordWrap = $true
     $bp = New-Object System.Windows.Forms.FlowLayoutPanel; $bp.Dock = 'Bottom'; $bp.Height = Px 44; $bp.FlowDirection = 'RightToLeft'; $bp.BackColor = $C.Panel
     $ok = New-Button 'Save' '' { param($src, $e) $src.FindForm().DialogResult = 'OK' } $bp $Glyph.Save 1
     [void](New-Button 'Cancel' '' { param($src, $e) $src.FindForm().DialogResult = 'Cancel' } $bp '' 2)
     $d.Controls.AddRange(@($tb, $bp, $l))
     Set-ControlTheme $d $null $script:IsDark
-    $d.add_Shown({ param($src, $e) [PowerClipHost]::EnsureShown($src.Handle) })
+    $d.Tag = $tb
+    $d.add_Shown({ param($src, $e) [PowerClipHost]::EnsureShown($src.Handle); $src.PerformLayout(); $t = $src.Tag; $src.ActiveControl = $t; $t.Select($t.TextLength, 0) })   # cursor at the end, nothing selected
+    $d.MinimumSize = New-Object System.Drawing.Size((Px 360), (Px 260))
     $script:Modal = $true
     try {
         if ($d.ShowDialog($ChainUI.Form) -ne 'OK') { return }
