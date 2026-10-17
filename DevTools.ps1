@@ -16874,6 +16874,26 @@ public class DevTestApi {
     }
 }
 
+// An owner-drawn list box that paints into a back buffer (no flicker when it's redrawn often).
+public class DevBufferedListBox : System.Windows.Forms.ListBox {
+    public DevBufferedListBox() {
+        SetStyle(System.Windows.Forms.ControlStyles.OptimizedDoubleBuffer | System.Windows.Forms.ControlStyles.AllPaintingInWmPaint |
+                 System.Windows.Forms.ControlStyles.ResizeRedraw | System.Windows.Forms.ControlStyles.UserPaint, true);
+        DrawMode = System.Windows.Forms.DrawMode.OwnerDrawFixed;
+    }
+    protected override void OnPaint(System.Windows.Forms.PaintEventArgs e) {
+        using (var b = new System.Drawing.SolidBrush(BackColor)) e.Graphics.FillRectangle(b, e.ClipRectangle);
+        for (int i = Math.Max(0, TopIndex); i < Items.Count; i++) {
+            var r = GetItemRectangle(i);
+            if (r.Top > ClientSize.Height) break;
+            if (!e.ClipRectangle.IntersectsWith(r)) continue;
+            var st = SelectedIndices.Contains(i) ? System.Windows.Forms.DrawItemState.Selected : System.Windows.Forms.DrawItemState.None;
+            OnDrawItem(new System.Windows.Forms.DrawItemEventArgs(e.Graphics, Font, r, i, st, ForeColor, BackColor));
+        }
+    }
+    protected override void OnSelectedIndexChanged(EventArgs e) { base.OnSelectedIndexChanged(e); Invalidate(); }
+}
+
 public static class DevEnv {
     const string MachineKey = @"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
     static RegistryKey Open(bool machine, bool write) {
@@ -19257,7 +19277,16 @@ $HostWatch.add_Tick({
         }
     }
     $p = $TbUI.Pages['hosts']
-    if ($p -and $p.State -and $p.Panel.Visible) { $p.State.List.Invalidate() }
+    if ($p -and $p.State -and $p.Panel.Visible) {
+        # redraw only the rows whose state changed since the last look
+        $l = $p.State.List
+        if (-not $p.State.Sig) { $p.State.Sig = @{} }
+        for ($i = 0; $i -lt $script:HostTargets.Count -and $i -lt $l.Items.Count; $i++) {
+            $t = $script:HostTargets[$i]
+            $sig = "$($t.Status)|$($t.LatencyMs)|$($t.LastCheck.Ticks)|$($t.Recent.Count)|$(Get-HostSilenceText $t)"
+            if ($p.State.Sig[$t.Id] -ne $sig) { $p.State.Sig[$t.Id] = $sig; $l.Invalidate($l.GetItemRectangle($i)) }
+        }
+    }
 })
 $HostWatch.Start()
 
@@ -19303,7 +19332,7 @@ function Show-HostDialog($Target) {
 Register-ToolboxPage 'hosts' 'Host monitor' $Glyph.Globe 'monitor uptime ping servers dashboard status up down' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
-    $list = New-Object System.Windows.Forms.ListBox
+    $list = New-Object DevBufferedListBox
     $list.Dock = 'Fill'; $list.BorderStyle = 'None'; $list.DrawMode = 'OwnerDrawFixed'; $list.IntegralHeight = $false
     $list.ItemHeight = $FontMain.Height + $FontSmall.Height + (Px 22); $list.BackColor = $C.Bg; $list.ForeColor = $C.Fore
     $list.add_DrawItem({
