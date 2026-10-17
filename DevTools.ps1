@@ -12596,7 +12596,7 @@ function Show-ApiChains {
     $ChainUI.Editor = $ed
     $hint = New-Object System.Windows.Forms.Label
     $hint.Dock = 'Fill'; $hint.TextAlign = 'MiddleCenter'; $hint.ForeColor = $C.Dim; $hint.BackColor = $C.Bg
-    $hint.Text = "Click a card to edit it.`n`nDrag requests from the left onto the canvas.`nDrag from a card's blue dot to another card to run it after.`nCtrl+click, or double-click empty space and drag a box, to select several cards;`nthen Del deletes them, Ctrl+C / Ctrl+V copies them, dragging moves them.`nDrag empty space to move around (or the mouse wheel, Shift = sideways)."
+    $hint.Text = "Click a card to edit it.`n`nDrag requests from the left onto the canvas.`nDrag from a card's blue dot to another card to run it after.`nCtrl+click, or double-click empty space and drag a box, to select several cards;`nthen Del deletes them, Ctrl+C / Ctrl+V copies them, dragging moves them.`nDrag empty space to move around (or the mouse wheel, Shift = sideways).`nCtrl+wheel zooms; Ctrl+0 = 100%, Ctrl+9 = fit (buttons bottom-right)."
     $right.Panel1.Controls.Add($hint)
     $ChainUI.EditorHint = $hint
 
@@ -15862,6 +15862,7 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
     public ChainLink SelectedLink;
     public string RunningId;
     public System.Drawing.PointF Pan = new System.Drawing.PointF(0, 0);
+    public float Zoom = 1f;                 // drawing scale; Pan and everything inside are in unzoomed units
     public event EventHandler SelectionChanged, Changed, NodeOpen;
 
     enum Mode { None, Drag, Link, Pan, Box }
@@ -15888,7 +15889,48 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
     public float NodeW { get { return S(240); } }
     public float NodeH { get { return S(74); } }
 
-    public System.Drawing.PointF ToCanvas(System.Drawing.Point p) { return new System.Drawing.PointF(p.X - Pan.X, p.Y - Pan.Y); }
+    public System.Drawing.PointF ToCanvas(System.Drawing.Point p) { return new System.Drawing.PointF(p.X / Zoom - Pan.X, p.Y / Zoom - Pan.Y); }
+    System.Drawing.PointF V(int x, int y) { return new System.Drawing.PointF(x / Zoom, y / Zoom); }   // mouse pixels -> unzoomed
+
+    // Zoom to z, keeping the point under the given pixel (default: the middle) where it is.
+    public void SetZoom(float z) { SetZoom(z, new System.Drawing.Point(Width / 2, Height / 2)); }
+    public void SetZoom(float z, System.Drawing.Point at) {
+        z = Math.Max(0.25f, Math.Min(2.5f, z));
+        if (Math.Abs(z - 1f) < 0.04f) z = 1f;
+        float wx = at.X / Zoom - Pan.X, wy = at.Y / Zoom - Pan.Y;
+        Zoom = z;
+        Pan = new System.Drawing.PointF(at.X / Zoom - wx, at.Y / Zoom - wy);
+        Invalidate();
+    }
+
+    // Shows every card (never bigger than 100%).
+    public void ZoomToFit() {
+        if (Nodes.Count == 0) { Zoom = 1f; Pan = new System.Drawing.PointF(0, 0); Invalidate(); return; }
+        float x0 = Nodes.Min(n => n.X), y0 = Nodes.Min(n => n.Y), x1 = Nodes.Max(n => n.X) + NodeW, y1 = Nodes.Max(n => n.Y) + NodeH + S(80);
+        float m = S(30);
+        float z = Math.Min((Width - 2 * m) / Math.Max(1f, x1 - x0), (Height - 2 * m) / Math.Max(1f, y1 - y0));
+        Zoom = Math.Max(0.25f, Math.Min(1f, z));
+        Pan = new System.Drawing.PointF((Width / Zoom - (x1 - x0)) / 2 - x0, (Height / Zoom - (y1 - y0)) / 2 - y0);
+        Invalidate();
+    }
+
+    // The zoom buttons in the bottom-right corner (pixels): out, percentage (= 100%), in, fit.
+    System.Drawing.RectangleF[] ZoomButtons() {
+        float h = S(28), y = Height - h - S(10), x = Width - S(10);
+        float[] w = { S(40), S(30), S(58), S(30) };     // fit, +, %, - (right to left)
+        var r = new System.Drawing.RectangleF[4];
+        for (int i = 0; i < 4; i++) { x -= w[i]; r[3 - i] = new System.Drawing.RectangleF(x, y, w[i], h); }
+        return r;                                         // [0] -, [1] %, [2] +, [3] fit
+    }
+    bool ZoomClick(System.Drawing.Point p) {
+        var b = ZoomButtons();
+        if (b[0].Contains(p)) SetZoom(Zoom / 1.2f);
+        else if (b[1].Contains(p)) SetZoom(1f);
+        else if (b[2].Contains(p)) SetZoom(Zoom * 1.2f);
+        else if (b[3].Contains(p)) ZoomToFit();
+        else return false;
+        return true;
+    }
     System.Drawing.RectangleF Box(ChainNode n) { return new System.Drawing.RectangleF(n.X + Pan.X, n.Y + Pan.Y, NodeW, NodeH); }
     System.Drawing.PointF OutPort(ChainNode n) { var r = Box(n); return new System.Drawing.PointF(r.Right, r.Y + r.Height / 2); }
     System.Drawing.PointF InPort(ChainNode n) { var r = Box(n); return new System.Drawing.PointF(r.X, r.Y + r.Height / 2); }
@@ -15973,10 +16015,11 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
     protected override void OnMouseDown(System.Windows.Forms.MouseEventArgs e) {
         base.OnMouseDown(e);
         Focus();
-        var p = new System.Drawing.PointF(e.X, e.Y);
+        if (e.Button == System.Windows.Forms.MouseButtons.Left && ZoomClick(e.Location)) { mode = Mode.None; return; }
+        var p = V(e.X, e.Y);
         downAt = e.Location; moved = false; mouse = p;
         bool ctrl = (ModifierKeys & System.Windows.Forms.Keys.Control) != 0, shift = (ModifierKeys & System.Windows.Forms.Keys.Shift) != 0;
-        if (e.Button == System.Windows.Forms.MouseButtons.Middle) { mode = Mode.Pan; panStart = new System.Drawing.PointF(e.X - Pan.X, e.Y - Pan.Y); Cursor = System.Windows.Forms.Cursors.SizeAll; return; }
+        if (e.Button == System.Windows.Forms.MouseButtons.Middle) { mode = Mode.Pan; panStart = new System.Drawing.PointF(p.X - Pan.X, p.Y - Pan.Y); Cursor = System.Windows.Forms.Cursors.SizeAll; return; }
         var n = NodeAt(p);
         if (n != null && e.Button == System.Windows.Forms.MouseButtons.Left && Dist(OutPort(n), p) < S(12)) {
             mode = Mode.Link; linkFrom = n; return;
@@ -16003,13 +16046,13 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
             if (!boxAdd && (Selection.Count > 0 || SelectedLink != null)) { Selection.Clear(); primary = null; SelectedLink = null; Fire(); }
         } else if (e.Button == System.Windows.Forms.MouseButtons.Left) {
             // plain drag on empty space moves the view; a plain click there clears the selection (on mouse up)
-            mode = Mode.Pan; panStart = new System.Drawing.PointF(e.X - Pan.X, e.Y - Pan.Y); Cursor = System.Windows.Forms.Cursors.SizeAll;
+            mode = Mode.Pan; panStart = new System.Drawing.PointF(p.X - Pan.X, p.Y - Pan.Y); Cursor = System.Windows.Forms.Cursors.SizeAll;
         } else if (e.Button == System.Windows.Forms.MouseButtons.Right && Selection.Count > 0 && !ctrl) { Selection.Clear(); primary = null; SelectedLink = null; Fire(); }
     }
 
     protected override void OnMouseMove(System.Windows.Forms.MouseEventArgs e) {
         base.OnMouseMove(e);
-        var p = new System.Drawing.PointF(e.X, e.Y);
+        var p = V(e.X, e.Y);
         if (Math.Abs(e.X - downAt.X) + Math.Abs(e.Y - downAt.Y) > 3) moved = true;
         if (mode == Mode.Drag) {
             float dx = p.X - dragStart.X, dy = p.Y - dragStart.Y;
@@ -16017,7 +16060,7 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
             Invalidate();
         }
         else if (mode == Mode.Link || mode == Mode.Box) { mouse = p; Invalidate(); }
-        else if (mode == Mode.Pan) { Pan = new System.Drawing.PointF(e.X - panStart.X, e.Y - panStart.Y); Invalidate(); }
+        else if (mode == Mode.Pan) { Pan = new System.Drawing.PointF(p.X - panStart.X, p.Y - panStart.Y); Invalidate(); }
         else {
             var n = NodeAt(p);
             Cursor = n != null && Dist(OutPort(n), p) < S(12) ? System.Windows.Forms.Cursors.Cross : n != null ? System.Windows.Forms.Cursors.Hand : System.Windows.Forms.Cursors.Default;
@@ -16026,7 +16069,7 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
 
     protected override void OnMouseUp(System.Windows.Forms.MouseEventArgs e) {
         base.OnMouseUp(e);
-        var p = new System.Drawing.PointF(e.X, e.Y);
+        var p = V(e.X, e.Y);
         if (mode == Mode.Link) {
             var t = NodeAt(p);
             if (t != null && t != linkFrom) Connect(linkFrom.Id, t.Id);
@@ -16051,7 +16094,8 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
 
     protected override void OnMouseWheel(System.Windows.Forms.MouseEventArgs e) {
         base.OnMouseWheel(e);
-        float step = e.Delta / 120f * S(60);
+        if ((ModifierKeys & System.Windows.Forms.Keys.Control) != 0) { SetZoom(Zoom * (float)Math.Pow(1.1, e.Delta / 120.0), e.Location); return; }
+        float step = e.Delta / 120f * S(60) / Zoom;
         if ((ModifierKeys & System.Windows.Forms.Keys.Shift) != 0) Pan = new System.Drawing.PointF(Pan.X + step, Pan.Y);
         else Pan = new System.Drawing.PointF(Pan.X, Pan.Y + step);
         Invalidate();
@@ -16059,7 +16103,8 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
 
     protected override void OnMouseDoubleClick(System.Windows.Forms.MouseEventArgs e) {
         base.OnMouseDoubleClick(e);
-        if (NodeAt(new System.Drawing.PointF(e.X, e.Y)) != null && NodeOpen != null) NodeOpen(this, EventArgs.Empty);
+        if (ZoomButtons().Any(b => b.Contains(e.Location))) return;
+        if (NodeAt(V(e.X, e.Y)) != null && NodeOpen != null) NodeOpen(this, EventArgs.Empty);
     }
 
     protected override bool IsInputKey(System.Windows.Forms.Keys k) { return k == System.Windows.Forms.Keys.Delete || base.IsInputKey(k); }
@@ -16067,6 +16112,10 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
         base.OnKeyDown(e);
         if (e.KeyCode == System.Windows.Forms.Keys.Delete) { RemoveSelected(); e.Handled = true; }
         else if (e.Control && e.KeyCode == System.Windows.Forms.Keys.A) { SelectAll(); e.Handled = true; }
+        else if (e.Control && (e.KeyCode == System.Windows.Forms.Keys.Oemplus || e.KeyCode == System.Windows.Forms.Keys.Add)) { SetZoom(Zoom * 1.2f); e.Handled = true; }
+        else if (e.Control && (e.KeyCode == System.Windows.Forms.Keys.OemMinus || e.KeyCode == System.Windows.Forms.Keys.Subtract)) { SetZoom(Zoom / 1.2f); e.Handled = true; }
+        else if (e.Control && (e.KeyCode == System.Windows.Forms.Keys.D0 || e.KeyCode == System.Windows.Forms.Keys.NumPad0)) { SetZoom(1f); e.Handled = true; }
+        else if (e.Control && e.KeyCode == System.Windows.Forms.Keys.D9) { ZoomToFit(); e.Handled = true; }
         else if (e.KeyCode == System.Windows.Forms.Keys.Escape && Selection.Count > 0) { SelectNode(null); e.Handled = true; }
     }
 
@@ -16160,17 +16209,19 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
         g.Clear(Back);
         g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+        g.ScaleTransform(Zoom, Zoom);
+        float vw = Width / Zoom, vh = Height / Zoom;
         float step = S(24);
-        using (var dot = new System.Drawing.SolidBrush(GridDot)) {
+        if (Zoom >= 0.45f) using (var dot = new System.Drawing.SolidBrush(GridDot)) {
             float ox = Pan.X % step, oy = Pan.Y % step;
             if (ox < 0) ox += step; if (oy < 0) oy += step;
-            for (float x = ox; x < Width; x += step) for (float y = oy; y < Height; y += step) g.FillRectangle(dot, x, y, S(1.6f), S(1.6f));
+            for (float x = ox; x < vw; x += step) for (float y = oy; y < vh; y += step) g.FillRectangle(dot, x, y, S(1.6f), S(1.6f));
         }
         if (Nodes.Count == 0) {
             using (var f = new System.Drawing.Font(Font.FontFamily, Font.Size * 1.1f))
             using (var br = new System.Drawing.SolidBrush(Dim)) {
                 var sf = new System.Drawing.StringFormat { Alignment = System.Drawing.StringAlignment.Center, LineAlignment = System.Drawing.StringAlignment.Center };
-                g.DrawString("Drag requests here from the list on the left (or right-click: Add a request).\nThen drag from a card's right dot to the next card to chain them.", f, br, ClientRectangle, sf);
+                g.DrawString("Drag requests here from the list on the left (or right-click: Add a request).\nThen drag from a card's right dot to the next card to chain them.", f, br, new System.Drawing.RectangleF(0, 0, vw, vh), sf);
             }
         }
         foreach (var l in Links) {
@@ -16190,7 +16241,7 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
                 bool sel = Selection.Contains(n), run = n.Id == RunningId;
                 var stateCol = run ? Accent : n.State == "ok" ? Green : n.State == "fail" ? Red : n.State == "skip" ? Yellow : Line;
                 using (var path = Round(r, S(8))) {
-                    using (var shadow = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(28, 0, 0, 0))) { g.TranslateTransform(0, S(2)); g.FillPath(shadow, path); g.ResetTransform(); }
+                    using (var shadow = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(28, 0, 0, 0))) { g.TranslateTransform(0, S(2)); g.FillPath(shadow, path); g.TranslateTransform(0, -S(2)); }
                     using (var br = new System.Drawing.SolidBrush(sel ? System.Drawing.Color.FromArgb(Card.A, (Card.R * 9 + Accent.R) / 10, (Card.G * 9 + Accent.G) / 10, (Card.B * 9 + Accent.B) / 10) : Card)) g.FillPath(br, path);
                     using (var pen = new System.Drawing.Pen(sel || run ? Accent : Line, sel || run ? S(2) : 1)) g.DrawPath(pen, path);
                 }
@@ -16229,6 +16280,19 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
             var r = BoxRect();
             using (var br = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(40, Accent))) g.FillRectangle(br, r);
             using (var pen = new System.Drawing.Pen(Accent, 1) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dash }) g.DrawRectangle(pen, r.X, r.Y, r.Width, r.Height);
+        }
+        // zoom buttons (not zoomed themselves)
+        g.ResetTransform();
+        var zb = ZoomButtons();
+        var all = System.Drawing.RectangleF.Union(zb[0], zb[3]);
+        using (var path = Round(all, S(6)))
+        using (var bg = new System.Drawing.SolidBrush(Card))
+        using (var pen = new System.Drawing.Pen(Line)) { g.FillPath(bg, path); g.DrawPath(pen, path); }
+        using (var f = new System.Drawing.Font(Font.FontFamily, Font.Size * 0.9f))
+        using (var br = new System.Drawing.SolidBrush(Fore)) {
+            var sf = new System.Drawing.StringFormat { Alignment = System.Drawing.StringAlignment.Center, LineAlignment = System.Drawing.StringAlignment.Center };
+            string[] t = { "-", ((int)Math.Round(Zoom * 100)) + "%", "+", "Fit" };
+            for (int i = 0; i < 4; i++) g.DrawString(t[i], f, br, zb[i], sf);
         }
     }
 }
