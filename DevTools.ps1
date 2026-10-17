@@ -11861,6 +11861,9 @@ function Show-ChainShareMenu($Button) {
     [void](Add-MenuItem $m 'Copy as text (to paste in a chat or email)' { Export-Chain -Clipboard } $Glyph.Copy)
     [void](Add-MenuItem $m 'Save all results of the last run to a folder...' { Save-ChainResults } $Glyph.Save)
     [void]$m.Items.Add('-')
+    [void](Add-MenuItem $m 'Export as a PowerShell script...' { Export-ChainScript 'ps' } $Glyph.Code)
+    [void](Add-MenuItem $m 'Export as a Bash script (curl)...' { Export-ChainScript 'sh' } $Glyph.Code)
+    [void]$m.Items.Add('-')
     [void](Add-MenuItem $m 'Import from a file...' {
         $d = New-Object System.Windows.Forms.OpenFileDialog
         $d.Filter = 'DevTools chain (*.devchain.json;*.json)|*.devchain.json;*.json|All files|*.*'; $d.Multiselect = $true
@@ -12452,6 +12455,691 @@ function Resume-ChainPage($Run, $Node, [int]$Wait) {
     $Run.Index--; $Run.JumpTo = $Node.Id; $Run.Visits[$Node.Id]--
     $ChainUI.Canvas.Invalidate()
     if ($Wait -gt 0) { $Run.WaitUntil = (Get-Date).AddMilliseconds($Wait); $ChainUI.Timer.Start() } else { Invoke-ChainNext }
+}
+
+$ChainScriptPsEngine = @'
+# ---- the engine (the same rules as the API chains window) ---------------------------------
+function Expand-Request([string]$Text) {          # {{name}} -> its value; unknown names stay as they are
+    [regex]::Replace($Text, '\{\{\s*([^{}\s]+)\s*\}\}', {
+        param($m)
+        $k = $m.Groups[1].Value
+        if ($ChainUI.Vars.ContainsKey($k)) { [string]$ChainUI.Vars[$k] } elseif ($k -in 'timestamp', 'date', 'time') { Expand-ChainText $m.Value } else { $m.Value }
+    })
+}
+
+$Session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+$IsCore = $PSVersionTable.PSVersion.Major -ge 6
+
+function Send-Step($S) {
+    $url = Expand-Request $S.Url
+    $headers = @{}; $ct = $null
+    foreach ($h in $S.Headers) { $k = Expand-Request $h.N; $v = Expand-Request $h.V; if ($k -eq 'Content-Type') { $ct = $v } else { $headers[$k] = $v } }
+    if ($S.Basic) { $headers['Authorization'] = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Expand-Request $S.Basic.User) + ':' + (Expand-Request $S.Basic.Password))) }
+    $p = @{ Uri = $url; Method = $S.Method; WebSession = $Session; UseBasicParsing = $true; TimeoutSec = $S.TimeoutSec }
+    if ($headers.Count) { $p.Headers = $headers }
+    if (-not $S.Follow) { $p.MaximumRedirection = 0 }
+    switch ($S.BodyMode) {
+        'raw'  { $p.Body = [Text.Encoding]::UTF8.GetBytes((Expand-Request $S.Body)); $p.ContentType = $(if ($ct) { $ct } else { $S.ContentType }) }
+        'form' { $p.Body = (@($S.Form | ForEach-Object { [Uri]::EscapeDataString((Expand-Request $_.N)) + '=' + [Uri]::EscapeDataString((Expand-Request $_.V)) }) -join '&'); $p.ContentType = 'application/x-www-form-urlencoded' }
+        'multipart' {
+            if (-not $IsCore) { throw 'Sending form-data (files) needs PowerShell 7 - run this script with pwsh.' }
+            $f = @{}; foreach ($x in $S.Form) { $v = Expand-Request $x.V; $f[(Expand-Request $x.N)] = $(if ($v.StartsWith('@')) { Get-Item -LiteralPath $v.Substring(1).Trim('"') } else { $v }) }
+            $p.Form = $f
+        }
+        default { if ($ct) { $p.ContentType = $ct } }
+    }
+    if ($IsCore) { $p.SkipHttpErrorCheck = $true; if ($S.Insecure) { $p.SkipCertificateCheck = $true } }
+    elseif ($S.Insecure) { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } }
+    $res = @{ Status = 0; Reason = ''; Headers = @{}; Bytes = [byte[]]@(); Text = ''; Error = ''; Ms = 0; Url = $url }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $r = Invoke-WebRequest @p
+        $res.Status = [int]$r.StatusCode; $res.Reason = [string]$r.StatusDescription
+        foreach ($k in $r.Headers.Keys) { $res.Headers[$k] = (@($r.Headers[$k]) -join ', ') }
+        $res.Bytes = $r.RawContentStream.ToArray()
+    } catch {
+        $er = $_.Exception.Response
+        if ($er -is [System.Net.HttpWebResponse]) {           # Windows PowerShell: 4xx / 5xx / redirects come as errors
+            $res.Status = [int]$er.StatusCode; $res.Reason = [string]$er.StatusDescription
+            foreach ($k in $er.Headers.AllKeys) { $res.Headers[$k] = $er.Headers[$k] }
+            $ms = New-Object IO.MemoryStream; $st = $er.GetResponseStream(); $st.CopyTo($ms); $st.Dispose(); $res.Bytes = $ms.ToArray()
+        } else { $res.Error = $_.Exception.Message }
+    }
+    $res.Ms = $sw.ElapsedMilliseconds
+    $res.Text = [Text.Encoding]::UTF8.GetString($res.Bytes)
+    $res
+}
+
+function Get-JsonValue([string]$Json, [string]$Path) {
+    try { $o = ConvertFrom-Json -InputObject $Json } catch { return $null }
+    $p = $Path.Trim(); if ($p.StartsWith('$')) { $p = $p.Substring(1) }
+    foreach ($m in [regex]::Matches($p, '\.([^.\[]+)|\[(\d+)\]|\[[''"](.+?)[''"]\]')) {
+        if ($null -eq $o) { return $null }
+        if ($m.Groups[2].Success) { $a = @($o); $ix = [int]$m.Groups[2].Value; $o = if ($ix -lt $a.Count) { $a[$ix] } else { $null } }
+        else { $name = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[3].Value }; $o = if ($o.PSObject.Properties[$name]) { $o.$name } else { $null } }
+    }
+    , $o
+}
+function Format-Value($V) {
+    if ($null -eq $V) { return $null }
+    if ($V -is [bool]) { return $V.ToString().ToLower() }
+    if ($V -is [string] -or $V -is [ValueType]) { return [string]$V }
+    ConvertTo-Json -InputObject $V -Compress -Depth 50
+}
+function Get-Extract($Res, [string]$From, [string]$Expr) {
+    switch ($From) {
+        'Header' { foreach ($k in $Res.Headers.Keys) { if ($k -eq $Expr) { return $Res.Headers[$k] } }; return $null }
+        'Cookie' { foreach ($ck in $Session.Cookies.GetCookies([Uri]$Res.Url)) { if ($ck.Name -eq $Expr) { return $ck.Value } }; return $null }
+        'Link header (rel=next)' { foreach ($k in $Res.Headers.Keys) { if ($k -eq 'Link' -and $Res.Headers[$k] -match '<([^>]+)>\s*;[^,]*rel="?next"?') { return $Matches[1] } }; return $null }
+        'Regex'  { $m = [regex]::Match($Res.Text, $Expr); if (-not $m.Success) { return $null }; if ($m.Groups.Count -gt 1) { return $m.Groups[1].Value }; return $m.Value }
+        'Status' { return [string]$Res.Status }
+        'Body'   { return $Res.Text }
+        default  { return Format-Value (Get-JsonValue $Res.Text $Expr) }
+    }
+}
+
+# A relative path is next to this script; {{vars}} and {{timestamp}} work.
+function Resolve-OutPath([string]$Path) {
+    $p = [Environment]::ExpandEnvironmentVariables((Expand-ChainText $Path).Trim().Trim('"'))
+    if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path $(if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }) $p }
+    $dir = Split-Path -Parent $p
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+    $p
+}
+
+# Records of many pages into one file, written as they come (JSON array, JSON lines or CSV).
+function Open-Records([string]$Path, [string]$Format) {
+    $w = New-Object IO.StreamWriter($Path, $false, (New-Object Text.UTF8Encoding $false))
+    if ($Format -eq 'json') { $w.Write("[`n") }
+    @{ W = $w; Format = $Format; First = $true; Cols = $null; Path = $Path }
+}
+function Add-Records($R, [string]$Json, [string]$ItemsPath) {
+    $v = Get-JsonValue $Json $(if ($ItemsPath) { $ItemsPath } else { '$' })
+    if ($null -eq $v) { return 0 }
+    $items = @(if ($v -is [array]) { $v } else { , $v })
+    if ($items.Count -eq 0) { return 0 }
+    switch ($R.Format) {
+        'ndjson' { foreach ($it in $items) { $R.W.WriteLine((Format-Value $it)) } }
+        'csv' {
+            $q = { param($s) if ($null -eq $s) { '' } elseif ($s -match '[,"\r\n]') { '"' + $s.Replace('"', '""') + '"' } else { $s } }
+            foreach ($it in $items) {
+                if (-not $R.Cols) { $R.Cols = @(if ($it -is [pscustomobject]) { $it.PSObject.Properties.Name } else { 'value' }); $R.W.Write((($R.Cols | ForEach-Object { & $q $_ }) -join ',') + "`r`n") }
+                $row = foreach ($c in $R.Cols) { if ($it -is [pscustomobject]) { & $q (Format-Value $it.$c) } else { & $q (Format-Value $it) } }
+                $R.W.Write((@($row) -join ',') + "`r`n")
+            }
+        }
+        default {                      # one page as one compact array: drop its brackets, add commas between pages
+            $t = ConvertTo-Json -InputObject @($items) -Compress -Depth 50
+            $t = $t.Substring(1, $t.Length - 2)
+            if (-not $R.First) { $R.W.Write(",`n") }
+            $R.W.Write('  ' + $t)
+        }
+    }
+    $R.First = $false
+    $R.W.Flush()
+    $items.Count
+}
+function Close-Records($R) { if ($R.Format -eq 'json') { $R.W.Write($(if ($R.First) { "]`n" } else { "`n]`n" })) }; $R.W.Dispose() }
+
+function Save-Response($S, $Res) {
+    if (-not $S.SaveTo -or $Res.Error) { return '' }
+    $path = Resolve-OutPath $S.SaveTo
+    if ($S.SaveWhat -eq 'full') {
+        $t = "### $($S.Name)  -  $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))`r`n$($S.Method) $($Res.Url)`r`n$($Res.Status) $($Res.Reason)   $($Res.Ms) ms`r`n" +
+             (($Res.Headers.Keys | ForEach-Object { "$($_): $($Res.Headers[$_])" }) -join "`r`n") + "`r`n`r`n" + $Res.Text + "`r`n"
+        if ($S.SaveAppend) { [IO.File]::AppendAllText($path, $t) } else { [IO.File]::WriteAllText($path, $t) }
+    } elseif ($S.SaveAppend) { $fs = [IO.File]::Open($path, 'Append', 'Write'); $fs.Write($Res.Bytes, 0, $Res.Bytes.Length); $fs.Write([byte[]](13, 10), 0, 2); $fs.Dispose() }
+    else { [IO.File]::WriteAllBytes($path, $Res.Bytes) }
+    "saved to $(Split-Path -Leaf $path)"
+}
+
+# ---- run the steps -------------------------------------------------------------------------
+$state = @{}; $visits = @{}; $i = 0; $jumpTo = -1; $okCount = 0; $failCount = 0; $skipCount = 0
+$started = Get-Date
+while ($i -lt $Steps.Count) {
+    $S = $Steps[$i]; $no = $i + 1; $next = $i + 1
+    $jumped = $jumpTo -eq $i; $jumpTo = -1
+    if (-not $jumped -and -not $S.RunAfterFail) {
+        $bad = @($S.Parents | Where-Object { $state[$_] -in 'fail', 'skip' })
+        if ($bad) { $state[$i] = 'skip'; $skipCount++; Write-Host ("[{0}] {1}  -  skipped: step {2} {3}" -f $no, $S.Name, ($bad[0] + 1), $(if ($state[$bad[0]] -eq 'fail') { 'failed' } else { 'was skipped' })) -ForegroundColor DarkYellow; $i = $next; continue }
+    }
+    if ($S.Condition) {
+        $t = Test-ChainCondition $S.Condition
+        if (-not $t.Ok) { $state[$i] = 'skip'; $skipCount++; Write-Host "[$no] $($S.Name)  -  skipped, not true: $($t.Text)" -ForegroundColor DarkYellow; $i = $next; continue }
+    }
+    $visits[$i] = 1 + [int]$visits[$i]
+    if ($visits[$i] -gt 100) { Write-Host "Stopped: step $no would run a 101st time - check its Go to rules (an endless loop?)." -ForegroundColor Red; $failCount++; break }
+    $pg = $S.Paging; $records = $null; $pages = 0; $count = 0; $attempt = 0; $note = ''
+    if ($pg) {
+        $ChainUI.Vars[$pg.Var] = if ($pg.Mode -eq 'cursor') { Expand-ChainText $pg.Start } else { [string]$pg.Start }
+        if ($pg.CollectTo) { $records = Open-Records (Resolve-OutPath $pg.CollectTo) $pg.Format }
+    }
+    while ($true) {                               # once - or once a page
+        $res = Send-Step $S
+        if ($pg -and ($res.Error -or $res.Status -eq 429 -or $res.Status -ge 500) -and $attempt -lt $pg.Retries) {
+            $attempt++
+            $wait = [Math]::Min(30000, 1000 * [Math]::Pow(2, $attempt - 1))
+            foreach ($k in $res.Headers.Keys) { if ($k -eq 'Retry-After') { $sec = 0; if ([int]::TryParse([string]$res.Headers[$k], [ref]$sec)) { $wait = $sec * 1000 } } }
+            Write-Host ("  page {0}: {1} - try {2} of {3} in {4} s" -f ($pages + 1), $(if ($res.Error) { $res.Error } else { "$($res.Status) $($res.Reason)" }), $attempt, $pg.Retries, ($wait / 1000)) -ForegroundColor DarkYellow
+            Start-Sleep -Milliseconds $wait
+            continue
+        }
+        $attempt = 0
+        $set = @(); $missing = @()
+        if (-not $res.Error) { foreach ($e in $S.Extract) { $v = Get-Extract $res $e.From $e.Expr; if ($null -eq $v) { $missing += $e.Var } else { $ChainUI.Vars[$e.Var] = [string]$v; $set += $e.Var } } }
+        $okStatus = -not $res.Error -and $res.Status -ge 200 -and $res.Status -lt 400
+        $failed = [bool]($res.Error -or ($S.StopOnFail -and (-not $okStatus -or $missing)))
+        $ChainUI.Vars['lastStatus'] = if ($res.Error) { '0' } else { [string]$res.Status }
+        if (-not $pg) { break }
+        if ($failed) { $note = "stopped at page $($pages + 1)"; break }
+        $n = if ($records) { Add-Records $records $res.Text $pg.ItemsPath } else { $v = Get-JsonValue $res.Text $pg.ItemsPath; if ($null -eq $v) { 0 } else { @($v).Count } }
+        if ($n -gt 0) { $pages++ }
+        $count += $n
+        $ChainUI.Vars['pageRecords'] = [string]$n; $ChainUI.Vars['records'] = [string]$count; $ChainUI.Vars['pages'] = [string]$pages
+        Write-Host ("  page {0}: {1} records ({2:N0} so far)" -f $(if ($n) { $pages } else { $pages + 1 }), $n, $count) -ForegroundColor DarkGray
+        if ($n -eq 0) { $note = 'the last page was empty'; break }
+        if ($pg.PageSize -gt 0 -and $n -lt $pg.PageSize) { $note = 'the last page was not full'; break }
+        if ($pg.StopWhen -and (Test-ChainCondition $pg.StopWhen).Ok) { $note = "stop: $($pg.StopWhen)"; break }
+        if ($pages -ge $pg.MaxPages) { $note = "the limit of $($pg.MaxPages) pages"; break }
+        if ($pg.Mode -eq 'cursor') {
+            $nx = Get-Extract $res $pg.CursorFrom $pg.CursorExpr
+            if (-not $nx -or $nx -eq 'null') { $note = 'no next page'; break }
+            $ChainUI.Vars[$pg.Var] = [string]$nx
+        } else {
+            $a = 0.0; $b = 0.0; [void][double]::TryParse([string]$ChainUI.Vars[$pg.Var], [ref]$a); [void][double]::TryParse([string]$pg.Step, [ref]$b); if ($b -eq 0) { $b = 1 }
+            $ChainUI.Vars[$pg.Var] = [string]($a + $b)
+        }
+        if ($pg.DelayMs) { Start-Sleep -Milliseconds $pg.DelayMs }
+    }
+    if ($records) { Close-Records $records }
+    $parts = @(if ($res.Error) { $res.Error } else { "$($res.Status) $($res.Reason)"; "$($res.Ms) ms" })
+    if ($set) { $parts += "set: $($set -join ', ')" }
+    if ($missing) { $parts += "not found: $($missing -join ', ')" }
+    if ($pg) { $parts += "$pages page(s), $($count.ToString('N0')) records ($note)$(if ($records) { " -> $($records.Path)" })" }
+    $saved = Save-Response $S $res; if ($saved) { $parts += $saved }
+    Write-Host ("[{0}] {1}  {2} {3}" -f $no, $S.Name, $S.Method, $res.Url) -NoNewline
+    Write-Host ("  ->  " + ($parts -join '  -  ')) -ForegroundColor $(if ($failed) { 'Red' } else { 'Green' })
+    $state[$i] = if ($failed) { 'fail' } else { 'ok' }
+    if ($failed) { $failCount++ } else { $okCount++ }
+    foreach ($j in $S.Jumps) {
+        if ($j.When -and -not (Test-ChainCondition $j.When).Ok) { continue }
+        if ($j.To -eq 0) {
+            for ($k = $i + 1; $k -lt $Steps.Count; $k++) { if (-not $visits[$k]) { $state[$k] = 'skip'; $skipCount++ } }
+            Write-Host '  then: end of the chain' -ForegroundColor DarkCyan
+            $next = $Steps.Count
+        } else {
+            $t = $j.To - 1
+            for ($k = $i + 1; $k -lt $t; $k++) { if (-not $visits[$k]) { $state[$k] = 'skip'; $skipCount++ } }
+            Write-Host "  then: go to $($j.To). $($Steps[$t].Name)" -ForegroundColor DarkCyan
+            $next = $t; $jumpTo = $t
+        }
+        if ($j.Wait) { Start-Sleep -Milliseconds $j.Wait }
+        break
+    }
+    $i = $next
+}
+Write-Host ("Done in {0:0.0} s:  {1} ok, {2} failed, {3} skipped" -f ((Get-Date) - $started).TotalSeconds, $okCount, $failCount, $skipCount) -ForegroundColor $(if ($failCount) { 'Red' } else { 'Green' })
+if ($failCount) { exit 1 }
+'@
+
+$ChainScriptShEngine = @'
+# ---- the engine (the same rules as the API chains window) ----------------------------------
+command -v curl >/dev/null || { echo 'curl is needed' >&2; exit 2; }
+PYTHON=''
+for p in python3 python; do if command -v "$p" >/dev/null 2>&1 && "$p" -c 'import json' >/dev/null 2>&1; then PYTHON=$p; break; fi; done
+if [[ -z $PYTHON ]] && ! command -v jq >/dev/null; then echo 'python3 or jq is needed to read JSON answers' >&2; exit 2; fi
+WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+JAR="$WORK/cookies"; : > "$JAR"
+if [[ -t 1 ]]; then C_OK=$'\e[32m'; C_BAD=$'\e[31m'; C_DIM=$'\e[90m'; C_NOTE=$'\e[33m'; C_GO=$'\e[36m'; C_END=$'\e[0m'; else C_OK=''; C_BAD=''; C_DIM=''; C_NOTE=''; C_GO=''; C_END=''; fi
+
+# {{name}} -> its value ({{timestamp}}, {{date}}, {{time}} always work; unknown names become empty)
+x() {
+  local s="$1" out="" k v whole
+  while [[ $s =~ \{\{[[:space:]]*([^{}[:space:]]+)[[:space:]]*\}\} ]]; do
+    whole="${BASH_REMATCH[0]}"; k="${BASH_REMATCH[1]}"
+    case "$k" in
+      timestamp) v=$(date +%Y%m%d-%H%M%S);; date) v=$(date +%Y-%m-%d);; time) v=$(date +%H-%M-%S);;
+      *) v="${V[$k]-}";;
+    esac
+    out+="${s%%"$whole"*}$v"; s="${s#*"$whole"}"
+  done
+  printf '%s' "$out$s"
+}
+
+# one request: STATUS, the body in $WORK/b, the headers in $WORK/h (uses HDRS, BODYMODE, BODY, FORM, FOLLOW, INSECURE, TIMEOUT)
+send() {
+  local args=(-sS -X "$1" "$2" -D "$WORK/h" -o "$WORK/b" -w '%{http_code}' -b "$JAR" -c "$JAR" --max-time "$TIMEOUT")
+  [[ $FOLLOW == 1 ]] && args+=(-L)
+  [[ $INSECURE == 1 ]] && args+=(-k)
+  local h f
+  for h in "${HDRS[@]}"; do args+=(-H "$h"); done
+  case "$BODYMODE" in
+    raw) args+=(--data-binary "$BODY");;
+    form) for f in "${FORM[@]}"; do args+=(--data-urlencode "$f"); done;;
+    multipart) for f in "${FORM[@]}"; do args+=(-F "$f"); done;;
+  esac
+  : > "$WORK/h"; : > "$WORK/b"
+  local t0; t0=$(date +%s%N 2>/dev/null || echo 0)
+  STATUS=$(curl "${args[@]}" 2>"$WORK/err") || STATUS=0
+  [[ $STATUS =~ ^[0-9]+$ ]] || STATUS=0
+  ERR=''; (( STATUS == 0 )) && ERR=$(head -c 300 "$WORK/err")
+  local t1; t1=$(date +%s%N 2>/dev/null || echo 0); MS=$(( (t1 - t0) / 1000000 )); (( MS < 0 )) && MS=0
+  URL="$2"
+}
+
+hdr() { tr -d '\r' < "$WORK/h" | grep -i "^$1:" | tail -n1 | sed -E 's/^[^:]+:[[:space:]]*//'; }
+cookie() { awk -v n="$1" -F'\t' '$6 == n { v = $7 } END { printf "%s", v }' "$JAR"; }
+
+PY=$(cat <<'PYEOF'
+import json, sys, re, csv, os
+def walk(o, p):
+    p = p.strip()
+    if p.startswith('$'): p = p[1:]
+    for m in re.finditer(r"\.([^.\[]+)|\[(\d+)\]|\[['\"](.+?)['\"]\]", p):
+        if o is None: return None
+        if m.group(2) is not None:
+            i = int(m.group(2)); o = o[i] if isinstance(o, list) and i < len(o) else None
+        else:
+            k = m.group(1) if m.group(1) is not None else m.group(3)
+            o = o.get(k) if isinstance(o, dict) else None
+    return o
+def fmt(v):
+    if isinstance(v, str): return v
+    if v is True: return 'true'
+    if v is False: return 'false'
+    return json.dumps(v, separators=(',', ':'), ensure_ascii=False)
+mode, path, src = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    data = json.load(open(src, encoding='utf-8'))
+except Exception:
+    sys.exit(3)
+v = walk(data, path)
+if mode == 'get':
+    if v is None: sys.exit(1)
+    sys.stdout.write(fmt(v)); sys.exit(0)
+items = v if isinstance(v, list) else ([] if v is None else [v])
+if mode == 'count':
+    print(len(items)); sys.exit(0)
+out, kind, first, colsf = sys.argv[4], sys.argv[5], sys.argv[6] == '1', sys.argv[7]
+with open(out, 'a', encoding='utf-8', newline='') as f:
+    if kind == 'json':
+        for i, it in enumerate(items):
+            f.write(('' if first and i == 0 else ',\n') + '  ' + json.dumps(it, separators=(',', ':'), ensure_ascii=False))
+    elif kind == 'ndjson':
+        for it in items: f.write(json.dumps(it, separators=(',', ':'), ensure_ascii=False) + '\n')
+    else:
+        cols = json.load(open(colsf)) if os.path.exists(colsf) else None
+        w = csv.writer(f, lineterminator='\r\n')
+        for it in items:
+            if cols is None:
+                cols = list(it.keys()) if isinstance(it, dict) else ['value']
+                json.dump(cols, open(colsf, 'w')); w.writerow(cols)
+            if isinstance(it, dict): w.writerow(['' if it.get(c) is None else fmt(it.get(c)) for c in cols])
+            else: w.writerow([fmt(it)])
+print(len(items))
+PYEOF
+)
+
+# a JSON path ($.a.b[0], $['x-y']) for jq
+jqpath() {
+  local p="$1"; p="${p#\$}"
+  p=$(printf '%s' "$p" | sed -E "s/\[['\"]([^]'\"]+)['\"]\]/[\"\1\"]/g")
+  [[ -z $p ]] && { printf '.'; return; }
+  [[ $p == \[* ]] && p=".$p"
+  printf '%s' "$p"
+}
+jget() {   # value at a JSON path of the last answer (strings as they are, the rest as JSON); fails when there is none
+  if [[ -n $PYTHON ]]; then "$PYTHON" -c "$PY" get "$1" "$WORK/b"
+  else jq -er "($(jqpath "$1")) as \$v | if \$v == null then error(\"none\") elif (\$v|type) == \"string\" then \$v else (\$v|tojson) end" "$WORK/b" 2>/dev/null; fi
+}
+collect() { # records at a JSON path -> file ($1 path, $2 file, $3 json|ndjson|csv, $4 first page 1/0, $5 columns file); prints how many
+  if [[ -n $PYTHON ]]; then "$PYTHON" -c "$PY" items "$1" "$WORK/b" "$2" "$3" "$4" "$5" || echo 0; return; fi
+  local sel; sel="($(jqpath "$1")) | if type == \"array\" then .[] elif . == null then empty else . end"
+  jq -c "$sel" "$WORK/b" > "$WORK/items" 2>/dev/null || : > "$WORK/items"
+  local n; n=$(wc -l < "$WORK/items" | tr -d ' ')
+  case "$3" in
+    ndjson) cat "$WORK/items" >> "$2";;
+    csv)
+      if [[ ! -s $5 ]] && (( n > 0 )); then head -n1 "$WORK/items" | jq -c 'if type == "object" then keys_unsorted else ["value"] end' > "$5"; jq -r '@csv' "$5" >> "$2"; fi
+      (( n > 0 )) && jq -r --argjson cols "$(cat "$5")" 'if type == "object" then [ .[$cols[]] | if type == "object" or type == "array" then tojson else . end ] else [ . ] end | @csv' "$WORK/items" >> "$2";;
+    *) awk -v first="$4" '{ if (NR > 1 || first != 1) printf ",\n"; printf "  %s", $0 }' "$WORK/items" >> "$2";;
+  esac
+  echo "$n"
+}
+extract() { # $1 from, $2 what -> prints the value; fails when there is none
+  local v
+  case "$1" in
+    Header) v=$(hdr "$2");;
+    Cookie) v=$(cookie "$2");;
+    'Link header (rel=next)') v=$(hdr Link | grep -oE '<[^>]+>[^,]*rel="?next"?' | head -n1 | sed -E 's/^<([^>]+)>.*/\1/');;
+    Regex) [[ $(cat "$WORK/b") =~ $2 ]] && v="${BASH_REMATCH[1]:-${BASH_REMATCH[0]}}";;
+    Status) v="$STATUS";;
+    Body) v=$(cat "$WORK/b");;
+    *) v=$(jget "$2") || return 1;;
+  esac
+  [[ -n $v ]] || return 1
+  printf '%s' "$v"
+}
+
+# conditions: cmp LEFT OP RIGHT (numbers as numbers, text ignoring case) / truthy VALUE
+unq() { local s="$1"; s="${s#[\"\']}"; s="${s%[\"\']}"; printf '%s' "$s"; }
+cmp() {
+  local l r; l=$(unq "$(x "$1")"); r=$(unq "$(x "$3")")
+  local num=0; [[ $l =~ ^-?[0-9]+([.][0-9]+)?$ && $r =~ ^-?[0-9]+([.][0-9]+)?$ ]] && num=1
+  local L="${l,,}" R="${r,,}"
+  case "$2" in
+    '=='|'=') if ((num)); then awk "BEGIN{exit !($l==$r)}"; else [[ $L == "$R" ]]; fi;;
+    '!=') if ((num)); then awk "BEGIN{exit !($l!=$r)}"; else [[ $L != "$R" ]]; fi;;
+    '>')  if ((num)); then awk "BEGIN{exit !($l>$r)}";  else [[ $L > "$R" ]]; fi;;
+    '<')  if ((num)); then awk "BEGIN{exit !($l<$r)}";  else [[ $L < "$R" ]]; fi;;
+    '>=') if ((num)); then awk "BEGIN{exit !($l>=$r)}"; else [[ ! $L < "$R" ]]; fi;;
+    '<=') if ((num)); then awk "BEGIN{exit !($l<=$r)}"; else [[ ! $L > "$R" ]]; fi;;
+    contains) [[ $L == *"$R"* ]];;
+    '!contains') [[ $L != *"$R"* ]];;
+    startswith) [[ $L == "$R"* ]];;
+    endswith) [[ $L == *"$R" ]];;
+    matches) [[ $l =~ $r ]];;
+  esac
+}
+truthy() { local v; v=$(x "$1"); v="${v,,}"; [[ -n $v && $v != false && $v != 0 && $v != null && $v != no ]]; }
+
+resolve_out() { local p; p=$(x "$1"); [[ $p == /* || $p =~ ^[A-Za-z]: ]] || p="$(dirname "$0")/$p"; mkdir -p "$(dirname "$p")"; printf '%s' "$p"; }
+save_resp() { # $1 path, $2 body|full, $3 append 1/0, $4 step name, $5 method
+  (( STATUS == 0 )) && return
+  local p; p=$(resolve_out "$1")
+  if [[ $2 == full ]]; then
+    { [[ $3 == 1 ]] || : ; printf '### %s  -  %s\n%s %s\n' "$4" "$(date '+%Y-%m-%d %H:%M:%S')" "$5" "$URL"; tr -d '\r' < "$WORK/h"; cat "$WORK/b"; printf '\n'; } > "$WORK/full"
+    if [[ $3 == 1 ]]; then cat "$WORK/full" >> "$p"; else cp "$WORK/full" "$p"; fi
+  elif [[ $3 == 1 ]]; then { cat "$WORK/b"; printf '\n'; } >> "$p"; else cp "$WORK/b" "$p"; fi
+  NOTES+="  -  saved to $(basename "$p")"
+}
+
+declare -A STATE VISITS
+OK=0; FAIL=0; SKIP=0; JUMPTO=0; N=${#NAMES[@]}
+skip() { STATE[$1]=skip; SKIP=$((SKIP + 1)); printf '%s[%s] %s  -  skipped: %s%s\n' "$C_NOTE" "$1" "${NAMES[$(( $1 - 1 ))]}" "$2" "$C_END"; }
+parents_ok() { local p; for p in "$@"; do if [[ ${STATE[$p]-} == fail || ${STATE[$p]-} == skip ]]; then skip "$CUR" "step $p $( [[ ${STATE[$p]} == fail ]] && echo failed || echo 'was skipped')"; return 1; fi; done; return 0; }
+visit() { VISITS[$1]=$(( ${VISITS[$1]-0} + 1 )); if (( VISITS[$1] > 100 )); then echo "${C_BAD}Stopped: step $1 would run a 101st time - check its Go to rules (an endless loop?).${C_END}"; FAIL=$((FAIL + 1)); NEXT=$((N + 1)); return 1; fi; }
+goto() { # $1 target step (0 = end), $2 wait ms
+  local k
+  if (( $1 == 0 )); then for (( k = CUR + 1; k <= N; k++ )); do [[ -n ${VISITS[$k]-} ]] || { STATE[$k]=skip; SKIP=$((SKIP + 1)); }; done; echo "${C_GO}  then: end of the chain${C_END}"; NEXT=$((N + 1))
+  else for (( k = CUR + 1; k < $1; k++ )); do [[ -n ${VISITS[$k]-} ]] || { STATE[$k]=skip; SKIP=$((SKIP + 1)); }; done; echo "${C_GO}  then: go to $1. ${NAMES[$(( $1 - 1 ))]}${C_END}"; NEXT=$1; JUMPTO=$1; fi
+  (( $2 > 0 )) && sleep "$(awk "BEGIN{print $2/1000}")"
+  return 0
+}
+retry_wait() { local w; w=$(hdr Retry-After); [[ $w =~ ^[0-9]+$ ]] || w=$(( 1 << ($1 - 1) )); (( w > 30 )) && w=30; printf '%s' "$w"; }
+report() { # $1 step, $2 failed 1/0
+  local what; if (( STATUS == 0 )); then what="${ERR:-no answer}"; else what="$STATUS  ${MS} ms"; fi
+  printf '[%s] %s  %s %s  ->  %s%s%s%s\n' "$1" "${NAMES[$(( $1 - 1 ))]}" "$METHOD" "$URL" "$( (( $2 )) && printf '%s' "$C_BAD" || printf '%s' "$C_OK")" "$what" "$NOTES" "$C_END"
+  if (( $2 )); then STATE[$1]=fail; FAIL=$((FAIL + 1)); else STATE[$1]=ok; OK=$((OK + 1)); fi
+}
+'@
+
+# ---- A chain as a script: PowerShell (Invoke-WebRequest, nothing to install) or Bash (curl + python3 or jq).
+#      The steps become data, followed by an engine with the same rules as this window.
+function Get-ChainScriptSteps {
+    $order = @(Get-ChainOrder)
+    $idx = @{}; for ($i = 0; $i -lt $order.Count; $i++) { $idx[$order[$i].Id] = $i }
+    $links = @($ChainUI.Canvas.Links)
+    foreach ($n in $order) {
+        $d = $ChainUI.Data[$n.Id]; $m = $d.Request
+        $url = [string]$m.Url
+        if ($url -and $url -notmatch '^\s*(\{\{|[a-zA-Z][a-zA-Z0-9+.-]*://)') { $url = "http://$url" }
+        $headers = @(foreach ($h in @($m.Headers)) { if ($h -and $h.On -ne $false -and $h.Key) { @{ N = [string]$h.Key; V = [string]$h.Value } } })
+        $basic = $null
+        switch ([string]$m.AuthType) {
+            'Bearer token' { $headers += @{ N = 'Authorization'; V = 'Bearer ' + ([string]$m.Token).Trim() } }
+            'Basic auth' { $basic = @{ User = [string]$m.User; Password = [string]$m.Password } }
+            'API key' {
+                if ($m.KeyName) {
+                    if ($m.KeyIn -eq 'Query') { $url += $(if ($url.Contains('?')) { '&' } else { '?' }) + [string]$m.KeyName + '=' + [string]$m.KeyValue }
+                    else { $headers += @{ N = [string]$m.KeyName; V = [string]$m.KeyValue } }
+                }
+            }
+        }
+        $mode = 'none'; $ct = ''; $body = ''; $form = @()
+        switch ([string]$m.BodyType) {
+            'JSON' { $mode = 'raw'; $ct = 'application/json'; $body = [string]$m.Body }
+            'Text' { $mode = 'raw'; $ct = 'text/plain; charset=utf-8'; $body = [string]$m.Body }
+            'XML'  { $mode = 'raw'; $ct = 'application/xml'; $body = [string]$m.Body }
+            'Form URL-encoded' { $mode = 'form' }
+            'Form-data' { $mode = 'multipart' }
+        }
+        if ($mode -in 'form', 'multipart') { $form = @(foreach ($f in @($m.Form)) { if ($f -and $f.On -ne $false -and $f.Key) { @{ N = [string]$f.Key; V = [string]$f.Value } } }) }
+        $jumps = @(foreach ($j in @($d.Jumps)) {
+            if (-not $j -or -not $j.On -or -not $j.Goto) { continue }
+            $to = if ($j.Goto -eq 'end') { 0 } elseif ($idx.ContainsKey([string]$j.Goto)) { $idx[[string]$j.Goto] + 1 } else { -1 }
+            if ($to -ge 0) { @{ When = [string]$j.When; To = $to; Wait = [int]$j.Wait } }
+        })
+        $pg = $d.Paging
+        $parents = @($links | Where-Object { $_.To -eq $n.Id -and $idx.ContainsKey($_.From) } | ForEach-Object { [int]$idx[$_.From] } | Sort-Object -Unique)
+        $extract = New-Object System.Collections.Generic.List[object]
+        foreach ($e in $d.Extract) { if ($e -and $e.Var) { $extract.Add(@{ Var = [string]$e.Var; From = $(if ($e.From) { [string]$e.From } else { 'JSON path' }); Expr = [string]$e.Expr }) } }
+        [pscustomobject]@{
+            Name = [string]$n.Title; Method = $(if ($m.Method) { ([string]$m.Method).ToUpperInvariant() } else { 'GET' }); Url = $url
+            Headers = $headers; Basic = $basic; BodyMode = $mode; ContentType = $ct; Body = $body; Form = $form
+            Follow = $m.Follow -ne $false; Insecure = $m.VerifySsl -eq $false; TimeoutSec = $(if ([int]$m.TimeoutSec -gt 0) { [int]$m.TimeoutSec } else { 30 })
+            Parents = $parents
+            RunAfterFail = [bool]$d.RunAfterFail; Condition = [string]$d.Condition; StopOnFail = [bool]$d.StopOnFail
+            Extract = $extract.ToArray()
+            SaveTo = [string]$d.SaveTo; SaveWhat = $(if ($d.SaveWhat -eq 'full') { 'full' } else { 'body' }); SaveAppend = [bool]$d.SaveAppend
+            Jumps = $jumps
+            Paging = $(if ($pg -and $pg.On) { $pg } else { $null })
+        }
+    }
+}
+
+function Get-ChainScriptPs($Steps, $Vars, [string]$Name, [string]$File) {
+    $q = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
+    $kv = { param($list) if (-not @($list).Count) { '@()' } else { '@(' + ((@($list) | ForEach-Object { "@{ N = $(& $q $_.N); V = $(& $q $_.V) }" }) -join ', ') + ')' } }
+    $sb = New-Object System.Text.StringBuilder
+    $line = { param($t) [void]$sb.AppendLine($t) }
+    & $line "<#"
+    & $line "  API chain: $Name"
+    & $line "  Made by DevTools on $((Get-Date).ToString('yyyy-MM-dd HH:mm')). Runs the steps like the API chains window: {{variables}},"
+    & $line "  cookies, 'Take from response', 'Run only if', 'Go to', paging (records into one file) and saving responses."
+    & $line "  Windows PowerShell 5.1 or PowerShell 7 - nothing to install. Files without a folder are saved next to this script."
+    & $line "    Run it:              powershell -ExecutionPolicy Bypass -File `".\$File`""
+    & $line "    Other start values:  .\$File -Vars @{ user = 'me'; password = 'secret' }"
+    & $line "#>"
+    & $line 'param([hashtable]$Vars = @{})'
+    & $line '$ErrorActionPreference = ''Stop'''
+    & $line '$ProgressPreference = ''SilentlyContinue''          # Invoke-WebRequest is much faster without the progress bar'
+    & $line 'try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }'
+    & $line ''
+    & $line '# ---- start values (yours from -Vars win)'
+    & $line '$ChainUI = @{ Vars = @{} }'
+    & $line '$Start = [ordered]@{'
+    foreach ($k in $Vars.Keys) { & $line "    $(& $q $k) = $(& $q $Vars[$k])" }
+    & $line '}'
+    & $line 'foreach ($k in $Start.Keys) { $ChainUI.Vars[$k] = $Start[$k] }'
+    & $line 'foreach ($k in $Vars.Keys) { $ChainUI.Vars[$k] = [string]$Vars[$k] }'
+    & $line ''
+    & $line '# ---- the steps, in the order they run (Parents / Jumps use step numbers - 1 / step numbers)'
+    & $line '$Steps = @('
+    $i = 0
+    foreach ($s in $Steps) {
+        $i++
+        & $line "    @{  # $i. $($s.Name -replace '[\r\n]', ' ')"
+        & $line "        Name = $(& $q $s.Name); Method = $(& $q $s.Method); Url = $(& $q $s.Url)"
+        & $line "        Headers = $(& $kv $s.Headers)"
+        if ($s.Basic) { & $line "        Basic = @{ User = $(& $q $s.Basic.User); Password = $(& $q $s.Basic.Password) }" }
+        & $line "        BodyMode = $(& $q $s.BodyMode); ContentType = $(& $q $s.ContentType); Body = $(& $q $s.Body); Form = $(& $kv $s.Form)"
+        & $line "        Follow = `$$($s.Follow.ToString().ToLower()); Insecure = `$$($s.Insecure.ToString().ToLower()); TimeoutSec = $($s.TimeoutSec)"
+        & $line "        Parents = @($(@($s.Parents) -join ', ')); RunAfterFail = `$$($s.RunAfterFail.ToString().ToLower()); Condition = $(& $q $s.Condition); StopOnFail = `$$($s.StopOnFail.ToString().ToLower())"
+        & $line "        Extract = @($((@($s.Extract) | ForEach-Object { "@{ Var = $(& $q $_.Var); From = $(& $q $_.From); Expr = $(& $q $_.Expr) }" }) -join ', '))"
+        & $line "        SaveTo = $(& $q $s.SaveTo); SaveWhat = $(& $q $s.SaveWhat); SaveAppend = `$$($s.SaveAppend.ToString().ToLower())"
+        & $line "        Jumps = @($((@($s.Jumps) | ForEach-Object { "@{ When = $(& $q $_.When); To = $($_.To); Wait = $($_.Wait) }" }) -join ', '))"
+        if ($s.Paging) {
+            $p = $s.Paging
+            & $line "        Paging = @{ Mode = $(& $q $p.Mode); Var = $(& $q $p.Var); Start = $(& $q $p.Start); Step = $(& $q $p.Step); CursorFrom = $(& $q $p.CursorFrom); CursorExpr = $(& $q $p.CursorExpr)"
+            & $line "                    ItemsPath = $(& $q $p.ItemsPath); PageSize = $([int]$p.PageSize); StopWhen = $(& $q $p.StopWhen); MaxPages = $([int]$p.MaxPages); DelayMs = $([int]$p.DelayMs); Retries = $([int]$p.Retries)"
+            & $line "                    CollectTo = $(& $q $p.CollectTo); Format = $(& $q $p.Format) }"
+        } else { & $line '        Paging = $null' }
+        & $line '    }'
+    }
+    & $line ')'
+    & $line ''
+    & $line '# ---- {{variables}} and conditions: the same code as in DevTools'
+    & $line "function Expand-ChainText {$(${function:Expand-ChainText}.ToString())}"
+    & $line "function Test-ChainCondition {$(${function:Test-ChainCondition}.ToString())}"
+    [void]$sb.Append($ChainScriptPsEngine)
+    $sb.ToString()
+}
+
+function ConvertTo-ShCondition([string]$Cond) {
+    $b = { param($s) "'" + ([string]$s).Replace("'", "'\''") + "'" }
+    $ors = foreach ($orPart in ($Cond.Trim() -split '\s+or\s+')) {
+        $ands = foreach ($clause in ($orPart -split '\s+and\s+')) {
+            $cl = $clause.Trim(); $neg = ''
+            if ($cl -match '^(not\s+|!)(.*)$') { $neg = '! '; $cl = $Matches[2].Trim() }
+            if ($cl -match '^(.*?)\s*(==|!=|>=|<=|>|<|=)\s*(.*)$' -or $cl -match '^(.*?)\s+(contains|!contains|startswith|endswith|matches)\s+(.*)$') { "${neg}cmp $(& $b $Matches[1].Trim()) $(& $b $Matches[2].ToLower()) $(& $b $Matches[3].Trim())" }
+            else { "${neg}truthy $(& $b $cl)" }
+        }
+        '{ ' + (@($ands) -join ' && ') + '; }'
+    }
+    @($ors) -join ' || '
+}
+# .NET regex -> extended regex for bash (the common parts)
+function ConvertTo-Ere([string]$Re) {
+    $Re -replace '\(\?:', '(' -replace '\\d', '[0-9]' -replace '\\D', '[^0-9]' -replace '\\s', '[[:space:]]' -replace '\\S', '[^[:space:]]' -replace '\\w', '[[:alnum:]_]' -replace '\\W', '[^[:alnum:]_]' -replace '([*+?}])\?', '$1'
+}
+
+function Get-ChainScriptSh($Steps, $Vars, [string]$Name, [string]$File) {
+    $b = { param($s) "'" + ([string]$s).Replace("'", "'\''") + "'" }
+    $sb = New-Object System.Text.StringBuilder
+    $line = { param($t) [void]$sb.Append($t + "`n") }
+    & $line '#!/usr/bin/env bash'
+    & $line "# API chain: $Name"
+    & $line "# Made by DevTools on $((Get-Date).ToString('yyyy-MM-dd HH:mm')). Runs the steps like the API chains window: {{variables}},"
+    & $line "# cookies, 'Take from response', 'Run only if', 'Go to', paging (records into one file) and saving responses."
+    & $line '# Needs bash 4+, curl, and python3 or jq. Files without a folder are saved next to this script.'
+    & $line "#   Run it:              bash $File"
+    & $line "#   Other start values:  bash $File user=me password=secret"
+    & $line 'set -u'
+    & $line 'declare -A V'
+    foreach ($k in $Vars.Keys) { & $line "V[$(& $b $k)]=$(& $b $Vars[$k])" }
+    & $line 'for a in "$@"; do [[ $a == *=* ]] && V["${a%%=*}"]="${a#*=}"; done'
+    & $line ('NAMES=(' + ((@($Steps) | ForEach-Object { & $b ($_.Name -replace '[\r\n]', ' ') }) -join ' ') + ')')
+    [void]$sb.Append(($ChainScriptShEngine -replace "`r`n", "`n"))
+    & $line ''
+    & $line '# ---- the steps'
+    $i = 0
+    foreach ($s in $Steps) {
+        $i++
+        $p = $s.Paging
+        & $line "step_$i() {   # $($s.Name -replace '[\r\n]', ' ')"
+        & $line "  CUR=$i; METHOD=$(& $b $s.Method); NOTES=''; MISSING=''"
+        if (@($s.Parents).Count -and -not $s.RunAfterFail) { & $line "  [[ `$JUMPED == 1 ]] || parents_ok $((@($s.Parents) | ForEach-Object { $_ + 1 }) -join ' ') || return" }
+        if ($s.Condition) { & $line "  if ! ( $(ConvertTo-ShCondition $s.Condition) ); then skip $i $(& $b "not true: $($s.Condition)"); return; fi" }
+        & $line "  visit $i || return"
+        & $line "  local attempt=0 pages=0 count=0 note='' n v failed=0 first=1 cols=`"`$WORK/cols$i`" rec=''"
+        if ($p) {
+            if ($p.Mode -eq 'cursor') { & $line "  V[$(& $b $p.Var)]=`$(x $(& $b $p.Start))" } else { & $line "  V[$(& $b $p.Var)]=$(& $b $p.Start)" }
+            if ($p.CollectTo) {
+                & $line "  rec=`$(resolve_out $(& $b $p.CollectTo)); rm -f `"`$cols`""
+                & $line $(if ($p.Format -eq 'json') { '  printf ''[\n'' > "$rec"' } else { '  : > "$rec"' })
+            }
+        }
+        & $line '  while :; do'
+        $hl = @($s.Headers | ForEach-Object { "`"`$(x $(& $b $_.N)): `$(x $(& $b $_.V))`"" })
+        & $line "    HDRS=($($hl -join ' '))"
+        if ($s.Basic) { & $line "    HDRS+=(`"Authorization: Basic `$(printf '%s:%s' `"`$(x $(& $b $s.Basic.User))`" `"`$(x $(& $b $s.Basic.Password))`" | base64 | tr -d '\n')`")" }
+        switch ($s.BodyMode) {
+            'raw' {
+                & $line "    BODYMODE=raw; BODY=`$(x $(& $b $s.Body))"
+                if (-not (@($s.Headers) | Where-Object { $_.N -eq 'Content-Type' })) { & $line "    HDRS+=($(& $b "Content-Type: $($s.ContentType)"))" }
+            }
+            'form' { $fl = @($s.Form | ForEach-Object { "`"`$(x $(& $b $_.N))=`$(x $(& $b $_.V))`"" }); & $line "    BODYMODE=form; FORM=($($fl -join ' '))" }
+            'multipart' { $fl = @($s.Form | ForEach-Object { "`"`$(x $(& $b $_.N))=`$(x $(& $b $_.V))`"" }); & $line "    BODYMODE=multipart; FORM=($($fl -join ' '))" }
+            default { & $line '    BODYMODE=none' }
+        }
+        & $line "    FOLLOW=$([int]$s.Follow); INSECURE=$([int]$s.Insecure); TIMEOUT=$($s.TimeoutSec)"
+        & $line "    send $(& $b $s.Method) `"`$(x $(& $b $s.Url))`""
+        if ($p) {
+            & $line "    if (( STATUS == 0 || STATUS == 429 || STATUS >= 500 )) && (( attempt < $([int]$p.Retries) )); then"
+            & $line "      attempt=`$((attempt + 1)); local w; w=`$(retry_wait `$attempt)"
+            & $line "      printf '%s  page %s: %s - try %s of %s in %s s%s\n' `"`$C_NOTE`" `$((pages + 1)) `"`$( (( STATUS )) && echo `$STATUS || echo `"`${ERR:-no answer}`")`" `$attempt $([int]$p.Retries) `"`$w`" `"`$C_END`""
+            & $line '      sleep "$w"; continue'
+            & $line '    fi'
+            & $line '    attempt=0; MISSING='''''
+        }
+        foreach ($e in @($s.Extract)) {
+            $expr = if ($e.From -eq 'Regex') { ConvertTo-Ere $e.Expr } else { $e.Expr }
+            & $line "    if v=`$(extract $(& $b $e.From) $(& $b $expr)); then V[$(& $b $e.Var)]=`$v; else MISSING+=$(& $b " $($e.Var)"); fi"
+        }
+        & $line '    failed=0; (( STATUS == 0 )) && failed=1'
+        if ($s.StopOnFail) { & $line '    { (( STATUS < 200 || STATUS >= 400 )) || [[ -n $MISSING ]]; } && failed=1' }
+        & $line '    V[lastStatus]=$STATUS'
+        if (-not $p) { & $line '    break' }
+        else {
+            & $line "    (( failed )) && { note=`"stopped at page `$((pages + 1))`"; break; }"
+            & $line "    n=`$(collect $(& $b $(if ($p.ItemsPath) { $p.ItemsPath } else { '$' })) `"`${rec:-/dev/null}`" $(& $b $p.Format) `$first `"`$cols`"); [[ `$n =~ ^[0-9]+`$ ]] || n=0; (( n > 0 )) && first=0"
+            & $line '    (( n > 0 )) && pages=$((pages + 1)); count=$((count + n)); V[pageRecords]=$n; V[records]=$count; V[pages]=$pages'
+            & $line '    printf ''%s  page %s: %s records (%s so far)%s\n'' "$C_DIM" "$(( n > 0 ? pages : pages + 1 ))" "$n" "$count" "$C_END"'
+            & $line "    (( n == 0 )) && { note='the last page was empty'; break; }"
+            if ([int]$p.PageSize -gt 0) { & $line "    (( n < $([int]$p.PageSize) )) && { note='the last page was not full'; break; }" }
+            if ($p.StopWhen) { & $line "    if ( $(ConvertTo-ShCondition $p.StopWhen) ); then note=$(& $b "stop: $($p.StopWhen)"); break; fi" }
+            & $line "    (( pages >= $([int]$p.MaxPages) )) && { note='the limit of $([int]$p.MaxPages) pages'; break; }"
+            if ($p.Mode -eq 'cursor') {
+                $cexpr = if ($p.CursorFrom -eq 'Regex') { ConvertTo-Ere $p.CursorExpr } else { $p.CursorExpr }
+                & $line "    v=`$(extract $(& $b $p.CursorFrom) $(& $b $cexpr)) || v=''"
+                & $line "    [[ -z `$v || `$v == null ]] && { note='no next page'; break; }"
+                & $line "    V[$(& $b $p.Var)]=`$v"
+            } else {
+                & $line "    V[$(& $b $p.Var)]=`$(awk -v a=`"`${V[$(& $b $p.Var)]:-0}`" -v b=$(& $b $(if ($p.Step) { $p.Step } else { '1' })) 'BEGIN { s = a + b; if (s == int(s)) printf `"%d`", s; else print s }')"
+            }
+            if ([int]$p.DelayMs -gt 0) { & $line "    sleep $([Math]::Round([int]$p.DelayMs / 1000.0, 3).ToString([Globalization.CultureInfo]::InvariantCulture))" }
+        }
+        & $line '  done'
+        if ($p) {
+            if ($p.CollectTo -and $p.Format -eq 'json') { & $line '  if (( first )); then printf '']\n'' >> "$rec"; else printf ''\n]\n'' >> "$rec"; fi' }
+            & $line "  NOTES+=`"  -  `$pages page(s), `$count records (`$note)`$( [[ -n `$rec ]] && printf ' -> %s' `"`$rec`")`""
+        }
+        & $line '  [[ -n $MISSING ]] && NOTES+="  -  not found:$MISSING"'
+        if ($s.SaveTo) { & $line "  save_resp $(& $b $s.SaveTo) $($s.SaveWhat) $([int]$s.SaveAppend) $(& $b $s.Name) $(& $b $s.Method)" }
+        & $line "  report $i `$failed"
+        foreach ($j in @($s.Jumps)) {
+            $c = if ($j.When) { ConvertTo-ShCondition $j.When } else { 'true' }
+            & $line "  if ( $c ); then goto $($j.To) $($j.Wait); return; fi"
+        }
+        & $line '}'
+    }
+    & $line ''
+    & $line '# ---- run them'
+    & $line 'STARTED=$(date +%s); CUR=1'
+    & $line 'while (( CUR <= N )); do NEXT=$((CUR + 1)); JUMPED=0; (( JUMPTO == CUR )) && JUMPED=1; JUMPTO=0; "step_$CUR"; CUR=$NEXT; done'
+    & $line 'printf ''%sDone in %s s:  %s ok, %s failed, %s skipped%s\n'' "$( (( FAIL )) && printf ''%s'' "$C_BAD" || printf ''%s'' "$C_OK")" $(( $(date +%s) - STARTED )) $OK $FAIL $SKIP "$C_END"'
+    & $line '(( FAIL )) && exit 1 || exit 0'
+    $sb.ToString()
+}
+
+# Share > Export as a PowerShell / Bash script
+function Export-ChainScript([string]$Lang) {
+    Save-ChainEditor; Save-Chains
+    if (-not $ChainUI.Canvas.Nodes.Count) { Set-ChainStatus 'Add some requests first.' $C.Red; return }
+    $vars = Get-ChainStartVars
+    if ($vars.Count) {
+        $r = [System.Windows.Forms.MessageBox]::Show($ChainUI.Form, "Put the start values of the variables (passwords, tokens ...) into the script?`n`nNo: they are left empty - fill them in the script or pass them when you run it.", 'Export as a script', 'YesNoCancel', 'Question')
+        if ($r -eq 'Cancel') { return }
+        if ($r -eq 'No') { foreach ($k in @($vars.Keys)) { $vars[$k] = '' } }
+    }
+    $sorted = [ordered]@{}; foreach ($k in ($vars.Keys | Sort-Object)) { $sorted[$k] = $vars[$k] }
+    $name = [string]$ChainUI.Current.Name
+    $base = (($name -replace '[\\/:*?"<>|]', '_') -replace '\s+', '-').Trim('-'); if (-not $base) { $base = 'chain' }
+    $ext = if ($Lang -eq 'sh') { 'sh' } else { 'ps1' }
+    $d = New-Object System.Windows.Forms.SaveFileDialog
+    $d.Filter = if ($Lang -eq 'sh') { 'Bash script|*.sh' } else { 'PowerShell script|*.ps1' }
+    $d.FileName = "$base.$ext"
+    $script:Modal = $true
+    try { if ($d.ShowDialog($ChainUI.Form) -ne 'OK') { return }; $path = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
+    $file = Split-Path -Leaf $path
+    $steps = @(Get-ChainScriptSteps)
+    try {
+        if ($Lang -eq 'sh') { [IO.File]::WriteAllText($path, (Get-ChainScriptSh $steps $sorted $name $file), (New-Object System.Text.UTF8Encoding $false)) }
+        else { [IO.File]::WriteAllText($path, ((Get-ChainScriptPs $steps $sorted $name $file) -replace "(?<!`r)`n", "`r`n"), (New-Object System.Text.UTF8Encoding $true)) }
+    } catch { Set-ChainStatus "Couldn't write the script: $($_.Exception.Message)" $C.Red; return }
+    Set-ChainStatus "Saved $file - run it with $(if ($Lang -eq 'sh') { "bash $file" } else { "powershell -ExecutionPolicy Bypass -File $file" })" $C.Green
+    Start-Process explorer.exe "/select,`"$path`""
 }
 
 function Complete-ChainStep {
@@ -16918,7 +17606,7 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
                 g.DrawString(m, badgeF, System.Drawing.Brushes.White, badge.X + S(4), badge.Y + S(1));
                 var tf = new System.Drawing.StringFormat { Trimming = System.Drawing.StringTrimming.EllipsisCharacter, FormatFlags = System.Drawing.StringFormatFlags.NoWrap };
                 using (var br = new System.Drawing.SolidBrush(Fore))
-                    g.DrawString(n.Title == "" ? "(no name)" : n.Title, titleF, br, new System.Drawing.RectangleF(badge.Right + S(6), r.Y + S(7), r.Right - badge.Right - S(32), titleF.Height + 2), tf);
+                    g.DrawString(n.Title == "" ? "(no name)" : n.Title, titleF, br, new System.Drawing.RectangleF(badge.Right + S(6), r.Y + S(7), Math.Max(S(20), mx - badge.Right - S(10)), titleF.Height + 2), tf);   // stops before the if / save marks
                 using (var br = new System.Drawing.SolidBrush(Dim))
                     g.DrawString(n.Url, small, br, new System.Drawing.RectangleF(r.X + S(12), r.Y + S(31), r.Width - S(22), small.Height + 2), tf);
                 if (n.Info != "") using (var br = new System.Drawing.SolidBrush(n.State == "fail" ? Red : n.State == "ok" ? Green : Dim))
