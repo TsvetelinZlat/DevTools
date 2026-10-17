@@ -10246,6 +10246,135 @@ function Show-ApiEnvironments {
 # ---- controls -----------------------------------------------------------------------------------
 
 # Key / value table with an on/off column (like Postman's params and headers tables).
+# ---- Copy / paste whole rows in the name-value grids (headers, params, form, take-from-response).
+#      Ctrl+C copies the selected rows as tab-separated lines; Ctrl+V splits lines back into rows -
+#      also "Header: value" and "name=value" lines - instead of putting everything into one cell.
+function Get-GridDataColumns($Grid) { @(for ($i = 0; $i -lt $Grid.Columns.Count; $i++) { if (-not ($Grid.Columns[$i] -is [System.Windows.Forms.DataGridViewCheckBoxColumn])) { $i } }) }
+
+function Copy-GridRows($Grid) {
+    [void]$Grid.EndEdit()
+    $cols = Get-GridDataColumns $Grid
+    $cells = @($Grid.SelectedCells)
+    if ($cells.Count -eq 1 -and -not $cells[0].OwningRow.IsNewRow -and -not ($cells[0] -is [System.Windows.Forms.DataGridViewCheckBoxCell])) {
+        $v = [string]$cells[0].Value; if ($v) { Copy-TbText $v }; return
+    }
+    $rows = @($cells | ForEach-Object { $_.RowIndex } | Sort-Object -Unique)
+    if (-not $rows) { $rows = @(0..($Grid.Rows.Count - 1)) }
+    $lines = foreach ($r in $rows) {
+        $row = $Grid.Rows[$r]
+        if ($row.IsNewRow) { continue }
+        $vals = @($cols | ForEach-Object { [string]$row.Cells[$_].Value })
+        if (($vals -join '').Trim()) { $vals -join "`t" }
+    }
+    if ($lines) { Copy-TbText (@($lines) -join "`r`n") }
+}
+
+# Text -> rows of values (for a grid with N data columns).
+function Split-GridText([string]$Text, [int]$N) {
+    $t = $Text.Trim("`r", "`n")
+    # a request part copied with Copy / paste: its headers or extract rules
+    if ($t -match '"DevToolsRequestPart"') {
+        try { $x = $t | ConvertFrom-Json } catch { $x = $null }
+        if ($x) {
+            $src = if ($x.DevToolsRequestPart -eq 'request') { $x.Request } else { $x }
+            if ($N -ge 3 -and $x.Extract) { return @(foreach ($e in @($x.Extract)) { , @([string]$e.Var, [string]$e.From, [string]$e.Expr) }) }
+            if ($src.Headers) { return @(foreach ($h in @($src.Headers)) { , @([string]$h.Key, [string]$h.Value) }) }
+        }
+    }
+    @(foreach ($line in ($t -split "`r?`n")) {
+        if (-not $line.Trim()) { continue }
+        if ($line.Contains("`t")) { , @($line -split "`t") }
+        elseif ($N -eq 2 -and $line -match '^\s*([^:=\s][^:=]*?)\s*:\s*(.*)$') { , @($Matches[1], $Matches[2]) }      # Header: value
+        elseif ($N -eq 2 -and $line -match '^\s*([^=\s][^=]*?)=(.*)$') { , @($Matches[1], $Matches[2]) }            # name=value
+        else { , @($line) }
+    })
+}
+
+function Paste-GridRows($Grid, [string]$Text = $null) {
+    if ($null -eq $Text) { try { $Text = [System.Windows.Forms.Clipboard]::GetText() } catch { $Text = '' } }
+    if (-not $Text) { return }
+    $cols = Get-GridDataColumns $Grid
+    $rows = @(Split-GridText $Text $cols.Count)        # @(): one row stays a list of one row
+    if (-not $rows) { return }
+    $isParams = $ApiUI.ParamGrid -and $Grid -eq $ApiUI.ParamGrid
+    if ($isParams) { $ApiUI.Syncing = $true }          # the params grid rebuilds itself from the URL on every change
+    if ($Grid.IsCurrentCellInEditMode) { [void]$Grid.CancelEdit(); [void]$Grid.EndEdit() }
+    $cur = $Grid.CurrentCell
+    # one value, one line: just into the current cell
+    if ($rows.Count -eq 1 -and @($rows[0]).Count -eq 1 -and $cur -and -not ($cur -is [System.Windows.Forms.DataGridViewCheckBoxCell]) -and -not $cur.OwningRow.IsNewRow) {
+        $cur.Value = [string]$rows[0][0]
+        if ($isParams) { $ApiUI.Syncing = $false; Sync-UrlFromParams }
+        return
+    }
+    $startCol = if ($cur -and $cols -contains $cur.ColumnIndex -and @($rows[0]).Count -lt $cols.Count) { [array]::IndexOf($cols, $cur.ColumnIndex) } else { 0 }
+    $r = if ($cur -and -not $cur.OwningRow.IsNewRow) { $cur.RowIndex } else { -1 }
+    $added = 0
+    foreach ($vals in $rows) {
+        if ($r -lt 0 -or $r -ge $Grid.Rows.Count -or $Grid.Rows[$r].IsNewRow) {
+            if (-not $Grid.AllowUserToAddRows -and $Grid.DataSource) { break }
+            $r = $Grid.Rows.Add()
+            for ($c = 0; $c -lt $Grid.Columns.Count; $c++) { if ($Grid.Columns[$c] -is [System.Windows.Forms.DataGridViewCheckBoxColumn]) { $Grid.Rows[$r].Cells[$c].Value = $true } }
+        }
+        $vals = @($vals)
+        for ($k = 0; $k -lt $vals.Count -and ($startCol + $k) -lt $cols.Count; $k++) {
+            $cell = $Grid.Rows[$r].Cells[$cols[$startCol + $k]]
+            $v = [string]$vals[$k]
+            if ($cell -is [System.Windows.Forms.DataGridViewComboBoxCell]) {
+                $items = @($cell.OwningColumn.Items)
+                if ($items -notcontains $v) { $v = [string]$items[0] }
+            }
+            $cell.Value = $v
+        }
+        $added++; $r++
+    }
+    if ($isParams) { $ApiUI.Syncing = $false; Sync-UrlFromParams }
+    if ($ChainUI.Form -and ($Grid -eq $ChainUI.EHeaders -or $Grid -eq $ChainUI.EExtract)) { Start-ChainEditorSave }
+}
+
+function Enable-GridClipboard($Grid) {
+    $Grid.ClipboardCopyMode = 'Disable'
+    $Grid.add_KeyDown({
+        param($src, $e)
+        if ($e.Control -and $e.KeyCode -eq 'C') { Copy-GridRows $src; $e.Handled = $true }
+        elseif ($e.Control -and $e.KeyCode -eq 'V') { Paste-GridRows $src; $e.Handled = $true }
+        elseif ($e.KeyCode -eq 'Delete' -and -not $src.IsCurrentCellInEditMode) {
+            $rows = @($src.SelectedCells | ForEach-Object { $_.RowIndex } | Sort-Object -Unique -Descending)
+            if ($rows.Count -gt 1 -or @($src.SelectedRows).Count) { foreach ($r in $rows) { if (-not $src.Rows[$r].IsNewRow) { $src.Rows.RemoveAt($r) } }; $e.Handled = $true; if ($ChainUI.Form -and ($src -eq $ChainUI.EHeaders -or $src -eq $ChainUI.EExtract)) { Start-ChainEditorSave } }
+        }
+    })
+    # while a cell is being typed in: pasting several lines / columns goes to the rows, not into the cell
+    $Grid.add_EditingControlShowing({
+        param($src, $e)
+        $tb = $e.Control -as [System.Windows.Forms.TextBox]
+        if (-not $tb -or $tb.Tag -eq 'gridclip') { return }
+        $tb.Tag = 'gridclip'
+        $tb.add_KeyDown({
+            param($s2, $e2)
+            if (-not ($e2.Control -and $e2.KeyCode -eq 'V')) { return }
+            $t = ''; try { $t = [System.Windows.Forms.Clipboard]::GetText() } catch { }
+            if ($t -notmatch "[`t`r`n]" -and $t -notmatch '"DevToolsRequestPart"') { return }      # plain text: normal paste
+            $grid = $s2.Parent; while ($grid -and -not ($grid -is [System.Windows.Forms.DataGridView])) { $grid = $grid.Parent }
+            if (-not $grid) { return }
+            $e2.Handled = $true; $e2.SuppressKeyPress = $true
+            Paste-GridRows $grid $t
+        })
+    })
+    $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $m.Tag = $Grid
+    [void](Add-MenuItem $m 'Copy rows' { param($src, $e) Copy-GridRows $src.Owner.Tag } $Glyph.Copy 'Ctrl+C')
+    [void](Add-MenuItem $m 'Paste rows' { param($src, $e) Paste-GridRows $src.Owner.Tag } $Glyph.Paste 'Ctrl+V')
+    [void](Add-MenuItem $m 'Select all' { param($src, $e) $src.Owner.Tag.SelectAll() } '' 'Ctrl+A')
+    [void]$m.Items.Add('-')
+    [void](Add-MenuItem $m 'Delete rows' {
+        param($src, $e)
+        $g = $src.Owner.Tag
+        foreach ($r in @($g.SelectedCells | ForEach-Object { $_.RowIndex } | Sort-Object -Unique -Descending)) { if (-not $g.Rows[$r].IsNewRow) { $g.Rows.RemoveAt($r) } }
+        if ($ChainUI.Form -and ($g -eq $ChainUI.EHeaders -or $g -eq $ChainUI.EExtract)) { Start-ChainEditorSave }
+    } $Glyph.Delete 'Del')
+    $Grid.ContextMenuStrip = $m
+    $Grid.add_CellMouseDown({ param($src, $e) if ($e.Button -eq 'Right' -and $e.RowIndex -ge 0 -and $e.ColumnIndex -ge 0) { $c = $src.Rows[$e.RowIndex].Cells[$e.ColumnIndex]; if (-not $c.Selected) { $src.ClearSelection(); $c.Selected = $true; $src.CurrentCell = $c } } })
+}
+
 function New-KvGrid($Parent, [string]$KeyTitle = 'Key', [string]$ValueTitle = 'Value', [switch]$ReadOnly) {
     $g = New-Object System.Windows.Forms.DataGridView
     $g.Dock = 'Fill'; $g.BorderStyle = 'None'; $g.BackgroundColor = $C.Bg; $g.GridColor = $C.Line
@@ -10269,6 +10398,7 @@ function New-KvGrid($Parent, [string]$KeyTitle = 'Key', [string]$ValueTitle = 'V
         $g.Columns[1].FillWeight = 35; $g.Columns[2].FillWeight = 65
         $g.add_DefaultValuesNeeded({ param($src, $e) $e.Row.Cells[0].Value = $true })
         $g.add_CurrentCellDirtyStateChanged({ param($src, $e) if ($src.CurrentCell -is [System.Windows.Forms.DataGridViewCheckBoxCell]) { [void]$src.CommitEdit('CurrentCellChange') } })
+        Enable-GridClipboard $g
     }
     $Parent.Controls.Add($g)
     $g
@@ -11862,6 +11992,7 @@ function Show-ApiChains {
     $xg.Columns[0].FillWeight = 30; $xg.Columns[1].FillWeight = 22; $xg.Columns[2].FillWeight = 48
     $xg.add_DefaultValuesNeeded({ param($src, $e) $e.Row.Cells[1].Value = 'JSON path' })
     $xg.add_DataError({ param($src, $e) $e.ThrowException = $false })
+    Enable-GridClipboard $xg
     $ChainUI.EExtract = $xg
     $xh = New-TbBar $pExt 'Bottom'
     $xl = New-TbLabel $xh 'JSON path: $.token, $.data.items[0].id   Header: X-Csrf-Token   Cookie: session   Regex: id="(\d+)"   Then use {{token}} in later steps.  Cookies are sent along by themselves.' -Dim

@@ -287,6 +287,7 @@ A Postman-style HTTP client. Open it with Ctrl+Shift+A in the picker, the right-
 - Paste a `curl ...` command into the URL box to import it: method, URL, headers, body, form fields, `-u` user, Bearer token, `-k` and `-L`.
 - **Params**: the query string as a table, kept in sync with the URL both ways. Untick a row to leave it out without deleting it.
 - **Headers**: name / value table; untick to switch a header off.
+- **Copy / paste rows** in every table (params, headers, form fields, and a chain card's *Take from response*): select cells in one or more rows and press Ctrl+C, then Ctrl+V in another table - each line becomes a row, also while a cell is being edited. Lines like `Content-Type: application/json` or `name=value`, and rows copied from Excel, are split into name and value. Right-click a table for Copy rows / Paste rows / Delete rows.
 - **Auth**: Bearer token, Basic auth (username + password), or API key sent as a header or query parameter.
 - **Body**: JSON, Text, XML (with **Beautify**), Form URL-encoded, or Form-data (multipart). For a file field use **Add file...** or type `@C:\path\file` as the value. The Content-Type is set for you unless you add your own header.
 - **Settings**: timeout, follow redirects, verify SSL certificate (untick for self-signed test servers).
