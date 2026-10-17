@@ -298,6 +298,19 @@ A Postman-style HTTP client. Open it with Ctrl+Shift+A in the picker, the right-
 - **Headers**, **Cookies** (each `Set-Cookie` with its attributes) and **Request**: the exact request that was sent, headers and body included.
 - Errors are spelled out: timeouts, unknown hosts, refused connections, untrusted SSL certificates.
 
+**Request chains** (the **Request chains...** button in the API tester, or **API chains** in the palette)
+
+Build a flow of requests on a canvas, for example: log in, then use the cookie or token in the next calls.
+
+- **Add cards**: drag a template (*Log in (JSON) -> {{token}}*, *Log in (form) -> session cookie*, *Request with Bearer {{token}}*, an empty request) or any saved request from the list on the left onto the canvas, or right-click the canvas. With a card selected, **Add request** adds the next one already linked.
+- **Chain them**: drag from a card's blue dot (right side) to another card. The arrow means "runs after". Loops are refused. Click an arrow and press Del to remove it; Del on a card removes the card. Drag cards to move them, drag empty space to scroll, **Arrange** lines them up.
+- **Edit a card** on the right: name, method, URL, headers, body. **Open in API tester** edits everything (auth, params, form-data ...) and **Take from API tester** brings it back.
+- **Take from response**: save values into `{{variables}}` for the later steps - a JSON path (`$.token`, `$.data.items[0].id`), a response header, a cookie, a regex (first group), the status or the whole body.
+- **Cookies** a response sets are sent along with the next requests to the same site, like a browser (**Send cookies along**).
+- **Variables...** sets start values (`baseUrl`, `user`, `password` ...); an API tester environment can be used as well.
+- **Run chain** (F5) runs the steps in order; each card turns green or red with the status, time and what it set. Steps after a failed step are skipped. **Run this step** (Shift+F5) re-sends one card with the variables of the last run. The **Result** tab shows the request sent and the full response, **Variables & cookies** the current values.
+- Chains are saved in `datapi\chains.json`.
+
 **Collections, history and environments**
 
 - **Save** (Ctrl+S) stores the request in a collection folder; Ctrl+Shift+S saves a copy. Click a saved request to open it; right-click to rename / move, duplicate or delete it (or a whole folder).

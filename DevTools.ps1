@@ -9837,6 +9837,7 @@ function Expand-ApiVars([string]$Text) {
     $vars = @{}
     $env = Get-ApiEnvironment
     if ($env) { foreach ($v in @($env.Vars)) { if ($v -and $v.On -ne $false -and $v.Key) { $vars[[string]$v.Key] = [string]$v.Value } } }
+    if ($script:ChainVars) { foreach ($k in $script:ChainVars.Keys) { $vars[$k] = $script:ChainVars[$k] } }
     [regex]::Replace($Text, '\{\{\s*([^{}\s]+)\s*\}\}', {
         param($m)
         $k = $m.Groups[1].Value
@@ -10552,6 +10553,8 @@ function Show-ApiTester([string]$Text = '') {
     $h1 = New-Object System.Windows.Forms.Label
     $h1.Text = '  COLLECTIONS'; $h1.Dock = 'Top'; $h1.Height = Px 28; $h1.TextAlign = 'MiddleLeft'; $h1.Font = $FontSmall; $h1.ForeColor = $C.Accent
     $left.Panel1.Controls.Add($h1)
+    $chainBtn = New-Button 'Request chains...' 'Chain requests on a canvas: log in, take the cookie / token, use it in the next requests' { Show-ApiChains } $left.Panel1 $Glyph.Apps 2
+    $chainBtn.Dock = 'Top'; $chainBtn.AutoSize = $false; $chainBtn.Height = $FontButton.Height + (Px 14)
     $hl = New-Object System.Windows.Forms.ListBox
     $hl.Dock = 'Fill'; $hl.BorderStyle = 'None'; $hl.BackColor = $C.Panel; $hl.ForeColor = $C.Fore
     $hl.DrawMode = 'OwnerDrawFixed'; $hl.ItemHeight = Px 40; $hl.IntegralHeight = $false
@@ -10701,6 +10704,702 @@ function Show-ApiTester([string]$Text = '') {
 }
 
 # Fills the window from text: a curl command is imported, a URL becomes a GET.
+# ======================================================================================
+# API chains: requests as cards on a canvas, joined by arrows, run in order. Each step can take
+# values out of its response (JSON path, header, cookie, regex, status, body) into {{variables}}
+# that later steps use; cookies are carried along by themselves.
+# ======================================================================================
+$ChainFile = Join-Path $ApiDir 'chains.json'
+$ChainUI = @{ Form = $null; Canvas = $null; Chains = (New-Object System.Collections.Generic.List[object]); Current = $null
+              Data = @{}; Results = @{}; Vars = @{}; Jar = @{}; Run = $null; Loading = $false; EditId = $null }
+$script:ChainVars = $null              # set while a chain step's request is built (see Expand-ApiVars)
+$ChainExtractFrom = @('JSON path', 'Header', 'Cookie', 'Regex', 'Status', 'Body')
+
+function Import-Chains {
+    $ChainUI.Chains.Clear()
+    foreach ($x in @(Read-ApiJson $ChainFile)) { if ($x -and $x.Id) { $ChainUI.Chains.Add($x) } }
+}
+
+function New-ChainRecord([string]$Name) {
+    [pscustomobject]@{ Id = [guid]::NewGuid().ToString('N'); Name = $Name; Vars = @(); AutoCookies = $true; Nodes = @(); Links = @() }
+}
+
+function New-ChainStep($Model) {
+    @{ Request = $Model; Extract = (New-Object System.Collections.Generic.List[object]); StopOnFail = $true }
+}
+
+# canvas + step data -> the current chain record, then to disk
+function Save-Chains {
+    $ch = $ChainUI.Current
+    if ($ch -and $ChainUI.Canvas) {
+        $cv = $ChainUI.Canvas
+        $ch.Nodes = @(foreach ($n in $cv.Nodes) {
+            $d = $ChainUI.Data[$n.Id]
+            if (-not $d) { continue }
+            [ordered]@{ Id = $n.Id; X = [int]$n.X; Y = [int]$n.Y; Request = $d.Request; StopOnFail = [bool]$d.StopOnFail
+                        Extract = @($d.Extract.ToArray() | ForEach-Object { [ordered]@{ Var = $_.Var; From = $_.From; Expr = $_.Expr } }) }
+        })
+        $ch.Links = @(foreach ($l in $cv.Links) { [ordered]@{ From = $l.From; To = $l.To } })
+    }
+    if (-not (Test-Path $ApiDir)) { [void](New-Item -ItemType Directory -Path $ApiDir) }
+    $json = ConvertTo-Json -InputObject $ChainUI.Chains.ToArray() -Depth 10
+    if (-not $json) { $json = '[]' }
+    try { Write-JsonFile $ChainFile $json } catch { Write-Log "chains save failed: $_" }
+}
+
+function Open-Chain($Chain) {
+    $ChainUI.Loading = $true
+    try {
+        Stop-ChainRun
+        $ChainUI.Current = $Chain
+        $ChainUI.Data = @{}; $ChainUI.Results = @{}
+        $cv = $ChainUI.Canvas
+        $cv.Nodes.Clear(); $cv.Links.Clear(); $cv.SelectedNode = $null; $cv.SelectedLink = $null; $cv.Pan = New-Object System.Drawing.PointF(0, 0)
+        foreach ($x in @($Chain.Nodes)) {
+            if (-not $x) { continue }
+            $m = New-ApiModel
+            if ($x.Request) { foreach ($p in $x.Request.PSObject.Properties) { if ($m.PSObject.Properties[$p.Name]) { $m.($p.Name) = $p.Value } } }
+            $n = $cv.AddNode([string]$m.Name, [string]$m.Method, [string]$m.Url, [float]$x.X, [float]$x.Y)
+            $n.Id = [string]$x.Id
+            $d = New-ChainStep $m
+            $d.StopOnFail = $x.StopOnFail -ne $false
+            foreach ($e in @($x.Extract)) { if ($e -and $e.Var) { $d.Extract.Add([pscustomobject]@{ Var = [string]$e.Var; From = [string]$e.From; Expr = [string]$e.Expr }) } }
+            $ChainUI.Data[$n.Id] = $d
+        }
+        foreach ($l in @($Chain.Links)) { if ($l -and $l.From -and $l.To) { $lk = New-Object ChainLink; $lk.From = [string]$l.From; $lk.To = [string]$l.To; $cv.Links.Add($lk) } }
+        $ChainUI.AutoCookies.Checked = $Chain.AutoCookies -ne $false
+        Update-ChainOrder
+        $cv.Invalidate()
+        Show-ChainStep $null
+        Update-ChainVarsView
+    } finally { $ChainUI.Loading = $false }
+}
+
+# Steps in run order: a step runs after every step that points to it; ties go left to right, top to bottom.
+function Get-ChainOrder {
+    $cv = $ChainUI.Canvas
+    $in = @{}; foreach ($n in $cv.Nodes) { $in[$n.Id] = 0 }
+    foreach ($l in $cv.Links) { if ($in.ContainsKey($l.To)) { $in[$l.To]++ } }
+    $done = New-Object System.Collections.Generic.List[object]
+    $left = New-Object System.Collections.Generic.List[object]; foreach ($n in $cv.Nodes) { $left.Add($n) }
+    while ($left.Count) {
+        $ready = @($left | Where-Object { $in[$_.Id] -eq 0 } | Sort-Object X, Y)
+        if (-not $ready) { $ready = @($left | Sort-Object X, Y | Select-Object -First 1) }
+        $n = $ready[0]
+        [void]$left.Remove($n); $done.Add($n)
+        foreach ($l in $cv.Links) { if ($l.From -eq $n.Id -and $in.ContainsKey($l.To)) { $in[$l.To]-- } }
+    }
+    $done.ToArray()
+}
+
+function Update-ChainOrder {
+    $i = 0
+    foreach ($n in (Get-ChainOrder)) { $i++; $n.Order = $i }
+    $ChainUI.Canvas.Invalidate()
+}
+
+# Columns by step (a step sits right of everything it waits for), rows within a column.
+function Invoke-ChainArrange {
+    $cv = $ChainUI.Canvas
+    $depth = @{}
+    foreach ($n in @(Get-ChainOrder)) {
+        $d = 0
+        foreach ($l in $cv.Links) { if ($l.To -eq $n.Id -and $depth.ContainsKey($l.From)) { $d = [math]::Max($d, $depth[$l.From] + 1) } }
+        $depth[$n.Id] = $d
+    }
+    $rows = @{}
+    foreach ($n in @(Get-ChainOrder)) {
+        $c = $depth[$n.Id]; $r = [int]$rows[$c]; $rows[$c] = $r + 1
+        $n.X = (Px 40) + $c * ($cv.NodeW + (Px 70)); $n.Y = (Px 50) + $r * ($cv.NodeH + (Px 40))
+    }
+    $cv.Pan = New-Object System.Drawing.PointF(0, 0)
+    $cv.Invalidate()
+    Save-Chains
+}
+
+function Add-ChainStep($Model, [float]$X = -1, [float]$Y = -1) {
+    $cv = $ChainUI.Canvas
+    if (-not $ChainUI.Current) { return }
+    if ($X -lt 0) {
+        $last = @($cv.Nodes | Sort-Object X | Select-Object -Last 1)
+        if ($last) { $X = $last[0].X + $cv.NodeW + (Px 60); $Y = $last[0].Y } else { $X = Px 40; $Y = Px 60 }
+        if ($last -and $X + $cv.NodeW + $cv.Pan.X -gt $cv.Width - (Px 20)) {          # next row instead of off screen
+            $X = Px 40; $Y = (($cv.Nodes | ForEach-Object { $_.Y } | Measure-Object -Maximum).Maximum) + $cv.NodeH + (Px 50)
+        }
+    }
+    $m = New-ApiModel
+    if ($Model) { foreach ($p in $Model.PSObject.Properties) { if ($m.PSObject.Properties[$p.Name]) { $m.($p.Name) = $p.Value } } }
+    $m.Id = $null
+    if (-not $m.Name) { $m.Name = if ($m.Url) { ($m.Url -replace '^https?://[^/]+', '' -replace '\?.*$', '') } else { 'New request' } }
+    $n = $cv.AddNode([string]$m.Name, [string]$m.Method, [string]$m.Url, $X, $Y)
+    $ChainUI.Data[$n.Id] = New-ChainStep $m
+    # link from the selected step, so building a chain is click, add, click, add
+    if ($cv.SelectedNode -and $cv.SelectedNode.Id -ne $n.Id) { [void]$cv.Connect($cv.SelectedNode.Id, $n.Id) }
+    $cv.SelectNode($n)
+    Update-ChainOrder
+    Save-Chains
+    $n
+}
+
+# ---- templates for the palette
+function Get-ChainTemplates {
+    $login = New-ApiModel
+    $login.Name = 'Log in'; $login.Method = 'POST'; $login.Url = '{{baseUrl}}/login'; $login.BodyType = 'JSON'
+    $login.Body = "{`r`n  `"username`": `"{{user}}`",`r`n  `"password`": `"{{password}}`"`r`n}"
+    $get = New-ApiModel
+    $get.Name = 'Get data (uses the token)'; $get.Method = 'GET'; $get.Url = '{{baseUrl}}/items'
+    $get.Headers = @([pscustomobject]@{ On = $true; Key = 'Authorization'; Value = 'Bearer {{token}}' })
+    $form = New-ApiModel
+    $form.Name = 'Log in (form, cookie)'; $form.Method = 'POST'; $form.Url = '{{baseUrl}}/login'; $form.BodyType = 'Form URL-encoded'
+    $form.Form = @([pscustomobject]@{ On = $true; Key = 'username'; Value = '{{user}}' }, [pscustomobject]@{ On = $true; Key = 'password'; Value = '{{password}}' })
+    $empty = New-ApiModel; $empty.Name = 'New request'
+    [ordered]@{
+        'New empty request' = @{ Model = $empty; Extract = @() }
+        'Log in (JSON) -> {{token}}' = @{ Model = $login; Extract = @([pscustomobject]@{ Var = 'token'; From = 'JSON path'; Expr = '$.token' }) }
+        'Log in (form) -> session cookie' = @{ Model = $form; Extract = @() }
+        'Request with Bearer {{token}}' = @{ Model = $get; Extract = @() }
+    }
+}
+
+function Update-ChainPalette {
+    $tv = $ChainUI.Palette
+    $tv.BeginUpdate(); $tv.Nodes.Clear()
+    $t = $tv.Nodes.Add('Start from')
+    foreach ($k in (Get-ChainTemplates).Keys) { $n = $t.Nodes.Add($k); $n.Tag = "tpl:$k" }
+    $t.Expand()
+    $folders = @{}
+    foreach ($m in $ApiUI.Collections) {
+        $f = if ($m.Folder) { [string]$m.Folder } else { 'Requests' }
+        if (-not $folders[$f]) { $folders[$f] = $tv.Nodes.Add($f) }
+        $n = $folders[$f].Nodes.Add("$([string]$m.Method)  $([string]$m.Name)")
+        $n.Tag = "req:$($m.Id)"
+    }
+    foreach ($f in $folders.Values) { $f.Expand() }
+    if (-not $ApiUI.Collections.Count) { [void]$tv.Nodes.Add('(save requests in the API tester to see them here)') }
+    $tv.EndUpdate()
+}
+
+function Get-PaletteModel([string]$Tag) {
+    if ($Tag -like 'tpl:*') { $t = (Get-ChainTemplates)[$Tag.Substring(4)]; return $t }
+    if ($Tag -like 'req:*') { $id = $Tag.Substring(4); foreach ($m in $ApiUI.Collections) { if ($m.Id -eq $id) { return @{ Model = $m; Extract = @() } } } }
+    $null
+}
+
+function Add-ChainFromPalette([string]$Tag, [float]$X = -1, [float]$Y = -1) {
+    $t = Get-PaletteModel $Tag
+    if (-not $t) { return }
+    $n = Add-ChainStep $t.Model $X $Y
+    if ($n) { foreach ($e in @($t.Extract)) { if ($e) { $ChainUI.Data[$n.Id].Extract.Add([pscustomobject]@{ Var = $e.Var; From = $e.From; Expr = $e.Expr }) } }; $ChainUI.EditId = $null; Show-ChainStep $n; Save-Chains }   # reload the editor without writing its (older) rows back
+}
+
+# ---- step editor (right side) -------------------------------------------------------------
+function Show-ChainStep($Node) {
+    Save-ChainEditor
+    $ChainUI.EditId = if ($Node) { $Node.Id } else { $null }
+    $ed = $ChainUI.Editor
+    $ed.Visible = [bool]$Node
+    $ChainUI.EditorHint.Visible = -not $Node
+    if (-not $Node) { Show-ChainResult $null; return }
+    $d = $ChainUI.Data[$Node.Id]
+    $m = $d.Request
+    $ChainUI.Loading = $true
+    try {
+        $ChainUI.EName.Text = [string]$m.Name
+        $ChainUI.EMethod.Text = ([string]$m.Method).ToUpperInvariant()
+        $ChainUI.EUrl.Text = [string]$m.Url
+        Write-KvGrid $ChainUI.EHeaders $m.Headers
+        $ChainUI.EBodyType.SelectedItem = if ($m.BodyType) { [string]$m.BodyType } else { 'none' }
+        $ChainUI.EBody.Text = if ($m.BodyType -in 'Form URL-encoded', 'Form-data') { (@($m.Form) | Where-Object { $_ -and $_.Key } | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "`r`n" } else { [string]$m.Body }
+        $g = $ChainUI.EExtract
+        $g.Rows.Clear()
+        foreach ($e in $d.Extract) { [void]$g.Rows.Add([string]$e.Var, $(if ($ChainExtractFrom -contains $e.From) { [string]$e.From } else { 'JSON path' }), [string]$e.Expr) }
+        $ChainUI.EStop.Checked = [bool]$d.StopOnFail
+        $ChainUI.EAuth.Text = if ($m.AuthType -and $m.AuthType -ne 'None') { "Auth: $($m.AuthType) (change it with Open in API tester)" } else { '' }
+    } finally { $ChainUI.Loading = $false }
+    Show-ChainResult $Node
+}
+
+function Save-ChainEditor {
+    $id = $ChainUI.EditId
+    if (-not $id -or $ChainUI.Loading) { return }
+    $d = $ChainUI.Data[$id]
+    $n = $ChainUI.Canvas.Find($id)
+    if (-not $d -or -not $n) { return }
+    $m = $d.Request
+    $m.Name = $ChainUI.EName.Text
+    $m.Method = ([string]$ChainUI.EMethod.Text).ToUpperInvariant()
+    $m.Url = $ChainUI.EUrl.Text
+    $m.Headers = @(Read-KvGrid $ChainUI.EHeaders)
+    $m.BodyType = [string]$ChainUI.EBodyType.SelectedItem
+    if ($m.BodyType -in 'Form URL-encoded', 'Form-data') {
+        $m.Form = @(foreach ($l in ($ChainUI.EBody.Text -split "`r?`n")) { if ($l.Trim()) { $i = $l.IndexOf('='); [pscustomobject]@{ On = $true; Key = $(if ($i -ge 0) { $l.Substring(0, $i).Trim() } else { $l.Trim() }); Value = $(if ($i -ge 0) { $l.Substring($i + 1) } else { '' }) } } })
+    } else { $m.Body = $ChainUI.EBody.Text }
+    [void]$ChainUI.EExtract.EndEdit()
+    $d.Extract.Clear()
+    foreach ($row in $ChainUI.EExtract.Rows) {
+        if ($row.IsNewRow) { continue }
+        $v = [string]$row.Cells[0].Value
+        if (-not $v.Trim()) { continue }
+        $d.Extract.Add([pscustomobject]@{ Var = $v.Trim().Trim('{', '}'); From = $(if ($row.Cells[1].Value) { [string]$row.Cells[1].Value } else { 'JSON path' }); Expr = [string]$row.Cells[2].Value })
+    }
+    $d.StopOnFail = $ChainUI.EStop.Checked
+    $n.Title = $m.Name; $n.Method = $m.Method; $n.Url = $m.Url
+    $ChainUI.Canvas.Invalidate()
+}
+
+function Start-ChainEditorSave {
+    if ($ChainUI.Loading) { return }
+    Save-ChainEditor
+    $ChainUI.SaveTimer.Stop(); $ChainUI.SaveTimer.Start()
+}
+
+# ---- running ------------------------------------------------------------------------------
+function Get-CookieHeader([string]$Url) {
+    try { $h = ([Uri]$Url).Host } catch { return '' }
+    $pairs = foreach ($c in $ChainUI.Jar.Values) { if ($h -eq $c.Domain -or $h.EndsWith('.' + $c.Domain)) { "$($c.Name)=$($c.Value)" } }
+    @($pairs) -join '; '
+}
+
+function Save-ResponseCookies($Resp, [string]$Url) {
+    $h = try { ([Uri]$Url).Host } catch { '' }
+    $set = @()
+    foreach ($x in $Resp.Headers) {
+        if ($x[0] -ne 'Set-Cookie') { continue }
+        $parts = $x[1] -split ';'
+        $nv = $parts[0]; $i = $nv.IndexOf('=')
+        if ($i -le 0) { continue }
+        $name = $nv.Substring(0, $i).Trim(); $value = $nv.Substring($i + 1).Trim()
+        $dom = $h
+        foreach ($p in $parts | Select-Object -Skip 1) { if ($p -match '^\s*domain\s*=\s*\.?(.+)$') { $dom = $Matches[1].Trim() } }
+        $ChainUI.Jar["$dom|$name"] = [pscustomobject]@{ Name = $name; Value = $value; Domain = $dom }
+        $set += $name
+    }
+    $set
+}
+
+function Get-ChainExtract($Rule, $Resp) {
+    $expr = [string]$Rule.Expr
+    switch ([string]$Rule.From) {
+        'Header' { foreach ($x in $Resp.Headers) { if ($x[0] -eq $expr) { return $x[1] } }; return $null }
+        'Cookie' { foreach ($x in $Resp.Headers) { if ($x[0] -eq 'Set-Cookie' -and $x[1] -match "^\s*$([regex]::Escape($expr))=([^;]*)") { return $Matches[1] } }; foreach ($c in $ChainUI.Jar.Values) { if ($c.Name -eq $expr) { return $c.Value } }; return $null }
+        'Regex'  { $m = [regex]::Match([string]$Resp.Text, $expr); if (-not $m.Success) { return $null }; if ($m.Groups.Count -gt 1) { return $m.Groups[1].Value }; return $m.Value }
+        'Status' { return [string]$Resp.Status }
+        'Body'   { return [string]$Resp.Text }
+        default {
+            if (-not $Resp.Text) { return $null }
+            $p = $expr.Trim(); if (-not $p.StartsWith('$')) { $p = '$.' + $p.TrimStart('.') }
+            $hits = [DevJson]::Query($Resp.Text, $p)
+            if (-not $hits -or $hits.Count -eq 0) { return $null }
+            $v = $hits[0].Value
+            if ($v -is [string]) { return $v }
+            return [DevJson]::Write($v, -1, $false)
+        }
+    }
+}
+
+function Start-ChainRun([string]$OnlyId = '') {
+    if ($ChainUI.Run) { Stop-ChainRun; return }
+    Save-ChainEditor
+    $cv = $ChainUI.Canvas
+    if (-not $cv.Nodes.Count) { Set-ChainStatus 'Add some requests first.' $C.Red; return }
+    Update-ChainOrder
+    $order = @(if ($OnlyId) { $cv.Find($OnlyId) } else { Get-ChainOrder })
+    if (-not $OnlyId) {
+        # fresh run: environment, then the chain's own variables; no cookies yet
+        $ChainUI.Vars = @{}; $ChainUI.Jar = @{}; $ChainUI.Results = @{}
+        $env = Get-ApiEnvironment
+        if ($env) { foreach ($v in @($env.Vars)) { if ($v -and $v.On -ne $false -and $v.Key) { $ChainUI.Vars[[string]$v.Key] = [string]$v.Value } } }
+        foreach ($v in @($ChainUI.Current.Vars)) { if ($v -and $v.Key) { $ChainUI.Vars[[string]$v.Key] = [string]$v.Value } }
+        foreach ($n in $cv.Nodes) { $n.State = ''; $n.Info = '' }
+    }
+    $ChainUI.Run = @{ Order = $order; Index = 0; Http = $null; Node = $null; Started = Get-Date; Ok = 0; Fail = 0; Skip = 0; Single = [bool]$OnlyId }
+    $ChainUI.RunBtn.Text = 'Stop'; $ChainUI.RunBtn.Glyph = $Glyph.Cancel; $ChainUI.RunBtn.Variant = 3; $ChainUI.RunBtn.Invalidate()
+    Invoke-ChainNext
+}
+
+function Stop-ChainRun([string]$Why = '') {
+    $r = $ChainUI.Run
+    if (-not $r) { return }
+    if ($r.Http -and -not $r.Http.Done) { $r.Http.Cancel() }
+    $ChainUI.Timer.Stop()
+    $ChainUI.Run = $null
+    if ($ChainUI.Canvas) { $ChainUI.Canvas.RunningId = $null; $ChainUI.Canvas.Invalidate() }
+    if ($ChainUI.RunBtn -and -not $ChainUI.RunBtn.IsDisposed) { $ChainUI.RunBtn.Text = 'Run chain'; $ChainUI.RunBtn.Glyph = $Glyph.Play; $ChainUI.RunBtn.Variant = 1; $ChainUI.RunBtn.Invalidate() }
+    $secs = ((Get-Date) - $r.Started).TotalSeconds
+    if ($ChainUI.Form) {
+        $msg = if ($Why) { $Why } else { "Done in $('{0:0.0}' -f $secs) s:  $($r.Ok) ok, $($r.Fail) failed, $($r.Skip) skipped" }
+        Set-ChainStatus $msg $(if ($r.Fail -or $Why) { $C.Red } else { $C.Green })
+        Update-ChainVarsView
+        if ($ChainUI.Canvas.SelectedNode) { Show-ChainResult $ChainUI.Canvas.SelectedNode }
+    }
+}
+
+function Invoke-ChainNext {
+    $r = $ChainUI.Run
+    $cv = $ChainUI.Canvas
+    while ($r.Index -lt $r.Order.Count) {
+        $n = $r.Order[$r.Index]
+        $r.Index++
+        if (-not $r.Single) {
+            $parents = @($cv.Links | Where-Object { $_.To -eq $n.Id } | ForEach-Object { $cv.Find($_.From) })
+            $bad = @($parents | Where-Object { $_ -and $_.State -in 'fail', 'skip' })
+            if ($bad) { $n.State = 'skip'; $n.Info = "skipped: $($bad[0].Title) failed"; $r.Skip++; continue }
+        }
+        $d = $ChainUI.Data[$n.Id]
+        $script:ChainVars = $ChainUI.Vars
+        try { $req = ConvertTo-HttpRequest $d.Request } finally { $script:ChainVars = $null }
+        $unknown = @($ApiUI.Unknown)
+        if (-not $req.Url -or $req.Url -eq 'http://') { $n.State = 'fail'; $n.Info = 'no URL'; $r.Fail++; continue }
+        $cookieNote = ''
+        if ($ChainUI.AutoCookies.Checked -and -not $req.HeaderValue('Cookie')) {
+            $ck = Get-CookieHeader $req.Url
+            if ($ck) { $req.AddHeader('Cookie', $ck); $cookieNote = $ck }
+        }
+        $r.Node = $n; $r.Req = $req; $r.Unknown = $unknown; $r.CookieNote = $cookieNote
+        $r.Http = New-Object PowerClipHttp
+        $r.Http.Start($req)
+        $n.State = ''; $n.Info = 'sending...'
+        $cv.RunningId = $n.Id; $cv.Invalidate()
+        Set-ChainStatus "Step $($n.Order): $($req.Method) $($req.Url)" $C.Dim
+        $ChainUI.Timer.Start()
+        return
+    }
+    Stop-ChainRun
+}
+
+function Complete-ChainStep {
+    $r = $ChainUI.Run
+    if (-not $r -or -not $r.Http -or -not $r.Http.Done) { return }
+    $ChainUI.Timer.Stop()
+    $n = $r.Node; $d = $ChainUI.Data[$n.Id]
+    $resp = $r.Http.Response
+    $set = New-Object System.Collections.Specialized.OrderedDictionary
+    $missing = @()
+    $cookies = @()
+    if (-not $resp.Error) {
+        $cookies = @(Save-ResponseCookies $resp $r.Req.Url)
+        foreach ($e in $d.Extract) {
+            $val = try { Get-ChainExtract $e $resp } catch { $null }
+            if ($null -eq $val) { $missing += $e.Var } else { $ChainUI.Vars[$e.Var] = [string]$val; $set[$e.Var] = [string]$val }
+        }
+    }
+    $okStatus = -not $resp.Error -and $resp.Status -ge 200 -and $resp.Status -lt 400
+    $failed = $resp.Error -or ($d.StopOnFail -and -not $okStatus) -or ($d.StopOnFail -and $missing)
+    $n.State = if ($failed) { 'fail' } else { 'ok' }
+    $parts = @()
+    $parts += if ($resp.Error) { $resp.Error } else { "$($resp.Status) $($resp.Reason)" }
+    if (-not $resp.Error) { $parts += "$($resp.ElapsedMs) ms" }
+    if ($set.Count) { $parts += "set: $(@($set.Keys) -join ', ')" }
+    if ($missing) { $parts += "not found: $($missing -join ', ')" }
+    if ($cookies) { $parts += "cookie: $($cookies -join ', ')" }
+    $n.Info = $parts -join '  -  '
+    if ($failed) { $r.Fail++ } else { $r.Ok++ }
+    $ChainUI.Results[$n.Id] = @{ Request = $r.Req; Response = $resp; Set = $set; Missing = $missing; Unknown = $r.Unknown; CookieSent = $r.CookieNote }
+    $ChainUI.Canvas.RunningId = $null; $ChainUI.Canvas.Invalidate()
+    if ($ChainUI.Canvas.SelectedNode -and $ChainUI.Canvas.SelectedNode.Id -eq $n.Id) { Show-ChainResult $n }
+    Invoke-ChainNext
+}
+
+function Set-ChainStatus([string]$Text, $Color) { if ($ChainUI.Status) { $ChainUI.Status.Text = $Text; if ($Color) { $ChainUI.Status.ForeColor = $Color } } }
+
+function Show-ChainResult($Node) {
+    $o = $ChainUI.Result
+    if (-not $o) { return }
+    if (-not $Node) { $o.Text = ''; return }
+    $res = $ChainUI.Results[$Node.Id]
+    if (-not $res) { $o.Text = if ($Node.State -eq 'skip') { "Skipped: $($Node.Info -replace '^skipped: ', '').`r`nA step it waits for failed, so it was not sent." } else { 'Not run yet. Press Run chain (F5), or Run this step (Shift+F5) to use the variables from the last run.' }; return }
+    $sb = New-Object System.Text.StringBuilder
+    $q = $res.Request; $p = $res.Response
+    [void]$sb.AppendLine("$($q.Method) $($q.Url)")
+    if ($res.CookieSent) { [void]$sb.AppendLine("Cookie sent: $($res.CookieSent)") }
+    if ($res.Unknown.Count) { [void]$sb.AppendLine("Unknown variables: {{$($res.Unknown -join '}}, {{')}}") }
+    [void]$sb.AppendLine()
+    if ($p.Error) { [void]$sb.AppendLine("ERROR: $($p.Error)") }
+    else { [void]$sb.AppendLine("$($p.HttpVersion) $($p.Status) $($p.Reason)   $($p.ElapsedMs) ms   $($p.Body.Length) bytes") }
+    if ($res.Set.Count) { [void]$sb.AppendLine(); [void]$sb.AppendLine('Variables set:'); foreach ($k in $res.Set.Keys) { $v = [string]$res.Set[$k]; [void]$sb.AppendLine("  {{$k}} = $(if ($v.Length -gt 200) { $v.Substring(0, 200) + '...' } else { $v })") } }
+    if ($res.Missing) { [void]$sb.AppendLine("Not found in the response: $($res.Missing -join ', ')") }
+    if (-not $p.Error) {
+        [void]$sb.AppendLine(); [void]$sb.AppendLine('Response headers:')
+        foreach ($h in $p.Headers) { [void]$sb.AppendLine("  $($h[0]): $($h[1])") }
+        [void]$sb.AppendLine(); [void]$sb.AppendLine('Body:')
+        $body = [string]$p.Text
+        if ($body -and ($body.TrimStart().StartsWith('{') -or $body.TrimStart().StartsWith('['))) { try { $body = [DevJson]::Format($body, 2) } catch { } }
+        if ($body.Length -gt 200000) { $body = $body.Substring(0, 200000) + "`n... (cut)" }
+        [void]$sb.Append($body)
+    }
+    $o.Text = $sb.ToString()
+}
+
+function Update-ChainVarsView {
+    $v = $ChainUI.VarsOut
+    if (-not $v) { return }
+    $lines = @()
+    if ($ChainUI.Vars.Count) { $lines += 'Variables:'; foreach ($k in ($ChainUI.Vars.Keys | Sort-Object)) { $val = [string]$ChainUI.Vars[$k]; $lines += "  {{$k}} = $(if ($val.Length -gt 120) { $val.Substring(0, 120) + '...' } else { $val })" } }
+    if ($ChainUI.Jar.Count) { $lines += ''; $lines += 'Cookies:'; foreach ($c in $ChainUI.Jar.Values) { $lines += "  $($c.Name) = $($c.Value)   ($($c.Domain))" } }
+    if (-not $lines) { $lines = @('Run the chain to see the variables and cookies.', '', 'Start values: Variables... in the toolbar, or an environment of the API tester.') }
+    $v.Text = $lines -join "`r`n"
+}
+
+function Show-ChainVarsDialog {
+    $ch = $ChainUI.Current
+    if (-not $ch) { return }
+    $text = (@($ch.Vars) | Where-Object { $_ -and $_.Key } | ForEach-Object { "$($_.Key) = $($_.Value)" }) -join "`r`n"
+    $d = New-Object System.Windows.Forms.Form
+    $d.Text = "Variables of $($ch.Name)"; $d.StartPosition = 'CenterParent'; $d.ShowInTaskbar = $false; $d.MinimizeBox = $false; $d.MaximizeBox = $false
+    $d.BackColor = $C.Panel; $d.ForeColor = $C.Fore; $d.Font = $FontMain; $d.Size = New-Object System.Drawing.Size((Px 520), (Px 400))
+    $l = New-Object System.Windows.Forms.Label; $l.Dock = 'Top'; $l.Height = Px 44; $l.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), 0)
+    $l.Text = 'One per line:  name = value.  Use them as {{name}}. They start every run (after the API tester''s environment); steps can change them.'
+    $tb = New-TbBox -Mono -Multi; $tb.Dock = 'Fill'; $tb.Text = $text
+    $bp = New-Object System.Windows.Forms.FlowLayoutPanel; $bp.Dock = 'Bottom'; $bp.Height = Px 44; $bp.FlowDirection = 'RightToLeft'; $bp.BackColor = $C.Panel
+    $ok = New-Button 'Save' '' { param($src, $e) $src.FindForm().DialogResult = 'OK' } $bp $Glyph.Save 1
+    [void](New-Button 'Cancel' '' { param($src, $e) $src.FindForm().DialogResult = 'Cancel' } $bp '' 2)
+    $d.Controls.AddRange(@($tb, $bp, $l))
+    Set-ControlTheme $d $null $script:IsDark
+    $d.add_Shown({ param($src, $e) [PowerClipHost]::EnsureShown($src.Handle) })
+    $script:Modal = $true
+    try {
+        if ($d.ShowDialog($ChainUI.Form) -ne 'OK') { return }
+        $ch.Vars = @(foreach ($line in ($tb.Text -split "`r?`n")) { $i = $line.IndexOf('='); if ($i -gt 0) { [pscustomobject]@{ Key = $line.Substring(0, $i).Trim().Trim('{', '}'); Value = $line.Substring($i + 1).Trim() } } })
+        Save-Chains
+    } finally { $script:Modal = $false; $d.Dispose() }
+}
+
+function Update-ChainCombo {
+    $cb = $ChainUI.ChainBox
+    $ChainUI.Loading = $true
+    try {
+        $cb.Items.Clear()
+        foreach ($c in $ChainUI.Chains) { [void]$cb.Items.Add([string]$c.Name) }
+        if ($ChainUI.Current) { $cb.SelectedIndex = $ChainUI.Chains.IndexOf($ChainUI.Current) }
+    } finally { $ChainUI.Loading = $false }
+}
+
+# ---- window -------------------------------------------------------------------------------
+function Show-ApiChains {
+    Hide-Picker
+    if ($ChainUI.Form) { if ($ChainUI.Form.WindowState -eq 'Minimized') { $ChainUI.Form.WindowState = 'Normal' }; $ChainUI.Form.Activate(); return }
+    if ($ApiUI.Collections.Count -eq 0 -and $ApiUI.Environments.Count -eq 0) { try { Import-ApiData } catch { } }
+    Import-Chains
+    if (-not $ChainUI.Chains.Count) { $ChainUI.Chains.Add((New-ChainRecord 'My first chain')) }
+
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'API chains'; $f.Icon = $IconActive
+    $f.Size = New-Object System.Drawing.Size((Px 1500), (Px 900)); $f.MinimumSize = New-Object System.Drawing.Size((Px 1000), (Px 600))
+    $f.StartPosition = 'CenterScreen'; $f.BackColor = $C.Panel; $f.ForeColor = $C.Fore; $f.Font = $FontMain; $f.KeyPreview = $true
+    $ChainUI.Form = $f
+
+    # right: step editor over the result
+    $right = New-Object System.Windows.Forms.SplitContainer
+    $right.Dock = 'Right'; $right.Width = Px 520; $right.Orientation = 'Horizontal'; $right.SplitterWidth = 4
+    $right.BackColor = $C.Line; $right.Panel1.BackColor = $C.Bg; $right.Panel2.BackColor = $C.Bg
+    $f.Controls.Add($right)
+    $ed = New-Object System.Windows.Forms.Panel
+    $ed.Dock = 'Fill'; $ed.BackColor = $C.Bg; $ed.Padding = New-Object System.Windows.Forms.Padding((Px 10), (Px 8), (Px 10), (Px 4))
+    $right.Panel1.Controls.Add($ed)
+    $ChainUI.Editor = $ed
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Dock = 'Fill'; $hint.TextAlign = 'MiddleCenter'; $hint.ForeColor = $C.Dim; $hint.BackColor = $C.Bg
+    $hint.Text = "Click a card to edit it.`n`nDrag requests from the left onto the canvas.`nDrag from a card's blue dot to another card to run it after.`nDel removes the selected card or arrow."
+    $right.Panel1.Controls.Add($hint)
+    $ChainUI.EditorHint = $hint
+
+    $etabs = New-TabSet $ed
+    $pReq = Add-ApiTab $etabs 'Request'
+    $pHead = Add-ApiTab $etabs 'Headers'
+    $pBody = Add-ApiTab $etabs 'Body'
+    $pExt = Add-ApiTab $etabs 'Take from response'
+    $ChainUI.ETabs = $etabs
+    # request tab
+    $rq = New-Object System.Windows.Forms.FlowLayoutPanel
+    $rq.Dock = 'Fill'; $rq.FlowDirection = 'TopDown'; $rq.WrapContents = $false; $rq.BackColor = $C.Bg; $rq.Padding = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0)
+    $pReq.Controls.Add($rq)
+    New-TbLabel $rq 'Name' -Dim | Out-Null
+    $ChainUI.EName = New-TbBox; $ChainUI.EName.Width = Px 470; $rq.Controls.Add($ChainUI.EName)
+    New-TbLabel $rq 'Method and URL  (use {{variables}})' -Dim | Out-Null
+    $mu = New-Object System.Windows.Forms.FlowLayoutPanel; $mu.AutoSize = $true; $mu.WrapContents = $false; $mu.BackColor = $C.Bg
+    $ChainUI.EMethod = New-Object System.Windows.Forms.ComboBox
+    $ChainUI.EMethod.DropDownStyle = 'DropDown'; $ChainUI.EMethod.FlatStyle = 'Flat'; $ChainUI.EMethod.BackColor = $C.Bg; $ChainUI.EMethod.ForeColor = $C.Fore; $ChainUI.EMethod.Width = Px 100
+    foreach ($x in $ApiMethods) { [void]$ChainUI.EMethod.Items.Add($x) }
+    $ChainUI.EUrl = New-TbBox -Mono; $ChainUI.EUrl.Width = Px 362
+    $mu.Controls.AddRange(@($ChainUI.EMethod, $ChainUI.EUrl))
+    $rq.Controls.Add($mu)
+    $ChainUI.EStop = New-CheckBox $rq 'Stop the chain here if it fails (error, 4xx / 5xx, or a value not found)' $true
+    $ChainUI.EStop.Margin = New-Object System.Windows.Forms.Padding(0, (Px 10), 0, 0)
+    $ChainUI.EAuth = New-TbLabel $rq '' -Dim
+    $eb = New-Object System.Windows.Forms.FlowLayoutPanel; $eb.AutoSize = $true; $eb.WrapContents = $true; $eb.BackColor = $C.Bg; $eb.Margin = New-Object System.Windows.Forms.Padding(0, (Px 10), 0, 0)
+    [void](New-Button 'Run this step' 'Send only this request, with the variables and cookies from the last run (Shift+F5)' { $n = $ChainUI.Canvas.SelectedNode; if ($n) { Start-ChainRun $n.Id } } $eb $Glyph.Play 2)
+    [void](New-Button 'Open in API tester' 'Edit every detail (auth, params, form-data ...) in the API tester; then come back and press Take from API tester' {
+        $n = $ChainUI.Canvas.SelectedNode; if (-not $n) { return }
+        Save-ChainEditor
+        Show-ApiTester; Set-ApiModel $ChainUI.Data[$n.Id].Request
+    } $eb $Glyph.Globe 2)
+    [void](New-Button 'Take from API tester' 'Replace this step with the request open in the API tester' {
+        $n = $ChainUI.Canvas.SelectedNode; if (-not $n -or -not $ApiUI.Form) { Set-ChainStatus 'Open the API tester with the request first.' $C.Red; return }
+        $m = Get-ApiModel; $m.Id = $null
+        if (-not $m.Name) { $m.Name = $ChainUI.Data[$n.Id].Request.Name }
+        $ChainUI.Data[$n.Id].Request = $m
+        $ChainUI.EditId = $null; Show-ChainStep $n; Save-ChainEditor; Save-Chains
+    } $eb $Glyph.Undo 2)
+    $rq.Controls.Add($eb)
+    # headers / body / extract
+    $ChainUI.EHeaders = New-KvGrid $pHead 'Header' 'Value'
+    $bb = New-TbBar $pBody
+    New-TbLabel $bb 'Body' -Dim | Out-Null
+    $ChainUI.EBodyType = New-TbCombo $bb @('none', 'JSON', 'Text', 'XML', 'Form URL-encoded', 'Form-data') 170
+    New-TbLabel $bb '(form: one name=value per line)' -Dim | Out-Null
+    $ChainUI.EBody = New-TbBox -Mono -Multi; $ChainUI.EBody.Dock = 'Fill'
+    $pBody.Controls.Add($ChainUI.EBody); $ChainUI.EBody.BringToFront()
+    $xg = New-KvGrid $pExt 'x' 'y' -ReadOnly
+    $xg.ReadOnly = $false; $xg.AllowUserToAddRows = $true; $xg.AllowUserToDeleteRows = $true
+    $xg.Columns.Clear()
+    [void]$xg.Columns.Add('Var', 'Save as {{variable}}')
+    $fc = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
+    $fc.HeaderText = 'From'; $fc.FlatStyle = 'Flat'; foreach ($x in $ChainExtractFrom) { [void]$fc.Items.Add($x) }
+    [void]$xg.Columns.Add($fc)
+    [void]$xg.Columns.Add('Expr', 'Path / name / pattern')
+    $xg.Columns[0].FillWeight = 30; $xg.Columns[1].FillWeight = 22; $xg.Columns[2].FillWeight = 48
+    $xg.add_DefaultValuesNeeded({ param($src, $e) $e.Row.Cells[1].Value = 'JSON path' })
+    $xg.add_DataError({ param($src, $e) $e.ThrowException = $false })
+    $ChainUI.EExtract = $xg
+    $xh = New-TbBar $pExt 'Bottom'
+    $xl = New-TbLabel $xh 'JSON path: $.token, $.data.items[0].id   Header: X-Csrf-Token   Cookie: session   Regex: id="(\d+)"   Then use {{token}} in later steps.  Cookies are sent along by themselves.' -Dim
+    $xl.MaximumSize = New-Object System.Drawing.Size((Px 480), 0)
+    Select-ApiTab $etabs 'Request'
+    $ed.Visible = $false
+
+    # result + variables
+    $rtabs = New-TabSet $right.Panel2
+    $pRes = Add-ApiTab $rtabs 'Result'
+    $pVars = Add-ApiTab $rtabs 'Variables & cookies'
+    $ChainUI.Result = New-TbRtb -ReadOnly; $ChainUI.Result.Dock = 'Fill'; $pRes.Controls.Add($ChainUI.Result)
+    $ChainUI.VarsOut = New-TbRtb -ReadOnly; $ChainUI.VarsOut.Dock = 'Fill'; $pVars.Controls.Add($ChainUI.VarsOut)
+    Select-ApiTab $rtabs 'Result'
+
+    # left: palette
+    $left = New-Object System.Windows.Forms.Panel
+    $left.Dock = 'Left'; $left.Width = Px 260; $left.BackColor = $C.Panel
+    $pal = New-Object System.Windows.Forms.TreeView
+    $pal.Dock = 'Fill'; $pal.BorderStyle = 'None'; $pal.BackColor = $C.Panel; $pal.ForeColor = $C.Fore; $pal.ItemHeight = Px 26; $pal.ShowLines = $false; $pal.FullRowSelect = $true
+    $pal.add_ItemDrag({ param($src, $e) if ($e.Item.Tag) { [void]$src.DoDragDrop("devtools-chain:$($e.Item.Tag)", 'Copy') } })
+    $pal.add_NodeMouseDoubleClick({ param($src, $e) if ($e.Node.Tag) { Add-ChainFromPalette ([string]$e.Node.Tag) } })
+    $left.Controls.Add($pal)
+    $lh = New-Object System.Windows.Forms.Label
+    $lh.Text = '  DRAG ONTO THE CANVAS'; $lh.Dock = 'Top'; $lh.Height = Px 30; $lh.TextAlign = 'MiddleLeft'; $lh.Font = $FontSmall; $lh.ForeColor = $C.Accent
+    $left.Controls.Add($lh)
+    $f.Controls.Add($left)
+    $ChainUI.Palette = $pal
+
+    # canvas
+    $cv = New-Object DevChainCanvas
+    $cv.Dock = 'Fill'; $cv.UiScale = $Scale * $TextZoom; $cv.Font = $FontMain; $cv.AllowDrop = $true
+    $cv.Back = $C.Bg; $cv.GridDot = $C.Line; $cv.Card = $C.Card; $cv.Fore = $C.Fore; $cv.Dim = $C.Dim; $cv.Line = $C.Line; $cv.Accent = $C.Accent; $cv.Green = $C.Green; $cv.Red = $C.Red; $cv.Yellow = $C.Yellow
+    $cv.add_DragEnter({ param($src, $e) $e.Effect = if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::UnicodeText) -and ([string]$e.Data.GetData([System.Windows.Forms.DataFormats]::UnicodeText)).StartsWith('devtools-chain:')) { 'Copy' } else { 'None' } })
+    $cv.add_DragDrop({
+        param($src, $e)
+        $tag = ([string]$e.Data.GetData([System.Windows.Forms.DataFormats]::UnicodeText)).Substring(15)
+        $p = $src.ToCanvas($src.PointToClient((New-Object System.Drawing.Point($e.X, $e.Y))))
+        $prev = $src.SelectedNode
+        $src.SelectedNode = $null            # dropping doesn't link by itself; drag the dot for that
+        Add-ChainFromPalette $tag ($p.X - $src.NodeW / 2) ($p.Y - $src.NodeH / 2)
+    })
+    $cv.add_SelectionChanged({ param($src, $e) Show-ChainStep $src.SelectedNode })
+    $cv.add_Changed({ param($src, $e) Update-ChainOrder; Save-Chains })
+    $cv.add_NodeOpen({ Select-ApiTab $ChainUI.ETabs 'Request'; [void]$ChainUI.EUrl.Focus() })
+    $cm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $cm.add_Opening({
+        param($src, $e)
+        $src.Items.Clear()
+        $cv2 = $ChainUI.Canvas
+        $pt = $cv2.ToCanvas($cv2.PointToClient([System.Windows.Forms.Cursor]::Position))
+        $src.Tag = $pt
+        $add = New-Object System.Windows.Forms.ToolStripMenuItem('Add a request here', (New-GlyphImage $Glyph.Add))
+        foreach ($k in (Get-ChainTemplates).Keys) { $it = $add.DropDownItems.Add($k, $null, { param($s2, $e2) $p = $s2.OwnerItem.Owner.Tag; Add-ChainFromPalette $s2.Tag ($p.X) ($p.Y) }); $it.Tag = "tpl:$k" }
+        if ($ApiUI.Collections.Count) { [void]$add.DropDownItems.Add('-') }
+        foreach ($m in $ApiUI.Collections) { $it = $add.DropDownItems.Add("$($m.Method)  $($m.Folder) / $($m.Name)", $null, { param($s2, $e2) $p = $s2.OwnerItem.Owner.Tag; Add-ChainFromPalette $s2.Tag ($p.X) ($p.Y) }); $it.Tag = "req:$($m.Id)" }
+        $add.DropDown.Renderer = $MenuRenderer
+        [void]$src.Items.Add($add)
+        if ($cv2.SelectedNode) {
+            [void](Add-MenuItem $src 'Run this step' { Start-ChainRun $ChainUI.Canvas.SelectedNode.Id } $Glyph.Play)
+            [void](Add-MenuItem $src 'Duplicate' { $n = $ChainUI.Canvas.SelectedNode; $m = $ChainUI.Data[$n.Id].Request | ConvertTo-Json -Depth 6 | ConvertFrom-Json; $sel = $ChainUI.Canvas.SelectedNode; $ChainUI.Canvas.SelectedNode = $null; $x = Add-ChainStep $m ($sel.X + (Px 30)) ($sel.Y + (Px 100)); foreach ($r in $ChainUI.Data[$sel.Id].Extract) { $ChainUI.Data[$x.Id].Extract.Add($r) }; Save-Chains } $Glyph.Copy)
+            [void](Add-MenuItem $src 'Delete' { $ChainUI.Canvas.RemoveSelected() } $Glyph.Delete 'Del')
+        } elseif ($cv2.SelectedLink) { [void](Add-MenuItem $src 'Delete arrow' { $ChainUI.Canvas.RemoveSelected() } $Glyph.Delete 'Del') }
+    })
+    $cv.ContextMenuStrip = $cm
+    $f.Controls.Add($cv)
+    $cv.BringToFront()
+    $ChainUI.Canvas = $cv
+
+    # top bar
+    $top = New-Object System.Windows.Forms.FlowLayoutPanel
+    $top.Dock = 'Top'; $top.AutoSize = $true; $top.WrapContents = $true; $top.BackColor = $C.Panel
+    $top.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 4))
+    New-TbLabel $top 'Chain' -Dim | Out-Null
+    $ChainUI.ChainBox = New-TbCombo $top @() 220
+    $ChainUI.ChainBox.add_SelectedIndexChanged({ param($src, $e) if ($ChainUI.Loading -or $src.SelectedIndex -lt 0) { return }; Save-ChainEditor; Save-Chains; Open-Chain $ChainUI.Chains[$src.SelectedIndex] })
+    [void](New-Button 'New' 'New chain' { $n = Read-TextDialog 'New chain' 'Name' 'New chain' $ChainUI.Form; if ($n) { Save-ChainEditor; Save-Chains; $c = New-ChainRecord $n.Trim(); $ChainUI.Chains.Add($c); Open-Chain $c; Update-ChainCombo; Save-Chains } } $top $Glyph.Add 2)
+    [void](New-Button 'Rename' 'Rename this chain' { $c = $ChainUI.Current; $n = Read-TextDialog 'Rename chain' 'Name' $c.Name $ChainUI.Form; if ($n) { $c.Name = $n.Trim(); Update-ChainCombo; Save-Chains } } $top $Glyph.Edit 2)
+    [void](New-Button 'Delete' 'Delete this chain' {
+        $c = $ChainUI.Current
+        if ([System.Windows.Forms.MessageBox]::Show($ChainUI.Form, "Delete the chain $($c.Name)?", 'API chains', 'YesNo', 'Warning') -ne 'Yes') { return }
+        [void]$ChainUI.Chains.Remove($c)
+        if (-not $ChainUI.Chains.Count) { $ChainUI.Chains.Add((New-ChainRecord 'My chain')) }
+        $ChainUI.EditId = $null
+        Open-Chain $ChainUI.Chains[0]; Update-ChainCombo; Save-Chains
+    } $top $Glyph.Delete 2)
+    $ChainUI.RunBtn = New-Button 'Run chain' 'Run every step in order (F5). Steps after a failed step are skipped.' { Start-ChainRun } $top $Glyph.Play 1
+    [void](New-Button 'Variables...' 'Start values for {{variables}}, e.g. baseUrl, user, password' { Show-ChainVarsDialog } $top $Glyph.Code 2)
+    New-TbLabel $top '  Environment' -Dim | Out-Null
+    $ChainUI.EnvBox = New-TbCombo $top @(@('(none)') + @($ApiUI.Environments | ForEach-Object { [string]$_.Name })) 150
+    $ChainUI.EnvBox.SelectedIndex = [math]::Max(0, @($ApiUI.Environments | ForEach-Object { [string]$_.Name }).IndexOf([string]$ApiUI.EnvName) + 1)
+    $ChainUI.EnvBox.add_SelectedIndexChanged({ param($src, $e) $ApiUI.EnvName = if ($src.SelectedIndex -le 0) { '' } else { [string]$src.SelectedItem }; if ($ApiUI.EnvBox -and -not $ApiUI.EnvBox.IsDisposed) { Update-ApiEnvCombo } })
+    $ChainUI.AutoCookies = New-CheckBox $top 'Send cookies along' $true 'Cookies a response sets are sent with the next requests to the same site (like a browser)'
+    $ChainUI.AutoCookies.add_CheckedChanged({ param($src, $e) if ($ChainUI.Current -and -not $ChainUI.Loading) { $ChainUI.Current.AutoCookies = $src.Checked; Save-Chains } })
+    [void](New-Button 'Add request' 'Add an empty request after the selected one' { Add-ChainFromPalette 'tpl:New empty request' } $top $Glyph.Add 2)
+    [void](New-Button 'Arrange' 'Line the cards up in run order (drag on empty space to scroll the canvas)' { Invoke-ChainArrange } $top $Glyph.Apps 2)
+    $f.Controls.Add($top)
+
+    $status = New-Object System.Windows.Forms.Label
+    $status.Dock = 'Bottom'; $status.Height = $FontMain.Height + (Px 10); $status.TextAlign = 'MiddleLeft'; $status.ForeColor = $C.Dim; $status.BackColor = $C.Panel
+    $status.Padding = New-Object System.Windows.Forms.Padding((Px 10), 0, 0, 0)
+    $f.Controls.Add($status)
+    $ChainUI.Status = $status
+
+    # editing writes back to the card and is saved shortly after
+    $ChainUI.SaveTimer = New-Object System.Windows.Forms.Timer
+    $ChainUI.SaveTimer.Interval = 800
+    $ChainUI.SaveTimer.add_Tick({ $ChainUI.SaveTimer.Stop(); Save-Chains })
+    foreach ($ctl in $ChainUI.EName, $ChainUI.EUrl, $ChainUI.EBody) { $ctl.add_TextChanged({ Start-ChainEditorSave }) }
+    $ChainUI.EMethod.add_TextChanged({ Start-ChainEditorSave })
+    $ChainUI.EBodyType.add_SelectedIndexChanged({ Start-ChainEditorSave })
+    $ChainUI.EStop.add_CheckedChanged({ Start-ChainEditorSave })
+    $ChainUI.EHeaders.add_CellEndEdit({ Start-ChainEditorSave })
+    $ChainUI.EExtract.add_CellEndEdit({ Start-ChainEditorSave })
+    $ChainUI.EExtract.add_UserDeletedRow({ Start-ChainEditorSave })
+    $ChainUI.EHeaders.add_UserDeletedRow({ Start-ChainEditorSave })
+
+    $ChainUI.Timer = New-Object System.Windows.Forms.Timer
+    $ChainUI.Timer.Interval = 100
+    $ChainUI.Timer.add_Tick({ Complete-ChainStep })
+
+    $f.add_KeyDown({
+        param($src, $e)
+        if ($e.KeyCode -eq 'F5' -and $e.Shift) { $n = $ChainUI.Canvas.SelectedNode; if ($n) { Start-ChainRun $n.Id }; $e.Handled = $true }
+        elseif ($e.KeyCode -eq 'F5') { Start-ChainRun; $e.Handled = $true }
+    })
+    $f.add_FormClosing({ Save-ChainEditor; Save-Chains; Stop-ChainRun })
+    $f.add_FormClosed({ param($src, $e) $ChainUI.Form = $null; $ChainUI.Canvas = $null; $ChainUI.EditId = $null; $ChainUI.Timer.Dispose(); $ChainUI.SaveTimer.Dispose(); $src.Dispose() })
+    Register-ThemedWindow $f
+
+    Update-ChainPalette
+    $ChainUI.Current = $ChainUI.Chains[0]
+    Update-ChainCombo
+    Open-Chain $ChainUI.Current
+    Set-ChainStatus 'F5 runs the chain. Values taken from a response are available to the next steps as {{name}}.' $C.Dim
+    $f.Show()
+    [PowerClipHost]::EnsureShown($f.Handle)
+    $f.Activate()
+}
+
 function Open-ApiText([string]$Text) {
     $t = $Text.Trim()
     if ($t -match '^curl(\.exe)?\s') { Import-ApiCurl $t; return }
@@ -12784,6 +13483,7 @@ Register-PaletteCommand 'Find in files' 'Ctrl+Shift+F' $Glyph.Search { Show-Find
 Register-PaletteCommand 'Transform text' 'Ctrl+T' $Glyph.Code { [void](Show-Transform) } 'hex base64 hash aes encode decode'
 Register-PaletteCommand 'Network tools' 'Ctrl+Shift+N' $Glyph.Network { [void](Show-Network) } 'ping tcp nslookup dns traceroute'
 Register-PaletteCommand 'API tester' 'Ctrl+Shift+A' $Glyph.Globe { Show-ApiTester } 'http rest postman curl'
+Register-PaletteCommand 'API chains' '' $Glyph.Apps { Show-ApiChains } 'chain flow login cookie token sequence workflow requests http'
 Register-PaletteCommand 'Edit the picture on the clipboard' '' $Glyph.Photo { Edit-ClipboardImage } 'image screenshot annotate draw arrow crop blur'
 Register-PaletteCommand 'Paste stack: collect what I copy next' '' $Glyph.Paste { Start-PasteStack } 'queue paste one after another multiple sequence'
 Register-PaletteCommand 'Paste stack: paste the next one' 'Ctrl+Alt+Space' $Glyph.Paste { Invoke-PasteNext } 'queue'
@@ -13542,6 +14242,267 @@ public static class DevMouse {
 
     // Keeps the PC and the screen from sleeping (or lets them again).
     public static void KeepAwake(bool on) { SetThreadExecutionState(on ? 0x80000003u : 0x80000000u); }
+}
+
+// ---- API chains: request cards on a canvas, joined by arrows (drag from a card's right dot to another card) ----
+public class ChainNode {
+    public string Id = Guid.NewGuid().ToString("N"), Title = "", Method = "GET", Url = "", State = "", Info = "";
+    public float X, Y;
+    public int Order;
+}
+public class ChainLink { public string From, To; }
+
+public class DevChainCanvas : System.Windows.Forms.Panel {
+    public List<ChainNode> Nodes = new List<ChainNode>();
+    public List<ChainLink> Links = new List<ChainLink>();
+    public float UiScale = 1f;
+    public System.Drawing.Color Back = System.Drawing.Color.White, GridDot = System.Drawing.Color.Gainsboro, Card = System.Drawing.Color.White,
+        Fore = System.Drawing.Color.Black, Dim = System.Drawing.Color.Gray, Line = System.Drawing.Color.Silver, Accent = System.Drawing.Color.RoyalBlue,
+        Green = System.Drawing.Color.SeaGreen, Red = System.Drawing.Color.Crimson, Yellow = System.Drawing.Color.Goldenrod;
+    public ChainNode SelectedNode;
+    public ChainLink SelectedLink;
+    public string RunningId;
+    public System.Drawing.PointF Pan = new System.Drawing.PointF(0, 0);
+    public event EventHandler SelectionChanged, Changed, NodeOpen;
+
+    enum Mode { None, Drag, Link, Pan }
+    Mode mode = Mode.None;
+    System.Drawing.PointF grab, mouse, panStart;
+    System.Drawing.Point downAt;
+    ChainNode linkFrom;
+    bool moved;
+
+    public DevChainCanvas() {
+        SetStyle(System.Windows.Forms.ControlStyles.AllPaintingInWmPaint | System.Windows.Forms.ControlStyles.OptimizedDoubleBuffer |
+                 System.Windows.Forms.ControlStyles.UserPaint | System.Windows.Forms.ControlStyles.ResizeRedraw | System.Windows.Forms.ControlStyles.Selectable, true);
+        TabStop = true;
+    }
+
+    float S(float v) { return v * UiScale; }
+    public float NodeW { get { return S(240); } }
+    public float NodeH { get { return S(74); } }
+
+    public System.Drawing.PointF ToCanvas(System.Drawing.Point p) { return new System.Drawing.PointF(p.X - Pan.X, p.Y - Pan.Y); }
+    System.Drawing.RectangleF Box(ChainNode n) { return new System.Drawing.RectangleF(n.X + Pan.X, n.Y + Pan.Y, NodeW, NodeH); }
+    System.Drawing.PointF OutPort(ChainNode n) { var r = Box(n); return new System.Drawing.PointF(r.Right, r.Y + r.Height / 2); }
+    System.Drawing.PointF InPort(ChainNode n) { var r = Box(n); return new System.Drawing.PointF(r.X, r.Y + r.Height / 2); }
+    public ChainNode Find(string id) { foreach (var n in Nodes) if (n.Id == id) return n; return null; }
+
+    public ChainNode AddNode(string title, string method, string url, float x, float y) {
+        var n = new ChainNode { Title = title, Method = method, Url = url, X = x, Y = y };
+        Nodes.Add(n);
+        Invalidate();
+        return n;
+    }
+
+    public void SelectNode(ChainNode n) {
+        SelectedNode = n; SelectedLink = null;
+        Invalidate();
+        if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty);
+    }
+
+    public void RemoveSelected() {
+        if (SelectedNode != null) {
+            var id = SelectedNode.Id;
+            Nodes.Remove(SelectedNode);
+            Links.RemoveAll(l => l.From == id || l.To == id);
+            SelectedNode = null;
+        } else if (SelectedLink != null) { Links.Remove(SelectedLink); SelectedLink = null; }
+        else return;
+        Invalidate();
+        if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty);
+        if (Changed != null) Changed(this, EventArgs.Empty);
+    }
+
+    // true when "to" can already reach "from" (a new link would make a loop)
+    bool Reaches(string start, string target) {
+        var seen = new HashSet<string>(); var stack = new Stack<string>(); stack.Push(start);
+        while (stack.Count > 0) {
+            var c = stack.Pop();
+            if (c == target) return true;
+            if (!seen.Add(c)) continue;
+            foreach (var l in Links) if (l.From == c) stack.Push(l.To);
+        }
+        return false;
+    }
+
+    public bool Connect(string from, string to) {
+        if (from == to || Links.Any(l => l.From == from && l.To == to) || Reaches(to, from)) return false;
+        Links.Add(new ChainLink { From = from, To = to });
+        Invalidate();
+        if (Changed != null) Changed(this, EventArgs.Empty);
+        return true;
+    }
+
+    ChainNode NodeAt(System.Drawing.PointF p) {
+        for (int i = Nodes.Count - 1; i >= 0; i--) { var r = Box(Nodes[i]); r.Inflate(S(6), 0); if (r.Contains(p)) return Nodes[i]; }
+        return null;
+    }
+
+    static float Dist(System.Drawing.PointF a, System.Drawing.PointF b) { float dx = a.X - b.X, dy = a.Y - b.Y; return (float)Math.Sqrt(dx * dx + dy * dy); }
+
+    static System.Drawing.PointF Bez(System.Drawing.PointF a, System.Drawing.PointF b, System.Drawing.PointF c, System.Drawing.PointF d, float t) {
+        float u = 1 - t;
+        return new System.Drawing.PointF(u * u * u * a.X + 3 * u * u * t * b.X + 3 * u * t * t * c.X + t * t * t * d.X,
+                                         u * u * u * a.Y + 3 * u * u * t * b.Y + 3 * u * t * t * c.Y + t * t * t * d.Y);
+    }
+
+    void Curve(System.Drawing.PointF a, System.Drawing.PointF d, out System.Drawing.PointF b, out System.Drawing.PointF c) {
+        float dx = Math.Max(S(50), Math.Abs(d.X - a.X) / 2);
+        b = new System.Drawing.PointF(a.X + dx, a.Y); c = new System.Drawing.PointF(d.X - dx, d.Y);
+    }
+
+    ChainLink LinkAt(System.Drawing.PointF p) {
+        foreach (var l in Links) {
+            var f = Find(l.From); var t = Find(l.To);
+            if (f == null || t == null) continue;
+            var a = OutPort(f); var d = InPort(t); System.Drawing.PointF b, c; Curve(a, d, out b, out c);
+            for (int i = 0; i <= 30; i++) if (Dist(Bez(a, b, c, d, i / 30f), p) < S(7)) return l;
+        }
+        return null;
+    }
+
+    protected override void OnMouseDown(System.Windows.Forms.MouseEventArgs e) {
+        base.OnMouseDown(e);
+        Focus();
+        var p = new System.Drawing.PointF(e.X, e.Y);
+        downAt = e.Location; moved = false;
+        var n = NodeAt(p);
+        if (n != null && Dist(OutPort(n), p) < S(12) && e.Button == System.Windows.Forms.MouseButtons.Left) {
+            mode = Mode.Link; linkFrom = n; mouse = p; SelectNode(n); return;
+        }
+        if (n != null) {
+            SelectNode(n);
+            if (e.Button == System.Windows.Forms.MouseButtons.Left) { mode = Mode.Drag; grab = new System.Drawing.PointF(p.X - n.X, p.Y - n.Y); }
+            return;
+        }
+        var l = LinkAt(p);
+        if (l != null) { SelectedNode = null; SelectedLink = l; Invalidate(); if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); return; }
+        SelectNode(null);
+        if (e.Button == System.Windows.Forms.MouseButtons.Left || e.Button == System.Windows.Forms.MouseButtons.Middle) { mode = Mode.Pan; panStart = new System.Drawing.PointF(e.X - Pan.X, e.Y - Pan.Y); Cursor = System.Windows.Forms.Cursors.SizeAll; }
+    }
+
+    protected override void OnMouseMove(System.Windows.Forms.MouseEventArgs e) {
+        base.OnMouseMove(e);
+        var p = new System.Drawing.PointF(e.X, e.Y);
+        if (Math.Abs(e.X - downAt.X) + Math.Abs(e.Y - downAt.Y) > 3) moved = true;
+        if (mode == Mode.Drag && SelectedNode != null) { SelectedNode.X = (float)Math.Round(p.X - grab.X); SelectedNode.Y = (float)Math.Round(p.Y - grab.Y); Invalidate(); }
+        else if (mode == Mode.Link) { mouse = p; Invalidate(); }
+        else if (mode == Mode.Pan) { Pan = new System.Drawing.PointF(e.X - panStart.X, e.Y - panStart.Y); Invalidate(); }
+        else {
+            var n = NodeAt(p);
+            Cursor = n != null && Dist(OutPort(n), p) < S(12) ? System.Windows.Forms.Cursors.Cross : n != null ? System.Windows.Forms.Cursors.Hand : System.Windows.Forms.Cursors.Default;
+        }
+    }
+
+    protected override void OnMouseUp(System.Windows.Forms.MouseEventArgs e) {
+        base.OnMouseUp(e);
+        var p = new System.Drawing.PointF(e.X, e.Y);
+        if (mode == Mode.Link) {
+            var t = NodeAt(p);
+            if (t != null && t != linkFrom) Connect(linkFrom.Id, t.Id);
+            Invalidate();
+        } else if (mode == Mode.Drag && moved && Changed != null) Changed(this, EventArgs.Empty);
+        mode = Mode.None; linkFrom = null; Cursor = System.Windows.Forms.Cursors.Default;
+    }
+
+    protected override void OnMouseDoubleClick(System.Windows.Forms.MouseEventArgs e) {
+        base.OnMouseDoubleClick(e);
+        if (NodeAt(new System.Drawing.PointF(e.X, e.Y)) != null && NodeOpen != null) NodeOpen(this, EventArgs.Empty);
+    }
+
+    protected override bool IsInputKey(System.Windows.Forms.Keys k) { return k == System.Windows.Forms.Keys.Delete || base.IsInputKey(k); }
+    protected override void OnKeyDown(System.Windows.Forms.KeyEventArgs e) {
+        base.OnKeyDown(e);
+        if (e.KeyCode == System.Windows.Forms.Keys.Delete) { RemoveSelected(); e.Handled = true; }
+    }
+
+    System.Drawing.Color MethodColor(string m) {
+        switch ((m ?? "").ToUpperInvariant()) {
+            case "GET": return Green; case "POST": return System.Drawing.Color.FromArgb(230, 126, 34); case "PUT": return Accent;
+            case "PATCH": return System.Drawing.Color.FromArgb(142, 68, 173); case "DELETE": return Red; default: return Dim;
+        }
+    }
+
+    static System.Drawing.Drawing2D.GraphicsPath Round(System.Drawing.RectangleF r, float rad) {
+        var p = new System.Drawing.Drawing2D.GraphicsPath(); float d = rad * 2;
+        p.AddArc(r.X, r.Y, d, d, 180, 90); p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90); p.AddArc(r.X, r.Bottom - d, d, d, 90, 90); p.CloseFigure();
+        return p;
+    }
+
+    void Arrow(System.Drawing.Graphics g, System.Drawing.PointF a, System.Drawing.PointF d, System.Drawing.Color col, float w) {
+        System.Drawing.PointF b, c; Curve(a, d, out b, out c);
+        using (var pen = new System.Drawing.Pen(col, w)) {
+            g.DrawBezier(pen, a, b, c, new System.Drawing.PointF(d.X - S(6), d.Y));
+        }
+        var tip = d; float s = S(8);
+        using (var br = new System.Drawing.SolidBrush(col))
+            g.FillPolygon(br, new[] { tip, new System.Drawing.PointF(tip.X - s * 1.3f, tip.Y - s * 0.7f), new System.Drawing.PointF(tip.X - s * 1.3f, tip.Y + s * 0.7f) });
+    }
+
+    protected override void OnPaint(System.Windows.Forms.PaintEventArgs e) {
+        var g = e.Graphics;
+        g.Clear(Back);
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+        float step = S(24);
+        using (var dot = new System.Drawing.SolidBrush(GridDot)) {
+            float ox = Pan.X % step, oy = Pan.Y % step;
+            for (float x = ox; x < Width; x += step) for (float y = oy; y < Height; y += step) g.FillRectangle(dot, x, y, S(1.6f), S(1.6f));
+        }
+        if (Nodes.Count == 0) {
+            using (var f = new System.Drawing.Font(Font.FontFamily, Font.Size * 1.1f))
+            using (var br = new System.Drawing.SolidBrush(Dim)) {
+                var sf = new System.Drawing.StringFormat { Alignment = System.Drawing.StringAlignment.Center, LineAlignment = System.Drawing.StringAlignment.Center };
+                g.DrawString("Drag requests here from the list on the left (or right-click: Add a request).\nThen drag from a card's right dot to the next card to chain them.", f, br, ClientRectangle, sf);
+            }
+        }
+        foreach (var l in Links) {
+            var f = Find(l.From); var t = Find(l.To);
+            if (f == null || t == null) continue;
+            var col = l == SelectedLink ? Accent : (t.State == "ok" && f.State == "ok") ? Green : Line;
+            Arrow(g, OutPort(f), InPort(t), col, l == SelectedLink ? S(3) : S(2));
+        }
+        if (mode == Mode.Link && linkFrom != null) Arrow(g, OutPort(linkFrom), mouse, Accent, S(2));
+
+        using (var titleF = new System.Drawing.Font(Font.FontFamily, Font.Size, System.Drawing.FontStyle.Bold))
+        using (var small = new System.Drawing.Font(Font.FontFamily, Font.Size * 0.85f))
+        using (var badgeF = new System.Drawing.Font(Font.FontFamily, Font.Size * 0.75f, System.Drawing.FontStyle.Bold)) {
+            foreach (var n in Nodes) {
+                var r = Box(n);
+                bool sel = n == SelectedNode, run = n.Id == RunningId;
+                var stateCol = run ? Accent : n.State == "ok" ? Green : n.State == "fail" ? Red : n.State == "skip" ? Yellow : Line;
+                using (var path = Round(r, S(8))) {
+                    using (var shadow = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(28, 0, 0, 0))) { g.TranslateTransform(0, S(2)); g.FillPath(shadow, path); g.ResetTransform(); }
+                    using (var br = new System.Drawing.SolidBrush(Card)) g.FillPath(br, path);
+                    using (var pen = new System.Drawing.Pen(sel || run ? Accent : Line, sel || run ? S(2) : 1)) g.DrawPath(pen, path);
+                }
+                using (var br = new System.Drawing.SolidBrush(stateCol)) g.FillRectangle(br, r.X + S(1), r.Y + S(8), S(4), r.Height - S(16));
+                // order number
+                if (n.Order > 0) using (var br = new System.Drawing.SolidBrush(Dim)) g.DrawString(n.Order.ToString(), small, br, r.Right - S(22), r.Y + S(6));
+                // method badge
+                var m = (n.Method ?? "GET").ToUpperInvariant();
+                var bs = g.MeasureString(m, badgeF);
+                var badge = new System.Drawing.RectangleF(r.X + S(12), r.Y + S(9), bs.Width + S(8), bs.Height + S(2));
+                using (var bp = Round(badge, S(4))) using (var br = new System.Drawing.SolidBrush(MethodColor(m))) g.FillPath(br, bp);
+                g.DrawString(m, badgeF, System.Drawing.Brushes.White, badge.X + S(4), badge.Y + S(1));
+                var tf = new System.Drawing.StringFormat { Trimming = System.Drawing.StringTrimming.EllipsisCharacter, FormatFlags = System.Drawing.StringFormatFlags.NoWrap };
+                using (var br = new System.Drawing.SolidBrush(Fore))
+                    g.DrawString(n.Title == "" ? "(no name)" : n.Title, titleF, br, new System.Drawing.RectangleF(badge.Right + S(6), r.Y + S(7), r.Right - badge.Right - S(32), titleF.Height + 2), tf);
+                using (var br = new System.Drawing.SolidBrush(Dim))
+                    g.DrawString(n.Url, small, br, new System.Drawing.RectangleF(r.X + S(12), r.Y + S(31), r.Width - S(22), small.Height + 2), tf);
+                if (n.Info != "") using (var br = new System.Drawing.SolidBrush(n.State == "fail" ? Red : n.State == "ok" ? Green : Dim))
+                    g.DrawString(n.Info, small, br, new System.Drawing.RectangleF(r.X + S(12), r.Y + S(50), r.Width - S(22), small.Height + 2), tf);
+                // ports
+                float pr = S(5);
+                var ip = InPort(n); var op = OutPort(n);
+                using (var br = new System.Drawing.SolidBrush(Card)) { g.FillEllipse(br, ip.X - pr, ip.Y - pr, pr * 2, pr * 2); g.FillEllipse(br, op.X - pr, op.Y - pr, pr * 2, pr * 2); }
+                using (var pen = new System.Drawing.Pen(Dim, S(1.5f))) g.DrawEllipse(pen, ip.X - pr, ip.Y - pr, pr * 2, pr * 2);
+                using (var br = new System.Drawing.SolidBrush(Accent)) g.FillEllipse(br, op.X - pr, op.Y - pr, pr * 2, pr * 2);
+            }
+        }
+    }
 }
 
 public static class DevEnv {
