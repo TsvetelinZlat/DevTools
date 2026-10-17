@@ -4152,11 +4152,13 @@ public class PowerClipHttp {
         }
     }
 
-    // Colours: 1 punctuation, 2 keys, 3 strings, 4 numbers, 5 true/false/null.
+    // Colours: 1 punctuation, 2 keys, 3 strings, 4 numbers, 5 true/false/null. Light = for a white background.
+    public static bool Light;
     public static string JsonToRtf(string json, string fontName, int halfPoints) {
         var sb = new StringBuilder();
         sb.Append("{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0\\fmodern " + fontName + ";}}");
-        sb.Append("{\\colortbl;\\red200\\green200\\blue200;\\red156\\green220\\blue254;\\red206\\green145\\blue120;\\red181\\green206\\blue168;\\red86\\green156\\blue214;}");
+        if (Light) sb.Append("{\\colortbl;\\red100\\green100\\blue100;\\red4\\green81\\blue165;\\red163\\green21\\blue21;\\red9\\green134\\blue88;\\red0\\green0\\blue255;}");
+        else sb.Append("{\\colortbl;\\red200\\green200\\blue200;\\red156\\green220\\blue254;\\red206\\green145\\blue120;\\red181\\green206\\blue168;\\red86\\green156\\blue214;}");
         sb.Append("\\f0\\fs" + halfPoints + " ");
         int i = 0;
         while (i < json.Length) {
@@ -7485,7 +7487,21 @@ function Set-ControlTheme($Ctl, $Map, [bool]$Dark) {
 }
 
 # Every window calls this once: theme title bar + scrollbars when shown, and re-theme on switches.
+function Limit-FormToScreen($F) {
+    $wa = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).WorkingArea
+    $maxW = [int]($wa.Width * 0.96); $maxH = [int]($wa.Height * 0.96)
+    if ($F.MinimumSize.Width -gt $maxW -or $F.MinimumSize.Height -gt $maxH) { $F.MinimumSize = New-Object System.Drawing.Size([Math]::Min($F.MinimumSize.Width, $maxW), [Math]::Min($F.MinimumSize.Height, $maxH)) }
+    $w = [Math]::Min($F.Width, $maxW); $h = [Math]::Min($F.Height, $maxH)
+    $resized = $w -ne $F.Width -or $h -ne $F.Height
+    if ($resized) { $F.Size = New-Object System.Drawing.Size($w, $h) }
+    $b = $F.Bounds
+    if ($resized -or $b.Right -gt $wa.Right -or $b.Bottom -gt $wa.Bottom -or $b.Left -lt $wa.Left -or $b.Top -lt $wa.Top) {
+        $F.Location = New-Object System.Drawing.Point(($wa.X + [int](($wa.Width - $F.Width) / 2)), ($wa.Y + [int](($wa.Height - $F.Height) / 2)))
+    }
+}
+
 function Register-ThemedWindow($Window) {
+    $Window.add_Load({ param($src, $e) if ($src.WindowState -eq 'Normal' -and -not ($src -is [PowerClipToast])) { try { Limit-FormToScreen $src } catch { } } })
     $Window.add_HandleCreated({ param($src, $e) [PowerClipTheme]::TitleBar($src.Handle, $script:IsDark) })
     $Window.add_Shown({ param($src, $e) Set-ControlTheme $src $null $script:IsDark })
     $Window.add_FormClosed({ param($src, $e) [void]$script:ThemedWindows.Remove($src) })
@@ -9974,6 +9990,7 @@ function Format-ApiBody($Resp, [bool]$Pretty) {
     if ($Resp.ContentType -match 'json' -or $trim.StartsWith('{') -or $trim.StartsWith('[')) {
         try {
             $formatted = [PowerClipTransform]::Run('JSON pretty print', $text, '')
+            [PowerClipHttp]::Light = -not $script:IsDark
             $rtb.Rtf = [PowerClipHttp]::JsonToRtf($formatted, 'Consolas', 21)
             return
         } catch { }
@@ -10256,7 +10273,8 @@ function New-TabSet($Parent) {
     $holder.Dock = 'Fill'; $holder.BackColor = $C.Bg
     $Parent.Controls.Add($holder)
     $strip = New-Object System.Windows.Forms.FlowLayoutPanel
-    $strip.Dock = 'Top'; $strip.Height = Px 34; $strip.WrapContents = $false; $strip.BackColor = $C.Panel
+    $strip.Dock = 'Top'; $strip.Height = Px 34; $strip.WrapContents = $true; $strip.BackColor = $C.Panel
+    $strip.AutoSize = $true; $strip.AutoSizeMode = 'GrowAndShrink'; $strip.MinimumSize = New-Object System.Drawing.Size(0, (Px 34))
     $strip.Padding = New-Object System.Windows.Forms.Padding((Px 4), (Px 2), 0, 0)
     $Parent.Controls.Add($strip)
     @{ Host = $holder; Strip = $strip; Panels = @{}; Buttons = @{}; Current = '' }
@@ -10355,6 +10373,20 @@ function Update-ApiAuthView {
 }
 
 # ---- the window -----------------------------------------------------------------------------------
+
+# Narrow window: drop the "Environment" label, then narrow the list, so the URL never disappears.
+function Update-ApiTopLayout {
+    $t = $ApiUI.Top
+    if (-not $t -or $t.IsDisposed) { return }
+    $fixed = (Px 110) + (Px 90) + (Px 70) + (Px 50) + $t.Padding.Horizontal
+    $room = $t.ClientSize.Width - $fixed
+    $label = if ($room - (Px 280) - (Px 190) -ge (Px 320)) { Px 90 } else { 0 }
+    $combo = [Math]::Max((Px 110), [Math]::Min((Px 190), $room - $label - (Px 320)))
+    $t.SuspendLayout()
+    $t.ColumnStyles[4].Width = $label
+    $t.ColumnStyles[5].Width = $combo
+    $t.ResumeLayout()
+}
 
 function Show-ApiTester([string]$Text = '') {
     Hide-Picker
@@ -10541,7 +10573,8 @@ function Show-ApiTester([string]$Text = '') {
     $tooltip.SetToolTip($envBtn, 'Edit environments and their variables. Use them anywhere as {{name}}.')
     $top.Controls.Add($envBtn, 6, 0)
     $main.Controls.Add($top)
-    $ApiUI.Method = $meth; $ApiUI.Url = $url; $ApiUI.Send = $send; $ApiUI.EnvBox = $envBox
+    $ApiUI.Method = $meth; $ApiUI.Url = $url; $ApiUI.Send = $send; $ApiUI.EnvBox = $envBox; $ApiUI.Top = $top
+    $top.add_Resize({ Update-ApiTopLayout })
 
     # --- left side: collections and history
     $left = New-Object System.Windows.Forms.SplitContainer
@@ -10815,12 +10848,12 @@ function Invoke-ChainArrange {
     foreach ($n in @(Get-ChainOrder)) { $c = $depth[$n.Id]; $rows[$c] = [int]$rows[$c] + 1 }
     $tallest = [math]::Max(1, ($rows.Values | Measure-Object -Maximum).Maximum)
     # as many columns as fit across, then the next ones continue in a band below
-    $fit = [math]::Max(1, [math]::Floor(($cv.Width - (Px 60)) / ($cv.NodeW + (Px 70))))
+    $fit = [math]::Max(1, [math]::Floor(($cv.Width - (Px 40)) / ($cv.NodeW + (Px 44))))
     $band = $tallest * ($cv.NodeH + (Px 40)) + (Px 40)
     $used = @{}
     foreach ($n in @(Get-ChainOrder)) {
         $c = $depth[$n.Id]; $r = [int]$used[$c]; $used[$c] = $r + 1
-        $n.X = (Px 40) + ($c % $fit) * ($cv.NodeW + (Px 70)); $n.Y = (Px 50) + [math]::Floor($c / $fit) * $band + $r * ($cv.NodeH + (Px 40))
+        $n.X = (Px 40) + ($c % $fit) * ($cv.NodeW + (Px 44)); $n.Y = (Px 50) + [math]::Floor($c / $fit) * $band + $r * ($cv.NodeH + (Px 40))
     }
     $cv.Pan = New-Object System.Drawing.PointF(0, 0)
     $cv.Invalidate()
