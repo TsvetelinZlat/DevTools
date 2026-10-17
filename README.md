@@ -318,6 +318,20 @@ Build a flow of requests on a canvas, for example: log in, then use the cookie o
 - **Environments** (the **...** button next to the Environment list) hold variables. Write `{{name}}` anywhere (URL, params, headers, auth, body) and it's replaced with the value from the selected environment, e.g. `{{baseUrl}}/users` with `baseUrl = https://api.example.com`. Unknown variables are reported in the status bar.
 - Everything is kept in `data\api\` (collections, history, environments, and the last request, which reopens next time).
 
+## Git
+
+**Git** in the command palette or the tray menu. It uses the `git.exe` already on the PC (Git for Windows, or the one inside GitHub Desktop); DevTools installs nothing. Without git the window just says that git isn't installed.
+
+- **Repository**: open any folder (if it isn't a repository yet you can `git init` it), or **Clone...** from a URL. Recent repositories are remembered.
+- **Graph** (middle): every branch with coloured lanes, merge commits, and badges for branches, remote branches, tags and HEAD. Find a commit by text, hash, author or branch. Click a commit for its message and files; double-click a file to compare it with the version before.
+  - Right-click a commit: check it out, create a branch or tag there, merge it into your branch, rebase onto it, cherry-pick, revert, reset (soft / mixed / hard), copy its hash.
+- **Changes** (left): staged and unstaged files. Space or **Stage** / **Unstage** (or **All**), **Discard** (asks first), double-click to compare with the last commit, open the file, add it to `.gitignore`. Write the message and **Commit** (Ctrl+Enter), **Commit & push**, or **Amend last commit**.
+- **Branches**: switch (double-click or the Branch list at the top), new, rename, delete, merge, rebase, push, check out a remote branch. **Tags**, **Stashes** (stash with new files, apply, pop, show, drop) and **Remotes** (add, change URL, fetch, remove).
+- **Fetch**, **Pull**, **Push** (the first push sets the upstream) and **Force push** (with lease) run in the background; the line under the toolbar shows your branch, its upstream and how many commits are ahead / behind.
+- A merge, rebase, cherry-pick or revert with conflicts shows a yellow bar: fix the files (double-click opens them), **Mark resolved**, then **Continue** - or **Abort**.
+- **Any git command**: type it in the box at the bottom (`log --oneline -5`, `bisect start`, `submodule update` ...) and press Enter. Everything DevTools runs is shown in the log there.
+- Passwords for remotes come from Git Credential Manager; DevTools never asks for them itself.
+
 ## Notes
 
 Open with **Notes** in the picker, Ctrl+N, or the tray menu. The list on the left shows all notes, newest first; the search box finds notes by title or text.

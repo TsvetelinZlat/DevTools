@@ -6734,6 +6734,7 @@ $script:SyncDir = ''                # sync between PCs: shared folder ('' = off)
 $script:TimeZones = @('UTC', 'Pacific Standard Time', 'Eastern Standard Time', 'GMT Standard Time', 'Central Europe Standard Time', 'India Standard Time', 'Tokyo Standard Time')
 $script:Pomodoro = @{ Work = 25; Short = 5; Long = 15; Every = 4 }
 $script:Hotkeys = @{}               # global shortcuts: palette command title -> 'Ctrl+Alt+N'
+$script:GitRepos = @()              # Git window: recently opened repositories
 $script:MouseCfg = @{ Interval = 60; Mode = 'zero'; Awake = $true; OnlyIdle = $true; StopMin = 0; ClickMs = 500; Button = 'left'; Double = $false; Count = 0; Fixed = $false; X = 0; Y = 0; StopOnMove = $true }
 $script:SyncLast = $null
 $script:ExpiryRules = @('# Examples (remove the # to use them):', '# text:(?i)password 10', '# app:chrome 1440')
@@ -6822,7 +6823,7 @@ function Save-Settings {
         BackupDir = $script:BackupDir; BackupHours = $script:BackupHours; BackupKeep = $script:BackupKeep
         HostInterval = $script:HostInterval; HostNotify = $script:HostNotify
         SyncDir = $script:SyncDir; SyncLast = $(if ($script:SyncLast) { $script:SyncLast.ToString('o') } else { $null }); ExpiryRules = @($script:ExpiryRules)
-        TimeZones = @($script:TimeZones); Pomodoro = $script:Pomodoro; Hotkeys = $script:Hotkeys; Mouse = $script:MouseCfg
+        TimeZones = @($script:TimeZones); Pomodoro = $script:Pomodoro; Hotkeys = $script:Hotkeys; Mouse = $script:MouseCfg; GitRepos = @($script:GitRepos)
         BackupLast = $(if ($script:BackupLast) { $script:BackupLast.ToString('o') } else { $null }) })
     try { Write-JsonFile $SettingsFile $json } catch { }
 }
@@ -6849,6 +6850,7 @@ function Import-Data {
             if ($null -ne $s.ExpiryRules) { $script:ExpiryRules = @($s.ExpiryRules | ForEach-Object { [string]$_ }) }
             if ($null -ne $s.TimeZones) { $script:TimeZones = @($s.TimeZones | ForEach-Object { [string]$_ }) }
             if ($s.Mouse) { foreach ($p in $s.Mouse.PSObject.Properties) { if ($script:MouseCfg.ContainsKey($p.Name) -and $null -ne $p.Value) { $script:MouseCfg[$p.Name] = $p.Value } } }
+            if ($null -ne $s.GitRepos) { $script:GitRepos = @($s.GitRepos | ForEach-Object { [string]$_ } | Where-Object { $_ }) }
             if ($s.Hotkeys) { $script:Hotkeys = @{}; foreach ($p in $s.Hotkeys.PSObject.Properties) { if ($p.Value) { $script:Hotkeys[$p.Name] = [string]$p.Value } } }
             if ($s.Pomodoro) { foreach ($k in 'Work', 'Short', 'Long', 'Every') { if ([int]$s.Pomodoro.$k -gt 0) { $script:Pomodoro[$k] = [int]$s.Pomodoro.$k } } }
             if ($null -ne $s.HostNotify) { $script:HostNotify = [bool]$s.HostNotify }
@@ -13483,6 +13485,7 @@ Register-PaletteCommand 'Find in files' 'Ctrl+Shift+F' $Glyph.Search { Show-Find
 Register-PaletteCommand 'Transform text' 'Ctrl+T' $Glyph.Code { [void](Show-Transform) } 'hex base64 hash aes encode decode'
 Register-PaletteCommand 'Network tools' 'Ctrl+Shift+N' $Glyph.Network { [void](Show-Network) } 'ping tcp nslookup dns traceroute'
 Register-PaletteCommand 'API tester' 'Ctrl+Shift+A' $Glyph.Globe { Show-ApiTester } 'http rest postman curl'
+Register-PaletteCommand 'Git' '' $Glyph.Code { Show-Git } 'git repository commit branch merge push pull graph history log stash rebase'
 Register-PaletteCommand 'API chains' '' $Glyph.Apps { Show-ApiChains } 'chain flow login cookie token sequence workflow requests http'
 Register-PaletteCommand 'Edit the picture on the clipboard' '' $Glyph.Photo { Edit-ClipboardImage } 'image screenshot annotate draw arrow crop blur'
 Register-PaletteCommand 'Paste stack: collect what I copy next' '' $Glyph.Paste { Start-PasteStack } 'queue paste one after another multiple sequence'
@@ -14500,6 +14503,286 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
                 using (var br = new System.Drawing.SolidBrush(Card)) { g.FillEllipse(br, ip.X - pr, ip.Y - pr, pr * 2, pr * 2); g.FillEllipse(br, op.X - pr, op.Y - pr, pr * 2, pr * 2); }
                 using (var pen = new System.Drawing.Pen(Dim, S(1.5f))) g.DrawEllipse(pen, ip.X - pr, ip.Y - pr, pr * 2, pr * 2);
                 using (var br = new System.Drawing.SolidBrush(Accent)) g.FillEllipse(br, op.X - pr, op.Y - pr, pr * 2, pr * 2);
+            }
+        }
+    }
+}
+
+// ---- Git: run git.exe (found on the PC, never installed), and draw the commit graph ----------------
+public class GitResult { public int Code; public string Out = "", Err = ""; public string Text { get { return (Out + (Err.Length > 0 && Out.Length > 0 ? "\n" : "") + Err).TrimEnd(); } } }
+
+public class DevGit {
+    public static string Find() {
+        var paths = new List<string>();
+        foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';')) {
+            try { if (dir.Trim() != "") paths.Add(System.IO.Path.Combine(dir.Trim().Trim('"'), "git.exe")); } catch { }
+        }
+        string pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), pf86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+        string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        paths.Add(System.IO.Path.Combine(pf, @"Git\cmd\git.exe"));
+        if (pf86 != "") paths.Add(System.IO.Path.Combine(pf86, @"Git\cmd\git.exe"));
+        paths.Add(System.IO.Path.Combine(local, @"Programs\Git\cmd\git.exe"));
+        try {
+            var gd = System.IO.Path.Combine(local, "GitHubDesktop");
+            if (System.IO.Directory.Exists(gd)) foreach (var d in System.IO.Directory.GetDirectories(gd, "app-*")) paths.Add(System.IO.Path.Combine(d, @"resources\app\git\cmd\git.exe"));
+        } catch { }
+        foreach (var p in paths) { try { if (System.IO.File.Exists(p)) return p; } catch { } }
+        return null;
+    }
+
+    public string Exe, Dir;
+    public DevGit(string exe, string dir) { Exe = exe; Dir = dir; }
+
+    System.Diagnostics.Process Start(string args) {
+        var psi = new System.Diagnostics.ProcessStartInfo(Exe, "-c core.quotepath=off -c color.ui=false " + args) {
+            WorkingDirectory = Dir, UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardOutput = true, RedirectStandardError = true, RedirectStandardInput = true,
+            StandardOutputEncoding = new UTF8Encoding(false), StandardErrorEncoding = new UTF8Encoding(false)
+        };
+        psi.EnvironmentVariables["GIT_TERMINAL_PROMPT"] = "0";        // no hanging on a hidden password prompt
+        psi.EnvironmentVariables["GIT_EDITOR"] = "true";              // merges / reverts keep their default message
+        psi.EnvironmentVariables["LC_ALL"] = "C.UTF-8";
+        var p = System.Diagnostics.Process.Start(psi);
+        p.StandardInput.Close();
+        return p;
+    }
+
+    // Quick commands: waits for the result.
+    public GitResult Run(string args) {
+        var r = new GitResult();
+        using (var p = Start(args)) {
+            var err = p.StandardError.ReadToEndAsync();
+            r.Out = p.StandardOutput.ReadToEnd();
+            p.WaitForExit();
+            r.Err = err.Result;
+            r.Code = p.ExitCode;
+        }
+        return r;
+    }
+
+    // Slow commands (fetch, pull, push, clone ...): run in the background, poll Done.
+    public volatile bool Done = true;
+    public GitResult Last;
+    System.Diagnostics.Process job;
+    public void RunAsync(string args) {
+        Done = false; Last = null;
+        var t = new System.Threading.Thread(delegate() {
+            var r = new GitResult();
+            try {
+                using (var p = Start(args)) {
+                    job = p;
+                    var err = p.StandardError.ReadToEndAsync();
+                    r.Out = p.StandardOutput.ReadToEnd();
+                    p.WaitForExit();
+                    r.Err = err.Result; r.Code = p.ExitCode;
+                }
+            } catch (Exception ex) { r.Code = -1; r.Err = ex.Message; }
+            finally { job = null; Last = r; Done = true; }
+        });
+        t.IsBackground = true;
+        t.Start();
+    }
+    public void Cancel() { try { if (job != null && !job.HasExited) job.Kill(); } catch { } }
+
+    // "a b" -> a quoted argument for the command line
+    public static string Q(string s) {
+        if (s == null) return "\"\"";
+        if (s.Length > 0 && s.IndexOfAny(new[] { ' ', '\t', '"' }) < 0) return s;
+        var sb = new StringBuilder("\"");
+        int bs = 0;
+        foreach (char c in s) {
+            if (c == '\\') { bs++; continue; }
+            if (c == '"') { sb.Append('\\', bs * 2 + 1); bs = 0; sb.Append('"'); continue; }
+            sb.Append('\\', bs); bs = 0; sb.Append(c);
+        }
+        sb.Append('\\', bs * 2).Append('"');
+        return sb.ToString();
+    }
+}
+
+public class GitCommit {
+    public string Hash, Short, Author, Email, Date, Refs, Subject;
+    public string[] Parents;
+    public int Col;
+    public string[] After;      // lanes after this row (hash expected next in each lane, or null)
+    public bool IsHead;
+}
+
+public class DevGitGraph : System.Windows.Forms.Panel {
+    public List<GitCommit> Commits = new List<GitCommit>();
+    public float UiScale = 1f;
+    public int Selected = -1;
+    public string Filter = "";
+    public System.Drawing.Color Back = System.Drawing.Color.White, Fore = System.Drawing.Color.Black, Dim = System.Drawing.Color.Gray,
+        Sel = System.Drawing.Color.LightSteelBlue, Line = System.Drawing.Color.Gainsboro, Accent = System.Drawing.Color.RoyalBlue;
+    public event EventHandler SelectionChanged, Open;
+    static readonly System.Drawing.Color[] LaneColors = {
+        System.Drawing.Color.FromArgb(47, 128, 237), System.Drawing.Color.FromArgb(39, 174, 96), System.Drawing.Color.FromArgb(235, 87, 87),
+        System.Drawing.Color.FromArgb(242, 153, 74), System.Drawing.Color.FromArgb(155, 81, 224), System.Drawing.Color.FromArgb(0, 163, 163),
+        System.Drawing.Color.FromArgb(214, 69, 122), System.Drawing.Color.FromArgb(120, 130, 60) };
+
+    public DevGitGraph() {
+        SetStyle(System.Windows.Forms.ControlStyles.AllPaintingInWmPaint | System.Windows.Forms.ControlStyles.OptimizedDoubleBuffer |
+                 System.Windows.Forms.ControlStyles.UserPaint | System.Windows.Forms.ControlStyles.ResizeRedraw | System.Windows.Forms.ControlStyles.Selectable, true);
+        AutoScroll = true; TabStop = true;
+    }
+
+    float S(float v) { return v * UiScale; }
+    public int RowH { get { return (int)S(26); } }
+    float LaneW { get { return S(14); } }
+
+    // git log --format=%H%x1f%h%x1f%P%x1f%an%x1f%ae%x1f%ad%x1f%D%x1f%s  (records separated by \x1e)
+    public void Load(string log, string head) {
+        Commits.Clear();
+        foreach (var rec in log.Split('\x1e')) {
+            var r = rec.Trim('\n', '\r');
+            if (r == "") continue;
+            var f = r.Split('\x1f');
+            if (f.Length < 8) continue;
+            Commits.Add(new GitCommit { Hash = f[0], Short = f[1], Parents = f[2].Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries), Author = f[3], Email = f[4], Date = f[5], Refs = f[6], Subject = f[7], IsHead = f[0] == head });
+        }
+        BuildLanes();
+        Selected = Commits.Count > 0 ? 0 : -1;
+        AutoScrollPosition = new System.Drawing.Point(0, 0);
+        UpdateSize();
+        Invalidate();
+    }
+
+    void BuildLanes() {
+        var lanes = new List<string>();
+        foreach (var c in Commits) {
+            int col = lanes.IndexOf(c.Hash);
+            if (col < 0) { col = lanes.IndexOf(null); if (col < 0) { lanes.Add(c.Hash); col = lanes.Count - 1; } else lanes[col] = c.Hash; }
+            for (int i = 0; i < lanes.Count; i++) if (i != col && lanes[i] == c.Hash) lanes[i] = null;     // branches that end here
+            c.Col = col;
+            if (c.Parents.Length == 0) lanes[col] = null;
+            else {
+                lanes[col] = c.Parents[0];
+                for (int k = 1; k < c.Parents.Length; k++) {
+                    if (lanes.Contains(c.Parents[k])) continue;
+                    int free = lanes.IndexOf(null);
+                    if (free < 0) lanes.Add(c.Parents[k]); else lanes[free] = c.Parents[k];
+                }
+            }
+            while (lanes.Count > 0 && lanes[lanes.Count - 1] == null) lanes.RemoveAt(lanes.Count - 1);
+            c.After = lanes.ToArray();
+        }
+    }
+
+    public void UpdateSize() { AutoScrollMinSize = new System.Drawing.Size(0, Commits.Count * RowH + RowH); }
+
+    int RowAt(int y) { int r = (y - AutoScrollPosition.Y) / RowH; return r >= 0 && r < Commits.Count ? r : -1; }
+
+    public void SelectRow(int r) {
+        if (r < 0 || r >= Commits.Count) return;
+        Selected = r;
+        int top = -AutoScrollPosition.Y, y = r * RowH;
+        if (y < top) AutoScrollPosition = new System.Drawing.Point(0, y);
+        else if (y + RowH > top + ClientSize.Height) AutoScrollPosition = new System.Drawing.Point(0, y + RowH - ClientSize.Height);
+        Invalidate();
+        if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty);
+    }
+
+    public int FindNext(string text, int from) {
+        if (string.IsNullOrEmpty(text)) return -1;
+        for (int k = 1; k <= Commits.Count; k++) {
+            int i = (from + k) % Commits.Count; var c = Commits[i];
+            if (c.Subject.IndexOf(text, StringComparison.OrdinalIgnoreCase) >= 0 || c.Hash.StartsWith(text, StringComparison.OrdinalIgnoreCase) ||
+                c.Author.IndexOf(text, StringComparison.OrdinalIgnoreCase) >= 0 || c.Refs.IndexOf(text, StringComparison.OrdinalIgnoreCase) >= 0) return i;
+        }
+        return -1;
+    }
+
+    protected override void OnMouseDown(System.Windows.Forms.MouseEventArgs e) {
+        base.OnMouseDown(e); Focus();
+        int r = RowAt(e.Y); if (r >= 0) SelectRow(r);
+    }
+    protected override void OnMouseDoubleClick(System.Windows.Forms.MouseEventArgs e) { base.OnMouseDoubleClick(e); if (RowAt(e.Y) >= 0 && Open != null) Open(this, EventArgs.Empty); }
+    protected override bool IsInputKey(System.Windows.Forms.Keys k) { return k == System.Windows.Forms.Keys.Up || k == System.Windows.Forms.Keys.Down || k == System.Windows.Forms.Keys.PageUp || k == System.Windows.Forms.Keys.PageDown || base.IsInputKey(k); }
+    protected override void OnKeyDown(System.Windows.Forms.KeyEventArgs e) {
+        base.OnKeyDown(e);
+        int page = Math.Max(1, ClientSize.Height / RowH - 1);
+        if (e.KeyCode == System.Windows.Forms.Keys.Down) SelectRow(Math.Min(Commits.Count - 1, Selected + 1));
+        else if (e.KeyCode == System.Windows.Forms.Keys.Up) SelectRow(Math.Max(0, Selected - 1));
+        else if (e.KeyCode == System.Windows.Forms.Keys.PageDown) SelectRow(Math.Min(Commits.Count - 1, Selected + page));
+        else if (e.KeyCode == System.Windows.Forms.Keys.PageUp) SelectRow(Math.Max(0, Selected - page));
+        else if (e.KeyCode == System.Windows.Forms.Keys.Enter && Open != null) Open(this, EventArgs.Empty);
+    }
+
+    float LX(int lane) { return S(12) + lane * LaneW; }
+
+    protected override void OnPaint(System.Windows.Forms.PaintEventArgs e) {
+        var g = e.Graphics;
+        g.Clear(Back);
+        if (Commits.Count == 0) return;
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+        int oy = AutoScrollPosition.Y, h = RowH;
+        int first = Math.Max(0, -oy / h - 1), last = Math.Min(Commits.Count - 1, (-oy + ClientSize.Height) / h + 1);
+        int maxLanes = 1;
+        for (int i = first; i <= last; i++) maxLanes = Math.Max(maxLanes, Math.Max(Commits[i].Col + 1, Commits[i].After.Length));
+        maxLanes = Math.Min(maxLanes, 24);
+        float textX = LX(maxLanes) + S(8);
+        // narrow window: drop the author, then the date, so the message keeps its room
+        float hashW = S(64), dateW = Width > S(760) ? S(118) : 0, authorW = Width > S(980) ? S(120) : 0;
+        float rightCols = dateW + authorW + hashW;
+        using (var small = new System.Drawing.Font(Font.FontFamily, Font.Size * 0.85f))
+        using (var bold = new System.Drawing.Font(Font, System.Drawing.FontStyle.Bold))
+        using (var mono = new System.Drawing.Font("Consolas", Font.Size * 0.9f)) {
+            var tf = new System.Drawing.StringFormat { Trimming = System.Drawing.StringTrimming.EllipsisCharacter, FormatFlags = System.Drawing.StringFormatFlags.NoWrap, LineAlignment = System.Drawing.StringAlignment.Center };
+            for (int i = first; i <= last; i++) {
+                var c = Commits[i];
+                float y = oy + i * h, cy = y + h / 2f;
+                if (i == Selected) using (var b = new System.Drawing.SolidBrush(Sel)) g.FillRectangle(b, 0, y, Width, h);
+                // lines to the next row
+                if (i + 1 < Commits.Count) {
+                    var n = Commits[i + 1];
+                    for (int l = 0; l < c.After.Length; l++) {
+                        var hsh = c.After[l]; if (hsh == null) continue;
+                        int start = Array.IndexOf(c.Parents, hsh) >= 0 ? c.Col : l;
+                        int end = n.Hash == hsh ? n.Col : l;
+                        var col = LaneColors[(Array.IndexOf(c.Parents, hsh) == 0 ? c.Col : l) % LaneColors.Length];
+                        if (l < 24 || start < 24) using (var pen = new System.Drawing.Pen(col, S(2))) {
+                            float x1 = LX(Math.Min(start, 23)), x2 = LX(Math.Min(end, 23)), y2 = cy + h;
+                            if (Math.Abs(x1 - x2) < 0.5f) g.DrawLine(pen, x1, cy, x2, y2);
+                            else g.DrawBezier(pen, x1, cy, x1, cy + h * 0.6f, x2, y2 - h * 0.6f, x2, y2);
+                        }
+                    }
+                }
+                // the dot
+                float r = S(4.5f), x = LX(Math.Min(c.Col, 23));
+                var dotCol = LaneColors[c.Col % LaneColors.Length];
+                using (var b = new System.Drawing.SolidBrush(c.Parents.Length > 1 ? Back : dotCol)) g.FillEllipse(b, x - r, cy - r, r * 2, r * 2);
+                using (var pen = new System.Drawing.Pen(dotCol, S(2))) g.DrawEllipse(pen, x - r, cy - r, r * 2, r * 2);
+                if (c.IsHead) using (var pen = new System.Drawing.Pen(Fore, S(1.5f))) g.DrawEllipse(pen, x - r - S(3), cy - r - S(3), (r + S(3)) * 2, (r + S(3)) * 2);
+                // ref badges
+                float tx = textX;
+                if (c.Refs != "") {
+                    foreach (var raw in c.Refs.Split(new[] { ", " }, StringSplitOptions.RemoveEmptyEntries)) {
+                        string name = raw; var bc = Accent;
+                        bool head = false;
+                        if (name.StartsWith("HEAD -> ")) { name = name.Substring(8); head = true; }
+                        else if (name == "HEAD") { head = true; }
+                        if (name.StartsWith("tag: ")) { name = name.Substring(5); bc = System.Drawing.Color.FromArgb(242, 153, 74); }
+                        else if (name.Contains("/")) bc = System.Drawing.Color.FromArgb(120, 120, 130);
+                        else bc = LaneColors[c.Col % LaneColors.Length];
+                        var sz = g.MeasureString(name, small);
+                        var br = new System.Drawing.RectangleF(tx, cy - sz.Height / 2 - S(1), sz.Width + S(6), sz.Height + S(2));
+                        if (br.Right > Width - rightCols - S(90)) break;
+                        using (var b = new System.Drawing.SolidBrush(bc)) g.FillRectangle(b, br);
+                        if (head) using (var pen = new System.Drawing.Pen(Fore, S(1.5f))) g.DrawRectangle(pen, br.X, br.Y, br.Width, br.Height);
+                        g.DrawString(name, small, System.Drawing.Brushes.White, br.X + S(3), br.Y + S(1));
+                        tx = br.Right + S(5);
+                    }
+                }
+                float subjW = Width - rightCols - tx - S(10);
+                using (var b = new System.Drawing.SolidBrush(Fore)) g.DrawString(c.Subject, c.IsHead ? bold : Font, b, new System.Drawing.RectangleF(tx, y, Math.Max(10, subjW), h), tf);
+                using (var b = new System.Drawing.SolidBrush(Dim)) {
+                    float rx = Width - rightCols - S(4);
+                    if (authorW > 0) g.DrawString(c.Author, small, b, new System.Drawing.RectangleF(rx, y, authorW, h), tf);
+                    if (dateW > 0) g.DrawString(c.Date, small, b, new System.Drawing.RectangleF(rx + authorW, y, dateW, h), tf);
+                    g.DrawString(c.Short, mono, b, new System.Drawing.RectangleF(rx + authorW + dateW, y, hashW, h), tf);
+                }
             }
         }
     }
@@ -17877,6 +18160,662 @@ Register-ToolboxPage 'mouse' 'Mouse mover & clicker' $Glyph.Apps 'mouse mover ji
     $st
 }
 
+
+# ======================================================================================
+# Git: a window for a repository you pick - commit graph, changes, branches, tags, stashes, remotes,
+# and any git command. Uses the git.exe already on the PC; without git the window says so and stops.
+# ======================================================================================
+$GitUI = @{ Form = $null; Exe = $null; Repo = ''; Git = $null; Job = $null; Status = @(); Branch = ''; Busy = $false }
+
+function Get-GitExe { if (-not $GitUI.Exe) { $GitUI.Exe = [DevGit]::Find() }; $GitUI.Exe }
+
+function Write-GitLog([string]$Text, $Color = $null) {
+    $o = $GitUI.Log
+    if (-not $o -or $o.IsDisposed) { return }
+    $o.SelectionStart = $o.TextLength; $o.SelectionLength = 0
+    $o.SelectionColor = if ($Color) { $Color } else { $C.Fore }
+    $o.AppendText($Text.TrimEnd() + "`n")
+    $o.SelectionColor = $C.Fore
+    $o.ScrollToCaret()
+}
+
+# Runs a quick git command, logs it, and returns the result.
+function Invoke-Git([string]$GitArgs, [switch]$Quiet) {
+    if (-not $GitUI.Git) { return $null }
+    $r = $GitUI.Git.Run($GitArgs)
+    if (-not $Quiet -or $r.Code -ne 0) {
+        Write-GitLog "> git $GitArgs" $C.Accent
+        if ($r.Text) { Write-GitLog $r.Text $(if ($r.Code -ne 0) { $C.Red } else { $null }) }
+    }
+    $r
+}
+
+# Runs a git command that changes something; shows errors; refreshes afterwards.
+function Invoke-GitAction([string]$GitArgs, [string]$Done = '') {
+    $r = Invoke-Git $GitArgs
+    if ($r.Code -ne 0) { Set-GitStatus ("git $(($GitArgs -split ' ')[0]) failed: " + (($r.Err + $r.Out).Trim() -split "`n" | Select-Object -Last 1)) $C.Red }
+    elseif ($Done) { Set-GitStatus $Done $C.Green }
+    Update-GitAll
+    $r
+}
+
+# Slow commands (fetch, pull, push, clone) run in the background; the window stays usable.
+function Start-GitJob([string]$GitArgs, [string]$Title, [scriptblock]$After = $null, [string]$Dir = '') {
+    if ($GitUI.Job) { Set-GitStatus 'Wait for the running git command (or press Stop).' $C.Yellow; return }
+    $g = if ($Dir) { New-Object DevGit($GitUI.Exe, $Dir) } else { $GitUI.Git }
+    $GitUI.Job = @{ Git = $g; Args = $GitArgs; Title = $Title; After = $After; Started = Get-Date }
+    Write-GitLog "> git $GitArgs" $C.Accent
+    $g.RunAsync($GitArgs)
+    Set-GitStatus "$Title..." $C.Dim
+    $GitUI.StopBtn.Visible = $true
+    $GitUI.JobTimer.Start()
+}
+
+function Complete-GitJob {
+    $j = $GitUI.Job
+    if (-not $j -or -not $j.Git.Done) {
+        if ($j) { Set-GitStatus "$($j.Title)...  $([int]((Get-Date) - $j.Started).TotalSeconds) s" $C.Dim }
+        return
+    }
+    $GitUI.JobTimer.Stop(); $GitUI.Job = $null; $GitUI.StopBtn.Visible = $false
+    $r = $j.Git.Last
+    if ($r.Text) { Write-GitLog $r.Text $(if ($r.Code -ne 0) { $C.Red } else { $null }) }
+    if ($r.Code -eq 0) { Set-GitStatus "$($j.Title): done." $C.Green }
+    else {
+        $msg = (($r.Err + "`n" + $r.Out).Trim() -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 2) -join '  '
+        if ($msg -match 'could not read Username|Authentication failed|terminal prompts disabled') { $msg = 'Git needs your login for this remote. Sign in once with Git Credential Manager (e.g. run the same command in a terminal), then try again.' }
+        Set-GitStatus "$($j.Title) failed: $msg" $C.Red
+    }
+    if ($j.After) { & $j.After $r }
+    if ($GitUI.Git) { Update-GitAll }
+}
+
+function Set-GitStatus([string]$Text, $Color) { if ($GitUI.StatusBar) { $GitUI.StatusBar.Text = $Text; if ($Color) { $GitUI.StatusBar.ForeColor = $Color } } }
+
+# ---- opening a repository --------------------------------------------------------------------
+function Open-GitRepo([string]$Path) {
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
+    $probe = New-Object DevGit($GitUI.Exe, $Path)
+    $top = $probe.Run('rev-parse --show-toplevel')
+    if ($top.Code -ne 0) {
+        if ([System.Windows.Forms.MessageBox]::Show($GitUI.Form, "$Path is not a git repository.`n`nCreate one here (git init)?", 'Git', 'YesNo', 'Question') -ne 'Yes') { return }
+        $init = $probe.Run('init')
+        Write-GitLog "> git init`n$($init.Text)" $C.Accent
+        $top = $probe.Run('rev-parse --show-toplevel')
+        if ($top.Code -ne 0) { return }
+    }
+    $root = ($top.Out.Trim()) -replace '/', '\'
+    $GitUI.Repo = $root
+    $GitUI.Git = New-Object DevGit($GitUI.Exe, $root)
+    $script:GitRepos = @(@($root) + @($script:GitRepos | Where-Object { $_ -and $_ -ne $root }) | Select-Object -First 12)
+    Save-Settings
+    Update-GitRepoCombo
+    $GitUI.Form.Text = "Git  -  $root"
+    $GitUI.Main.Enabled = $true
+    Update-GitAll
+}
+
+function Update-GitRepoCombo {
+    $cb = $GitUI.RepoBox
+    $GitUI.Loading = $true
+    try {
+        $cb.Items.Clear()
+        foreach ($r in $script:GitRepos) { [void]$cb.Items.Add($r) }
+        if ($GitUI.Repo) { $cb.SelectedItem = $GitUI.Repo }
+    } finally { $GitUI.Loading = $false }
+}
+
+# ---- reading the repository -------------------------------------------------------------------
+function Update-GitAll {
+    if (-not $GitUI.Git -or -not $GitUI.Form) { return }
+    $GitUI.Form.Cursor = 'WaitCursor'
+    try {
+        Update-GitChanges
+        Update-GitBranches
+        Update-GitGraph
+        Update-GitState
+    } finally { $GitUI.Form.Cursor = 'Default' }
+}
+
+function Get-GitStatusEntries {
+    $r = Invoke-Git 'status --porcelain=v1 -b -uall' -Quiet
+    $list = @()
+    $GitUI.Ahead = 0; $GitUI.Behind = 0; $GitUI.Upstream = ''
+    foreach ($line in ($r.Out -split "`n")) {
+        if ($line.Length -lt 3) { continue }
+        if ($line.StartsWith('## ')) {
+            if ($line -match '\.\.\.(\S+)') { $GitUI.Upstream = $Matches[1] }
+            if ($line -match 'ahead (\d+)') { $GitUI.Ahead = [int]$Matches[1] }
+            if ($line -match 'behind (\d+)') { $GitUI.Behind = [int]$Matches[1] }
+            continue
+        }
+        $x = $line[0]; $y = $line[1]; $path = $line.Substring(3)
+        $old = ''
+        if ($path -match '^(.*) -> (.*)$') { $old = $Matches[1]; $path = $Matches[2] }
+        $path = $path.Trim('"')
+        $list += [pscustomobject]@{ X = [string]$x; Y = [string]$y; Path = $path; Old = $old.Trim('"'); Conflict = ("$x$y" -match 'U|AA|DD') }
+    }
+    $list
+}
+
+function Get-GitStatusText([string]$Code) {
+    switch ($Code) { 'M' { 'changed' } 'A' { 'added' } 'D' { 'deleted' } 'R' { 'renamed' } 'C' { 'copied' } '?' { 'new' } 'U' { 'conflict' } 'T' { 'type changed' } default { $Code } }
+}
+
+function Update-GitChanges {
+    $entries = @(Get-GitStatusEntries)
+    $GitUI.Status = $entries
+    foreach ($pair in @(@($GitUI.Staged, 'staged'), @($GitUI.Unstaged, 'unstaged'))) {
+        $lv = $pair[0]
+        $sel = @($lv.SelectedItems | ForEach-Object { $_.Tag.Path })
+        $lv.BeginUpdate(); $lv.Items.Clear()
+        foreach ($e in $entries) {
+            $code = if ($pair[1] -eq 'staged') { $e.X } else { $e.Y }
+            if ($pair[1] -eq 'staged' -and ($e.X -eq ' ' -or $e.X -eq '?' -or $e.Conflict)) { continue }
+            if ($pair[1] -eq 'unstaged' -and $e.Y -eq ' ' -and -not $e.Conflict) { continue }
+            if ($e.Conflict) { $code = 'U' }
+            $it = New-Object System.Windows.Forms.ListViewItem((Get-GitStatusText $code))
+            [void]$it.SubItems.Add($(if ($e.Old) { "$($e.Old) -> $($e.Path)" } else { $e.Path }))
+            $it.Tag = $e
+            $it.ForeColor = switch ($code) { 'A' { $C.Green } '?' { $C.Green } 'D' { $C.Red } 'U' { $C.Red } default { $C.Fore } }
+            if ($sel -contains $e.Path) { $it.Selected = $true }
+            [void]$lv.Items.Add($it)
+        }
+        $lv.EndUpdate()
+    }
+    $GitUI.StagedLabel.Text = "STAGED ($($GitUI.Staged.Items.Count))"
+    $GitUI.UnstagedLabel.Text = "CHANGES ($($GitUI.Unstaged.Items.Count))"
+}
+
+function Update-GitBranches {
+    $cur = (Invoke-Git 'branch --show-current' -Quiet).Out.Trim()
+    if (-not $cur) { $cur = '(detached HEAD) ' + (Invoke-Git 'rev-parse --short HEAD' -Quiet).Out.Trim() }
+    $GitUI.Branch = $cur
+    $r = Invoke-Git 'for-each-ref --format=%(refname)%1f%(refname:short)%1f%(upstream:short)%1f%(upstream:track)%1f%(committerdate:short)%1f%(objectname:short) refs/heads refs/remotes refs/tags' -Quiet
+    $lv = $GitUI.Branches; $tv = $GitUI.Tags
+    $lv.BeginUpdate(); $lv.Items.Clear(); $tv.BeginUpdate(); $tv.Items.Clear()
+    $locals = @()
+    foreach ($line in ($r.Out -split "`n")) {
+        $f = $line -split [char]0x1f
+        if ($f.Count -lt 6) { continue }
+        if ($f[0].StartsWith('refs/tags/')) {
+            $it = New-Object System.Windows.Forms.ListViewItem($f[1]); [void]$it.SubItems.Add($f[5]); [void]$it.SubItems.Add($f[4]); $it.Tag = $f[1]
+            [void]$tv.Items.Add($it); continue
+        }
+        if ($f[1] -match '/HEAD$') { continue }
+        $remote = $f[0].StartsWith('refs/remotes/')
+        $it = New-Object System.Windows.Forms.ListViewItem($(if ($f[1] -eq $cur) { "$([char]0x25CF) $($f[1])" } else { "   $($f[1])" }))
+        [void]$it.SubItems.Add($(if ($remote) { 'remote' } else { $f[2] + $(if ($f[3]) { " $($f[3])" }) }))
+        [void]$it.SubItems.Add($f[4])
+        $it.Tag = [pscustomobject]@{ Name = $f[1]; Remote = $remote; Upstream = $f[2] }
+        if ($remote) { $it.ForeColor = $C.Dim } elseif ($f[1] -eq $cur) { $it.Font = New-Object System.Drawing.Font($FontMain, [System.Drawing.FontStyle]::Bold) }
+        if (-not $remote) { $locals += $f[1] }
+        [void]$lv.Items.Add($it)
+    }
+    $lv.EndUpdate(); $tv.EndUpdate()
+    # branch switcher
+    $GitUI.Loading = $true
+    try {
+        $GitUI.BranchBox.Items.Clear()
+        foreach ($b in $locals) { [void]$GitUI.BranchBox.Items.Add($b) }
+        if ($locals -contains $cur) { $GitUI.BranchBox.SelectedItem = $cur } else { $GitUI.BranchBox.Text = $cur }
+    } finally { $GitUI.Loading = $false }
+    # stashes and remotes
+    $sv = $GitUI.Stashes
+    $sv.BeginUpdate(); $sv.Items.Clear()
+    foreach ($line in ((Invoke-Git 'stash list --format=%gd%x1f%s%x1f%cr' -Quiet).Out -split "`n")) {
+        $f = $line -split [char]0x1f; if ($f.Count -lt 3) { continue }
+        $it = New-Object System.Windows.Forms.ListViewItem($f[0]); [void]$it.SubItems.Add($f[1]); [void]$it.SubItems.Add($f[2]); $it.Tag = $f[0]
+        [void]$sv.Items.Add($it)
+    }
+    $sv.EndUpdate()
+    $rv = $GitUI.Remotes
+    $rv.BeginUpdate(); $rv.Items.Clear()
+    $seen = @{}
+    foreach ($line in ((Invoke-Git 'remote -v' -Quiet).Out -split "`n")) {
+        if ($line -match '^(\S+)\s+(\S+)\s+\((fetch|push)\)') { if ($seen[$Matches[1]]) { continue }; $seen[$Matches[1]] = 1; $it = New-Object System.Windows.Forms.ListViewItem($Matches[1]); [void]$it.SubItems.Add($Matches[2]); $it.Tag = $Matches[1]; [void]$rv.Items.Add($it) }
+    }
+    $rv.EndUpdate()
+}
+
+function Update-GitGraph {
+    $n = @(200, 1000, 5000, 50000)[$GitUI.Depth.SelectedIndex]
+    $scope = if ($GitUI.AllRefs.Checked) { '--all' } else { 'HEAD' }
+    $r = Invoke-Git "log $scope --topo-order --date=format:`"%Y-%m-%d %H:%M`" `"--format=%H%x1f%h%x1f%P%x1f%an%x1f%ae%x1f%ad%x1f%D%x1f%s%x1e`" -n $n" -Quiet
+    $head = (Invoke-Git 'rev-parse HEAD' -Quiet).Out.Trim()
+    $keep = if ($GitUI.Graph.Selected -ge 0 -and $GitUI.Graph.Selected -lt $GitUI.Graph.Commits.Count) { $GitUI.Graph.Commits[$GitUI.Graph.Selected].Hash } else { '' }
+    $GitUI.Graph.Load($(if ($r.Code -eq 0) { $r.Out } else { '' }), $head)
+    if ($keep) { for ($i = 0; $i -lt $GitUI.Graph.Commits.Count; $i++) { if ($GitUI.Graph.Commits[$i].Hash -eq $keep) { $GitUI.Graph.SelectRow($i); break } } }
+    Show-GitCommit
+}
+
+# merge / rebase / cherry-pick in progress -> banner with Continue / Abort
+function Update-GitState {
+    $gitDir = (Invoke-Git 'rev-parse --absolute-git-dir' -Quiet).Out.Trim() -replace '/', '\'
+    $op = $null
+    if (Test-Path (Join-Path $gitDir 'rebase-merge')) { $op = 'rebase' } elseif (Test-Path (Join-Path $gitDir 'rebase-apply')) { $op = 'rebase' }
+    elseif (Test-Path (Join-Path $gitDir 'MERGE_HEAD')) { $op = 'merge' } elseif (Test-Path (Join-Path $gitDir 'CHERRY_PICK_HEAD')) { $op = 'cherry-pick' } elseif (Test-Path (Join-Path $gitDir 'REVERT_HEAD')) { $op = 'revert' }
+    $GitUI.Op = $op
+    $conf = @($GitUI.Status | Where-Object { $_.Conflict }).Count
+    $GitUI.Banner.Visible = [bool]$op
+    if ($op) { $GitUI.BannerText.Text = "A $op is in progress$(if ($conf) { " - $conf file(s) with conflicts: double-click to open, fix, then Mark resolved" } else { ' - no conflicts left' })." }
+    $sync = if ($GitUI.Upstream) { "$Dot  $($GitUI.Upstream)  $([char]0x2191)$($GitUI.Ahead) $([char]0x2193)$($GitUI.Behind)" } else { "$Dot  no upstream (Push sets it)" }
+    $GitUI.Info.Text = "On $($GitUI.Branch)  $sync  $Dot  $($GitUI.Status.Count) changed file(s)"
+}
+
+function Get-GitSelectedCommit { $g = $GitUI.Graph; if ($g.Selected -ge 0 -and $g.Selected -lt $g.Commits.Count) { $g.Commits[$g.Selected] } else { $null } }
+
+function Show-GitCommit {
+    $c = Get-GitSelectedCommit
+    $d = $GitUI.Detail; $fl = $GitUI.Files
+    $fl.Items.Clear()
+    if (-not $c) { $d.Text = ''; return }
+    $body = (Invoke-Git "show -s --format=%B $($c.Hash)" -Quiet).Out.Trim()
+    $d.Text = "$($c.Hash)`n$($c.Author) <$($c.Email)>   $($c.Date)$(if ($c.Parents.Count -gt 1) { "`nMerge of " + ($c.Parents | ForEach-Object { $_.Substring(0, 7) }) -join ' + ' })$(if ($c.Refs) { "`n$($c.Refs)" })`n`n$body"
+    $first = if ($c.Parents.Count) { "$($c.Parents[0])" } else { '' }
+    $ns = if ($first) { Invoke-Git "diff --name-status -M $first $($c.Hash)" -Quiet } else { Invoke-Git "show --name-status --format= $($c.Hash)" -Quiet }
+    foreach ($line in ($ns.Out -split "`n")) {
+        $f = $line -split "`t"; if ($f.Count -lt 2) { continue }
+        $it = New-Object System.Windows.Forms.ListViewItem((Get-GitStatusText $f[0].Substring(0, 1)))
+        [void]$it.SubItems.Add($(if ($f.Count -ge 3) { "$($f[1]) -> $($f[2])" } else { $f[1] }))
+        $it.Tag = [pscustomobject]@{ Path = $f[$f.Count - 1]; Old = $(if ($f.Count -ge 3) { $f[1] } else { $f[1] }) }
+        [void]$fl.Items.Add($it)
+    }
+}
+
+# ---- diffs in the Compare window ---------------------------------------------------------------
+function Get-GitBlob([string]$Spec) { $r = Invoke-Git "show $([DevGit]::Q($Spec))" -Quiet; if ($r.Code -eq 0) { $r.Out } else { '' } }
+
+function Show-GitDiff([string]$LeftSpec, [string]$RightSpec, [string]$RightFile = '') {
+    $lt = if ($LeftSpec) { Get-GitBlob $LeftSpec } else { '' }
+    $rt = if ($RightFile) { if (Test-Path -LiteralPath $RightFile) { Read-TextFile $RightFile } else { '' } } elseif ($RightSpec) { Get-GitBlob $RightSpec } else { '' }
+    Show-Compare ([pscustomobject]@{ Kind = 'text'; Text = $lt; Id = '' }) ([pscustomobject]@{ Kind = 'text'; Text = $rt; Id = '' })
+}
+
+function Open-GitChangeDiff($Entry, [bool]$Staged) {
+    $p = $Entry.Path
+    $full = Join-Path $GitUI.Repo $p
+    if ($Entry.Conflict) { Start-Process -FilePath $full; return }
+    if ($Staged) { Show-GitDiff "HEAD:$(if ($Entry.Old) { $Entry.Old } else { $p })" ":$p" }
+    else { Show-GitDiff $(if ($Entry.Y -eq '?') { '' } else { ":$p" }) '' $full }
+}
+
+# ---- actions -------------------------------------------------------------------------------------
+function Get-GitSelectedPaths($Lv) { @($Lv.SelectedItems | ForEach-Object { $_.Tag.Path }) }
+function Join-GitPaths($Paths) { (@($Paths) | ForEach-Object { [DevGit]::Q($_) }) -join ' ' }
+
+function Invoke-GitStage([switch]$All) {
+    $paths = if ($All) { @() } else { Get-GitSelectedPaths $GitUI.Unstaged }
+    if ($All) { [void](Invoke-GitAction 'add -A') } elseif ($paths) { [void](Invoke-GitAction "add -- $(Join-GitPaths $paths)") }
+}
+function Invoke-GitUnstage([switch]$All) {
+    $paths = if ($All) { @() } else { Get-GitSelectedPaths $GitUI.Staged }
+    $hasHead = (Invoke-Git 'rev-parse --verify HEAD' -Quiet).Code -eq 0
+    if ($All) { [void](Invoke-GitAction $(if ($hasHead) { 'reset -q HEAD' } else { 'rm -r --cached -q .' })) }
+    elseif ($paths) { [void](Invoke-GitAction $(if ($hasHead) { "reset -q HEAD -- $(Join-GitPaths $paths)" } else { "rm --cached -q -- $(Join-GitPaths $paths)" })) }
+}
+function Invoke-GitDiscard {
+    $items = @($GitUI.Unstaged.SelectedItems | ForEach-Object { $_.Tag })
+    if (-not $items) { return }
+    if ([System.Windows.Forms.MessageBox]::Show($GitUI.Form, "Throw away the changes in $($items.Count) file(s)? New files are deleted. This can't be undone.", 'Git', 'YesNo', 'Warning') -ne 'Yes') { return }
+    $new = @($items | Where-Object { $_.Y -eq '?' } | ForEach-Object { $_.Path })
+    $tracked = @($items | Where-Object { $_.Y -ne '?' } | ForEach-Object { $_.Path })
+    if ($tracked) { [void](Invoke-Git "checkout -- $(Join-GitPaths $tracked)") }
+    if ($new) { [void](Invoke-Git "clean -f -- $(Join-GitPaths $new)") }
+    Update-GitAll
+}
+
+function Invoke-GitCommit([switch]$Push) {
+    $msg = $GitUI.Message.Text.Trim()
+    $amend = $GitUI.Amend.Checked
+    if (-not $msg -and -not $amend) { Set-GitStatus 'Write a commit message first.' $C.Red; [void]$GitUI.Message.Focus(); return }
+    if ($GitUI.Staged.Items.Count -eq 0 -and -not $amend) {
+        if ($GitUI.Unstaged.Items.Count -eq 0) { Set-GitStatus 'Nothing to commit.' $C.Yellow; return }
+        if ([System.Windows.Forms.MessageBox]::Show($GitUI.Form, 'Nothing is staged. Stage all changes and commit them?', 'Git', 'YesNo', 'Question') -ne 'Yes') { return }
+        [void](Invoke-Git 'add -A')
+    }
+    $tmp = [IO.Path]::GetTempFileName()
+    [IO.File]::WriteAllText($tmp, $msg, (New-Object System.Text.UTF8Encoding $false))
+    try { $r = Invoke-Git "commit $(if ($amend) { '--amend ' })$(if (-not $msg) { '--no-edit' } else { "-F $([DevGit]::Q($tmp))" })" } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
+    if ($r.Code -eq 0) { $GitUI.Message.Text = ''; $GitUI.Amend.Checked = $false; Set-GitStatus 'Committed.' $C.Green; Update-GitAll; if ($Push) { Invoke-GitPush } }
+    else { Set-GitStatus "Commit failed: $((($r.Err + $r.Out).Trim() -split "`n")[0])" $C.Red; Update-GitAll }
+}
+
+function Invoke-GitPush([switch]$Force) {
+    $b = (Invoke-Git 'branch --show-current' -Quiet).Out.Trim()
+    if (-not $b) { Set-GitStatus 'You are not on a branch (detached HEAD); create a branch first.' $C.Red; return }
+    $hasUp = (Invoke-Git "rev-parse --abbrev-ref $b@{upstream}" -Quiet).Code -eq 0
+    $remote = @((Invoke-Git 'remote' -Quiet).Out -split "`n" | Where-Object { $_.Trim() })
+    if (-not $remote) { Set-GitStatus 'This repository has no remote. Add one on the Remotes tab.' $C.Red; return }
+    $r0 = if ($remote -contains 'origin') { 'origin' } else { $remote[0] }
+    $f = if ($Force) { '--force-with-lease ' } else { '' }
+    Start-GitJob $(if ($hasUp) { "push $f" } else { "push $f-u $r0 $([DevGit]::Q($b))" }).Trim() 'Pushing'
+}
+
+function Read-GitText([string]$Title, [string]$Prompt, [string]$Value = '') { Read-TextDialog $Title $Prompt $Value $GitUI.Form }
+
+function Confirm-Git([string]$Text) { [System.Windows.Forms.MessageBox]::Show($GitUI.Form, $Text, 'Git', 'YesNo', 'Warning') -eq 'Yes' }
+
+function Show-GitCommitMenu($Menu) {
+    $Menu.Items.Clear()
+    $c = Get-GitSelectedCommit
+    if (-not $c) { return }
+    $h = $c.Hash; $s = $c.Short
+    $Menu.Tag = $c
+    [void](Add-MenuItem $Menu "Check out $s (detached)" { $c = $GitUI.Menu.Tag; if (Confirm-Git "Check out $($c.Short)? You will not be on a branch until you create or check out one.") { [void](Invoke-GitAction "checkout $($c.Hash)") } } $Glyph.Open)
+    [void](Add-MenuItem $Menu 'Create branch here...' { $c = $GitUI.Menu.Tag; $n = Read-GitText 'New branch' "Branch name (starts at $($c.Short))"; if ($n) { [void](Invoke-GitAction "checkout -b $([DevGit]::Q($n.Trim())) $($c.Hash)" "Now on $($n.Trim()).") } } $Glyph.Add)
+    [void](Add-MenuItem $Menu 'Create tag here...' { $c = $GitUI.Menu.Tag; $n = Read-GitText 'New tag' "Tag name (on $($c.Short))" 'v'; if ($n) { [void](Invoke-GitAction "tag $([DevGit]::Q($n.Trim())) $($c.Hash)" "Tagged $($n.Trim()).") } } $Glyph.Add)
+    [void]$Menu.Items.Add('-')
+    [void](Add-MenuItem $Menu "Merge $s into $($GitUI.Branch)" { $c = $GitUI.Menu.Tag; [void](Invoke-GitAction "merge --no-edit $($c.Hash)") } $Glyph.Compare)
+    [void](Add-MenuItem $Menu "Rebase $($GitUI.Branch) onto $s" { $c = $GitUI.Menu.Tag; if (Confirm-Git "Rebase $($GitUI.Branch) onto $($c.Short)? This rewrites its commits.") { [void](Invoke-GitAction "rebase $($c.Hash)") } } $Glyph.Undo)
+    [void](Add-MenuItem $Menu "Cherry-pick $s" { $c = $GitUI.Menu.Tag; [void](Invoke-GitAction "cherry-pick $(if ($c.Parents.Count -gt 1) { '-m 1 ' })$($c.Hash)") } $Glyph.Copy)
+    [void](Add-MenuItem $Menu "Revert $s" { $c = $GitUI.Menu.Tag; [void](Invoke-GitAction "revert --no-edit $(if ($c.Parents.Count -gt 1) { '-m 1 ' })$($c.Hash)") } $Glyph.Undo)
+    $reset = New-Object System.Windows.Forms.ToolStripMenuItem("Reset $($GitUI.Branch) to $s", (New-GlyphImage $Glyph.Undo))
+    foreach ($mode in @(@('soft', 'Soft - keep the changes staged'), @('mixed', 'Mixed - keep the changes, unstaged'), @('hard', 'Hard - throw the changes away'))) {
+        $it = $reset.DropDownItems.Add($mode[1], $null, { param($src, $e) $c = $GitUI.Menu.Tag; if ($src.Tag -ne 'hard' -or (Confirm-Git "Hard reset to $($c.Short)? Uncommitted changes and later commits on this branch are lost.")) { [void](Invoke-GitAction "reset --$($src.Tag) $($c.Hash)") } })
+        $it.Tag = $mode[0]
+    }
+    $reset.DropDown.Renderer = $MenuRenderer
+    [void]$Menu.Items.Add($reset)
+    [void]$Menu.Items.Add('-')
+    [void](Add-MenuItem $Menu 'Copy hash' { Copy-TbText $GitUI.Menu.Tag.Hash } $Glyph.Copy)
+    [void](Add-MenuItem $Menu 'Copy message' { Copy-TbText $GitUI.Menu.Tag.Subject } $Glyph.Copy)
+}
+
+function Show-GitBranchMenu($Menu) {
+    $Menu.Items.Clear()
+    $it = @($GitUI.Branches.SelectedItems)[0]
+    if (-not $it) { return }
+    $b = $it.Tag; $Menu.Tag = $b
+    $name = $b.Name
+    if ($b.Remote) {
+        $local = $name -replace '^[^/]+/', ''
+        [void](Add-MenuItem $Menu "Check out as $local" { $b = $GitUI.Menu.Tag; $l = $b.Name -replace '^[^/]+/', ''; [void](Invoke-GitAction "checkout -b $([DevGit]::Q($l)) --track $([DevGit]::Q($b.Name))" "Now on $l.") } $Glyph.Open)
+    } else {
+        [void](Add-MenuItem $Menu "Check out $name" { [void](Invoke-GitAction "checkout $([DevGit]::Q($GitUI.Menu.Tag.Name))") } $Glyph.Open)
+    }
+    if ($name -ne $GitUI.Branch) {
+        [void](Add-MenuItem $Menu "Merge $name into $($GitUI.Branch)" { [void](Invoke-GitAction "merge --no-edit $([DevGit]::Q($GitUI.Menu.Tag.Name))") } $Glyph.Compare)
+        [void](Add-MenuItem $Menu "Rebase $($GitUI.Branch) onto $name" { if (Confirm-Git "Rebase $($GitUI.Branch) onto $($GitUI.Menu.Tag.Name)? This rewrites its commits.") { [void](Invoke-GitAction "rebase $([DevGit]::Q($GitUI.Menu.Tag.Name))") } } $Glyph.Undo)
+    }
+    if (-not $b.Remote) {
+        [void](Add-MenuItem $Menu 'Rename...' { $o = $GitUI.Menu.Tag.Name; $n = Read-GitText 'Rename branch' 'New name' $o; if ($n -and $n.Trim() -ne $o) { [void](Invoke-GitAction "branch -m $([DevGit]::Q($o)) $([DevGit]::Q($n.Trim()))") } } $Glyph.Edit)
+        [void](Add-MenuItem $Menu 'Push this branch' { $n = $GitUI.Menu.Tag.Name; Start-GitJob "push -u origin $([DevGit]::Q($n))" "Pushing $n" } $Glyph.Send)
+        [void]$Menu.Items.Add('-')
+        [void](Add-MenuItem $Menu 'Delete...' {
+            $n = $GitUI.Menu.Tag.Name
+            if ($n -eq $GitUI.Branch) { Set-GitStatus 'You can''t delete the branch you are on; check out another one first.' $C.Red; return }
+            if (-not (Confirm-Git "Delete the branch $n?")) { return }
+            $r = Invoke-Git "branch -d $([DevGit]::Q($n))"
+            if ($r.Code -ne 0 -and (Confirm-Git "$n has commits that are not merged anywhere. Delete it anyway (they may be lost)?")) { $r = Invoke-Git "branch -D $([DevGit]::Q($n))" }
+            Update-GitAll
+        } $Glyph.Delete)
+    } else {
+        [void]$Menu.Items.Add('-')
+        [void](Add-MenuItem $Menu 'Delete on the remote...' { $n = $GitUI.Menu.Tag.Name; $rem = ($n -split '/')[0]; $br = $n.Substring($rem.Length + 1); if (Confirm-Git "Delete the branch $br on $rem?") { Start-GitJob "push $rem --delete $([DevGit]::Q($br))" "Deleting $n" } } $Glyph.Delete)
+    }
+}
+
+function Show-GitCloneDialog {
+    $url = Read-GitText 'Clone a repository' 'Repository URL (https://... or git@...)'
+    if (-not $url) { return }
+    $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Folder to clone into (a new subfolder is created)'
+    $script:Modal = $true
+    try { if ($d.ShowDialog($GitUI.Form) -ne 'OK') { return }; $parent = $d.SelectedPath } finally { $script:Modal = $false; $d.Dispose() }
+    $name = ($url.Trim().TrimEnd('/') -split '[/:]')[-1] -replace '\.git$', ''
+    $target = Join-Path $parent $name
+    $GitUI.CloneTarget = $target
+    Start-GitJob "clone --progress $([DevGit]::Q($url.Trim())) $([DevGit]::Q($target))" "Cloning $name" { param($r) if ($r.Code -eq 0) { Open-GitRepo $GitUI.CloneTarget } } $parent
+}
+
+# ---- window -------------------------------------------------------------------------------------
+function New-GitList($Parent, [string[]]$Cols, [int[]]$Widths) {
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.BorderStyle = 'None'; $lv.HideSelection = $false
+    $lv.BackColor = $C.Bg; $lv.ForeColor = $C.Fore
+    for ($i = 0; $i -lt $Cols.Count; $i++) { [void]$lv.Columns.Add($Cols[$i], (Px ($Widths[$i] * $TextZoom))) }
+    $Parent.Controls.Add($lv)
+    $lv
+}
+
+function Show-Git([string]$Folder = '') {
+    Hide-Picker
+    if (-not (Get-GitExe)) {
+        [void][System.Windows.Forms.MessageBox]::Show("Git isn't installed on this PC, so the Git window is not available.`n`nDevTools doesn't install anything. If you install Git for Windows (git-scm.com) later, this window works straight away.", 'Git', 'OK', 'Information')
+        return
+    }
+    if ($GitUI.Form) { if ($GitUI.Form.WindowState -eq 'Minimized') { $GitUI.Form.WindowState = 'Normal' }; $GitUI.Form.Activate(); if ($Folder) { Open-GitRepo $Folder }; return }
+
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'Git'; $f.Icon = $IconActive
+    $f.Size = New-Object System.Drawing.Size((Px 1550), (Px 950)); $f.MinimumSize = New-Object System.Drawing.Size((Px 1000), (Px 600))
+    $f.StartPosition = 'CenterScreen'; $f.BackColor = $C.Panel; $f.ForeColor = $C.Fore; $f.Font = $FontMain; $f.KeyPreview = $true
+    $GitUI.Form = $f
+
+    $main = New-Object System.Windows.Forms.Panel
+    $main.Dock = 'Fill'; $main.BackColor = $C.Bg; $main.Enabled = $false
+    $f.Controls.Add($main)
+    $GitUI.Main = $main
+
+    # bottom: git console + log
+    $bottom = New-Object System.Windows.Forms.Panel
+    $bottom.Dock = 'Bottom'; $bottom.Height = Px 170; $bottom.BackColor = $C.Panel
+    $GitUI.Log = New-TbRtb -ReadOnly; $GitUI.Log.Dock = 'Fill'; $GitUI.Log.Font = New-Object System.Drawing.Font('Consolas', (Fz 9.5))
+    $bottom.Controls.Add($GitUI.Log)
+    $cbar = New-TbBar $bottom
+    New-TbLabel $cbar 'git' -Title | Out-Null
+    $GitUI.Cmd = New-TbBox -Mono -Cue 'any git command, e.g.  log --oneline -5   stash push -m wip   bisect start   (Enter runs it)'
+    $GitUI.Cmd.Width = Px (700 * $TextZoom); $GitUI.Cmd.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 6), 0)
+    $cbar.Controls.Add($GitUI.Cmd)
+    $GitUI.RunCmd = {
+        $t = $GitUI.Cmd.Text.Trim() -replace '^git\s+', ''
+        if (-not $t -or -not $GitUI.Git) { return }
+        $GitUI.Cmd.Text = ''
+        if ($t -match '^(fetch|pull|push|clone|submodule update|lfs)') { Start-GitJob $t "git $($t.Split(' ')[0])" } else { [void](Invoke-GitAction $t) }
+    }
+    $GitUI.Cmd.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Return') { $e.SuppressKeyPress = $true; & $GitUI.RunCmd } })
+    [void](New-Button 'Run' 'Run the git command (Enter)' $GitUI.RunCmd $cbar $Glyph.Play 1)
+    [void](New-Button 'Clear' 'Clear the log' { $GitUI.Log.Clear() } $cbar $Glyph.Clear 2)
+    $GitUI.StopBtn = New-Button 'Stop' 'Stop the running git command' { if ($GitUI.Job) { $GitUI.Job.Git.Cancel() } } $cbar $Glyph.Cancel 3
+    $GitUI.StopBtn.Visible = $false
+    $main.Controls.Add($bottom)
+
+    # left: changes / branches / tags / stashes / remotes
+    $left = New-Object System.Windows.Forms.Panel
+    $left.Dock = 'Left'; $left.Width = Px (370 * $TextZoom); $left.BackColor = $C.Bg
+    $tabs = New-TabSet $left
+    $pCh = Add-ApiTab $tabs 'Changes'; $pBr = Add-ApiTab $tabs 'Branches'; $pTg = Add-ApiTab $tabs 'Tags'; $pSt = Add-ApiTab $tabs 'Stashes'; $pRm = Add-ApiTab $tabs 'Remotes'
+    # changes: staged over unstaged, commit box at the bottom
+    $commit = New-Object System.Windows.Forms.Panel
+    $commit.Dock = 'Bottom'; $commit.Height = Px 160; $commit.BackColor = $C.Panel; $commit.Padding = New-Object System.Windows.Forms.Padding((Px 6))
+    $GitUI.Message = New-TbBox -Multi -Cue 'Commit message (first line = summary)'; $GitUI.Message.Dock = 'Fill'; $GitUI.Message.WordWrap = $true; $GitUI.Message.ScrollBars = 'Vertical'
+    $commit.Controls.Add($GitUI.Message)
+    $cb2 = New-TbBar $commit 'Bottom'
+    [void](New-Button 'Commit' 'Commit the staged changes (Ctrl+Enter)' { Invoke-GitCommit } $cb2 $Glyph.Save 1)
+    [void](New-Button 'Commit & push' 'Commit, then push' { Invoke-GitCommit -Push } $cb2 $Glyph.Send 2)
+    $GitUI.Amend = New-CheckBox $cb2 'Amend last commit' $false 'Add to the last commit instead of making a new one (empty message keeps its message)'
+    $GitUI.Message.add_KeyDown({ param($src, $e) if ($e.Control -and $e.KeyCode -eq 'Return') { $e.SuppressKeyPress = $true; Invoke-GitCommit } })
+    $pCh.Controls.Add($commit)
+    $chs = New-Object System.Windows.Forms.SplitContainer
+    $chs.Dock = 'Fill'; $chs.Orientation = 'Horizontal'; $chs.SplitterWidth = 3; $chs.BackColor = $C.Line; $chs.Panel1.BackColor = $C.Bg; $chs.Panel2.BackColor = $C.Bg
+    $pCh.Controls.Add($chs); $chs.BringToFront()
+    $GitUI.Staged = New-GitList $chs.Panel1 @('', 'File') @(72, 280)
+    $sb1 = New-TbBar $chs.Panel1
+    $GitUI.StagedLabel = New-TbLabel $sb1 'STAGED' -Dim
+    [void](New-Button 'Unstage' 'Unstage the selected files' { Invoke-GitUnstage } $sb1 '' 2)
+    [void](New-Button 'All' 'Unstage everything' { Invoke-GitUnstage -All } $sb1 '' 2)
+    $GitUI.Unstaged = New-GitList $chs.Panel2 @('', 'File') @(72, 280)
+    $sb2 = New-TbBar $chs.Panel2
+    $GitUI.UnstagedLabel = New-TbLabel $sb2 'CHANGES' -Dim
+    [void](New-Button 'Stage' 'Stage the selected files (Space)' { Invoke-GitStage } $sb2 '' 2)
+    [void](New-Button 'All' 'Stage everything' { Invoke-GitStage -All } $sb2 '' 2)
+    [void](New-Button 'Discard' 'Throw away the changes in the selected files' { Invoke-GitDiscard } $sb2 $Glyph.Delete 2)
+    foreach ($pair in @(@($GitUI.Staged, $true), @($GitUI.Unstaged, $false))) {
+        $pair[0].Tag = $pair[1]
+        $pair[0].add_DoubleClick({ param($src, $e) if ($src.SelectedItems.Count) { Open-GitChangeDiff $src.SelectedItems[0].Tag ([bool]$src.Tag) } })
+    }
+    $GitUI.Unstaged.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Space') { Invoke-GitStage; $e.Handled = $true } })
+    $GitUI.Staged.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Space') { Invoke-GitUnstage; $e.Handled = $true } })
+    $um = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    [void](Add-MenuItem $um 'Show the changes' { $i = @($GitUI.Unstaged.SelectedItems)[0]; if ($i) { Open-GitChangeDiff $i.Tag $false } } $Glyph.Compare)
+    [void](Add-MenuItem $um 'Stage' { Invoke-GitStage } $Glyph.Add 'Space')
+    [void](Add-MenuItem $um 'Mark resolved (stage)' { Invoke-GitStage } $Glyph.Add)
+    [void](Add-MenuItem $um 'Open the file' { foreach ($i in $GitUI.Unstaged.SelectedItems) { Start-Process -FilePath (Join-Path $GitUI.Repo $i.Tag.Path) } } $Glyph.Open)
+    [void](Add-MenuItem $um 'Show in Explorer' { $i = @($GitUI.Unstaged.SelectedItems)[0]; if ($i) { Start-Process explorer.exe "/select,`"$(Join-Path $GitUI.Repo $i.Tag.Path)`"" } } $Glyph.Folder)
+    [void](Add-MenuItem $um 'Add to .gitignore' { foreach ($i in $GitUI.Unstaged.SelectedItems) { Add-Content -LiteralPath (Join-Path $GitUI.Repo '.gitignore') -Value ($i.Tag.Path -replace '\\', '/') }; Update-GitAll } $Glyph.Cancel)
+    [void]$um.Items.Add('-')
+    [void](Add-MenuItem $um 'Discard changes...' { Invoke-GitDiscard } $Glyph.Delete)
+    $GitUI.Unstaged.ContextMenuStrip = $um
+    $smn = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    [void](Add-MenuItem $smn 'Show the changes' { $i = @($GitUI.Staged.SelectedItems)[0]; if ($i) { Open-GitChangeDiff $i.Tag $true } } $Glyph.Compare)
+    [void](Add-MenuItem $smn 'Unstage' { Invoke-GitUnstage } $Glyph.Undo 'Space')
+    $GitUI.Staged.ContextMenuStrip = $smn
+    # branches
+    $GitUI.Branches = New-GitList $pBr @('Branch', 'Upstream', 'Date') @(220, 140, 90)
+    $bb = New-TbBar $pBr
+    [void](New-Button 'New branch...' 'Create a branch from where you are and switch to it' { $n = Read-GitText 'New branch' 'Branch name'; if ($n) { [void](Invoke-GitAction "checkout -b $([DevGit]::Q($n.Trim()))" "Now on $($n.Trim()).") } } $bb $Glyph.Add 2)
+    $GitUI.Branches.add_DoubleClick({ $i = @($GitUI.Branches.SelectedItems)[0]; if ($i -and -not $i.Tag.Remote) { [void](Invoke-GitAction "checkout $([DevGit]::Q($i.Tag.Name))") } })
+    $bm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $bm.add_Opening({ param($src, $e) $GitUI.Menu = $src; Show-GitBranchMenu $src; if (-not $src.Items.Count) { $e.Cancel = $true } })
+    $GitUI.Branches.ContextMenuStrip = $bm
+    # tags
+    $GitUI.Tags = New-GitList $pTg @('Tag', 'Commit', 'Date') @(200, 90, 100)
+    $tb2 = New-TbBar $pTg
+    [void](New-Button 'New tag...' 'Tag the current commit' { $n = Read-GitText 'New tag' 'Tag name' 'v'; if ($n) { [void](Invoke-GitAction "tag $([DevGit]::Q($n.Trim()))") } } $tb2 $Glyph.Add 2)
+    [void](New-Button 'Push tags' 'Push all tags' { Start-GitJob 'push --tags' 'Pushing tags' } $tb2 $Glyph.Send 2)
+    $tm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    [void](Add-MenuItem $tm 'Check out' { $i = @($GitUI.Tags.SelectedItems)[0]; if ($i) { [void](Invoke-GitAction "checkout $([DevGit]::Q($i.Tag))") } } $Glyph.Open)
+    [void](Add-MenuItem $tm 'Push this tag' { $i = @($GitUI.Tags.SelectedItems)[0]; if ($i) { Start-GitJob "push origin $([DevGit]::Q($i.Tag))" "Pushing $($i.Tag)" } } $Glyph.Send)
+    [void](Add-MenuItem $tm 'Delete' { $i = @($GitUI.Tags.SelectedItems)[0]; if ($i -and (Confirm-Git "Delete the tag $($i.Tag) (here, not on the remote)?")) { [void](Invoke-GitAction "tag -d $([DevGit]::Q($i.Tag))") } } $Glyph.Delete)
+    $GitUI.Tags.ContextMenuStrip = $tm
+    # stashes
+    $GitUI.Stashes = New-GitList $pSt @('Stash', 'Message', 'When') @(80, 240, 90)
+    $stb = New-TbBar $pSt
+    [void](New-Button 'Stash changes...' 'Put your changes aside (new files too) and get a clean working folder' { $n = Read-GitText 'Stash' 'Message (optional)' ''; if ($null -ne $n) { [void](Invoke-GitAction "stash push -u $(if ($n.Trim()) { "-m $([DevGit]::Q($n.Trim()))" })" 'Stashed.') } } $stb $Glyph.Save 2)
+    $stm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    [void](Add-MenuItem $stm 'Apply (keep the stash)' { $i = @($GitUI.Stashes.SelectedItems)[0]; if ($i) { [void](Invoke-GitAction "stash apply $($i.Tag)") } } $Glyph.Paste)
+    [void](Add-MenuItem $stm 'Pop (apply and remove)' { $i = @($GitUI.Stashes.SelectedItems)[0]; if ($i) { [void](Invoke-GitAction "stash pop $($i.Tag)") } } $Glyph.Paste)
+    [void](Add-MenuItem $stm 'Show the changes' { $i = @($GitUI.Stashes.SelectedItems)[0]; if ($i) { $r = Invoke-Git "stash show -p --include-untracked $($i.Tag)" -Quiet; Show-Compare ([pscustomobject]@{ Kind = 'text'; Text = $r.Out; Id = '' }) $null } } $Glyph.Compare)
+    [void](Add-MenuItem $stm 'Drop' { $i = @($GitUI.Stashes.SelectedItems)[0]; if ($i -and (Confirm-Git "Delete $($i.Tag)? Its changes are lost.")) { [void](Invoke-GitAction "stash drop $($i.Tag)") } } $Glyph.Delete)
+    $GitUI.Stashes.ContextMenuStrip = $stm
+    # remotes
+    $GitUI.Remotes = New-GitList $pRm @('Remote', 'URL') @(110, 300)
+    $rb = New-TbBar $pRm
+    [void](New-Button 'Add...' 'Add a remote' { $n = Read-GitText 'Add remote' 'Name' 'origin'; if (-not $n) { return }; $u = Read-GitText 'Add remote' 'URL'; if ($u) { [void](Invoke-GitAction "remote add $([DevGit]::Q($n.Trim())) $([DevGit]::Q($u.Trim()))") } } $rb $Glyph.Add 2)
+    $rmm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    [void](Add-MenuItem $rmm 'Change URL...' { $i = @($GitUI.Remotes.SelectedItems)[0]; if (-not $i) { return }; $u = Read-GitText 'Remote URL' $i.Tag $i.SubItems[1].Text; if ($u) { [void](Invoke-GitAction "remote set-url $($i.Tag) $([DevGit]::Q($u.Trim()))") } } $Glyph.Edit)
+    [void](Add-MenuItem $rmm 'Fetch this remote' { $i = @($GitUI.Remotes.SelectedItems)[0]; if ($i) { Start-GitJob "fetch --prune $($i.Tag)" "Fetching $($i.Tag)" } } $Glyph.Refresh)
+    [void](Add-MenuItem $rmm 'Copy URL' { $i = @($GitUI.Remotes.SelectedItems)[0]; if ($i) { Copy-TbText $i.SubItems[1].Text } } $Glyph.Copy)
+    [void](Add-MenuItem $rmm 'Remove' { $i = @($GitUI.Remotes.SelectedItems)[0]; if ($i -and (Confirm-Git "Remove the remote $($i.Tag)? (Nothing on the server changes.)")) { [void](Invoke-GitAction "remote remove $($i.Tag)") } } $Glyph.Delete)
+    $GitUI.Remotes.ContextMenuStrip = $rmm
+    Select-ApiTab $tabs 'Changes'
+    $main.Controls.Add($left)
+
+    # right: commit details
+    $right = New-Object System.Windows.Forms.SplitContainer
+    $right.Dock = 'Right'; $right.Width = Px (380 * $TextZoom); $right.Orientation = 'Horizontal'; $right.SplitterWidth = 3
+    $right.BackColor = $C.Line; $right.Panel1.BackColor = $C.Bg; $right.Panel2.BackColor = $C.Bg
+    $GitUI.Detail = New-TbRtb -ReadOnly; $GitUI.Detail.Dock = 'Fill'; $GitUI.Detail.WordWrap = $true
+    $right.Panel1.Controls.Add($GitUI.Detail)
+    $GitUI.Files = New-GitList $right.Panel2 @('', 'Files in this commit (double-click: compare)') @(72, 300)
+    $GitUI.Files.add_DoubleClick({
+        $i = @($GitUI.Files.SelectedItems)[0]; $c = Get-GitSelectedCommit
+        if (-not $i -or -not $c) { return }
+        $parent = if ($c.Parents.Count) { $c.Parents[0] } else { '' }
+        Show-GitDiff $(if ($parent) { "$($parent):$($i.Tag.Old)" } else { '' }) "$($c.Hash):$($i.Tag.Path)"
+    })
+    $main.Controls.Add($right)
+
+    # centre: the graph
+    $center = New-Object System.Windows.Forms.Panel
+    $center.Dock = 'Fill'; $center.BackColor = $C.Bg
+    $g = New-Object DevGitGraph
+    $g.Dock = 'Fill'; $g.UiScale = $Scale * $TextZoom; $g.Font = $FontMain
+    $g.Back = $C.Bg; $g.Fore = $C.Fore; $g.Dim = $C.Dim; $g.Sel = $C.Sel; $g.Line = $C.Line; $g.Accent = $C.Accent
+    $g.add_SelectionChanged({ Show-GitCommit })
+    $g.add_Open({ $i = $GitUI.Files.Items; if ($i.Count) { $GitUI.Files.Items[0].Selected = $true } })
+    $gm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $gm.add_Opening({ param($src, $e) $GitUI.Menu = $src; Show-GitCommitMenu $src; if (-not $src.Items.Count) { $e.Cancel = $true } })
+    $g.ContextMenuStrip = $gm
+    $center.Controls.Add($g)
+    $GitUI.Graph = $g
+    $gbar = New-TbBar $center
+    $GitUI.AllRefs = New-CheckBox $gbar 'All branches' $true 'Show every branch, or only the history of the current one'
+    $GitUI.AllRefs.Margin = New-Object System.Windows.Forms.Padding((Px 4), (Px 8), (Px 8), 0)
+    $GitUI.AllRefs.add_CheckedChanged({ Update-GitGraph })
+    $GitUI.Depth = New-TbCombo $gbar @('200 commits', '1000 commits', '5000 commits', 'all commits') 130
+    $GitUI.Depth.SelectedIndex = 1
+    $GitUI.Depth.add_SelectedIndexChanged({ if ($GitUI.Git) { Update-GitGraph } })
+    $GitUI.Find = New-TbBox -Cue 'find a commit: text, hash, author, branch (Enter = next)'
+    $GitUI.Find.Width = Px (330 * $TextZoom); $GitUI.Find.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 6), 0)
+    $GitUI.Find.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Return') { $e.SuppressKeyPress = $true; $i = $GitUI.Graph.FindNext($src.Text, $GitUI.Graph.Selected); if ($i -ge 0) { $GitUI.Graph.SelectRow($i) } else { Set-GitStatus 'No commit matches.' $C.Yellow } } })
+    $gbar.Controls.Add($GitUI.Find)
+    # banner for merges / rebases in progress
+    $banner = New-TbBar $center
+    $banner.BackColor = $C.Yellow; $banner.Visible = $false
+    $GitUI.BannerText = New-TbLabel $banner '' -Title
+    $GitUI.BannerText.ForeColor = [System.Drawing.Color]::Black
+    [void](New-Button 'Continue' 'Continue after fixing the conflicts (and staging them)' { $op = $GitUI.Op; [void](Invoke-GitAction "-c core.editor=true $op --continue") } $banner '' 1)
+    [void](New-Button 'Abort' 'Stop and go back to how it was before' { $op = $GitUI.Op; if (Confirm-Git "Abort the $op?") { [void](Invoke-GitAction "$op --abort") } } $banner '' 3)
+    $GitUI.Banner = $banner
+    $main.Controls.Add($center)
+    $center.BringToFront()
+
+    # top bar
+    $top = New-Object System.Windows.Forms.FlowLayoutPanel
+    $top.Dock = 'Top'; $top.AutoSize = $true; $top.WrapContents = $true; $top.BackColor = $C.Panel
+    $top.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 4))
+    New-TbLabel $top 'Repository' -Dim | Out-Null
+    $GitUI.RepoBox = New-TbCombo $top @() 320
+    $GitUI.RepoBox.add_SelectedIndexChanged({ param($src, $e) if (-not $GitUI.Loading -and $src.SelectedItem) { Open-GitRepo ([string]$src.SelectedItem) } })
+    [void](New-Button 'Open...' 'Open a folder (a new repository can be created there)' {
+        $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Repository folder'
+        if ($GitUI.Repo) { $d.SelectedPath = $GitUI.Repo }
+        $script:Modal = $true
+        try { if ($d.ShowDialog($GitUI.Form) -eq 'OK') { Open-GitRepo $d.SelectedPath } } finally { $script:Modal = $false; $d.Dispose() }
+    } $top $Glyph.Folder 2)
+    [void](New-Button 'Clone...' 'Clone a repository from a URL' { Show-GitCloneDialog } $top $Glyph.Add 2)
+    New-TbLabel $top '   Branch' -Dim | Out-Null
+    $GitUI.BranchBox = New-TbCombo $top @() 200
+    $GitUI.BranchBox.add_SelectedIndexChanged({ param($src, $e) if (-not $GitUI.Loading -and $src.SelectedItem -and [string]$src.SelectedItem -ne $GitUI.Branch) { [void](Invoke-GitAction "checkout $([DevGit]::Q([string]$src.SelectedItem))" "Now on $($src.SelectedItem).") } })
+    [void](New-Button 'Fetch' 'Download what is new on the remotes (doesn''t change your files)' { Start-GitJob 'fetch --all --prune' 'Fetching' } $top $Glyph.Refresh 2)
+    [void](New-Button 'Pull' 'Fetch and bring the remote changes into this branch' { Start-GitJob 'pull' 'Pulling' } $top $Glyph.Undo 2)
+    [void](New-Button 'Push' 'Send your commits to the remote (sets the upstream the first time)' { Invoke-GitPush } $top $Glyph.Send 1)
+    [void](New-Button 'Force push...' 'Overwrite the remote branch (with lease: refuses if someone else pushed meanwhile)' { if (Confirm-Git "Force push $($GitUI.Branch)? Commits on the remote that you don't have are replaced.") { Invoke-GitPush -Force } } $top '' 2)
+    [void](New-Button 'Refresh' 'Read everything again (F5)' { Update-GitAll } $top $Glyph.Refresh 2)
+    [void](New-Button 'Explorer' 'Open the folder' { if ($GitUI.Repo) { Start-Process explorer.exe $GitUI.Repo } } $top $Glyph.Folder 2)
+    [void](New-Button 'Terminal' 'Open a PowerShell window in the folder' { if ($GitUI.Repo) { Start-Process powershell.exe -WorkingDirectory $GitUI.Repo } } $top $Glyph.Code 2)
+    $f.Controls.Add($top)
+    $info = New-Object System.Windows.Forms.Label
+    $info.Dock = 'Top'; $info.Height = $FontMain.Height + (Px 10); $info.TextAlign = 'MiddleLeft'; $info.ForeColor = $C.Fore; $info.BackColor = $C.Panel
+    $info.Padding = New-Object System.Windows.Forms.Padding((Px 12), 0, 0, 0)
+    $f.Controls.Add($info); $info.BringToFront(); $main.BringToFront()
+    $GitUI.Info = $info
+    $status = New-Object System.Windows.Forms.Label
+    $status.Dock = 'Bottom'; $status.Height = $FontMain.Height + (Px 10); $status.TextAlign = 'MiddleLeft'; $status.ForeColor = $C.Dim; $status.BackColor = $C.Panel
+    $status.Padding = New-Object System.Windows.Forms.Padding((Px 10), 0, 0, 0)
+    $f.Controls.Add($status)
+    $GitUI.StatusBar = $status
+    $top.SendToBack(); $status.SendToBack()
+
+    $GitUI.JobTimer = New-Object System.Windows.Forms.Timer
+    $GitUI.JobTimer.Interval = 300
+    $GitUI.JobTimer.add_Tick({ Complete-GitJob })
+    # changes made outside (editor, terminal) show up when you come back to the window
+    $f.add_Activated({ if ($GitUI.Git -and -not $GitUI.Job -and -not $script:Modal) { Update-GitChanges; Update-GitState } })
+    $f.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'F5') { Update-GitAll; $e.Handled = $true } })
+    $f.add_FormClosed({ param($src, $e) if ($GitUI.Job) { $GitUI.Job.Git.Cancel() }; $GitUI.JobTimer.Dispose(); $GitUI.Form = $null; $GitUI.Git = $null; $GitUI.Repo = ''; $GitUI.Job = $null; $src.Dispose() })
+    Register-ThemedWindow $f
+
+    Write-GitLog "git: $($GitUI.Exe)" $C.Dim
+    Update-GitRepoCombo
+    $f.Show()
+    [PowerClipHost]::EnsureShown($f.Handle)
+    $start = if ($Folder) { $Folder } elseif (@($script:GitRepos).Count) { @($script:GitRepos)[0] } else { '' }
+    if ($start -and (Test-Path -LiteralPath $start)) { Open-GitRepo $start } else { Set-GitStatus 'Open a repository folder (Open...), or Clone one.' $C.Dim }
+    $f.Activate()
+}
+
 # ---------------------------------------------------------------------------
 # Smart clip actions: recognise what a text clip is (JSON, JWT, URL, GUID, timestamp, colour, cron,
 # Base64, file path, email, IP / host) and offer one-click actions for it. Shown as a badge in the
@@ -20035,6 +20974,7 @@ $miOpen.Font = New-Object System.Drawing.Font($miOpen.Font, [System.Drawing.Font
 [void](Add-MenuItem $trayMenu 'Toolbox' { Show-Toolbox } $Glyph.Toolbox)
 [void](Add-MenuItem $trayMenu 'Take screenshot' { Start-ScreenCapture } $Glyph.Photo 'Ctrl+Shift+X')
 [void](Add-MenuItem $trayMenu 'New reminder...' { New-QuickReminder } $Glyph.History)
+[void](Add-MenuItem $trayMenu 'Git...' { Show-Git } $Glyph.Code)
 $miMover = Add-MenuItem $trayMenu 'Keep me active (mouse mover)' { Switch-MouseMover } $Glyph.Apps
 $trayMenu.add_Opening({ $miMover.Checked = [bool]$Mouse.Mover })
 [void](Add-MenuItem $trayMenu 'Paste stack (collect, then paste in order)' { Start-PasteStack } $Glyph.Paste)
