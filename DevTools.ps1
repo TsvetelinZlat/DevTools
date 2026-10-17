@@ -6695,8 +6695,10 @@ public static class PowerClipWindows {
 # ---------------------------------------------------------------------------
 # Single instance
 # ---------------------------------------------------------------------------
+# one DevTools per folder: copies in other folders (another data folder) can run side by side
 $createdNew = $false
-$mutex = New-Object System.Threading.Mutex($true, 'Local\DevTools_SingleInstance', [ref]$createdNew)
+$instKey = [BitConverter]::ToString([System.Security.Cryptography.SHA1]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes((Split-Path -Parent $PSCommandPath).ToLowerInvariant()))).Replace('-', '').Substring(0, 12)
+$mutex = New-Object System.Threading.Mutex($true, "Local\DevTools_SingleInstance_$instKey", [ref]$createdNew)
 if (-not $createdNew) {
     [void][System.Windows.Forms.MessageBox]::Show('DevTools is already running. Press Ctrl+Shift+V to open it.', 'DevTools')
     return
