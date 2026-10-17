@@ -11714,9 +11714,54 @@ function Add-ChainCopyMenu($Menu, $Node) {
     }
 }
 
-# Ctrl+V on the canvas (or right-click > Paste): a copied request, a curl command, a link or a chain.
+# Copies the selected cards: one card as a request (also pastes into the API tester), several with their arrows.
+function Copy-ChainCards {
+    Save-ChainEditor
+    $cv = $ChainUI.Canvas
+    $sel = @($cv.Selection)
+    if (-not $sel) { return }
+    if ($sel.Count -eq 1) {
+        Copy-RequestPart 'request' $ChainUI.Data[$sel[0].Id].Request $ChainUI.Data[$sel[0].Id].Extract.ToArray()
+        Set-ChainStatus "Copied $($sel[0].Title). Ctrl+V pastes it as a new card (here or in another chain); the API tester can paste it too." $C.Green
+        return
+    }
+    $ids = @($sel | ForEach-Object { $_.Id })
+    $doc = [ordered]@{
+        DevToolsRequestPart = 'requests'
+        Items = @(foreach ($n in $sel) { $d = $ChainUI.Data[$n.Id]; [ordered]@{ Id = $n.Id; X = [int]$n.X; Y = [int]$n.Y; Request = $d.Request; StopOnFail = [bool]$d.StopOnFail; Extract = @($d.Extract.ToArray()) } })
+        Links = @(foreach ($l in $cv.Links) { if ($ids -contains $l.From -and $ids -contains $l.To) { [ordered]@{ From = $l.From; To = $l.To } } })
+    }
+    try { [System.Windows.Forms.Clipboard]::SetText((ConvertTo-Json -InputObject $doc -Depth 10)) } catch { }
+    Set-ChainStatus "Copied $($sel.Count) cards (with the arrows between them). Ctrl+V pastes them - here or in another chain." $C.Green
+}
+
+# Ctrl+V on the canvas (or right-click > Paste): copied cards, a request, a curl command, a link or a chain.
 function Invoke-ChainPaste([float]$X = -1, [float]$Y = -1) {
     $part = Get-RequestPart
+    if ($part -and $part.DevToolsRequestPart -eq 'requests') {
+        $cv = $ChainUI.Canvas
+        $items = @($part.Items | Where-Object { $_ })
+        $minX = ($items | ForEach-Object { [float]$_.X } | Measure-Object -Minimum).Minimum
+        $minY = ($items | ForEach-Object { [float]$_.Y } | Measure-Object -Minimum).Minimum
+        if ($X -lt 0) { $X = $minX + (Px 40); $Y = $minY + (Px 40) }
+        $map = @{}; $new = @()
+        foreach ($it in $items) {
+            $m = New-ApiModel
+            foreach ($p in $it.Request.PSObject.Properties) { if ($m.PSObject.Properties[$p.Name]) { $m.($p.Name) = $p.Value } }
+            $m.Id = $null
+            $n = $cv.AddNode([string]$m.Name, [string]$m.Method, [string]$m.Url, ($X + [float]$it.X - $minX), ($Y + [float]$it.Y - $minY))
+            $d = New-ChainStep $m; $d.StopOnFail = $it.StopOnFail -ne $false
+            foreach ($e in @($it.Extract)) { if ($e -and $e.Var) { $d.Extract.Add([pscustomobject]@{ Var = [string]$e.Var; From = [string]$e.From; Expr = [string]$e.Expr }) } }
+            $ChainUI.Data[$n.Id] = $d
+            $map[[string]$it.Id] = $n.Id; $new += $n
+        }
+        foreach ($l in @($part.Links)) { if ($l -and $map[[string]$l.From] -and $map[[string]$l.To]) { $lk = New-Object ChainLink; $lk.From = $map[[string]$l.From]; $lk.To = $map[[string]$l.To]; $cv.Links.Add($lk) } }
+        $ChainUI.EditId = $null
+        $cv.SelectIds([string[]]@($new | ForEach-Object { $_.Id }))
+        Update-ChainOrder; Save-Chains
+        Set-ChainStatus "Pasted $($new.Count) cards (still selected - drag one to move them all)." $C.Green
+        return
+    }
     if ($part -and $part.DevToolsRequestPart -eq 'request') {
         $cv = $ChainUI.Canvas; $cv.SelectedNode = $null
         $n = Add-ChainStep (New-ModelFromPart $part) $X $Y
@@ -11931,7 +11976,7 @@ function Show-ApiChains {
     $ChainUI.Editor = $ed
     $hint = New-Object System.Windows.Forms.Label
     $hint.Dock = 'Fill'; $hint.TextAlign = 'MiddleCenter'; $hint.ForeColor = $C.Dim; $hint.BackColor = $C.Bg
-    $hint.Text = "Click a card to edit it.`n`nDrag requests from the left onto the canvas.`nDrag from a card's blue dot to another card to run it after.`nDel removes the selected card or arrow."
+    $hint.Text = "Click a card to edit it.`n`nDrag requests from the left onto the canvas.`nDrag from a card's blue dot to another card to run it after.`nCtrl+click, or drag a box on empty space, to select several cards;`nthen Del deletes them, Ctrl+C / Ctrl+V copies them, dragging moves them.`nScroll with the mouse wheel (Shift = sideways) or drag with the middle button."
     $right.Panel1.Controls.Add($hint)
     $ChainUI.EditorHint = $hint
 
@@ -12082,7 +12127,13 @@ function Show-ApiChains {
         $p = $src.ToCanvas($src.PointToClient((New-Object System.Drawing.Point($e.X, $e.Y))))
         Add-ChainDrop $e.Data ($p.X - $src.NodeW / 2) ($p.Y - $src.NodeH / 2)
     })
-    $cv.add_SelectionChanged({ param($src, $e) Show-ChainStep $src.SelectedNode })
+    $cv.add_SelectionChanged({
+        param($src, $e)
+        Show-ChainStep $src.SelectedNode
+        $k = $src.Selection.Count
+        if ($k -gt 1) { Set-ChainStatus "$k cards selected  -  drag one to move them together, Del deletes them, Ctrl+C copies them (with their arrows)." $C.Accent }
+        elseif ($ChainUI.Status -and $ChainUI.Status.Text -match '^\d+ cards selected') { Set-ChainStatus 'Ctrl+click or drag a box on empty space to select several cards.' $C.Dim }
+    })
     $cv.add_Changed({ param($src, $e) Update-ChainOrder; Save-Chains })
     $cv.add_NodeOpen({ Select-ApiTab $ChainUI.ETabs 'Request'; [void]$ChainUI.EUrl.Focus() })
     $cm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
@@ -12100,10 +12151,14 @@ function Show-ApiChains {
         [void]$src.Items.Add($add)
         $pp = Get-RequestPart
         $clipText = ''; try { $clipText = [System.Windows.Forms.Clipboard]::GetText() } catch { }
-        if (($pp -and $pp.DevToolsRequestPart -eq 'request') -or $clipText -match '^\s*(curl\s|https?://)') {
-            [void](Add-MenuItem $src $(if ($pp) { 'Paste the copied request here' } else { 'Paste (curl command / link) here' }) { param($s2, $e2) $p = $s2.Owner.Tag; $ChainUI.Canvas.SelectedNode = $null; Invoke-ChainPaste ($p.X) ($p.Y) } $Glyph.Paste 'Ctrl+V')
+        if (($pp -and $pp.DevToolsRequestPart -in 'request', 'requests') -or $clipText -match '^\s*(curl\s|https?://)') {
+            [void](Add-MenuItem $src $(if ($pp -and $pp.DevToolsRequestPart -eq 'requests') { "Paste the $(@($pp.Items).Count) copied cards here" } elseif ($pp) { 'Paste the copied request here' } else { 'Paste (curl command / link) here' }) { param($s2, $e2) $p = $s2.Owner.Tag; $ChainUI.Canvas.SelectedNode = $null; Invoke-ChainPaste ($p.X) ($p.Y) } $Glyph.Paste 'Ctrl+V')
         }
-        if ($cv2.SelectedNode) {
+        if ($cv2.Selection.Count -gt 1) {
+            [void](Add-MenuItem $src "Copy $($cv2.Selection.Count) cards" { Copy-ChainCards } $Glyph.Copy 'Ctrl+C')
+            [void](Add-MenuItem $src "Delete $($cv2.Selection.Count) cards" { $ChainUI.Canvas.RemoveSelected() } $Glyph.Delete 'Del')
+            [void](Add-MenuItem $src 'Select all' { $ChainUI.Canvas.SelectAll() } '' 'Ctrl+A')
+        } elseif ($cv2.SelectedNode) {
             [void](Add-MenuItem $src 'Run this step' { Start-ChainRun $ChainUI.Canvas.SelectedNode.Id } $Glyph.Play)
             Add-ChainCopyMenu $src $cv2.SelectedNode
             [void](Add-MenuItem $src 'Duplicate' { $n = $ChainUI.Canvas.SelectedNode; $m = $ChainUI.Data[$n.Id].Request | ConvertTo-Json -Depth 6 | ConvertFrom-Json; $sel = $ChainUI.Canvas.SelectedNode; $ChainUI.Canvas.SelectedNode = $null; $x = Add-ChainStep $m ($sel.X + (Px 30)) ($sel.Y + (Px 100)); foreach ($r in $ChainUI.Data[$sel.Id].Extract) { $ChainUI.Data[$x.Id].Extract.Add($r) }; Save-Chains } $Glyph.Copy)
@@ -12149,7 +12204,7 @@ function Show-ApiChains {
     $ChainUI.AutoCookies = New-CheckBox $top 'Send cookies along' $true 'Cookies a response sets are sent with the next requests to the same site (like a browser)'
     $ChainUI.AutoCookies.add_CheckedChanged({ param($src, $e) if ($ChainUI.Current -and -not $ChainUI.Loading) { $ChainUI.Current.AutoCookies = $src.Checked; Save-Chains } })
     [void](New-Button 'Add request' 'Add an empty request after the selected one' { Add-ChainFromPalette 'tpl:New empty request' } $top $Glyph.Add 2)
-    [void](New-Button 'Arrange' 'Line the cards up in run order (drag on empty space to scroll the canvas)' { Invoke-ChainArrange } $top $Glyph.Apps 2)
+    [void](New-Button 'Arrange' 'Line the cards up in run order (mouse wheel or middle-button drag scrolls the canvas)' { Invoke-ChainArrange } $top $Glyph.Apps 2)
     [void](New-Button 'Examples' 'Ready-made chains to learn from: log in -> token, session cookie, create and read, headers / regex / status' { param($src, $e) Show-ChainExampleMenu $src } $top $Glyph.Lightning 2)
     [void](New-Button 'Share' 'Export this chain for a colleague, or import one' { param($src, $e) Show-ChainShareMenu $src } $top $Glyph.Send 2)
     $ChainUI.TestApiBtn = New-Button 'Test API' 'A practice API on this PC: log in, token, cookie, CSRF, items. No internet needed.' { param($src, $e) Show-TestApiMenu $src } $top $Glyph.Network 2
@@ -12182,10 +12237,8 @@ function Show-ApiChains {
         param($src, $e)
         if ($e.KeyCode -eq 'F5' -and $e.Shift) { $n = $ChainUI.Canvas.SelectedNode; if ($n) { Start-ChainRun $n.Id }; $e.Handled = $true }
         elseif ($e.KeyCode -eq 'F5') { Start-ChainRun; $e.Handled = $true }
-        elseif ($ChainUI.Canvas.Focused -and $e.Control -and $e.KeyCode -eq 'C' -and $ChainUI.Canvas.SelectedNode) {
-            Save-ChainEditor; $n = $ChainUI.Canvas.SelectedNode
-            Copy-RequestPart 'request' $ChainUI.Data[$n.Id].Request $ChainUI.Data[$n.Id].Extract.ToArray()
-            Set-ChainStatus "Copied $($n.Title). Ctrl+V pastes it as a new card (here or in another chain); the API tester can paste it too." $C.Green
+        elseif ($ChainUI.Canvas.Focused -and $e.Control -and $e.KeyCode -eq 'C' -and $ChainUI.Canvas.Selection.Count) {
+            Copy-ChainCards
             $e.Handled = $true; $e.SuppressKeyPress = $true
         }
         elseif ($ChainUI.Canvas.Focused -and $e.Control -and $e.KeyCode -eq 'V') {
@@ -12610,15 +12663,17 @@ function Read-TextDialog([string]$Title, [string]$Prompt, [string]$Value = '', $
     $d.Text = $Title; $d.FormBorderStyle = 'FixedDialog'; $d.MaximizeBox = $false; $d.MinimizeBox = $false
     $d.StartPosition = 'CenterParent'; $d.ShowInTaskbar = $false; $d.BackColor = $C.Panel; $d.ForeColor = $C.Fore; $d.Font = $FontMain
     $d.ClientSize = New-Object System.Drawing.Size((Px (380 * $TextZoom)), ($FontMain.Height * 2 + $FontButton.Height + (Px 70)))
-    $l = New-Object System.Windows.Forms.Label; $l.Text = $Prompt; $l.AutoSize = $true; $l.Location = New-Object System.Drawing.Point((Px 14), (Px 12))
+    $l = New-Object System.Windows.Forms.Label; $l.Text = $Prompt; $l.Font = $FontMain; $l.AutoSize = $true; $l.Location = New-Object System.Drawing.Point((Px 14), (Px 12))
+    $l.MaximumSize = New-Object System.Drawing.Size(($d.ClientSize.Width - (Px 28)), 0)          # long prompts wrap
     $b = New-Object System.Windows.Forms.TextBox; $b.Text = $Value; $b.BorderStyle = 'FixedSingle'; $b.BackColor = $C.Bg; $b.ForeColor = $C.Fore
-    $b.Location = New-Object System.Drawing.Point((Px 14), ($FontMain.Height + (Px 20))); $b.Width = $d.ClientSize.Width - (Px 28)
+    $b.Location = New-Object System.Drawing.Point((Px 14), ($l.Top + $l.PreferredSize.Height + (Px 8))); $b.Width = $d.ClientSize.Width - (Px 28)
     $ok = New-Object PowerClipButton; $ok.Text = 'OK'; $ok.Variant = 1; $ok.Font = $FontButton; $ok.AutoSize = $true; $ok.DialogResult = 'OK'
     $cancel = New-Object PowerClipButton; $cancel.Text = 'Cancel'; $cancel.Font = $FontButton; $cancel.AutoSize = $true; $cancel.DialogResult = 'Cancel'
     $d.Controls.AddRange(@($l, $b, $ok, $cancel))
     $y = $b.Bottom + (Px 14)
     $cancel.Location = New-Object System.Drawing.Point(($d.ClientSize.Width - $cancel.Width - (Px 14)), $y)
     $ok.Location = New-Object System.Drawing.Point(($cancel.Left - $ok.Width - (Px 8)), $y)
+    $d.ClientSize = New-Object System.Drawing.Size($d.ClientSize.Width, ($cancel.Bottom + (Px 14)))
     $d.AcceptButton = $ok; $d.CancelButton = $cancel
     Register-ThemedWindow $d
     $script:Modal = $true
@@ -15063,30 +15118,40 @@ public class ChainNode {
 }
 public class ChainLink { public string From, To; }
 
+// API chains canvas: cards joined by arrows. Click / Ctrl+click / drag a box on empty space to select;
+// drag selected cards together; drag from a card's right dot to another card to link; wheel or middle-drag scrolls.
 public class DevChainCanvas : System.Windows.Forms.Panel {
     public List<ChainNode> Nodes = new List<ChainNode>();
     public List<ChainLink> Links = new List<ChainLink>();
+    public List<ChainNode> Selection = new List<ChainNode>();
     public float UiScale = 1f;
     public System.Drawing.Color Back = System.Drawing.Color.White, GridDot = System.Drawing.Color.Gainsboro, Card = System.Drawing.Color.White,
         Fore = System.Drawing.Color.Black, Dim = System.Drawing.Color.Gray, Line = System.Drawing.Color.Silver, Accent = System.Drawing.Color.RoyalBlue,
         Green = System.Drawing.Color.SeaGreen, Red = System.Drawing.Color.Crimson, Yellow = System.Drawing.Color.Goldenrod;
-    public ChainNode SelectedNode;
+    ChainNode primary;
     public ChainLink SelectedLink;
     public string RunningId;
     public System.Drawing.PointF Pan = new System.Drawing.PointF(0, 0);
     public event EventHandler SelectionChanged, Changed, NodeOpen;
 
-    enum Mode { None, Drag, Link, Pan }
+    enum Mode { None, Drag, Link, Pan, Box }
     Mode mode = Mode.None;
-    System.Drawing.PointF grab, mouse, panStart;
+    System.Drawing.PointF mouse, panStart, boxStart, dragStart;
+    Dictionary<ChainNode, System.Drawing.PointF> dragFrom = new Dictionary<ChainNode, System.Drawing.PointF>();
     System.Drawing.Point downAt;
     ChainNode linkFrom;
-    bool moved;
+    bool moved, boxAdd;
 
     public DevChainCanvas() {
         SetStyle(System.Windows.Forms.ControlStyles.AllPaintingInWmPaint | System.Windows.Forms.ControlStyles.OptimizedDoubleBuffer |
                  System.Windows.Forms.ControlStyles.UserPaint | System.Windows.Forms.ControlStyles.ResizeRedraw | System.Windows.Forms.ControlStyles.Selectable, true);
         TabStop = true;
+    }
+
+    // The card shown in the editor: the last one clicked (null when none, or the selection is empty).
+    public ChainNode SelectedNode {
+        get { return primary != null && Selection.Contains(primary) ? primary : (Selection.Count > 0 ? Selection[Selection.Count - 1] : null); }
+        set { Selection.Clear(); primary = value; if (value != null) Selection.Add(value); SelectedLink = null; Invalidate(); }
     }
 
     float S(float v) { return v * UiScale; }
@@ -15106,26 +15171,24 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
         return n;
     }
 
-    public void SelectNode(ChainNode n) {
-        SelectedNode = n; SelectedLink = null;
-        Invalidate();
-        if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty);
-    }
+    void Fire() { Invalidate(); if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); }
+
+    public void SelectNode(ChainNode n) { SelectedNode = n; Fire(); }
+    public void SelectAll() { Selection = new List<ChainNode>(Nodes); primary = Nodes.Count > 0 ? Nodes[Nodes.Count - 1] : null; SelectedLink = null; Fire(); }
+    public void SelectIds(string[] ids) { var want = new HashSet<string>(ids ?? new string[0]); Selection = Nodes.Where(n => want.Contains(n.Id)).ToList(); primary = Selection.Count > 0 ? Selection[Selection.Count - 1] : null; SelectedLink = null; Fire(); }
 
     public void RemoveSelected() {
-        if (SelectedNode != null) {
-            var id = SelectedNode.Id;
-            Nodes.Remove(SelectedNode);
-            Links.RemoveAll(l => l.From == id || l.To == id);
-            SelectedNode = null;
+        if (Selection.Count > 0) {
+            var ids = new HashSet<string>(Selection.Select(n => n.Id));
+            Nodes.RemoveAll(n => ids.Contains(n.Id));
+            Links.RemoveAll(l => ids.Contains(l.From) || ids.Contains(l.To));
+            Selection.Clear(); primary = null;
         } else if (SelectedLink != null) { Links.Remove(SelectedLink); SelectedLink = null; }
         else return;
-        Invalidate();
-        if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty);
+        Fire();
         if (Changed != null) Changed(this, EventArgs.Empty);
     }
 
-    // true when "to" can already reach "from" (a new link would make a loop)
     bool Reaches(string start, string target) {
         var seen = new HashSet<string>(); var stack = new Stack<string>(); stack.Push(start);
         while (stack.Count > 0) {
@@ -15173,32 +15236,53 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
         return null;
     }
 
+    System.Drawing.RectangleF BoxRect() {
+        return System.Drawing.RectangleF.FromLTRB(Math.Min(boxStart.X, mouse.X), Math.Min(boxStart.Y, mouse.Y), Math.Max(boxStart.X, mouse.X), Math.Max(boxStart.Y, mouse.Y));
+    }
+
     protected override void OnMouseDown(System.Windows.Forms.MouseEventArgs e) {
         base.OnMouseDown(e);
         Focus();
         var p = new System.Drawing.PointF(e.X, e.Y);
-        downAt = e.Location; moved = false;
+        downAt = e.Location; moved = false; mouse = p;
+        bool ctrl = (ModifierKeys & System.Windows.Forms.Keys.Control) != 0, shift = (ModifierKeys & System.Windows.Forms.Keys.Shift) != 0;
+        if (e.Button == System.Windows.Forms.MouseButtons.Middle) { mode = Mode.Pan; panStart = new System.Drawing.PointF(e.X - Pan.X, e.Y - Pan.Y); Cursor = System.Windows.Forms.Cursors.SizeAll; return; }
         var n = NodeAt(p);
-        if (n != null && Dist(OutPort(n), p) < S(12) && e.Button == System.Windows.Forms.MouseButtons.Left) {
-            mode = Mode.Link; linkFrom = n; mouse = p; SelectNode(n); return;
+        if (n != null && e.Button == System.Windows.Forms.MouseButtons.Left && Dist(OutPort(n), p) < S(12)) {
+            mode = Mode.Link; linkFrom = n; return;
         }
         if (n != null) {
-            SelectNode(n);
-            if (e.Button == System.Windows.Forms.MouseButtons.Left) { mode = Mode.Drag; grab = new System.Drawing.PointF(p.X - n.X, p.Y - n.Y); }
+            if (ctrl && e.Button == System.Windows.Forms.MouseButtons.Left) {
+                if (Selection.Contains(n)) { Selection.Remove(n); if (primary == n) primary = null; } else { Selection.Add(n); primary = n; }
+                SelectedLink = null; Fire();
+                return;
+            }
+            if (!Selection.Contains(n)) { Selection.Clear(); Selection.Add(n); }
+            primary = n; SelectedLink = null; Fire();
+            if (e.Button == System.Windows.Forms.MouseButtons.Left) {
+                mode = Mode.Drag; dragStart = p; dragFrom.Clear();
+                foreach (var s in Selection) dragFrom[s] = new System.Drawing.PointF(s.X, s.Y);
+            }
             return;
         }
         var l = LinkAt(p);
-        if (l != null) { SelectedNode = null; SelectedLink = l; Invalidate(); if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); return; }
-        SelectNode(null);
-        if (e.Button == System.Windows.Forms.MouseButtons.Left || e.Button == System.Windows.Forms.MouseButtons.Middle) { mode = Mode.Pan; panStart = new System.Drawing.PointF(e.X - Pan.X, e.Y - Pan.Y); Cursor = System.Windows.Forms.Cursors.SizeAll; }
+        if (l != null) { Selection.Clear(); primary = null; SelectedLink = l; Fire(); return; }
+        if (e.Button == System.Windows.Forms.MouseButtons.Left) {
+            mode = Mode.Box; boxStart = p; boxAdd = ctrl || shift;
+            if (!boxAdd && (Selection.Count > 0 || SelectedLink != null)) { Selection.Clear(); primary = null; SelectedLink = null; Fire(); }
+        } else if (e.Button == System.Windows.Forms.MouseButtons.Right && Selection.Count > 0 && !ctrl) { Selection.Clear(); primary = null; SelectedLink = null; Fire(); }
     }
 
     protected override void OnMouseMove(System.Windows.Forms.MouseEventArgs e) {
         base.OnMouseMove(e);
         var p = new System.Drawing.PointF(e.X, e.Y);
         if (Math.Abs(e.X - downAt.X) + Math.Abs(e.Y - downAt.Y) > 3) moved = true;
-        if (mode == Mode.Drag && SelectedNode != null) { SelectedNode.X = (float)Math.Round(p.X - grab.X); SelectedNode.Y = (float)Math.Round(p.Y - grab.Y); Invalidate(); }
-        else if (mode == Mode.Link) { mouse = p; Invalidate(); }
+        if (mode == Mode.Drag) {
+            float dx = p.X - dragStart.X, dy = p.Y - dragStart.Y;
+            foreach (var kv in dragFrom) { kv.Key.X = (float)Math.Round(kv.Value.X + dx); kv.Key.Y = (float)Math.Round(kv.Value.Y + dy); }
+            Invalidate();
+        }
+        else if (mode == Mode.Link || mode == Mode.Box) { mouse = p; Invalidate(); }
         else if (mode == Mode.Pan) { Pan = new System.Drawing.PointF(e.X - panStart.X, e.Y - panStart.Y); Invalidate(); }
         else {
             var n = NodeAt(p);
@@ -15214,7 +15298,26 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
             if (t != null && t != linkFrom) Connect(linkFrom.Id, t.Id);
             Invalidate();
         } else if (mode == Mode.Drag && moved && Changed != null) Changed(this, EventArgs.Empty);
+        else if (mode == Mode.Box) {
+            if (moved) {
+                var r = BoxRect();
+                var hit = Nodes.Where(n => r.IntersectsWith(Box(n))).ToList();
+                if (!boxAdd) Selection.Clear();
+                foreach (var n in hit) if (!Selection.Contains(n)) Selection.Add(n);
+                primary = Selection.Count > 0 ? Selection[Selection.Count - 1] : null;
+                Fire();
+            }
+            Invalidate();
+        }
         mode = Mode.None; linkFrom = null; Cursor = System.Windows.Forms.Cursors.Default;
+    }
+
+    protected override void OnMouseWheel(System.Windows.Forms.MouseEventArgs e) {
+        base.OnMouseWheel(e);
+        float step = e.Delta / 120f * S(60);
+        if ((ModifierKeys & System.Windows.Forms.Keys.Shift) != 0) Pan = new System.Drawing.PointF(Pan.X + step, Pan.Y);
+        else Pan = new System.Drawing.PointF(Pan.X, Pan.Y + step);
+        Invalidate();
     }
 
     protected override void OnMouseDoubleClick(System.Windows.Forms.MouseEventArgs e) {
@@ -15226,6 +15329,8 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
     protected override void OnKeyDown(System.Windows.Forms.KeyEventArgs e) {
         base.OnKeyDown(e);
         if (e.KeyCode == System.Windows.Forms.Keys.Delete) { RemoveSelected(); e.Handled = true; }
+        else if (e.Control && e.KeyCode == System.Windows.Forms.Keys.A) { SelectAll(); e.Handled = true; }
+        else if (e.KeyCode == System.Windows.Forms.Keys.Escape && Selection.Count > 0) { SelectNode(null); e.Handled = true; }
     }
 
     System.Drawing.Color MethodColor(string m) {
@@ -15244,9 +15349,7 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
 
     void Arrow(System.Drawing.Graphics g, System.Drawing.PointF a, System.Drawing.PointF d, System.Drawing.Color col, float w) {
         System.Drawing.PointF b, c; Curve(a, d, out b, out c);
-        using (var pen = new System.Drawing.Pen(col, w)) {
-            g.DrawBezier(pen, a, b, c, new System.Drawing.PointF(d.X - S(6), d.Y));
-        }
+        using (var pen = new System.Drawing.Pen(col, w)) g.DrawBezier(pen, a, b, c, new System.Drawing.PointF(d.X - S(6), d.Y));
         var tip = d; float s = S(8);
         using (var br = new System.Drawing.SolidBrush(col))
             g.FillPolygon(br, new[] { tip, new System.Drawing.PointF(tip.X - s * 1.3f, tip.Y - s * 0.7f), new System.Drawing.PointF(tip.X - s * 1.3f, tip.Y + s * 0.7f) });
@@ -15260,6 +15363,7 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
         float step = S(24);
         using (var dot = new System.Drawing.SolidBrush(GridDot)) {
             float ox = Pan.X % step, oy = Pan.Y % step;
+            if (ox < 0) ox += step; if (oy < 0) oy += step;
             for (float x = ox; x < Width; x += step) for (float y = oy; y < Height; y += step) g.FillRectangle(dot, x, y, S(1.6f), S(1.6f));
         }
         if (Nodes.Count == 0) {
@@ -15282,17 +15386,15 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
         using (var badgeF = new System.Drawing.Font(Font.FontFamily, Font.Size * 0.75f, System.Drawing.FontStyle.Bold)) {
             foreach (var n in Nodes) {
                 var r = Box(n);
-                bool sel = n == SelectedNode, run = n.Id == RunningId;
+                bool sel = Selection.Contains(n), run = n.Id == RunningId;
                 var stateCol = run ? Accent : n.State == "ok" ? Green : n.State == "fail" ? Red : n.State == "skip" ? Yellow : Line;
                 using (var path = Round(r, S(8))) {
                     using (var shadow = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(28, 0, 0, 0))) { g.TranslateTransform(0, S(2)); g.FillPath(shadow, path); g.ResetTransform(); }
-                    using (var br = new System.Drawing.SolidBrush(Card)) g.FillPath(br, path);
+                    using (var br = new System.Drawing.SolidBrush(sel ? System.Drawing.Color.FromArgb(Card.A, (Card.R * 9 + Accent.R) / 10, (Card.G * 9 + Accent.G) / 10, (Card.B * 9 + Accent.B) / 10) : Card)) g.FillPath(br, path);
                     using (var pen = new System.Drawing.Pen(sel || run ? Accent : Line, sel || run ? S(2) : 1)) g.DrawPath(pen, path);
                 }
                 using (var br = new System.Drawing.SolidBrush(stateCol)) g.FillRectangle(br, r.X + S(1), r.Y + S(8), S(4), r.Height - S(16));
-                // order number
                 if (n.Order > 0) using (var br = new System.Drawing.SolidBrush(Dim)) g.DrawString(n.Order.ToString(), small, br, r.Right - S(22), r.Y + S(6));
-                // method badge
                 var m = (n.Method ?? "GET").ToUpperInvariant();
                 var bs = g.MeasureString(m, badgeF);
                 var badge = new System.Drawing.RectangleF(r.X + S(12), r.Y + S(9), bs.Width + S(8), bs.Height + S(2));
@@ -15305,7 +15407,6 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
                     g.DrawString(n.Url, small, br, new System.Drawing.RectangleF(r.X + S(12), r.Y + S(31), r.Width - S(22), small.Height + 2), tf);
                 if (n.Info != "") using (var br = new System.Drawing.SolidBrush(n.State == "fail" ? Red : n.State == "ok" ? Green : Dim))
                     g.DrawString(n.Info, small, br, new System.Drawing.RectangleF(r.X + S(12), r.Y + S(50), r.Width - S(22), small.Height + 2), tf);
-                // ports
                 float pr = S(5);
                 var ip = InPort(n); var op = OutPort(n);
                 using (var br = new System.Drawing.SolidBrush(Card)) { g.FillEllipse(br, ip.X - pr, ip.Y - pr, pr * 2, pr * 2); g.FillEllipse(br, op.X - pr, op.Y - pr, pr * 2, pr * 2); }
@@ -15313,10 +15414,14 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
                 using (var br = new System.Drawing.SolidBrush(Accent)) g.FillEllipse(br, op.X - pr, op.Y - pr, pr * 2, pr * 2);
             }
         }
+        if (mode == Mode.Box && moved) {
+            var r = BoxRect();
+            using (var br = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(40, Accent))) g.FillRectangle(br, r);
+            using (var pen = new System.Drawing.Pen(Accent, 1) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dash }) g.DrawRectangle(pen, r.X, r.Y, r.Width, r.Height);
+        }
     }
 }
 
-// ---- Git: run git.exe (found on the PC, never installed), and draw the commit graph ----------------
 public class GitResult { public int Code; public string Out = "", Err = ""; public string Text { get { return (Out + (Err.Length > 0 && Out.Length > 0 ? "\n" : "") + Err).TrimEnd(); } } }
 
 public class DevGit {
