@@ -17812,6 +17812,510 @@ public static class DevStego {
     }
 }
 
+// ---- Log viewer: a big text file shown line by line, new lines added as the file grows (tail -f).
+// Filter (text or regex) keeps only matching lines; ERROR / WARN / DEBUG lines are coloured.
+public class DevLogView : System.Windows.Forms.Control {
+    List<string> lines = new List<string>();
+    List<int> view = new List<int>();
+    System.Windows.Forms.VScrollBar bar = new System.Windows.Forms.VScrollBar();
+    string path; long pos; System.Text.Decoder dec; string partial = "";
+    public bool Follow = true;
+    public int MaxLines = 500000;
+    public string Filter = ""; public bool UseRegex, Invert;
+    System.Text.RegularExpressions.Regex rx;
+    public string FilterError = "";
+    int selA = -1, selB = -1;
+    public float UiScale = 1f;
+    public System.Drawing.Color Back = System.Drawing.Color.White, Fore = System.Drawing.Color.Black, Dim = System.Drawing.Color.Gray,
+        Red = System.Drawing.Color.Red, Yellow = System.Drawing.Color.Goldenrod, Accent = System.Drawing.Color.RoyalBlue, Sel = System.Drawing.Color.LightBlue, Mark = System.Drawing.Color.Khaki;
+    public event EventHandler Changed;
+    static readonly System.Text.RegularExpressions.Regex ErrRx = new System.Text.RegularExpressions.Regex(@"\b(ERROR|ERR|FATAL|CRITICAL|CRIT|SEVERE|EXCEPTION|Exception|FAIL(ED|URE)?)\b");
+    static readonly System.Text.RegularExpressions.Regex WarnRx = new System.Text.RegularExpressions.Regex(@"\b(WARN(ING)?|WRN)\b");
+    static readonly System.Text.RegularExpressions.Regex DbgRx = new System.Text.RegularExpressions.Regex(@"\b(DEBUG|DBG|TRACE|VERBOSE)\b");
+
+    public DevLogView() {
+        SetStyle(System.Windows.Forms.ControlStyles.AllPaintingInWmPaint | System.Windows.Forms.ControlStyles.OptimizedDoubleBuffer |
+                 System.Windows.Forms.ControlStyles.UserPaint | System.Windows.Forms.ControlStyles.ResizeRedraw | System.Windows.Forms.ControlStyles.Selectable, true);
+        bar.Dock = System.Windows.Forms.DockStyle.Right;
+        bar.Scroll += (s, e) => { Follow = bar.Value >= MaxTop(); Invalidate(); };
+        Controls.Add(bar);
+        TabStop = true;
+    }
+    public int LineCount { get { return lines.Count; } }
+    public int ShownCount { get { return view.Count; } }
+    public string FilePath { get { return path; } }
+    int RowH { get { return Font.Height + 1; } }
+    int Rows { get { return Math.Max(1, Height / RowH); } }
+    int MaxTop() { return Math.Max(0, view.Count - Rows); }
+
+    // Opens a file and reads its last tailBytes; returns a note ('' or "showing the last ...").
+    public string Open(string file, long tailBytes) {
+        path = file; lines.Clear(); view.Clear(); partial = ""; selA = selB = -1; Follow = true;
+        string note = "";
+        using (var f = new System.IO.FileStream(file, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete)) {
+            var head = new byte[4]; int hn = f.Read(head, 0, 4);
+            System.Text.Encoding enc = System.Text.Encoding.UTF8;
+            if (hn >= 2 && head[0] == 0xFF && head[1] == 0xFE) enc = System.Text.Encoding.Unicode;
+            else if (hn >= 2 && head[0] == 0xFE && head[1] == 0xFF) enc = System.Text.Encoding.BigEndianUnicode;
+            dec = enc.GetDecoder();
+            long start = 0;
+            if (f.Length > tailBytes) { start = f.Length - tailBytes; if (enc != System.Text.Encoding.UTF8) start -= start % 2; note = "showing the last " + (tailBytes / 1048576) + " MB"; }
+            else if (hn >= 3 && head[0] == 0xEF && head[1] == 0xBB && head[2] == 0xBF) start = 3;
+            else if (enc != System.Text.Encoding.UTF8) start = 2;
+            pos = start;
+            ReadFrom(f, start > 0 && note != "");
+        }
+        Rebuild();
+        return note;
+    }
+    // Reads what was added since last time; returns the number of new lines (-1: the file was cut, reloaded).
+    public int Poll() {
+        if (path == null) return 0;
+        try {
+            using (var f = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete)) {
+                if (f.Length < pos) { Open(path, 4L << 20); return -1; }
+                if (f.Length == pos) return 0;
+                int before = lines.Count;
+                ReadFrom(f, false);
+                int added = lines.Count - before;
+                if (added > 0) { AppendToView(before); }
+                return added;
+            }
+        } catch { return 0; }
+    }
+    void ReadFrom(System.IO.FileStream f, bool skipFirst) {
+        f.Seek(pos, System.IO.SeekOrigin.Begin);
+        var buf = new byte[1 << 16]; var chars = new char[(1 << 16) + 4];
+        var sb = new System.Text.StringBuilder(partial);
+        int n;
+        while ((n = f.Read(buf, 0, buf.Length)) > 0) { int c = dec.GetChars(buf, 0, n, chars, 0); sb.Append(chars, 0, c); pos += n; }
+        string all = sb.ToString();
+        int s = 0;
+        if (skipFirst) { int nl = all.IndexOf('\n'); s = nl >= 0 ? nl + 1 : all.Length; }
+        for (int i = s; i < all.Length; i++) {
+            if (all[i] == '\n') { int e = i > s && all[i - 1] == '\r' ? i - 1 : i; lines.Add(all.Substring(s, e - s)); s = i + 1; }
+        }
+        partial = all.Substring(Math.Min(s, all.Length));
+        if (lines.Count > MaxLines) { lines.RemoveRange(0, lines.Count - MaxLines); Rebuild(); }
+    }
+    public void Clear() { lines.Clear(); view.Clear(); selA = selB = -1; UpdateBar(); Invalidate(); if (Changed != null) Changed(this, EventArgs.Empty); }
+
+    public void SetFilter(string text, bool regex, bool invert) {
+        Filter = text ?? ""; UseRegex = regex; Invert = invert; FilterError = ""; rx = null;
+        if (Filter.Length > 0) {
+            try { rx = new System.Text.RegularExpressions.Regex(regex ? Filter : System.Text.RegularExpressions.Regex.Escape(Filter), System.Text.RegularExpressions.RegexOptions.IgnoreCase, TimeSpan.FromMilliseconds(200)); }
+            catch (Exception ex) { FilterError = ex.Message; }
+        }
+        Rebuild();
+    }
+    bool Keep(string l) {
+        if (rx == null) return true;
+        bool m; try { m = rx.IsMatch(l); } catch { m = false; }
+        return Invert ? !m : m;
+    }
+    void Rebuild() {
+        view.Clear();
+        for (int i = 0; i < lines.Count; i++) if (Keep(lines[i])) view.Add(i);
+        selA = selB = -1;
+        UpdateBar(); if (Follow) bar.Value = MaxTop(); Invalidate();
+        if (Changed != null) Changed(this, EventArgs.Empty);
+    }
+    void AppendToView(int from) {
+        for (int i = from; i < lines.Count; i++) if (Keep(lines[i])) view.Add(i);
+        UpdateBar(); if (Follow) bar.Value = MaxTop(); Invalidate();
+        if (Changed != null) Changed(this, EventArgs.Empty);
+    }
+    void UpdateBar() { bar.Minimum = 0; bar.LargeChange = Rows; bar.SmallChange = 1; bar.Maximum = Math.Max(0, view.Count - 1); bar.Enabled = view.Count > Rows; if (bar.Value > MaxTop()) bar.Value = MaxTop(); }
+    protected override void OnResize(EventArgs e) { base.OnResize(e); UpdateBar(); if (Follow) bar.Value = MaxTop(); }
+    public void ScrollTo(int top) { bar.Value = Math.Max(0, Math.Min(MaxTop(), top)); Follow = bar.Value >= MaxTop(); Invalidate(); }
+    public void GoToEnd() { Follow = true; ScrollTo(MaxTop()); }
+    protected override void OnMouseWheel(System.Windows.Forms.MouseEventArgs e) { base.OnMouseWheel(e); ScrollTo(bar.Value - e.Delta / 120 * 3); }
+    int RowAt(int y) { return bar.Value + y / RowH; }
+    protected override void OnMouseDown(System.Windows.Forms.MouseEventArgs e) {
+        base.OnMouseDown(e); Focus();
+        int r = RowAt(e.Y); if (r >= view.Count) return;
+        if ((ModifierKeys & System.Windows.Forms.Keys.Shift) != 0 && selA >= 0) selB = r; else { selA = selB = r; }
+        Invalidate();
+    }
+    protected override void OnMouseMove(System.Windows.Forms.MouseEventArgs e) {
+        base.OnMouseMove(e);
+        if (e.Button == System.Windows.Forms.MouseButtons.Left && selA >= 0) { selB = Math.Max(0, Math.Min(view.Count - 1, RowAt(e.Y))); Invalidate(); }
+    }
+    protected override bool IsInputKey(System.Windows.Forms.Keys k) { return k == System.Windows.Forms.Keys.Up || k == System.Windows.Forms.Keys.Down || base.IsInputKey(k); }
+    protected override void OnKeyDown(System.Windows.Forms.KeyEventArgs e) {
+        base.OnKeyDown(e);
+        if (e.Control && e.KeyCode == System.Windows.Forms.Keys.C) { var t = SelectedText(); if (t.Length > 0) System.Windows.Forms.Clipboard.SetText(t); e.Handled = true; }
+        else if (e.Control && e.KeyCode == System.Windows.Forms.Keys.A) { selA = 0; selB = view.Count - 1; Invalidate(); e.Handled = true; }
+        else if (e.KeyCode == System.Windows.Forms.Keys.End) GoToEnd();
+        else if (e.KeyCode == System.Windows.Forms.Keys.Home) ScrollTo(0);
+        else if (e.KeyCode == System.Windows.Forms.Keys.PageDown) ScrollTo(bar.Value + Rows);
+        else if (e.KeyCode == System.Windows.Forms.Keys.PageUp) ScrollTo(bar.Value - Rows);
+        else if (e.KeyCode == System.Windows.Forms.Keys.Down) ScrollTo(bar.Value + 1);
+        else if (e.KeyCode == System.Windows.Forms.Keys.Up) ScrollTo(bar.Value - 1);
+    }
+    public string SelectedText() {
+        if (selA < 0) return "";
+        int a = Math.Min(selA, selB), b = Math.Max(selA, selB);
+        var sb = new System.Text.StringBuilder();
+        for (int i = a; i <= b && i < view.Count; i++) sb.AppendLine(lines[view[i]]);
+        return sb.ToString();
+    }
+    public string ShownText() { var sb = new System.Text.StringBuilder(); foreach (int i in view) sb.AppendLine(lines[i]); return sb.ToString(); }
+    public int SelectedCount { get { return selA < 0 ? 0 : Math.Abs(selB - selA) + 1; } }
+
+    protected override void OnPaint(System.Windows.Forms.PaintEventArgs e) {
+        var g = e.Graphics; g.Clear(Back);
+        var flags = System.Windows.Forms.TextFormatFlags.NoPadding | System.Windows.Forms.TextFormatFlags.NoPrefix | System.Windows.Forms.TextFormatFlags.SingleLine | System.Windows.Forms.TextFormatFlags.ExpandTabs;
+        if (view.Count == 0) {
+            System.Windows.Forms.TextRenderer.DrawText(g, path == null ? "Open a log file (or drop one here). New lines appear as the file grows." : (lines.Count == 0 ? "The file is empty - waiting for lines..." : "No line matches the filter."), Font, new System.Drawing.Point((int)(8 * UiScale), (int)(8 * UiScale)), Dim, flags);
+            return;
+        }
+        int rh = RowH, w = ClientSize.Width - bar.Width;
+        int a = Math.Min(selA, selB), b = Math.Max(selA, selB);
+        int numW = System.Windows.Forms.TextRenderer.MeasureText(g, (lines.Count).ToString() + "0", Font, System.Drawing.Size.Empty, flags).Width;
+        using (var selBr = new System.Drawing.SolidBrush(Sel)) using (var markBr = new System.Drawing.SolidBrush(Mark)) {
+            for (int r = 0; r < Rows + 1; r++) {
+                int vi = bar.Value + r; if (vi >= view.Count) break;
+                string l = lines[view[vi]];
+                int y = r * rh;
+                if (selA >= 0 && vi >= a && vi <= b) g.FillRectangle(selBr, 0, y, w, rh);
+                var col = ErrRx.IsMatch(l) ? Red : WarnRx.IsMatch(l) ? Yellow : DbgRx.IsMatch(l) ? Dim : Fore;
+                System.Windows.Forms.TextRenderer.DrawText(g, (view[vi] + 1).ToString(), Font, new System.Drawing.Rectangle(2, y, numW, rh), Dim, flags | System.Windows.Forms.TextFormatFlags.Right);
+                int x = numW + (int)(10 * UiScale);
+                string shown = l.Length > 2000 ? l.Substring(0, 2000) : l;
+                // the filter's matches get a highlight behind them
+                if (rx != null && !Invert && shown.Length > 0) {
+                    try {
+                        foreach (System.Text.RegularExpressions.Match m in rx.Matches(shown)) {
+                            if (m.Length == 0) continue;
+                            int x0 = x + (m.Index == 0 ? 0 : System.Windows.Forms.TextRenderer.MeasureText(g, shown.Substring(0, m.Index), Font, System.Drawing.Size.Empty, flags).Width);
+                            int mw = System.Windows.Forms.TextRenderer.MeasureText(g, m.Value, Font, System.Drawing.Size.Empty, flags).Width;
+                            g.FillRectangle(markBr, x0, y, mw, rh);
+                        }
+                    } catch { }
+                }
+                System.Windows.Forms.TextRenderer.DrawText(g, shown, Font, new System.Drawing.Rectangle(x, y, w - x, rh), col, flags);
+            }
+        }
+    }
+}
+
+// ---- Subnets (IPv4 and IPv6): ranges, masks, host counts, splitting, "is this IP inside?".
+public static class DevSubnet {
+    static bool Parse(string input, out BigInteger addr, out int prefix, out int bits) {
+        addr = 0; prefix = -1; bits = 32;
+        var s = (input ?? "").Trim();
+        string a = s, p = null;
+        int slash = s.IndexOf('/');
+        if (slash >= 0) { a = s.Substring(0, slash).Trim(); p = s.Substring(slash + 1).Trim(); }
+        else { var parts = s.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries); if (parts.Length == 2) { a = parts[0]; p = parts[1]; } }
+        System.Net.IPAddress ip;
+        if (!System.Net.IPAddress.TryParse(a, out ip)) return false;
+        var bytes = ip.GetAddressBytes(); bits = bytes.Length * 8;
+        addr = ToBig(bytes);
+        if (p == null) { prefix = bits; return true; }
+        int n;
+        if (int.TryParse(p, out n)) { if (n < 0 || n > bits) return false; prefix = n; return true; }
+        System.Net.IPAddress mask;
+        if (bits == 32 && System.Net.IPAddress.TryParse(p, out mask)) {           // 255.255.252.0
+            var m = ToBig(mask.GetAddressBytes()); int c = 0; bool zero = false;
+            for (int i = 31; i >= 0; i--) { bool one = !((m >> i) & 1).IsZero; if (one && zero) return false; if (one) c++; else zero = true; }
+            prefix = c; return true;
+        }
+        return false;
+    }
+    static BigInteger ToBig(byte[] b) { var r = BigInteger.Zero; foreach (var x in b) r = (r << 8) | x; return r; }
+    static string ToIp(BigInteger v, int bits) {
+        var b = new byte[bits / 8];
+        for (int i = b.Length - 1; i >= 0; i--) { b[i] = (byte)(v & 255); v >>= 8; }
+        return new System.Net.IPAddress(b).ToString();
+    }
+    static BigInteger Mask(int prefix, int bits) { return ((BigInteger.One << bits) - 1) ^ ((BigInteger.One << (bits - prefix)) - 1); }
+    static string Bin(BigInteger v, int bits) {
+        var sb = new System.Text.StringBuilder();
+        for (int i = bits - 1; i >= 0; i--) { sb.Append(((v >> i) & 1).IsZero ? '0' : '1'); if (i % 8 == 0 && i > 0) sb.Append(bits == 32 ? "." : (i % 16 == 0 ? ":" : "")); }
+        return sb.ToString();
+    }
+
+    public static string Describe(string input) {
+        BigInteger a; int p, bits;
+        if (!Parse(input, out a, out p, out bits)) throw new Exception("Type an address with a prefix or mask, e.g. 192.168.1.10/24, 10.0.0.0 255.255.252.0 or 2001:db8::/48");
+        var m = Mask(p, bits); var net = a & m; var last = net | (((BigInteger.One << bits) - 1) ^ m);
+        var total = BigInteger.One << (bits - p);
+        var sb = new System.Text.StringBuilder();
+        Action<string, string> row = (k, v) => sb.AppendLine(k.PadRight(18) + v);
+        row("Network", ToIp(net, bits) + "/" + p);
+        if (bits == 32) {
+            row("Netmask", ToIp(m, 32) + "   (/" + p + ")");
+            row("Wildcard", ToIp(((BigInteger.One << 32) - 1) ^ m, 32));
+            row("Broadcast", p >= 31 ? "(none)" : ToIp(last, 32));
+            var first = p >= 31 ? net : net + 1; var lastHost = p >= 31 ? last : last - 1;
+            row("Hosts", ToIp(first, 32) + "  -  " + ToIp(lastHost, 32));
+            row("Usable hosts", (p >= 31 ? total : total - 2).ToString("N0"));
+            row("Addresses", total.ToString("N0"));
+            uint top = (uint)(net >> 24);
+            string kind = (top == 10 || (top == 172 && ((net >> 16) & 255) >= 16 && ((net >> 16) & 255) <= 31) || (top == 192 && ((net >> 16) & 255) == 168)) ? "private (RFC 1918)"
+                : top == 127 ? "loopback" : (top == 169 && ((net >> 16) & 255) == 254) ? "link-local" : (top == 100 && ((net >> 16) & 255) >= 64 && ((net >> 16) & 255) <= 127) ? "carrier-grade NAT (100.64/10)"
+                : top >= 224 && top <= 239 ? "multicast" : top >= 240 ? "reserved" : "public";
+            row("Type", kind);
+            row("Your address", ToIp(a, 32) + (a == net && p < 31 ? "  (the network address itself)" : a == last && p < 31 ? "  (the broadcast address)" : ""));
+            sb.AppendLine();
+            row("Binary address", Bin(a, 32));
+            row("Binary mask", Bin(m, 32));
+        } else {
+            row("Prefix length", "/" + p);
+            row("First", ToIp(net, 128));
+            row("Last", ToIp(last, 128));
+            row("Addresses", total < BigInteger.Pow(10, 15) ? total.ToString("N0") : "2^" + (128 - p));
+            row("/64 networks", p <= 64 ? (BigInteger.One << (64 - p)).ToString("N0") : "(smaller than a /64)");
+            row("Your address", ToIp(a, 128));
+        }
+        return sb.ToString();
+    }
+    // the network split into /newPrefix pieces (at most max listed)
+    public static string[] Split(string input, int newPrefix, int max) {
+        BigInteger a; int p, bits;
+        if (!Parse(input, out a, out p, out bits)) return new string[0];
+        if (newPrefix <= p || newPrefix > bits) return new string[0];
+        var m = Mask(p, bits); var net = a & m;
+        var step = BigInteger.One << (bits - newPrefix);
+        var count = BigInteger.One << (newPrefix - p);
+        var r = new List<string>();
+        for (BigInteger i = 0; i < count && r.Count < max; i++) {
+            var s = net + i * step; var e = s + step - 1;
+            r.Add((ToIp(s, bits) + "/" + newPrefix).PadRight(bits == 32 ? 20 : 44) + ToIp(s, bits) + "  -  " + ToIp(e, bits));
+        }
+        if (count > max) r.Add("... " + (count - max).ToString("N0") + " more");
+        return r.ToArray();
+    }
+    public static int PrefixOf(string input) { BigInteger a; int p, bits; return Parse(input, out a, out p, out bits) ? p : -1; }
+    public static int BitsOf(string input) { BigInteger a; int p, bits; return Parse(input, out a, out p, out bits) ? bits : 0; }
+    // 1 inside, 0 outside, -1 not an address of the same kind
+    public static int Contains(string input, string ip) {
+        BigInteger a, b; int p, bits, p2, bits2;
+        if (!Parse(input, out a, out p, out bits) || !Parse(ip, out b, out p2, out bits2) || bits != bits2) return -1;
+        var m = Mask(p, bits);
+        return (a & m) == (b & m) ? 1 : 0;
+    }
+}
+
+// ---- Animated GIF writer for the screen recorder: each frame gets its own palette of its most used colours,
+// identical frames are merged (longer delay), LZW compressed.
+public class DevGifWriter {
+    System.IO.Stream s; int w, h;
+    byte[] pendIdx; int[] pendPal; int pendDelay; int[] lastArgb;
+    public int Frames;
+
+    public DevGifWriter(System.IO.Stream stream, int width, int height) {
+        s = stream; w = width; h = height;
+        Write(System.Text.Encoding.ASCII.GetBytes("GIF89a"));
+        Short(w); Short(h);
+        s.WriteByte(0x70); s.WriteByte(0); s.WriteByte(0);                   // no global colour table
+        Write(new byte[] { 0x21, 0xFF, 0x0B });                                // loop forever
+        Write(System.Text.Encoding.ASCII.GetBytes("NETSCAPE2.0"));
+        Write(new byte[] { 3, 1, 0, 0, 0 });
+    }
+    void Write(byte[] b) { s.Write(b, 0, b.Length); }
+    void Short(int v) { s.WriteByte((byte)(v & 255)); s.WriteByte((byte)((v >> 8) & 255)); }
+
+    // the screen area as a picture (with the mouse pointer drawn in)
+    public static System.Drawing.Bitmap Capture(System.Drawing.Rectangle area, bool cursor) {
+        var bmp = new System.Drawing.Bitmap(area.Width, area.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        using (var g = System.Drawing.Graphics.FromImage(bmp)) {
+            g.CopyFromScreen(area.Location, System.Drawing.Point.Empty, area.Size);
+            if (cursor) {
+                var p = System.Windows.Forms.Cursor.Position;
+                var c = System.Windows.Forms.Cursor.Current ?? System.Windows.Forms.Cursors.Default;
+                var hs = c.HotSpot;
+                c.Draw(g, new System.Drawing.Rectangle(p.X - area.X - hs.X, p.Y - area.Y - hs.Y, c.Size.Width, c.Size.Height));
+            }
+        }
+        return bmp;
+    }
+
+    public void AddFrame(System.Drawing.Bitmap frame, int delayCs) {
+        var argb = new int[w * h];
+        var bd = frame.LockBits(new System.Drawing.Rectangle(0, 0, w, h), System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        try { for (int y = 0; y < h; y++) System.Runtime.InteropServices.Marshal.Copy(bd.Scan0 + y * bd.Stride, argb, y * w, w); } finally { frame.UnlockBits(bd); }
+        if (lastArgb != null && Same(argb, lastArgb)) { pendDelay += delayCs; return; }
+        Flush();
+        lastArgb = argb;
+        Quantize(argb, out pendIdx, out pendPal);
+        pendDelay = delayCs;
+    }
+    static bool Same(int[] a, int[] b) { for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false; return true; }
+
+    static void Quantize(int[] argb, out byte[] idx, out int[] pal) {
+        var count = new int[32768];
+        foreach (int p in argb) count[((p >> 9) & 0x7C00) | ((p >> 6) & 0x3E0) | ((p >> 3) & 0x1F)]++;
+        var bins = new List<int>();
+        for (int i = 0; i < count.Length; i++) if (count[i] > 0) bins.Add(i);
+        bins.Sort((x, y) => count[y].CompareTo(count[x]));
+        int n = Math.Min(256, bins.Count);
+        pal = new int[n];
+        var map = new int[32768]; for (int i = 0; i < map.Length; i++) map[i] = -1;
+        // palette colour = the average of the real pixels in its bin
+        long[] sr = new long[n], sg = new long[n], sb = new long[n]; int[] sc = new int[n];
+        for (int i = 0; i < n; i++) map[bins[i]] = i;
+        foreach (int p in argb) {
+            int k = map[((p >> 9) & 0x7C00) | ((p >> 6) & 0x3E0) | ((p >> 3) & 0x1F)];
+            if (k >= 0) { sr[k] += (p >> 16) & 255; sg[k] += (p >> 8) & 255; sb[k] += p & 255; sc[k]++; }
+        }
+        for (int i = 0; i < n; i++) pal[i] = (int)((sr[i] / sc[i]) << 16 | (sg[i] / sc[i]) << 8 | (sb[i] / sc[i]));
+        // the other bins go to their nearest palette colour
+        for (int i = n; i < bins.Count; i++) {
+            int bin = bins[i], r = (bin >> 10) << 3, g = ((bin >> 5) & 31) << 3, b = (bin & 31) << 3, best = 0, bd = int.MaxValue;
+            for (int j = 0; j < n; j++) { int dr = r - ((pal[j] >> 16) & 255), dg = g - ((pal[j] >> 8) & 255), db = b - (pal[j] & 255); int d = dr * dr * 3 + dg * dg * 4 + db * db * 2; if (d < bd) { bd = d; best = j; } }
+            map[bin] = best;
+        }
+        idx = new byte[argb.Length];
+        for (int i = 0; i < argb.Length; i++) { int p = argb[i]; idx[i] = (byte)map[((p >> 9) & 0x7C00) | ((p >> 6) & 0x3E0) | ((p >> 3) & 0x1F)]; }
+    }
+
+    void Flush() {
+        if (pendIdx == null) return;
+        Write(new byte[] { 0x21, 0xF9, 4, 0x04 }); Short(Math.Min(65535, Math.Max(2, pendDelay))); s.WriteByte(0); s.WriteByte(0);   // graphic control
+        s.WriteByte(0x2C); Short(0); Short(0); Short(w); Short(h);
+        s.WriteByte(0x87);                                                      // local colour table, 256 entries
+        for (int i = 0; i < 256; i++) { int c = i < pendPal.Length ? pendPal[i] : 0; s.WriteByte((byte)((c >> 16) & 255)); s.WriteByte((byte)((c >> 8) & 255)); s.WriteByte((byte)(c & 255)); }
+        Lzw(pendIdx);
+        pendIdx = null; Frames++;
+    }
+    public void Finish() { Flush(); s.WriteByte(0x3B); s.Flush(); }
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetWindowDisplayAffinity(IntPtr h, uint affinity);
+    // keeps a window (the recorder's Stop bar) out of screen captures (Windows 10 2004+)
+    public static void ExcludeFromCapture(IntPtr h) { try { SetWindowDisplayAffinity(h, 0x11); } catch { } }
+
+    void Lzw(byte[] data) {
+        const int minCode = 8;
+        s.WriteByte(minCode);
+        var outBuf = new List<byte>(); int acc = 0, accBits = 0;
+        int clear = 1 << minCode, eoi = clear + 1, next = eoi + 1, size = minCode + 1;
+        var dict = new Dictionary<int, int>();
+        Action<int> emit = code => {
+            acc |= code << accBits; accBits += size;
+            while (accBits >= 8) { outBuf.Add((byte)(acc & 255)); acc >>= 8; accBits -= 8; }
+        };
+        emit(clear);
+        int prefix = data.Length > 0 ? data[0] : 0;
+        for (int i = 1; i < data.Length; i++) {
+            int k = data[i]; int key = (prefix << 8) | k; int code;
+            if (dict.TryGetValue(key, out code)) { prefix = code; continue; }
+            emit(prefix);
+            if (next < 4096) { dict[key] = next++; if (next == (1 << size) && size < 12) size++; }
+            else { emit(clear); dict.Clear(); next = eoi + 1; size = minCode + 1; }
+            prefix = k;
+        }
+        emit(prefix); emit(eoi);
+        if (accBits > 0) outBuf.Add((byte)(acc & 255));
+        for (int i = 0; i < outBuf.Count; i += 255) {
+            int n = Math.Min(255, outBuf.Count - i);
+            s.WriteByte((byte)n); s.Write(outBuf.ToArray(), i, n);
+        }
+        s.WriteByte(0);
+    }
+}
+
+// ---- Code to image: syntax-coloured code in a window frame on a coloured background (like carbon.sh).
+public static class DevCodeImage {
+    public static System.Drawing.Bitmap Render(string code, string lang, bool dark, float fontPt, bool lineNumbers, bool chrome, string title,
+                                                 System.Drawing.Color bgA, System.Drawing.Color bgB, float scale) {
+        code = (code ?? "").Replace("\r\n", "\n").Replace("\t", "    ").TrimEnd('\n');
+        var lines = code.Split('\n');
+        var colors = dark
+            ? new[] { System.Drawing.Color.FromArgb(212, 212, 212), System.Drawing.Color.FromArgb(86, 156, 214), System.Drawing.Color.FromArgb(206, 145, 120), System.Drawing.Color.FromArgb(106, 153, 85), System.Drawing.Color.FromArgb(181, 206, 168), System.Drawing.Color.FromArgb(78, 201, 176) }
+            : new[] { System.Drawing.Color.FromArgb(36, 41, 47), System.Drawing.Color.FromArgb(207, 34, 46), System.Drawing.Color.FromArgb(10, 48, 105), System.Drawing.Color.FromArgb(110, 119, 129), System.Drawing.Color.FromArgb(5, 80, 174), System.Drawing.Color.FromArgb(130, 80, 223) };
+        var winBack = dark ? System.Drawing.Color.FromArgb(30, 30, 30) : System.Drawing.Color.FromArgb(255, 255, 255);
+        var dim = dark ? System.Drawing.Color.FromArgb(110, 110, 110) : System.Drawing.Color.FromArgb(160, 160, 160);
+        // which colour each character gets
+        var kind = new int[code.Length];
+        if (lang != "none") foreach (var t in DevCode.Tokens(code, lang)) for (int i = t[0]; i < t[0] + t[1] && i < kind.Length; i++) kind[i] = t[2];
+        using (var font = new System.Drawing.Font("Consolas", fontPt * scale))
+        using (var tmp = new System.Drawing.Bitmap(1, 1))
+        using (var tg = System.Drawing.Graphics.FromImage(tmp)) {
+            var sf = System.Drawing.StringFormat.GenericTypographic;
+            float cw = tg.MeasureString("MMMMMMMMMM", font, 10000, sf).Width / 10f, lh = font.GetHeight(tg) * 1.35f;
+            int maxLen = 1; foreach (var l in lines) maxLen = Math.Max(maxLen, l.Length);
+            float gutter = lineNumbers ? cw * (lines.Length.ToString().Length + 2) : 0;
+            float pad = 28 * scale, outer = 48 * scale, bar = chrome ? 40 * scale : 0;
+            float winW = Math.Max(gutter + cw * maxLen + pad * 2, 240 * scale), winH = bar + lh * lines.Length + pad * 2 - (chrome ? 8 * scale : 0);
+            var bmp = new System.Drawing.Bitmap((int)Math.Ceiling(winW + outer * 2), (int)Math.Ceiling(winH + outer * 2), System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            using (var g = System.Drawing.Graphics.FromImage(bmp)) {
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+                var all = new System.Drawing.RectangleF(0, 0, bmp.Width, bmp.Height);
+                if (bgA.A == 0) g.Clear(System.Drawing.Color.Transparent);
+                else using (var br = new System.Drawing.Drawing2D.LinearGradientBrush(all, bgA, bgB, 45f)) g.FillRectangle(br, all);
+                var win = new System.Drawing.RectangleF(outer, outer, winW, winH);
+                using (var path = Rounded(win, 10 * scale)) {
+                    for (int i = 6; i >= 1; i--) using (var sh = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(10, 0, 0, 0))) using (var sp = Rounded(new System.Drawing.RectangleF(win.X - i * scale, win.Y + i * 2 * scale - i * scale, win.Width + i * 2 * scale, win.Height + i * 2 * scale), 12 * scale)) g.FillPath(sh, sp);
+                    using (var br = new System.Drawing.SolidBrush(winBack)) g.FillPath(br, path);
+                }
+                if (chrome) {
+                    var dots = new[] { System.Drawing.Color.FromArgb(255, 95, 86), System.Drawing.Color.FromArgb(255, 189, 46), System.Drawing.Color.FromArgb(39, 201, 63) };
+                    for (int i = 0; i < 3; i++) using (var br = new System.Drawing.SolidBrush(dots[i])) g.FillEllipse(br, win.X + (18 + i * 20) * scale, win.Y + 14 * scale, 12 * scale, 12 * scale);
+                    if (!string.IsNullOrEmpty(title)) using (var tf = new System.Drawing.Font("Segoe UI", 9.5f * scale)) using (var br = new System.Drawing.SolidBrush(dim)) {
+                        var fmt = new System.Drawing.StringFormat { Alignment = System.Drawing.StringAlignment.Center };
+                        g.DrawString(title, tf, br, new System.Drawing.RectangleF(win.X, win.Y + 11 * scale, win.Width, 20 * scale), fmt);
+                    }
+                }
+                float y0 = win.Y + bar + pad - (chrome ? 8 * scale : 0);
+                int off = 0;
+                for (int li = 0; li < lines.Length; li++) {
+                    string l = lines[li]; float y = y0 + li * lh;
+                    if (lineNumbers) using (var br = new System.Drawing.SolidBrush(dim)) g.DrawString((li + 1).ToString().PadLeft(lines.Length.ToString().Length), font, br, win.X + pad, y, sf);
+                    float x = win.X + pad + gutter;
+                    int s = 0;
+                    while (s < l.Length) {
+                        int k = kind[off + s], e = s;
+                        while (e < l.Length && kind[off + e] == k) e++;
+                        using (var br = new System.Drawing.SolidBrush(colors[Math.Min(k, colors.Length - 1)])) g.DrawString(l.Substring(s, e - s), font, br, x + s * cw, y, sf);
+                        s = e;
+                    }
+                    off += l.Length + 1;
+                }
+            }
+            return bmp;
+        }
+    }
+    static System.Drawing.Drawing2D.GraphicsPath Rounded(System.Drawing.RectangleF r, float rad) {
+        var p = new System.Drawing.Drawing2D.GraphicsPath(); float d = rad * 2;
+        p.AddArc(r.X, r.Y, d, d, 180, 90); p.AddArc(r.Right - d, r.Y, d, d, 270, 90); p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90); p.AddArc(r.X, r.Bottom - d, d, d, 90, 90); p.CloseFigure();
+        return p;
+    }
+}
+
+// ---- whois over port 43: asks IANA which server knows the domain / IP, then asks that one (and its registrar).
+public static class DevWhois {
+    static string Ask(string server, string q) {
+        using (var c = new System.Net.Sockets.TcpClient()) {
+            var ar = c.BeginConnect(server, 43, null, null);
+            if (!ar.AsyncWaitHandle.WaitOne(8000)) throw new Exception("No answer from " + server);
+            c.EndConnect(ar);
+            c.ReceiveTimeout = 10000; c.SendTimeout = 5000;
+            using (var st = c.GetStream()) {
+                var b = System.Text.Encoding.ASCII.GetBytes(q + "\r\n"); st.Write(b, 0, b.Length);
+                using (var r = new System.IO.StreamReader(st, System.Text.Encoding.UTF8)) return r.ReadToEnd();
+            }
+        }
+    }
+    public static string Query(string q) {
+        q = (q ?? "").Trim();
+        var sb = new System.Text.StringBuilder();
+        string iana = Ask("whois.iana.org", q);
+        var m = System.Text.RegularExpressions.Regex.Match(iana, @"(?im)^\s*(refer|whois):\s*(\S+)");
+        if (!m.Success) return iana;
+        string server = m.Groups[2].Value;
+        string ans = Ask(server, q);
+        sb.AppendLine("% from " + server).AppendLine(ans);
+        var reg = System.Text.RegularExpressions.Regex.Match(ans, @"(?im)^\s*Registrar WHOIS Server:\s*(\S+)");
+        if (reg.Success && !string.Equals(reg.Groups[1].Value, server, StringComparison.OrdinalIgnoreCase)) {
+            try { sb.AppendLine("% from " + reg.Groups[1].Value).AppendLine(Ask(reg.Groups[1].Value, q)); } catch { }
+        }
+        return sb.ToString();
+    }
+}
+
 // An owner-drawn list box that paints into a back buffer (no flicker when it's redrawn often).
 public class DevBufferedListBox : System.Windows.Forms.ListBox {
     public DevBufferedListBox() {
@@ -18119,8 +18623,8 @@ function Get-ToolRows {
                 if ($p) { $seen[$p.Key] = $true; [pscustomobject]@{ Id = "page:$($p.Key)"; Group = $g; Title = $p.Title; Icon = $p.Icon; Page = $p.Key; Action = $null; Words = $p.Words; Cmd = $null } }
             } else {
                 if ($e -match '^(.+?)=(.+)$') { $label = $Matches[1]; $cmd = $Matches[2] } else { $label = $e; $cmd = $e }
-                $c = $script:PaletteCommands | Where-Object { $_.Title -eq $cmd } | Select-Object -First 1
-                if ($c) { [pscustomobject]@{ Id = "tool:$label"; Group = $g; Title = $label; Icon = $c.Icon; Page = $null; Action = $c.Action; Words = "$cmd $($c.Words)"; Cmd = $c } }
+                $pcmd = $script:PaletteCommands | Where-Object { $_.Title -eq $cmd } | Select-Object -First 1
+                if ($pcmd) { [pscustomobject]@{ Id = "tool:$label"; Group = $g; Title = $label; Icon = $pcmd.Icon; Page = $null; Action = $pcmd.Action; Words = "$cmd $($pcmd.Words)"; Cmd = $pcmd } }
             }
         }
     }
@@ -18181,10 +18685,10 @@ function Update-FavoriteButtons {
 # The palette shows each tool's group (and its keys) next to it.
 function Set-PaletteGroups {
     foreach ($r in @(Get-ToolRows)) {
-        $c = if ($r.Cmd) { $r.Cmd } else { $script:PaletteCommands | Where-Object { $_.Title -eq $r.Title -and $_.Sub -eq 'Toolbox' } | Select-Object -First 1 }
-        if (-not $c -or $c.Grouped) { continue }
-        $c.Sub = if ($c.Sub -and $c.Sub -ne 'Toolbox') { "$($r.Group)  -  $($c.Sub)" } else { $r.Group }
-        $c | Add-Member -NotePropertyName Grouped -NotePropertyValue $true -Force
+        $pcmd = if ($r.Cmd) { $r.Cmd } else { $script:PaletteCommands | Where-Object { $_.Title -eq $r.Title -and $_.Sub -eq 'Toolbox' } | Select-Object -First 1 }
+        if (-not $pcmd -or $pcmd.Grouped) { continue }
+        $pcmd.Sub = if ($pcmd.Sub -and $pcmd.Sub -ne 'Toolbox') { "$($r.Group)  -  $($pcmd.Sub)" } else { $r.Group }
+        $pcmd | Add-Member -NotePropertyName Grouped -NotePropertyValue $true -Force
     }
 }
 
@@ -19958,6 +20462,730 @@ function Invoke-StegoRemove($S) {
         }
         default { Set-TbStatus $S.Status 'A picture''s message is part of its pixels - open the original picture instead (or hide a new message over it).' }
     }
+}
+
+# ======================================================================================
+# Log viewer: follow a log file as it grows, filter and colour its lines.
+# ======================================================================================
+Register-ToolboxPage 'log' 'Log viewer' $Glyph.Document 'log tail follow watch file errors filter grep live' {
+    param($panel, $st)
+    $st.Status = New-TbPage $panel
+    $v = New-Object DevLogView
+    $v.Dock = 'Fill'; $v.UiScale = $Scale; $v.Font = New-Object System.Drawing.Font('Consolas', (Fz 10)); $v.AllowDrop = $true
+    $v.Back = $C.Bg; $v.Fore = $C.Fore; $v.Dim = $C.Dim; $v.Red = $C.Red; $v.Yellow = $C.Yellow; $v.Accent = $C.Accent; $v.Sel = $C.Sel
+    $v.Mark = [PowerClipTheme]::Mix($C.Bg, $C.Yellow, 0.35)
+    $v.add_DragEnter({ param($src, $e) $e.Effect = if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { 'Copy' } else { 'None' } })
+    $v.add_DragDrop({ param($src, $e) $f = @([string[]]$e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop))[0]; if ($f) { Open-LogFile $TbUI.Pages['log'].State $f } })
+    $v.add_Changed({ Update-LogStatus $TbUI.Pages['log'].State })
+    $panel.Controls.Add($v)
+    $st.View = $v
+    $fb = New-TbBar $panel
+    New-TbLabel $fb 'Filter' -Dim | Out-Null
+    $st.Filter = New-TbBox -Mono -Cue 'text to look for (e.g. error, user=42, timeout)'
+    $st.Filter.Width = Px (300 * $TextZoom); $st.Filter.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 6), 0)
+    $fb.Controls.Add($st.Filter)
+    $st.Regex = New-CheckBox $fb 'Regex' $false
+    $st.Invert = New-CheckBox $fb 'Hide matching lines' $false
+    foreach ($ctl in $st.Regex, $st.Invert) { $ctl.add_CheckedChanged({ $s = $TbUI.Pages['log'].State; $s.View.SetFilter($s.Filter.Text, $s.Regex.Checked, $s.Invert.Checked) }) }
+    $st.FilterTimer = New-TbDebounce 250 { $s = $TbUI.Pages['log'].State; $s.View.SetFilter($s.Filter.Text, $s.Regex.Checked, $s.Invert.Checked) }
+    $st.Filter.add_TextChanged({ $s = $TbUI.Pages['log'].State; $s.FilterTimer.Stop(); $s.FilterTimer.Start() })
+    foreach ($q in @(@('Errors', 'error|fatal|exception|fail'), @('Warnings', 'warn'))) {
+        $b = New-Button $q[0] "Show only lines with: $($q[1])" { param($src, $e) $s = $TbUI.Pages['log'].State; $s.Regex.Checked = $true; $s.Invert.Checked = $false; $s.Filter.Text = $src.Tag } $fb '' 2
+        $b.Tag = $q[1]
+    }
+    $bar = New-TbBar $panel
+    [void](New-Button 'Open log...' 'Open a log file (or drop one on the list)' {
+        $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Filter = 'Logs|*.log;*.txt;*.out;*.err;*.json;*.csv|All files|*.*'
+        $script:Modal = $true
+        try { if ($d.ShowDialog($TbUI.Form) -eq 'OK') { Open-LogFile $TbUI.Pages['log'].State $d.FileName } } finally { $script:Modal = $false; $d.Dispose() }
+    } $bar $Glyph.Open 1)
+    $st.Follow = New-CheckBox $bar 'Follow new lines' $true
+    $st.Follow.add_CheckedChanged({ $s = $TbUI.Pages['log'].State; if ($s.Follow.Checked) { $s.View.GoToEnd() } else { $s.View.Follow = $false } })
+    [void](New-Button 'Clear' 'Empty the list (the file is not changed); new lines keep coming' { $TbUI.Pages['log'].State.View.Clear() } $bar $Glyph.Clear 2)
+    [void](New-Button 'Copy' 'Copy the selected lines, or every shown line' { $s = $TbUI.Pages['log'].State; $t = $s.View.SelectedText(); if (-not $t) { $t = $s.View.ShownText() }; Copy-TbText $t } $bar $Glyph.Copy 2)
+    [void](New-Button 'Show in Explorer' 'Open the folder of the log' { $s = $TbUI.Pages['log'].State; if ($s.View.FilePath) { Start-Process explorer.exe "/select,`"$($s.View.FilePath)`"" } } $bar $Glyph.Folder 2)
+    $st.Path = New-TbLabel $bar '' -Dim
+    $st.Timer = New-Object System.Windows.Forms.Timer
+    $st.Timer.Interval = 500
+    $st.Timer.add_Tick({
+        $s = $TbUI.Pages['log'].State
+        if (-not $s -or -not $s.View.FilePath) { return }
+        $n = $s.View.Poll()
+        if ($s.Follow.Checked -ne $s.View.Follow) { $s.Follow.Checked = $s.View.Follow }
+        if ($n -lt 0) { Set-TbStatus $s.Status 'The file got shorter (rotated or emptied) - read it again from the start.' 'warn' }
+    })
+    $st.Timer.Start()
+    $st.Close = { $s = $TbUI.Pages['log'].State; $s.Timer.Stop(); $s.Timer.Dispose() }
+    $st.SetInput = { param($t) $p = $t.Trim().Trim('"'); if ($p -and (Test-Path -LiteralPath $p -PathType Leaf)) { Open-LogFile $TbUI.Pages['log'].State $p } else { $TbUI.Pages['log'].State.Filter.Text = $t } }
+    $st.Focus = { $TbUI.Pages['log'].State.View.Focus() }
+    Set-TbStatus $st.Status 'Open or drop a log file. New lines show up as they are written; ERROR lines are red, WARN yellow, DEBUG grey. Click / Shift+click lines, Ctrl+C copies.'
+    $st
+}
+
+function Open-LogFile($S, [string]$Path) {
+    try { $note = $S.View.Open($Path, 16MB) } catch { Set-TbStatus $S.Status "Can't open: $($_.Exception.Message)" 'error'; return }
+    $S.Path.Text = $Path
+    $S.Follow.Checked = $true
+    Update-LogStatus $S
+    if ($note) { Set-TbStatus $S.Status "Big file - $note. New lines keep coming." 'warn' }
+}
+
+function Update-LogStatus($S) {
+    $v = $S.View
+    if (-not $v.FilePath) { return }
+    $size = try { (Get-Item -LiteralPath $v.FilePath).Length } catch { 0 }
+    $txt = "$($v.LineCount.ToString('N0')) lines$(if ($v.Filter) { "  $Dot  $($v.ShownCount.ToString('N0')) shown" })  $Dot  $([Math]::Round($size / 1KB).ToString('N0')) KB  $Dot  $(if ($v.Follow) { 'following new lines' } else { 'paused - End or Follow to continue' })"
+    if ($v.FilterError) { Set-TbStatus $S.Status "Filter: $($v.FilterError)" 'error' } else { Set-TbStatus $S.Status $txt 'ok' }
+}
+
+# ======================================================================================
+# Subnet calculator: ranges, masks and host counts for IPv4 and IPv6, splitting, "is this IP inside?".
+# ======================================================================================
+Register-ToolboxPage 'subnet' 'Subnet calculator' $Glyph.Network 'subnet cidr netmask ip range network calculator ipv4 ipv6 broadcast hosts' {
+    param($panel, $st)
+    $st.Status = New-TbPage $panel
+    $st.Out = New-TbRtb -ReadOnly; $st.Out.Dock = 'Fill'; $st.Out.Font = New-Object System.Drawing.Font('Consolas', (Fz 11))
+    $panel.Controls.Add($st.Out)
+    $b2 = New-TbBar $panel
+    New-TbLabel $b2 'Split into' -Dim | Out-Null
+    $st.Split = New-TbCombo $b2 @('(don''t split)') 140
+    New-TbLabel $b2 'Is this address inside?' -Dim | Out-Null
+    $st.Check = New-TbBox -Mono -Cue '10.0.3.200'
+    $st.Check.Width = Px (200 * $TextZoom); $st.Check.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 6), 0)
+    $b2.Controls.Add($st.Check)
+    $st.CheckOut = New-TbLabel $b2 '' -Dim
+    $b1 = New-TbBar $panel
+    New-TbLabel $b1 'Network' -Title | Out-Null
+    $st.Input = New-TbBox -Mono -Cue '192.168.1.10/24   10.0.0.0 255.255.252.0   2001:db8::/48'
+    $st.Input.Width = Px (360 * $TextZoom); $st.Input.Font = New-Object System.Drawing.Font('Consolas', (Fz 12)); $st.Input.Margin = New-Object System.Windows.Forms.Padding(0, (Px 2), (Px 10), 0)
+    $b1.Controls.Add($st.Input)
+    [void](New-Button 'Copy' 'Copy the result' { Copy-TbText $TbUI.Pages['subnet'].State.Out.Text } $b1 $Glyph.Copy 2)
+    $st.Input.add_TextChanged({ Update-SubnetTool $TbUI.Pages['subnet'].State -NewInput })
+    $st.Split.add_SelectedIndexChanged({ $s = $TbUI.Pages['subnet'].State; if (-not $s.Busy) { Update-SubnetTool $s } })
+    $st.Check.add_TextChanged({ Update-SubnetTool $TbUI.Pages['subnet'].State })
+    $st.SetInput = { param($t) $TbUI.Pages['subnet'].State.Input.Text = $t.Trim() }
+    $st.Focus = { $TbUI.Pages['subnet'].State.Input.Focus() }
+    $st.Input.Text = '192.168.1.10/24'
+    $st
+}
+
+function Update-SubnetTool($S, [switch]$NewInput) {
+    $t = $S.Input.Text.Trim()
+    if (-not $t) { $S.Out.Text = ''; Set-TbStatus $S.Status 'Type a network, e.g. 10.0.0.0/22'; return }
+    try { $txt = [DevSubnet]::Describe($t) } catch { $S.Out.Text = ''; $ex = $_.Exception; while ($ex.InnerException) { $ex = $ex.InnerException }; Set-TbStatus $S.Status $ex.Message 'error'; return }
+    $p = [DevSubnet]::PrefixOf($t); $bits = [DevSubnet]::BitsOf($t)
+    if ($NewInput) {                      # split choices: the next prefixes down
+        $S.Busy = $true
+        try {
+            $keep = [string]$S.Split.SelectedItem
+            $S.Split.Items.Clear(); [void]$S.Split.Items.Add('(don''t split)')
+            for ($n = $p + 1; $n -le [Math]::Min($bits, $p + 12); $n++) { [void]$S.Split.Items.Add("/$n  ($([Math]::Pow(2, $n - $p)) networks)") }
+            $i = [Math]::Max(0, $S.Split.Items.IndexOf($keep)); $S.Split.SelectedIndex = $i
+        } finally { $S.Busy = $false }
+    }
+    if ($S.Split.SelectedIndex -gt 0) {
+        $np = $p + $S.Split.SelectedIndex
+        $txt += "`r`nSplit into /$($np):`r`n" + ([DevSubnet]::Split($t, $np, 256) -join "`r`n")
+    }
+    $S.Out.Text = $txt
+    $chk = $S.Check.Text.Trim()
+    if ($chk) {
+        $r = [DevSubnet]::Contains($t, $chk)
+        $S.CheckOut.Text = switch ($r) { 1 { 'yes, inside' } 0 { 'no, outside' } default { '(not an address of the same kind)' } }
+        $S.CheckOut.ForeColor = switch ($r) { 1 { $C.Green } 0 { $C.Red } default { $C.Dim } }
+    } else { $S.CheckOut.Text = '' }
+    Set-TbStatus $S.Status 'Also accepts a mask (10.0.0.0 255.255.252.0) or a single address (shown as /32 or /128).' 'ok'
+}
+
+# ======================================================================================
+# DNS lookup: any record type from any DNS server, plus whois.
+# ======================================================================================
+Register-ToolboxPage 'dns' 'DNS lookup & whois' $Glyph.Globe 'dns nslookup dig record mx txt cname ns soa srv ptr caa whois domain registrar' {
+    param($panel, $st)
+    $st.Status = New-TbPage $panel
+    $tabs = New-TabSet $panel
+    $rp = Add-ApiTab $tabs 'Records'; $wp = Add-ApiTab $tabs 'Whois'
+    $st.Tabs = $tabs
+    $st.List = New-Object System.Windows.Forms.ListView
+    $st.List.Dock = 'Fill'; $st.List.View = 'Details'; $st.List.FullRowSelect = $true; $st.List.BorderStyle = 'None'; $st.List.BackColor = $C.Bg; $st.List.ForeColor = $C.Fore
+    $st.List.Font = New-Object System.Drawing.Font('Consolas', (Fz 10))
+    foreach ($col in @(@('Type', 70), @('Name', 260), @('TTL', 70), @('Value', 640))) { [void]$st.List.Columns.Add($col[0], (Px ($col[1] * $TextZoom))) }
+    $st.List.add_KeyDown({ param($src, $e) if ($e.Control -and $e.KeyCode -eq 'C') { Copy-TbText ((@($src.SelectedItems) | ForEach-Object { $_.SubItems[3].Text }) -join "`r`n"); $e.Handled = $true } })
+    $rp.Controls.Add($st.List)
+    $st.Whois = New-TbRtb -ReadOnly; $st.Whois.Dock = 'Fill'
+    $wp.Controls.Add($st.Whois)
+    Select-ApiTab $tabs 'Records'
+    $bar = New-TbBar $panel
+    New-TbLabel $bar 'Name' -Title | Out-Null
+    $st.Name = New-TbBox -Mono -Cue 'example.com   or an IP for its name (PTR)'
+    $st.Name.Width = Px (300 * $TextZoom); $st.Name.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 8), 0)
+    $bar.Controls.Add($st.Name)
+    $st.Type = New-TbCombo $bar @('All common', 'A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS', 'SOA', 'SRV', 'PTR', 'CAA') 110
+    New-TbLabel $bar 'Server' -Dim | Out-Null
+    $st.Server = New-TbCombo $bar @('This PC''s DNS', '1.1.1.1  Cloudflare', '8.8.8.8  Google', '9.9.9.9  Quad9') 170
+    $st.Server.DropDownStyle = 'DropDown'
+    [void](New-Button 'Look up' 'Ask the DNS server (Enter)' { Start-DnsLookup $TbUI.Pages['dns'].State } $bar $Glyph.Search 1)
+    [void](New-Button 'Whois' 'Who owns the domain or IP (registrar, dates, name servers)' { Start-Whois $TbUI.Pages['dns'].State } $bar $Glyph.View 2)
+    $st.Name.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Return') { Start-DnsLookup $TbUI.Pages['dns'].State; $e.SuppressKeyPress = $true } })
+    $st.Timer = New-Object System.Windows.Forms.Timer; $st.Timer.Interval = 150
+    $st.Timer.add_Tick({ Update-DnsJob $TbUI.Pages['dns'].State })
+    $st.Close = { $s = $TbUI.Pages['dns'].State; $s.Timer.Stop(); $s.Timer.Dispose(); if ($s.Job) { try { $s.Job.PS.Stop() } catch { } } }
+    $st.SetInput = { param($t) $s = $TbUI.Pages['dns'].State; $s.Name.Text = ($t.Trim() -replace '^\w+://', '' -replace '[/:].*$', ''); Start-DnsLookup $s }
+    $st.Focus = { $TbUI.Pages['dns'].State.Name.Focus() }
+    Set-TbStatus $st.Status 'Type a domain and press Enter. Any record type, from this PC''s DNS or a public one (type another server''s IP in the box).'
+    $st
+}
+
+# Runs a script in the background (its own runspace) so the window doesn't freeze; Update-DnsJob collects it.
+function Start-TbJob($S, [string]$Kind, [scriptblock]$Script, [object[]]$Arguments) {
+    if ($S.Job) { try { $S.Job.PS.Stop() } catch { } }
+    $ps = [PowerShell]::Create()
+    [void]$ps.AddScript($Script.ToString())
+    foreach ($a in $Arguments) { [void]$ps.AddArgument($a) }
+    $S.Job = @{ PS = $ps; Handle = $ps.BeginInvoke(); Kind = $Kind; Started = Get-Date }
+    $S.Timer.Start()
+}
+
+function Start-DnsLookup($S) {
+    $name = $S.Name.Text.Trim() -replace '^\w+://', '' -replace '/.*$', ''
+    if (-not $name) { Set-TbStatus $S.Status 'Type a domain name first.' 'error'; return }
+    $type = [string]$S.Type.SelectedItem
+    $ip = $null
+    if ([System.Net.IPAddress]::TryParse($name, [ref]$ip)) { $type = 'PTR' }
+    $types = if ($type -eq 'All common') { @('A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS', 'SOA', 'CAA') } else { @($type) }
+    $server = ([string]$S.Server.Text -split '\s+')[0]
+    if ($server -notmatch '^[\d.:a-fA-F]+$') { $server = '' }
+    $S.List.Items.Clear()
+    Select-ApiTab $S.Tabs 'Records'
+    Set-TbStatus $S.Status "Looking up $name ..."
+    Start-TbJob $S 'dns' {
+        param($name, $types, $server)
+        foreach ($t in $types) {
+            try {
+                $args2 = @{ Name = $name; Type = $t; DnsOnly = $true; ErrorAction = 'Stop'; QuickTimeout = $true }
+                if ($server) { $args2.Server = $server }
+                foreach ($r in @(Resolve-DnsName @args2 | Where-Object { $_.Section -eq 'Answer' })) {
+                    $data = switch ([string]$r.Type) {
+                        'A' { $r.IPAddress } 'AAAA' { $r.IPAddress } 'CNAME' { $r.NameHost } 'NS' { $r.NameHost } 'PTR' { $r.NameHost }
+                        'MX' { "$($r.Preference)  $($r.NameExchange)" } 'TXT' { ($r.Strings -join '') }
+                        'SOA' { "$($r.PrimaryServer)  $($r.NameAdministrator)  serial $($r.SerialNumber)  refresh $($r.TimeToZoneRefresh)" }
+                        'SRV' { "$($r.Priority) $($r.Weight) $($r.Port)  $($r.NameTarget)" }
+                        default { (($r | Select-Object * -ExcludeProperty Name, Type, TTL, Section, CharacterSet, DataLength, QueryType | Format-List | Out-String).Trim() -replace '\s*\r?\n\s*', '  ') }
+                    }
+                    [pscustomobject]@{ Type = [string]$r.Type; Name = [string]$r.Name; TTL = [string]$r.TTL; Data = [string]$data }
+                }
+            } catch {
+                $m = $_.Exception.Message
+                if ($m -notmatch 'DNS name does not exist|No records|record (does not|doesn.t) exist|9501') { [pscustomobject]@{ Type = $t; Name = $name; TTL = ''; Data = "($m)" } }
+            }
+        }
+    } @($name, $types, $server)
+}
+
+function Start-Whois($S) {
+    $q = $S.Name.Text.Trim() -replace '^\w+://', '' -replace '/.*$', '' -replace '^www\.', ''
+    if (-not $q) { Set-TbStatus $S.Status 'Type a domain or IP first.' 'error'; return }
+    Select-ApiTab $S.Tabs 'Whois'
+    $S.Whois.Text = "Asking whois about $q ..."
+    Set-TbStatus $S.Status "Whois $q ..."
+    Start-TbJob $S 'whois' { param($q) [DevWhois]::Query($q) } @($q)
+}
+
+function Update-DnsJob($S) {
+    $j = $S.Job
+    if (-not $j) { $S.Timer.Stop(); return }
+    if (-not $j.Handle.IsCompleted) {
+        if (((Get-Date) - $j.Started).TotalSeconds -gt 30) { try { $j.PS.Stop() } catch { }; $S.Job = $null; $S.Timer.Stop(); Set-TbStatus $S.Status 'No answer after 30 seconds.' 'error' }
+        return
+    }
+    $S.Timer.Stop(); $S.Job = $null
+    try { $out = @($j.PS.EndInvoke($j.Handle)) } catch { $out = @(); $err = $_.Exception.Message }
+    $errs = @($j.PS.Streams.Error | ForEach-Object { $_.Exception.Message })
+    $j.PS.Dispose()
+    if ($j.Kind -eq 'whois') {
+        $S.Whois.Text = if ($out) { ($out -join "`n") -replace "`r?`n", "`r`n" } else { "Whois failed: $err $($errs -join ' ')" }
+        Set-TbStatus $S.Status $(if ($out) { 'Whois answer below (registrar, dates, name servers ...).' } else { 'Whois failed (port 43 blocked?).' }) $(if ($out) { 'ok' } else { 'error' })
+        return
+    }
+    $S.List.BeginUpdate()
+    foreach ($r in $out) {
+        $it = New-Object System.Windows.Forms.ListViewItem([string]$r.Type)
+        [void]$it.SubItems.Add([string]$r.Name); [void]$it.SubItems.Add([string]$r.TTL); [void]$it.SubItems.Add([string]$r.Data)
+        if ($r.Data -like '(*') { $it.ForeColor = $C.Red }
+        [void]$S.List.Items.Add($it)
+    }
+    $S.List.EndUpdate()
+    $n = @($out | Where-Object { $_.Data -notlike '(*' }).Count
+    if ($errs -and -not $out) { Set-TbStatus $S.Status "Lookup failed: $($errs[0])" 'error' }
+    else { Set-TbStatus $S.Status "$n record(s). Select rows and press Ctrl+C to copy their values." $(if ($n) { 'ok' } else { 'warn' }) }
+}
+
+$CertToolSource = @'
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+
+// Certificates: make a self-signed certificate or a signing request (CSR), read any certificate file
+// (PEM, DER/CER, PFX) and write it out in another format. Needs .NET Framework 4.7.2+ (CertificateRequest).
+public class DevCertResult {
+    public X509Certificate2 Cert;
+    public string CertPem = "", KeyPem = "", CsrPem = "";
+}
+
+public static class DevCertTool {
+    public static string Pem(string label, byte[] der) {
+        var b64 = Convert.ToBase64String(der);
+        var sb = new StringBuilder("-----BEGIN " + label + "-----\n");
+        for (int i = 0; i < b64.Length; i += 64) sb.Append(b64.Substring(i, Math.Min(64, b64.Length - i))).Append('\n');
+        return sb.Append("-----END " + label + "-----\n").ToString();
+    }
+
+    // kind: 0 RSA 2048, 1 RSA 4096, 2 ECDSA P-256, 3 ECDSA P-384
+    static object NewKey(int kind) {
+        if (kind <= 1) return new RSACng(kind == 0 ? 2048 : 4096);
+        return ECDsa.Create(kind == 2 ? ECCurve.NamedCurves.nistP256 : ECCurve.NamedCurves.nistP384);
+    }
+    static CertificateRequest Request(string subject, object key) {
+        var dn = new X500DistinguishedName(subject.Contains("=") ? subject : "CN=" + subject);
+        var rsa = key as RSA;
+        return rsa != null ? new CertificateRequest(dn, rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1) : new CertificateRequest(dn, (ECDsa)key, HashAlgorithmName.SHA256);
+    }
+    static void AddExtensions(CertificateRequest req, string[] dns, string[] ips, bool ca) {
+        var san = new SubjectAlternativeNameBuilder(); bool any = false;
+        foreach (var d in dns ?? new string[0]) if (!string.IsNullOrWhiteSpace(d)) { san.AddDnsName(d.Trim()); any = true; }
+        foreach (var i in ips ?? new string[0]) { System.Net.IPAddress ip; if (System.Net.IPAddress.TryParse((i ?? "").Trim(), out ip)) { san.AddIpAddress(ip); any = true; } }
+        if (any) req.CertificateExtensions.Add(san.Build());
+        req.CertificateExtensions.Add(new X509BasicConstraintsExtension(ca, false, 0, true));
+        req.CertificateExtensions.Add(new X509KeyUsageExtension(ca ? X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign | X509KeyUsageFlags.DigitalSignature
+                                                                   : X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
+        if (!ca) req.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(new OidCollection { new Oid("1.3.6.1.5.5.7.3.1"), new Oid("1.3.6.1.5.5.7.3.2") }, false));
+        req.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(req.PublicKey, false));
+    }
+
+    public static DevCertResult SelfSigned(string subject, string[] dns, string[] ips, int kind, int days, bool ca) {
+        var key = NewKey(kind);
+        var req = Request(subject, key);
+        AddExtensions(req, dns, ips, ca);
+        var now = DateTimeOffset.UtcNow.AddMinutes(-5);
+        var cert = req.CreateSelfSigned(now, now.AddDays(days));
+        return new DevCertResult { Cert = cert, CertPem = Pem("CERTIFICATE", cert.RawData), KeyPem = KeyToPem(key) };
+    }
+    public static DevCertResult Csr(string subject, string[] dns, string[] ips, int kind) {
+        var key = NewKey(kind);
+        var req = Request(subject, key);
+        AddExtensions(req, dns, ips, false);
+        return new DevCertResult { CsrPem = Pem("CERTIFICATE REQUEST", req.CreateSigningRequest()), KeyPem = KeyToPem(key) };
+    }
+
+    // ---- private keys as PEM (RSA: PKCS#1, EC: SEC1) - .NET Framework has no exporter for these
+    static string KeyToPem(object key) {
+        var rsa = key as RSA;
+        if (rsa != null) {
+            var p = rsa.ExportParameters(true);
+            var seq = Der(0x30, Concat(Int(new byte[] { 0 }), Int(p.Modulus), Int(p.Exponent), Int(p.D), Int(p.P), Int(p.Q), Int(p.DP), Int(p.DQ), Int(p.InverseQ)));
+            return Pem("RSA PRIVATE KEY", seq);
+        }
+        var ec = (ECDsa)key;
+        var e = ec.ExportParameters(true);
+        string oid = e.Curve.Oid.Value ?? (e.D.Length == 32 ? "1.2.840.10045.3.1.7" : "1.3.132.0.34");
+        var pub = new byte[1 + e.Q.X.Length + e.Q.Y.Length]; pub[0] = 4; e.Q.X.CopyTo(pub, 1); e.Q.Y.CopyTo(pub, 1 + e.Q.X.Length);
+        var bits = new byte[pub.Length + 1]; pub.CopyTo(bits, 1);
+        var body = Concat(Int(new byte[] { 1 }), Der(0x04, e.D), Der(0xA0, OidDer(oid)), Der(0xA1, Der(0x03, bits)));
+        return Pem("EC PRIVATE KEY", Der(0x30, body));
+    }
+    static byte[] Concat(params byte[][] parts) { var r = new List<byte>(); foreach (var p in parts) r.AddRange(p); return r.ToArray(); }
+    static byte[] Der(byte tag, byte[] content) {
+        var r = new List<byte> { tag };
+        int n = content.Length;
+        if (n < 128) r.Add((byte)n);
+        else { var lb = new List<byte>(); while (n > 0) { lb.Insert(0, (byte)(n & 255)); n >>= 8; } r.Add((byte)(0x80 | lb.Count)); r.AddRange(lb); }
+        r.AddRange(content);
+        return r.ToArray();
+    }
+    static byte[] Int(byte[] v) {
+        int i = 0; while (i < v.Length - 1 && v[i] == 0) i++;
+        var t = v.Skip(i).ToList();
+        if ((t[0] & 0x80) != 0) t.Insert(0, 0);
+        return Der(0x02, t.ToArray());
+    }
+    static byte[] OidDer(string oid) {
+        var parts = oid.Split('.').Select(long.Parse).ToArray();
+        var r = new List<byte> { (byte)(parts[0] * 40 + parts[1]) };
+        for (int i = 2; i < parts.Length; i++) {
+            long v = parts[i]; var st = new Stack<byte>(); st.Push((byte)(v & 0x7F)); v >>= 7;
+            while (v > 0) { st.Push((byte)(0x80 | (v & 0x7F))); v >>= 7; }
+            r.AddRange(st);
+        }
+        return Der(0x06, r.ToArray());
+    }
+
+    // ---- reading: PEM text (first certificate), DER / CER, PFX (with password)
+    public static X509Certificate2 Load(string path, string password) {
+        var bytes = System.IO.File.ReadAllBytes(path);
+        var text = Encoding.ASCII.GetString(bytes);
+        var m = System.Text.RegularExpressions.Regex.Match(text, "-----BEGIN CERTIFICATE-----([A-Za-z0-9+/=\\s]+)-----END CERTIFICATE-----");
+        if (m.Success) return new X509Certificate2(Convert.FromBase64String(m.Groups[1].Value));
+        if (text.Contains("-----BEGIN")) throw new Exception("This PEM file has no certificate in it (a key or a CSR?).");
+        return new X509Certificate2(bytes, password ?? "", X509KeyStorageFlags.Exportable | X509KeyStorageFlags.EphemeralKeySet);
+    }
+    public static string Describe(X509Certificate2 c) {
+        var sb = new StringBuilder();
+        Action<string, string> row = (k, v) => sb.AppendLine(k.PadRight(28) + v);
+        row("Subject", c.Subject);
+        row("Issuer", c.Issuer + (c.Subject == c.Issuer ? "   (self-signed)" : ""));
+        var left = (c.NotAfter - DateTime.Now).TotalDays;
+        row("Valid", c.NotBefore.ToString("yyyy-MM-dd HH:mm") + "  to  " + c.NotAfter.ToString("yyyy-MM-dd HH:mm") + "   (" + (left < 0 ? "EXPIRED " + (int)-left + " days ago" : (int)left + " days left") + ")");
+        row("Serial number", c.SerialNumber);
+        row("Key", KeyText(c));
+        row("Signature", c.SignatureAlgorithm.FriendlyName);
+        row("SHA-1", c.Thumbprint);
+        using (var sha = SHA256.Create()) row("SHA-256", BitConverter.ToString(sha.ComputeHash(c.RawData)).Replace("-", ""));
+        row("Private key", c.HasPrivateKey ? "included" : "not included");
+        foreach (var ext in c.Extensions) {
+            string name = ext.Oid.FriendlyName ?? ext.Oid.Value;
+            string val; try { val = ext.Format(false); } catch { val = "(can't show)"; }
+            row(name, val);
+        }
+        return sb.ToString();
+    }
+    static string KeyText(X509Certificate2 c) {
+        try { var r = c.GetRSAPublicKey(); if (r != null) return "RSA " + r.KeySize + " bits"; } catch { }
+        try { var e = c.GetECDsaPublicKey(); if (e != null) return "ECDSA " + e.KeySize + " bits"; } catch { }
+        return c.PublicKey.Oid.FriendlyName;
+    }
+    // format: pem, cer (DER), pfx (with the private key when there is one)
+    public static byte[] Export(X509Certificate2 c, string format, string password) {
+        switch (format) {
+            case "pem": return Encoding.ASCII.GetBytes(Pem("CERTIFICATE", c.RawData));
+            case "cer": return c.RawData;
+            default: return c.Export(X509ContentType.Pfx, password ?? "");
+        }
+    }
+}
+'@
+
+# ======================================================================================
+# Certificate maker: self-signed certificates (also CAs), signing requests (CSR), open and convert PEM / CER / PFX.
+# ======================================================================================
+Register-ToolboxPage 'certmake' 'Certificate maker' $Glyph.Lock 'certificate self-signed csr pem pfx p12 cer der convert ssl tls https localhost key openssl' {
+    param($panel, $st)
+    $st.Status = New-TbPage $panel
+    if (-not ('DevCertTool' -as [type])) {           # compiled the first time it's needed (needs .NET 4.7.2+)
+        try { Add-Type -ReferencedAssemblies System.Core, System.Security -TypeDefinition $CertToolSource -ErrorAction Stop } catch { Write-Log "certificate maker: $_" }
+    }
+    if (-not ('DevCertTool' -as [type])) { Set-TbStatus $st.Status 'This needs .NET Framework 4.7.2 or newer (Windows 10 1803+ has it).' 'error'; return $st }
+    $tabs = New-TabSet $panel
+    $mk = Add-ApiTab $tabs 'Make'; $op = Add-ApiTab $tabs 'Open / convert'
+    # make
+    $st.MakeOut = New-TbRtb -ReadOnly; $st.MakeOut.Dock = 'Fill'
+    $mk.Controls.Add($st.MakeOut)
+    $ab = New-TbBar $mk
+    [void](New-Button 'Make a self-signed certificate' 'Certificate + private key, ready for a local HTTPS server' { Invoke-CertMake $TbUI.Pages['certmake'].State $false } $ab $Glyph.Lock 1)
+    [void](New-Button 'Make a signing request (CSR)' 'A CSR to send to a certificate authority, plus its private key' { Invoke-CertMake $TbUI.Pages['certmake'].State $true } $ab $Glyph.Send 2)
+    [void](New-Button 'Save files...' 'Save the certificate (.crt), key (.key), PFX and CSR into a folder' { Save-CertFiles $TbUI.Pages['certmake'].State } $ab $Glyph.Save 2)
+    $fb = New-TbBar $mk
+    $fld = { param($label, $cue, $w) New-TbLabel $fb $label -Dim | Out-Null; $b = New-TbBox -Cue $cue; $b.Width = Px ($w * $TextZoom); $b.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 10), 0); $fb.Controls.Add($b); $b }
+    $st.Cn = & $fld 'Name (CN)' 'localhost' 160
+    $st.Dns = & $fld 'Other names' 'localhost, *.dev.local' 200
+    $st.Ips = & $fld 'IPs' '127.0.0.1, ::1' 130
+    $fb2 = New-TbBar $mk
+    New-TbLabel $fb2 'Key' -Dim | Out-Null
+    $st.Key = New-TbCombo $fb2 @('RSA 2048', 'RSA 4096', 'ECDSA P-256', 'ECDSA P-384') 130
+    New-TbLabel $fb2 'Valid for (days)' -Dim | Out-Null
+    $st.Days = New-SettingsNumber 825 1 36500 0 { }
+    $st.Days.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 10), 0)
+    $fb2.Controls.Add($st.Days)
+    $st.Ca = New-CheckBox $fb2 'Certificate authority (to sign others)' $false
+    New-TbLabel $fb2 'PFX password' -Dim | Out-Null
+    $st.PfxPw = New-TbBox -Cue 'for the .pfx file'; $st.PfxPw.UseSystemPasswordChar = $true; $st.PfxPw.Width = Px (140 * $TextZoom); $st.PfxPw.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 6), 0)
+    $fb2.Controls.Add($st.PfxPw)
+    # open / convert
+    $st.OpenOut = New-TbRtb -ReadOnly; $st.OpenOut.Dock = 'Fill'
+    $op.Controls.Add($st.OpenOut)
+    $ob = New-TbBar $op
+    [void](New-Button 'Open certificate...' 'A .pem / .crt / .cer / .der / .pfx / .p12 file (or drop it here)' {
+        $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Filter = 'Certificates|*.pem;*.crt;*.cer;*.der;*.pfx;*.p12|All files|*.*'
+        $script:Modal = $true
+        try { if ($d.ShowDialog($TbUI.Form) -eq 'OK') { Open-CertFile $TbUI.Pages['certmake'].State $d.FileName } } finally { $script:Modal = $false; $d.Dispose() }
+    } $ob $Glyph.Open 1)
+    New-TbLabel $ob 'Password' -Dim | Out-Null
+    $st.OpenPw = New-TbBox -Cue 'for a .pfx'; $st.OpenPw.UseSystemPasswordChar = $true; $st.OpenPw.Width = Px (130 * $TextZoom); $st.OpenPw.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 6), 0)
+    $ob.Controls.Add($st.OpenPw)
+    foreach ($fmt in @(@('pem', 'Save as PEM...', 'Text, starts with -----BEGIN CERTIFICATE----- (.pem / .crt)'), @('cer', 'Save as CER...', 'Binary DER (.cer / .der), what Windows double-clicks'), @('pfx', 'Save as PFX...', 'With the private key when the file had one (.pfx / .p12)'))) {
+        $b = New-Button $fmt[1] $fmt[2] { param($src, $e) Save-CertAs $TbUI.Pages['certmake'].State $src.Tag } $ob $Glyph.Save 2
+        $b.Tag = $fmt[0]
+    }
+    $st.OpenOut.AllowDrop = $true
+    $st.OpenOut.add_DragEnter({ param($src, $e) $e.Effect = if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { 'Copy' } else { 'None' } })
+    $st.OpenOut.add_DragDrop({ param($src, $e) $f = @([string[]]$e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop))[0]; if ($f) { Open-CertFile $TbUI.Pages['certmake'].State $f } })
+    $st.Tabs = $tabs
+    Select-ApiTab $tabs 'Make'
+    $st.Cn.Text = 'localhost'; $st.Dns.Text = 'localhost'; $st.Ips.Text = '127.0.0.1, ::1'
+    Set-TbStatus $st.Status 'Make a certificate for local HTTPS, a CA, or a CSR - or open one to see what''s inside and convert it. Keys are made on this PC and never leave it.'
+    $st
+}
+
+function Invoke-CertMake($S, [bool]$Csr) {
+    $cn = $S.Cn.Text.Trim(); if (-not $cn) { $cn = 'localhost' }
+    $dns = @($S.Dns.Text -split '[,;\s]+' | Where-Object { $_ }); $ips = @($S.Ips.Text -split '[,;\s]+' | Where-Object { $_ })
+    try {
+        $r = if ($Csr) { [DevCertTool]::Csr($cn, [string[]]$dns, [string[]]$ips, $S.Key.SelectedIndex) } else { [DevCertTool]::SelfSigned($cn, [string[]]$dns, [string[]]$ips, $S.Key.SelectedIndex, [int]$S.Days.Value, $S.Ca.Checked) }
+    } catch { $ex = $_.Exception; while ($ex.InnerException) { $ex = $ex.InnerException }; Set-TbStatus $S.Status $ex.Message 'error'; return }
+    $S.Made = $r; $S.MadeName = ($cn -replace '^CN=', '' -replace '[\\/:*?"<>|, =]', '_')
+    $o = $S.MakeOut; $o.Clear()
+    if ($Csr) {
+        Add-RtbLine $o 'Signing request - send this to your certificate authority:' $C.Accent -Bold
+        Add-RtbLine $o $r.CsrPem.TrimEnd() $C.Fore
+    } else {
+        Add-RtbLine $o 'Certificate' $C.Accent -Bold
+        Add-RtbLine $o ([DevCertTool]::Describe($r.Cert)).TrimEnd() $C.Fore
+        Add-RtbLine $o '' ; Add-RtbLine $o $r.CertPem.TrimEnd() $C.Dim
+    }
+    Add-RtbLine $o ''
+    Add-RtbLine $o 'Private key - keep it secret' $C.Red -Bold
+    Add-RtbLine $o $r.KeyPem.TrimEnd() $C.Dim
+    Set-TbStatus $S.Status "$(if ($Csr) { 'CSR' } else { 'Certificate' }) made. Save files... writes $($S.MadeName).$(if ($Csr) { 'csr' } else { 'crt, .pfx' }) and .key; select text here to copy one part." 'ok'
+}
+
+function Save-CertFiles($S) {
+    if (-not $S.Made) { Set-TbStatus $S.Status 'Make a certificate or CSR first.' 'error'; return }
+    $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Folder for the certificate files'
+    $script:Modal = $true
+    try { if ($d.ShowDialog($TbUI.Form) -ne 'OK') { return }; $dir = $d.SelectedPath } finally { $script:Modal = $false; $d.Dispose() }
+    $n = Join-Path $dir $S.MadeName; $written = @()
+    $enc = New-Object System.Text.UTF8Encoding $false
+    if ($S.Made.CsrPem) { [IO.File]::WriteAllText("$n.csr", $S.Made.CsrPem, $enc); $written += "$($S.MadeName).csr" }
+    if ($S.Made.CertPem) {
+        [IO.File]::WriteAllText("$n.crt", $S.Made.CertPem, $enc); $written += "$($S.MadeName).crt"
+        try { [IO.File]::WriteAllBytes("$n.pfx", [DevCertTool]::Export($S.Made.Cert, 'pfx', $S.PfxPw.Text)); $written += "$($S.MadeName).pfx$(if (-not $S.PfxPw.Text) { ' (no password)' })" } catch { }
+    }
+    [IO.File]::WriteAllText("$n.key", $S.Made.KeyPem, $enc); $written += "$($S.MadeName).key"
+    Set-TbStatus $S.Status "Saved $($written -join ', ') in $dir" 'ok'
+    Start-Process explorer.exe "`"$dir`""
+}
+
+function Open-CertFile($S, [string]$Path) {
+    try { $cert = [DevCertTool]::Load($Path, $S.OpenPw.Text) } catch {
+        $ex = $_.Exception; while ($ex.InnerException) { $ex = $ex.InnerException }
+        Set-TbStatus $S.Status "Can't read it: $($ex.Message)$(if ($Path -match '\.(pfx|p12)$') { ' - type its password and open it again.' })" 'error'; return
+    }
+    $S.Opened = $cert; $S.OpenedName = [IO.Path]::GetFileNameWithoutExtension($Path)
+    Select-ApiTab $S.Tabs 'Open / convert'
+    $S.OpenOut.Clear()
+    Add-RtbLine $S.OpenOut (Split-Path -Leaf $Path) $C.Accent -Bold
+    Add-RtbLine $S.OpenOut ([DevCertTool]::Describe($cert)).TrimEnd() $C.Fore
+    Set-TbStatus $S.Status 'Save it as PEM, CER or PFX to convert it.' 'ok'
+}
+
+function Save-CertAs($S, [string]$Format) {
+    if (-not $S.Opened) { Set-TbStatus $S.Status 'Open a certificate first.' 'error'; return }
+    $d = New-Object System.Windows.Forms.SaveFileDialog
+    $d.Filter = switch ($Format) { 'pem' { 'PEM certificate|*.pem;*.crt' } 'cer' { 'DER certificate|*.cer;*.der' } default { 'PFX|*.pfx;*.p12' } }
+    $d.FileName = "$($S.OpenedName).$(if ($Format -eq 'pem') { 'pem' } else { $Format })"
+    $script:Modal = $true
+    try { if ($d.ShowDialog($TbUI.Form) -ne 'OK') { return }; $p = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
+    try { [IO.File]::WriteAllBytes($p, [DevCertTool]::Export($S.Opened, $Format, $S.OpenPw.Text)); Set-TbStatus $S.Status "Saved $(Split-Path -Leaf $p)$(if ($Format -eq 'pfx' -and -not $S.Opened.HasPrivateKey) { ' (no private key in the original, so none in the PFX)' })" 'ok' }
+    catch { Set-TbStatus $S.Status "Can't save: $($_.Exception.Message)" 'error' }
+}
+
+# ======================================================================================
+# Screen recorder: record an area of the screen as an animated GIF.
+# ======================================================================================
+Register-ToolboxPage 'record' 'Screen recorder (GIF)' $Glyph.Photo 'screen recorder record gif video capture animation demo bug report' {
+    param($panel, $st)
+    $st.Status = New-TbPage $panel
+    $st.Preview = New-Object System.Windows.Forms.PictureBox
+    $st.Preview.Dock = 'Fill'; $st.Preview.SizeMode = 'Zoom'; $st.Preview.BackColor = $C.Bg
+    $panel.Controls.Add($st.Preview)
+    $ob = New-TbBar $panel
+    [void](New-Button 'Save GIF...' 'Save the last recording' { Save-Recording $TbUI.Pages['record'].State } $ob $Glyph.Save 2)
+    [void](New-Button 'Copy file' 'Copy the GIF file - paste it into a chat, email, ticket or Explorer' { $s = $TbUI.Pages['record'].State; if ($s.File) { $fc = New-Object System.Collections.Specialized.StringCollection; [void]$fc.Add($s.File); [System.Windows.Forms.Clipboard]::SetFileDropList($fc); Set-TbStatus $s.Status 'GIF file copied - paste it anywhere.' 'ok' } } $ob $Glyph.Copy 2)
+    $bar = New-TbBar $panel
+    [void](New-Button 'Record an area...' 'Drag a box around what to record (Esc cancels)' { Start-ScreenRecording $TbUI.Pages['record'].State $false } $bar $Glyph.Play 1)
+    [void](New-Button 'Record the whole screen' 'Record the screen the mouse is on' { Start-ScreenRecording $TbUI.Pages['record'].State $true } $bar $Glyph.Play 2)
+    New-TbLabel $bar 'Frames a second' -Dim | Out-Null
+    $st.Fps = New-TbCombo $bar @('5', '10', '15', '20') 60
+    $st.Fps.SelectedIndex = 1
+    $st.Cursor = New-CheckBox $bar 'Show the mouse pointer' $true
+    $st.SetInput = { }
+    $st.Close = { $s = $TbUI.Pages['record'].State; if ($s.Preview.Image) { $s.Preview.Image.Dispose(); $s.Preview.Image = $null } }
+    Set-TbStatus $st.Status 'Record an area or the whole screen; a small Stop bar appears (it is not in the recording). Up to 2 minutes; the GIF plays here when you stop.'
+    $st
+}
+
+# A box dragged on a dimmed copy of the screen; returns the rectangle (screen pixels) or $null.
+function Select-ScreenArea {
+    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $f = New-Object System.Windows.Forms.Form
+    $f.FormBorderStyle = 'None'; $f.StartPosition = 'Manual'; $f.Bounds = $vs; $f.TopMost = $true; $f.ShowInTaskbar = $false
+    $f.BackColor = [System.Drawing.Color]::Black; $f.Opacity = 0.35; $f.Cursor = [System.Windows.Forms.Cursors]::Cross; $f.KeyPreview = $true
+    $f.Tag = @{ A = $null; B = $null; Result = $null; Origin = $vs.Location }
+    $f.GetType().GetProperty('DoubleBuffered', [Reflection.BindingFlags]'Instance, NonPublic').SetValue($f, $true, $null)
+    $f.add_MouseDown({ param($src, $e) $src.Tag.A = $e.Location; $src.Tag.B = $e.Location })
+    $f.add_MouseMove({ param($src, $e) if ($src.Tag.A) { $src.Tag.B = $e.Location; $src.Invalidate() } })
+    $f.add_MouseUp({
+        param($src, $e)
+        $t = $src.Tag
+        if (-not $t.A) { return }
+        $r = [System.Drawing.Rectangle]::FromLTRB([Math]::Min($t.A.X, $e.X), [Math]::Min($t.A.Y, $e.Y), [Math]::Max($t.A.X, $e.X), [Math]::Max($t.A.Y, $e.Y))
+        if ($r.Width -gt 8 -and $r.Height -gt 8) { $r.Offset($t.Origin); $t.Result = $r; $src.DialogResult = 'OK' } else { $t.A = $null; $src.Invalidate() }
+    })
+    $f.add_Paint({
+        param($src, $e)
+        $t = $src.Tag
+        if ($t.A -and $t.B) {
+            $r = [System.Drawing.Rectangle]::FromLTRB([Math]::Min($t.A.X, $t.B.X), [Math]::Min($t.A.Y, $t.B.Y), [Math]::Max($t.A.X, $t.B.X), [Math]::Max($t.A.Y, $t.B.Y))
+            $p = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), 2; $e.Graphics.DrawRectangle($p, $r); $p.Dispose()
+            $e.Graphics.FillRectangle([System.Drawing.Brushes]::Gray, $r)
+        }
+        [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, 'Drag a box around what to record  -  Esc cancels', $FontTitle, (New-Object System.Drawing.Point((Px 30), (Px 30))), [System.Drawing.Color]::White)
+    })
+    $f.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Escape') { $src.DialogResult = 'Cancel' } })
+    $script:Modal = $true
+    try { $ok = $f.ShowDialog() -eq 'OK'; $res = $f.Tag.Result } finally { $script:Modal = $false; $f.Dispose() }
+    if ($ok) { $res } else { $null }
+}
+
+function Start-ScreenRecording($S, [bool]$WholeScreen) {
+    if ($script:Recording) { return }
+    $TbUI.Form.Hide()
+    Start-Sleep -Milliseconds 200
+    $area = if ($WholeScreen) { [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).Bounds } else { Select-ScreenArea }
+    if (-not $area) { Show-Toolbox 'record'; return }
+    if ($area.Width % 2) { $area.Width-- }; if ($area.Height % 2) { $area.Height-- }
+    $fps = [int]$S.Fps.SelectedItem
+    $file = Join-Path ([IO.Path]::GetTempPath()) "DevTools-recording-$((Get-Date).ToString('yyyyMMdd-HHmmss')).gif"
+    $fs = [IO.File]::Create($file)
+    $rec = @{ S = $S; Area = $area; File = $file; Stream = $fs; Writer = (New-Object DevGifWriter($fs, $area.Width, $area.Height)); Delay = [int](100 / $fps); Started = Get-Date; Cursor = $S.Cursor.Checked }
+    $script:Recording = $rec
+    # the Stop bar: below the area (or above it, or in its corner), kept out of the recording
+    $bar = New-Object System.Windows.Forms.Form
+    $bar.FormBorderStyle = 'None'; $bar.StartPosition = 'Manual'; $bar.TopMost = $true; $bar.ShowInTaskbar = $false; $bar.BackColor = $C.Card
+    $bar.Size = New-Object System.Drawing.Size((Px 230), (Px 40))
+    $wa = [System.Windows.Forms.Screen]::FromRectangle($area).WorkingArea
+    $y = if ($area.Bottom + $bar.Height + (Px 6) -le $wa.Bottom) { $area.Bottom + (Px 6) } elseif ($area.Top - $bar.Height - (Px 6) -ge $wa.Top) { $area.Top - $bar.Height - (Px 6) } else { $area.Bottom - $bar.Height - (Px 10) }
+    $bar.Location = New-Object System.Drawing.Point(([Math]::Max($wa.Left, [Math]::Min($area.Right - $bar.Width, $wa.Right - $bar.Width))), $y)
+    $lbl = New-Object System.Windows.Forms.Label; $lbl.AutoSize = $false; $lbl.Dock = 'Fill'; $lbl.TextAlign = 'MiddleLeft'; $lbl.ForeColor = $C.Red; $lbl.Font = $FontMain; $lbl.Padding = New-Object System.Windows.Forms.Padding((Px 10), 0, 0, 0)
+    $lbl.Text = 'REC 0:00'
+    $stop = New-Button 'Stop' 'Stop recording' { Stop-ScreenRecording } $bar $Glyph.Cancel 3
+    $stop.Dock = 'Right'
+    $bar.Controls.Add($lbl); $lbl.BringToFront()
+    $rec.Bar = $bar; $rec.Label = $lbl
+    $bar.Show()
+    [DevGifWriter]::ExcludeFromCapture($bar.Handle)
+    $rec.Timer = New-Object System.Windows.Forms.Timer
+    $rec.Timer.Interval = [int](1000 / $fps)
+    $rec.Timer.add_Tick({
+        $r = $script:Recording
+        if (-not $r) { return }
+        try { $b = [DevGifWriter]::Capture($r.Area, $r.Cursor); $r.Writer.AddFrame($b, $r.Delay); $b.Dispose() } catch { }
+        $sec = [int]((Get-Date) - $r.Started).TotalSeconds
+        $r.Label.Text = 'REC {0}:{1:00}' -f [int][Math]::Floor($sec / 60), ($sec % 60)
+        if ($sec -ge 120) { Stop-ScreenRecording }
+    })
+    $rec.Timer.Start()
+}
+
+function Stop-ScreenRecording {
+    $r = $script:Recording
+    if (-not $r) { return }
+    $script:Recording = $null
+    $r.Timer.Stop(); $r.Timer.Dispose()
+    try { $r.Writer.Finish() } finally { $r.Stream.Dispose() }
+    $r.Bar.Close(); $r.Bar.Dispose()
+    $S = $r.S
+    $S.File = $r.File
+    if ($S.Preview.Image) { $S.Preview.Image.Dispose() }
+    $S.Preview.Image = [System.Drawing.Image]::FromFile($r.File)
+    $secs = [Math]::Round(((Get-Date) - $r.Started).TotalSeconds, 1)
+    Show-Toolbox 'record'
+    Set-TbStatus $S.Status "Recorded $secs s, $($r.Writer.Frames) frames, $([Math]::Round((Get-Item -LiteralPath $r.File).Length / 1KB).ToString('N0')) KB  -  Save GIF... or Copy file." 'ok'
+}
+
+function Save-Recording($S) {
+    if (-not $S.File) { Set-TbStatus $S.Status 'Record something first.' 'error'; return }
+    $d = New-Object System.Windows.Forms.SaveFileDialog; $d.Filter = 'GIF animation|*.gif'; $d.FileName = Split-Path -Leaf $S.File
+    $script:Modal = $true
+    try { if ($d.ShowDialog($TbUI.Form) -ne 'OK') { return }; $p = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
+    Copy-Item -LiteralPath $S.File -Destination $p -Force
+    Set-TbStatus $S.Status "Saved $(Split-Path -Leaf $p)" 'ok'
+}
+
+# ======================================================================================
+# Code to image: a nice picture of a code snippet (syntax colours, window frame, background) to share.
+# ======================================================================================
+$CodeImageBackgrounds = [ordered]@{
+    'Purple' = @('#A78BFA', '#4F46E5'); 'Ocean' = @('#22D3EE', '#2563EB'); 'Sunset' = @('#FB923C', '#DB2777'); 'Forest' = @('#34D399', '#047857')
+    'Grey' = @('#9CA3AF', '#4B5563'); 'None (transparent)' = @('', '')
+}
+Register-ToolboxPage 'codeimg' 'Code to image' $Glyph.Code 'code image screenshot snippet carbon share picture syntax highlight pretty' {
+    param($panel, $st)
+    $st.Status = New-TbPage $panel
+    $split = New-Object System.Windows.Forms.SplitContainer
+    $split.Dock = 'Fill'; $split.BackColor = $C.Line; $split.SplitterWidth = 3
+    $split.Panel1.BackColor = $C.Bg; $split.Panel2.BackColor = $C.Bg
+    $panel.Controls.Add($split)
+    $st.Code = New-TbBox -Mono -Multi -Cue 'Paste your code here'
+    $st.Code.Dock = 'Fill'
+    $split.Panel1.Controls.Add($st.Code)
+    $st.Preview = New-Object System.Windows.Forms.PictureBox
+    $st.Preview.Dock = 'Fill'; $st.Preview.SizeMode = 'Zoom'; $st.Preview.BackColor = $C.Bg
+    $split.Panel2.Controls.Add($st.Preview)
+    $ob = New-TbBar $panel
+    [void](New-Button 'Copy image' 'Copy the picture - paste it into a chat, slides or a document' { $s = $TbUI.Pages['codeimg'].State; if ($s.Bitmap) { [System.Windows.Forms.Clipboard]::SetImage($s.Bitmap); Set-TbStatus $s.Status 'Image copied.' 'ok' } } $ob $Glyph.Copy 1)
+    [void](New-Button 'Save PNG...' 'Save the picture' {
+        $s = $TbUI.Pages['codeimg'].State; if (-not $s.Bitmap) { return }
+        $d = New-Object System.Windows.Forms.SaveFileDialog; $d.Filter = 'PNG image|*.png'; $d.FileName = $(if ($s.Title.Text) { $s.Title.Text -replace '[\\/:*?"<>|]', '_' } else { 'code' }) + '.png'
+        $script:Modal = $true
+        try { if ($d.ShowDialog($TbUI.Form) -eq 'OK') { $s.Bitmap.Save($d.FileName, [System.Drawing.Imaging.ImageFormat]::Png) } } finally { $script:Modal = $false; $d.Dispose() }
+    } $ob $Glyph.Save 2)
+    $b1 = New-TbBar $panel
+    New-TbLabel $b1 'Language' -Dim | Out-Null
+    $st.Lang = New-TbCombo $b1 @('Guess', 'C#', 'JavaScript / TypeScript', 'Python', 'PowerShell', 'JSON', 'SQL', 'XML / HTML', 'Bash', 'Java / Kotlin', 'Go', 'Rust', 'C / C++', 'CSS', 'YAML', 'PHP', 'Plain text') 170
+    New-TbLabel $b1 'Theme' -Dim | Out-Null
+    $st.Theme = New-TbCombo $b1 @('Dark', 'Light') 80
+    New-TbLabel $b1 'Background' -Dim | Out-Null
+    $st.Bg = New-TbCombo $b1 @($CodeImageBackgrounds.Keys) 140
+    New-TbLabel $b1 'Size' -Dim | Out-Null
+    $st.Size = New-TbCombo $b1 @('10', '11', '12', '13', '14', '16', '18') 60
+    $st.Size.SelectedIndex = 2
+    $b2 = New-TbBar $panel
+    $st.Lines = New-CheckBox $b2 'Line numbers' $true
+    $st.Frame = New-CheckBox $b2 'Window frame' $true
+    New-TbLabel $b2 'Title' -Dim | Out-Null
+    $st.Title = New-TbBox -Cue 'e.g. app.js'
+    $st.Title.Width = Px (200 * $TextZoom); $st.Title.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 6), 0)
+    $b2.Controls.Add($st.Title)
+    $st.Timer = New-TbDebounce 300 { Update-CodeImage $TbUI.Pages['codeimg'].State }
+    foreach ($c2 in $st.Code, $st.Title) { $c2.add_TextChanged({ $s = $TbUI.Pages['codeimg'].State; $s.Timer.Stop(); $s.Timer.Start() }) }
+    foreach ($c2 in $st.Lang, $st.Theme, $st.Bg, $st.Size) { $c2.add_SelectedIndexChanged({ Update-CodeImage $TbUI.Pages['codeimg'].State }) }
+    foreach ($c2 in $st.Lines, $st.Frame) { $c2.add_CheckedChanged({ Update-CodeImage $TbUI.Pages['codeimg'].State }) }
+    $split.Tag = $true
+    $split.add_Resize({ param($src, $e) if ($src.Tag -and $src.Width -gt (Px 500)) { $src.Tag = $false; $src.SplitterDistance = [int]($src.Width * 0.42) } })
+    $st.SetInput = { param($t) $TbUI.Pages['codeimg'].State.Code.Text = $t }
+    $st.Focus = { $TbUI.Pages['codeimg'].State.Code.Focus() }
+    $st.Close = { $s = $TbUI.Pages['codeimg'].State; if ($s.Bitmap) { $s.Preview.Image = $null; $s.Bitmap.Dispose() } }
+    $st.Code.Text = "function greet(name) {`r`n  // say hello`r`n  return ``Hello, `${name}!``;`r`n}`r`n`r`nconsole.log(greet('world'));"
+    $st.Title.Text = 'greet.js'
+    $st
+}
+
+function Update-CodeImage($S) {
+    if (-not $S.Code.Text.Trim()) { if ($S.Bitmap) { $S.Preview.Image = $null; $S.Bitmap.Dispose(); $S.Bitmap = $null }; Set-TbStatus $S.Status 'Paste some code.'; return }
+    $lang = @('', 'cs', 'js', 'py', 'ps', 'json', 'sql', 'xml', 'sh', 'java', 'go', 'rust', 'c', 'css', 'yaml', 'php', 'none')[$S.Lang.SelectedIndex]
+    $bg = $CodeImageBackgrounds[[string]$S.Bg.SelectedItem]
+    $ca = if ($bg[0]) { [System.Drawing.ColorTranslator]::FromHtml($bg[0]) } else { [System.Drawing.Color]::Transparent }
+    $cb = if ($bg[1]) { [System.Drawing.ColorTranslator]::FromHtml($bg[1]) } else { [System.Drawing.Color]::Transparent }
+    try {
+        $bmp = [DevCodeImage]::Render($S.Code.Text, $lang, ($S.Theme.SelectedIndex -eq 0), [float]$S.Size.SelectedItem, $S.Lines.Checked, $S.Frame.Checked, $S.Title.Text, $ca, $cb, 2)
+    } catch { Set-TbStatus $S.Status $_.Exception.Message 'error'; return }
+    $old = $S.Bitmap
+    $S.Bitmap = $bmp; $S.Preview.Image = $bmp
+    if ($old) { $old.Dispose() }
+    Set-TbStatus $S.Status "$($bmp.Width) x $($bmp.Height) (sharp at 2x)  $Dot  Copy image, or Save PNG..." 'ok'
 }
 
 # ======================================================================================

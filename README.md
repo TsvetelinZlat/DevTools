@@ -51,7 +51,7 @@ Press **Ctrl+Shift+V** anywhere to open the picker. It opens at the mouse. Press
 The window has three parts:
 
 - **Quick access** (the strip of round bubbles on the left): your own links, files, programs and folders. Click one to open it, Ctrl+click copies its link / path, right-click to rename, change, move or remove it. Add one with the **+** bubble (a link, a file, a folder, or what's on the clipboard) or drop files, folders or links from the browser onto the strip.
-- **Top bar**: icons for every tool (Notes, Compare, Find in files, Transform, Network tools, API tester, Secrets, Toolbox, Command palette), then Pause / Resume, Settings and Exit. Hover an icon to see its name and shortcut.
+- **Top bar**: your **favourite** tools (Notes, Compare and API tester until you change them), then the Toolbox (every tool) and the Command palette, then Pause / Resume, Settings and Exit. Hover an icon to see its name and shortcut. From here Compare compares the two selected clips, and API tester / Transform / Network tools start from the selected clip.
 - **Search box and filter chips** (All, Text, Images, Files, Pinned).
 - **The list**: each clip shows when it was copied, its size and the app it came from, plus a badge such as JSON, JWT or URL when DevTools recognises it.
 - **Bottom bar**: Paste, Copy, Actions (smart actions), Pin, Edit, Delete for the selected clip, and Clear all.
@@ -120,7 +120,22 @@ An encrypted vault for passwords, API keys and tokens: the lock icon, **Ctrl+Shi
 
 ## Toolbox
 
-All the small developer tools in one window: the wrench icon, **Ctrl+B**, the tray menu, or each page by name from the command palette. Ctrl+PageUp / PageDown switch pages.
+**Every tool lives here**, in groups: the wrench icon, **Ctrl+B**, the tray menu, or any tool by name from the command palette. The sidebar lists:
+
+| Group | Tools |
+|---|---|
+| Clipboard & notes | Clipboard history, Notes, Snippets, Secrets, Paste stack |
+| Text & data | Transform, JSON / YAML / CSV / XML, Regex tester, JWT decoder, Markdown preview, Number bases, Units, Cron expressions, Time & time zones, Generators |
+| Encode & share | QR code, Hide secret messages, Code to image |
+| Files | Compare, Find in files, File hash, Log viewer |
+| Web & API | API tester, API chains, Test API |
+| Network | Network tools, DNS lookup & whois, Subnet calculator, Host monitor, Ports, Certificates, Certificate maker |
+| System | Environment & PATH, Processes & services, Git |
+| Screen & productivity | Screenshot, Text from a picture (OCR), Edit clipboard picture, Colour picker, Screen recorder (GIF), Timer & Pomodoro, Reminder, Mouse mover & clicker |
+
+Tools with an arrow open in their own window; the others open on the right. Type in **Search** to filter the list (Enter opens the first match). Ctrl+PageUp / PageDown switch pages.
+
+**Favourites**: right-click any tool > **Add to favourites** (a star). Favourites are listed first in the Toolbox, become icons on the picker's top bar and come first in the tray menu; right-click again (or the icon on the top bar) to remove one. The tray menu has the same groups as submenus, and the command palette shows each tool's group.
 
 - **JSON, YAML, CSV, XML**: converts any of the four into any other. Paste the input (its format is detected, or pick it) and press **JSON**, **Minified**, **Sorted keys**, **YAML**, **CSV**, **Tab-separated** or **XML**. Tab-separated data (copied from Excel or a database tool) is recognised too, and **Tab-separated** converts back to it. CSV: the first row names the columns, `address.city` columns become nested objects (and back), any separator (`,` `;` tab `|`). XML: attributes become `@name` keys, repeated elements become lists. The input is checked as you type.
   - **Tree**: browse the data. Click a value and **Path & loop code** shows its path and ready-to-copy code that loads *your* kind of text, reads that value and loops over its list, in JavaScript, Python, C#, PowerShell and a command-line tool:
@@ -139,6 +154,12 @@ All the small developer tools in one window: the wrench icon, **Ctrl+B**, the tr
   - **Cheat sheet** tab: the common tokens with what they mean; double-click one to put it into the pattern (or into Replace for `$1` ...).
 - **Cron expressions**: explains an expression in plain English and lists the next 12 runs. 5 fields, or 6 with seconds first; `@daily`, `@hourly` and friends; names like MON-FRI.
 - **Generators**: GUIDs (several formats), passwords (length and character sets), lorem ipsum (words, sentences, paragraphs), and test data (names, emails, phones, addresses, companies, dates, amounts ...) as JSON, CSV or SQL INSERT.
+- **Log viewer**: open or drop a log file and watch it live - new lines appear as they are written (like `tail -f`), even for big files (the last 16 MB are loaded). ERROR / FATAL / Exception lines are red, WARN yellow, DEBUG / TRACE grey. **Filter** keeps only matching lines (text or regex, matches highlighted; **Hide matching lines** does the opposite; **Errors** / **Warnings** are one click). Scrolling up pauses following; End or **Follow new lines** resumes. Click / Shift+click / drag selects lines, Ctrl+C copies them. A log that gets rotated or emptied is read again from the start.
+- **Subnet calculator**: `192.168.1.10/24`, `10.0.0.0 255.255.252.0` or `2001:db8::/48` - network, mask, wildcard, broadcast, first and last host, usable hosts, private / public, binary. **Split into** smaller networks (/25, /26 ...) and **Is this address inside?**.
+- **DNS lookup & whois**: any record type (A, AAAA, CNAME, MX, TXT, NS, SOA, SRV, PTR, CAA, or all common ones at once) from this PC's DNS, Cloudflare, Google, Quad9 or any server you type; an IP looks up its name. **Whois** asks the registry (and the registrar) who owns a domain or IP. Runs in the background.
+- **Certificate maker**: make a **self-signed certificate** (for local HTTPS: names like `localhost`, `*.dev.local`, IPs; RSA 2048 / 4096 or ECDSA P-256 / P-384; any validity) or a **certificate authority**, or a **signing request (CSR)** to send to a CA. **Save files...** writes `.crt`, `.key` (PEM), `.pfx` (with your password) and `.csr`. **Open / convert**: open a `.pem` / `.crt` / `.cer` / `.der` / `.pfx` / `.p12` (or drop it) to see everything inside (names, dates, key, thumbprints, extensions) and save it as PEM, CER or PFX. Keys are made on this PC. Needs .NET Framework 4.7.2+ (Windows 10 1803 and newer).
+- **Screen recorder (GIF)**: **Record an area...** (drag a box) or **the whole screen**, 5 - 20 frames a second, with or without the mouse pointer. A small Stop bar shows the time; it isn't in the recording. When you stop, the GIF plays in the window: **Save GIF...** or **Copy file** (paste it into a chat, ticket or email). Up to 2 minutes; frames that don't change cost nothing.
+- **Code to image**: paste code and get a nice picture of it - syntax colours (guessed, or pick the language), dark or light, a coloured or transparent background, line numbers, a window frame with a title. **Copy image** or **Save PNG** (twice the screen size, so it stays sharp).
 - **QR code**: type text or a link; copy the image or save it as PNG. Error correction L / M / Q / H; up to a few hundred characters.
 - **Hide secret messages** (steganography): hide a secret message in a picture, in normal text or in any file so nobody sees it's there, optionally locked with a password (AES-256, key from PBKDF2). **Read the message** gets it back.
   - **In a picture**: stored in the lowest bit of each pixel's red, green and blue, so the picture looks the same. Open, paste or drop any picture (**Close picture** takes it out again); the result is saved as PNG (a 1920 x 1080 picture holds about 750 KB of text). Send the PNG file itself - apps that shrink or re-save pictures (most chats, JPEG) destroy the message. Opening a picture tells you if it carries a message.
