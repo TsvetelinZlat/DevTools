@@ -9726,12 +9726,14 @@ $ApiFiles = @{
     Collections  = Join-Path $ApiDir 'collections.json'
     History      = Join-Path $ApiDir 'history.json'
     Environments = Join-Path $ApiDir 'environments.json'
+    Folders      = Join-Path $ApiDir 'folders.json'
     State        = Join-Path $ApiDir 'state.json'
 }
 $ApiUI = @{ Form = $null; Http = $null; Syncing = $false; CurrentId = $null; CurrentName = ''; CurrentFolder = ''
             Collections = (New-Object System.Collections.Generic.List[object])
             History = (New-Object System.Collections.Generic.List[object])
-            Environments = (New-Object System.Collections.Generic.List[object]); EnvName = '' }
+            Environments = (New-Object System.Collections.Generic.List[object]); EnvName = ''
+            Folders = (New-Object System.Collections.Generic.List[string]) }
 $ApiMethods = 'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'
 
 # ---- storage -------------------------------------------------------------------------------
@@ -9749,6 +9751,7 @@ function Save-ApiData([string]$Which) {
         'Collections'  { ConvertTo-Json -InputObject $ApiUI.Collections.ToArray() -Depth 8 }
         'History'      { ConvertTo-Json -InputObject $ApiUI.History.ToArray() -Depth 8 }
         'Environments' { ConvertTo-Json -InputObject $ApiUI.Environments.ToArray() -Depth 6 }
+        'Folders'      { ConvertTo-Json -InputObject @($ApiUI.Folders.ToArray()) -Depth 2 }
         'State'        { ConvertTo-Json -InputObject ([ordered]@{ Environment = $ApiUI.EnvName; Last = (Get-ApiModel) }) -Depth 8 }
     }
     if (-not $json) { $json = '[]' }
@@ -9759,6 +9762,7 @@ function Import-ApiData {
     foreach ($x in Read-ApiJson $ApiFiles.Collections) { if ($x) { $ApiUI.Collections.Add($x) } }
     foreach ($x in Read-ApiJson $ApiFiles.History) { if ($x) { $ApiUI.History.Add($x) } }
     foreach ($x in Read-ApiJson $ApiFiles.Environments) { if ($x) { $ApiUI.Environments.Add($x) } }
+    foreach ($x in Read-ApiJson $ApiFiles.Folders) { if ($x -is [string] -and $x.Trim() -and -not $ApiUI.Folders.Contains($x)) { $ApiUI.Folders.Add($x) } }
 }
 
 # ---- model <-> window ------------------------------------------------------------------------
@@ -10099,6 +10103,10 @@ function Update-ApiCollections {
     $tv.BeginUpdate()
     $tv.Nodes.Clear()
     $folders = @{}
+    foreach ($fname in @($ApiUI.Folders | Sort-Object)) {          # folders without requests yet
+        $fn = New-Object System.Windows.Forms.TreeNode($fname)
+        [void]$tv.Nodes.Add($fn); $folders[$fname] = $fn
+    }
     foreach ($r in @($ApiUI.Collections | Sort-Object { [string]$_.Folder }, { [string]$_.Name })) {
         $fname = if ($r.Folder) { [string]$r.Folder } else { 'My requests' }
         if (-not $folders.ContainsKey($fname)) {
@@ -10789,6 +10797,25 @@ function Show-ApiTester([string]$Text = '') {
 
     $tv.add_NodeMouseClick({ param($src, $e) $src.SelectedNode = $e.Node; if ($e.Button -eq 'Left' -and $e.Node.Tag) { Set-ApiModel $e.Node.Tag -Bind; Set-ApiStatus "Opened $($e.Node.Tag.Folder) / $($e.Node.Tag.Name)" $C.Dim } })
     $tm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    # right-click anywhere: on empty space only the "new" items; on a folder / request all of them
+    $tv.add_MouseDown({ param($src, $e) if ($e.Button -eq 'Right') { $src.SelectedNode = $src.GetNodeAt($e.Location) } })
+    $tm.add_Opening({
+        param($src, $e)
+        $n = $ApiUI.Tree.SelectedNode
+        foreach ($it in $src.Items) { if ($it.Tag -ne 'new') { $it.Visible = [bool]$n } }
+        $src.Items[1].Visible = $n -and -not $n.Tag                     # 'New request here' only on folders
+    })
+    $it = $tm.Items.Add('New folder...', $null, {
+        $name = Read-TextDialog 'New folder' 'Folder name' '' $ApiUI.Form
+        if (-not $name) { return }
+        $name = $name.Trim()
+        if (-not $ApiUI.Folders.Contains($name)) { $ApiUI.Folders.Add($name) }
+        Save-ApiData 'Folders'; Update-ApiCollections
+        Set-ApiStatus "Folder '$name' created. Save requests into it (Ctrl+S), or drag them later with Rename / move." $C.Green
+    }); $it.Tag = 'new'
+    $it = $tm.Items.Add('New request here', $null, { $n = $ApiUI.Tree.SelectedNode; $f = if ($n -and -not $n.Tag) { $n.Text } else { '' }; Set-ApiModel (New-ApiModel); $ApiUI.CurrentFolder = $f; [void]$ApiUI.Url.Focus(); Set-ApiStatus "New request - Ctrl+S saves it into $f." $C.Dim })
+    $it = $tm.Items.Add('New request', $null, { Set-ApiModel (New-ApiModel); [void]$ApiUI.Url.Focus() }); $it.Tag = 'new'
+    [void]$tm.Items.Add('-')
     [void]$tm.Items.Add('Open', $null, { $n = $ApiUI.Tree.SelectedNode; if ($n -and $n.Tag) { Set-ApiModel $n.Tag -Bind } })
     [void]$tm.Items.Add('Rename...', $null, {
         $n = $ApiUI.Tree.SelectedNode
@@ -10799,7 +10826,10 @@ function Show-ApiTester([string]$Text = '') {
         } else {
             $old = $n.Text
             $a = Show-ApiSaveDialog $old $old 'Rename folder'
-            if ($a) { foreach ($r in $ApiUI.Collections) { $f = if ($r.Folder) { [string]$r.Folder } else { 'My requests' }; if ($f -eq $old) { $r.Folder = $a.Name } } }
+            if ($a) {
+                foreach ($r in $ApiUI.Collections) { $f = if ($r.Folder) { [string]$r.Folder } else { 'My requests' }; if ($f -eq $old) { $r.Folder = $a.Name } }
+                if ($ApiUI.Folders.Remove($old)) { $ApiUI.Folders.Add($a.Name) }; Save-ApiData 'Folders'
+            }
         }
         Save-ApiData 'Collections'; Update-ApiCollections
     })
@@ -10817,7 +10847,8 @@ function Show-ApiTester([string]$Text = '') {
         $what = if ($n.Tag) { "the request `"$($n.Tag.Name)`"" } else { "the folder `"$($n.Text)`" and its $($n.Nodes.Count) requests" }
         if ([System.Windows.Forms.MessageBox]::Show($ApiUI.Form, "Delete $what?", 'API tester', 'YesNo', 'Warning') -ne 'Yes') { return }
         $gone = if ($n.Tag) { @($n.Tag) } else { @($n.Nodes | ForEach-Object { $_.Tag }) }
-        foreach ($g in $gone) { [void]$ApiUI.Collections.Remove($g); if ($ApiUI.CurrentId -eq $g.Id) { $ApiUI.CurrentId = $null; Update-ApiTitle } }
+        foreach ($g in $gone) { if ($g) { [void]$ApiUI.Collections.Remove($g); if ($ApiUI.CurrentId -eq $g.Id) { $ApiUI.CurrentId = $null; Update-ApiTitle } } }
+        if (-not $n.Tag) { [void]$ApiUI.Folders.Remove($n.Text); Save-ApiData 'Folders' }
         Save-ApiData 'Collections'; Update-ApiCollections
     })
     $tv.ContextMenuStrip = $tm
@@ -10896,14 +10927,15 @@ $ChainExtractFrom = @('JSON path', 'Header', 'Cookie', 'Regex', 'Status', 'Body'
 function Import-Chains {
     $ChainUI.Chains.Clear()
     foreach ($x in @(Read-ApiJson $ChainFile)) { foreach ($y in @($x)) { if ($y -and $y.Id -is [string] -and $y.Id) { $ChainUI.Chains.Add($y) } } }
+    Import-ChainFolders
 }
 
 function New-ChainRecord([string]$Name) {
-    [pscustomobject]@{ Id = [guid]::NewGuid().ToString('N'); Name = $Name; Vars = @(); AutoCookies = $true; Nodes = @(); Links = @() }
+    [pscustomobject]@{ Id = [guid]::NewGuid().ToString('N'); Name = $Name; Folder = ''; Example = ''; Vars = @(); AutoCookies = $true; Nodes = @(); Links = @() }
 }
 
 function New-ChainStep($Model) {
-    @{ Request = $Model; Extract = (New-Object System.Collections.Generic.List[object]); StopOnFail = $true }
+    @{ Request = $Model; Extract = (New-Object System.Collections.Generic.List[object]); StopOnFail = $true; Condition = ''; RunAfterFail = $false; SaveTo = ''; SaveWhat = 'body'; SaveAppend = $false; Jumps = @() }
 }
 
 # canvas + step data -> the current chain record, then to disk
@@ -10914,8 +10946,10 @@ function Save-Chains {
         $ch.Nodes = @(foreach ($n in $cv.Nodes) {
             $d = $ChainUI.Data[$n.Id]
             if (-not $d) { continue }
-            [ordered]@{ Id = $n.Id; X = [int]$n.X; Y = [int]$n.Y; Request = $d.Request; StopOnFail = [bool]$d.StopOnFail
+            $rec = [ordered]@{ Id = $n.Id; X = [int]$n.X; Y = [int]$n.Y; Request = $d.Request; StopOnFail = [bool]$d.StopOnFail
                         Extract = @($d.Extract.ToArray() | ForEach-Object { [ordered]@{ Var = $_.Var; From = $_.From; Expr = $_.Expr } }) }
+            foreach ($kv in (Get-ChainStepExtras $d).GetEnumerator()) { $rec[$kv.Key] = $kv.Value }
+            $rec
         })
         $ch.Links = @(foreach ($l in $cv.Links) { [ordered]@{ From = $l.From; To = $l.To } })
     }
@@ -10923,6 +10957,7 @@ function Save-Chains {
     $json = ConvertTo-Json -InputObject $ChainUI.Chains.ToArray() -Depth 10
     if (-not $json) { $json = '[]' }
     try { Write-JsonFile $ChainFile $json } catch { Write-Log "chains save failed: $_" }
+    Save-ChainFolders
 }
 
 function Open-Chain($Chain) {
@@ -10942,6 +10977,8 @@ function Open-Chain($Chain) {
             $n.Id = [string]$x.Id
             $d = New-ChainStep $m
             $d.StopOnFail = $x.StopOnFail -ne $false
+            Set-ChainStepExtras $d $x
+            Set-ChainNodeMarks $n $d
             foreach ($e in @($x.Extract)) { if ($e -and $e.Var) { $d.Extract.Add([pscustomobject]@{ Var = [string]$e.Var; From = [string]$e.From; Expr = [string]$e.Expr }) } }
             $ChainUI.Data[$n.Id] = $d
         }
@@ -11135,6 +11172,20 @@ function Get-ChainExamples {
             )
             Links = @('1>2', '2>3', '3>4', '4>5', '5>6', '6>7')
         }
+        'Conditions and go to (offline)' = @{
+            LocalApi = $true
+            Note = "Runs against the Test API on this PC. Look at the If & save and Go to tabs of each step; the dashed arrows are the go-to rules.`n1. Am I logged in? GET /me with {{token}}; its Go to rule jumps straight to step 3 when the answer is 200 (put a fresh token in Variables to see that).`n2. Log in: only reached when step 1 didn't go to 3.`n3. List items: saves {{count}}; when {{count}} >= 5 it goes to step 5.`n4. Add an item: then always back to step 3 - a loop that runs until there are 5 items.`n5. Save the list to a file: Documents\DevTools API results\examples\items-<date>.json.`n6. Only for user 99: Run only if {{userId}} == 99, so it's skipped."
+            Vars = [ordered]@{ baseUrl = 'http://127.0.0.1:8799'; user = 'demo'; password = 'demo'; token = '' }
+            Steps = @(
+                @{ Model = (New-ExampleModel 'Am I logged in?' 'GET' '{{baseUrl}}/me' @{ Headers = (New-ExampleKv ([ordered]@{ Authorization = 'Bearer {{token}}' })) }); Extract = @((New-ExampleRule 'meStatus' 'Status' '')); NoStop = $true; Jumps = @(@{ When = '{{meStatus}} == 200'; Goto = 3 }) }
+                @{ Model = (New-ExampleModel 'Log in' 'POST' '{{baseUrl}}/login' @{ BodyType = 'JSON'; Body = "{`r`n  `"username`": `"{{user}}`",`r`n  `"password`": `"{{password}}`"`r`n}" }); Extract = @((New-ExampleRule 'token' 'JSON path' '$.token'), (New-ExampleRule 'userId' 'JSON path' '$.userId')) }
+                @{ Model = (New-ExampleModel 'List items' 'GET' '{{baseUrl}}/items' @{ Headers = (New-ExampleKv ([ordered]@{ Authorization = 'Bearer {{token}}' })) }); Extract = @((New-ExampleRule 'count' 'JSON path' '$.count')); Jumps = @(@{ When = '{{count}} >= 5'; Goto = 5 }) }
+                @{ Model = (New-ExampleModel 'Add an item' 'POST' '{{baseUrl}}/items' @{ Headers = (New-ExampleKv ([ordered]@{ Authorization = 'Bearer {{token}}' })); BodyType = 'JSON'; Body = "{`r`n  `"name`": `"Item {{timestamp}}`",`r`n  `"price`": 5`r`n}" }); Extract = @((New-ExampleRule 'newId' 'JSON path' '$.id')); Jumps = @(@{ When = ''; Goto = 3 }) }
+                @{ Model = (New-ExampleModel 'Save the list to a file' 'GET' '{{baseUrl}}/items' @{ Headers = (New-ExampleKv ([ordered]@{ Authorization = 'Bearer {{token}}' })) }); Extract = @(); SaveTo = 'examples\items-{{date}}.json' }
+                @{ Model = (New-ExampleModel 'Only for user 99' 'GET' '{{baseUrl}}/me' @{ Headers = (New-ExampleKv ([ordered]@{ Authorization = 'Bearer {{token}}' })) }); Extract = @(); Condition = '{{userId}} == 99' }
+            )
+            Links = @('1>2', '2>3', '3>4', '4>5', '5>6')
+        }
         'Headers, regex and status' = @{
             Note = "1. Get an id: a Regex rule takes the uuid out of the response (its first group) - handy when the answer isn't JSON.`n2. Send it as a header: X-Demo-Id: {{requestId}}. httpbin sends it back (saved with the JSON path `$.headers['X-Demo-Id'] - brackets because of the dashes), and a Header rule saves the Content-Type.`n3. Expect 418: a 4xx normally stops the chain, but here 'Stop the chain here if it fails' is unticked; a Status rule saves 418 as {{status}}.`n4. Runs anyway and uses {{status}}."
             Vars = [ordered]@{ baseUrl = 'https://httpbin.org' }
@@ -11227,12 +11278,24 @@ function Show-TestApiLog {
 }
 
 # Opens a copy of an example as a new chain, so you can change it freely.
-function New-ChainFromExample([string]$Name) {
+function New-ChainFromExample([string]$Name, [switch]$Reset) {
     $ex = (Get-ChainExamples)[$Name]
     if (-not $ex) { return }
     if ($ex.LocalApi) { $u = Start-TestApi; if (-not $u) { return }; $ex.Vars['baseUrl'] = $u }
     Save-ChainEditor; Save-Chains
-    $ch = New-ChainRecord "Example - $Name"
+    $have = $ChainUI.Chains | Where-Object { $_.Example -eq $Name } | Select-Object -First 1
+    if ($have -and -not $Reset) {
+        if ($ex.LocalApi) { foreach ($v in @($have.Vars)) { if ($v.Key -eq 'baseUrl') { $v.Value = $ex.Vars['baseUrl'] } } }
+        $ChainUI.EditId = $null
+        Open-Chain $have; Update-ChainCombo
+        $ChainUI.Result.Text = "Example: $Name`r`n`r`n$($ex.Note -replace "`n", "`r`n")`r`n`r`nThis is your version of the example; right-click it in the Examples folder > Reset to the original example."
+        Set-ChainStatus "Example opened. Press F5 to run it." $C.Accent
+        return
+    }
+    $at = -1
+    if ($have) { $at = $ChainUI.Chains.IndexOf($have); [void]$ChainUI.Chains.Remove($have) }
+    $ch = New-ChainRecord $Name
+    $ch.Folder = 'Examples'; $ch.Example = $Name
     $ch.Vars = @(foreach ($k in $ex.Vars.Keys) { [pscustomobject]@{ Key = $k; Value = $ex.Vars[$k] } })
     $ids = @()
     $nodes = @()
@@ -11240,18 +11303,21 @@ function New-ChainFromExample([string]$Name) {
     foreach ($s in $ex.Steps) {
         $id = [guid]::NewGuid().ToString('N'); $ids += $id
         $nodes += [pscustomobject]@{ Id = $id; X = $x; Y = 60; Request = $s.Model; StopOnFail = -not $s.NoStop
-            Extract = @($s.Extract | ForEach-Object { [pscustomobject]@{ Var = $_.Var; From = $_.From; Expr = $_.Expr } }) }
+            Extract = @($s.Extract | ForEach-Object { [pscustomobject]@{ Var = $_.Var; From = $_.From; Expr = $_.Expr } })
+            Condition = [string]$s.Condition; RunAfterFail = [bool]$s.RunAfterFail; SaveTo = [string]$s.SaveTo; SaveWhat = $(if ($s.SaveWhat) { $s.SaveWhat } else { 'body' }); SaveAppend = [bool]$s.SaveAppend
+            Jumps = @(foreach ($j in @($s.Jumps)) { if ($j) { [pscustomobject]@{ On = $true; When = [string]$j.When; Goto = $(if ($j.Goto -eq 'end') { 'end' } else { "#$($j.Goto)" }); Wait = [int]$j.Wait } } }) }
         $x += 320
     }
+    foreach ($nd in $nodes) { foreach ($j in @($nd.Jumps)) { if ($j.Goto -match '^#(\d+)$') { $j.Goto = $ids[[int]$Matches[1] - 1] } } }
     $ch.Nodes = $nodes
     $ch.Links = @(foreach ($l in $ex.Links) { $p = $l -split '>'; [pscustomobject]@{ From = $ids[[int]$p[0] - 1]; To = $ids[[int]$p[1] - 1] } })
-    $ChainUI.Chains.Add($ch)
+    if ($at -ge 0) { $ChainUI.Chains.Insert($at, $ch) } else { $ChainUI.Chains.Add($ch) }
     $ChainUI.EditId = $null
     Open-Chain $ch
     Update-ChainCombo
     Invoke-ChainArrange
-    $ChainUI.Result.Text = "Example: $Name`r`n`r`n$($ex.Note -replace "`n", "`r`n")`r`n`r`nThis is your copy - change it as you like. The original stays under Examples."
-    Set-ChainStatus "Example opened as a copy. Press F5 to run it." $C.Accent
+    $ChainUI.Result.Text = "Example: $Name`r`n`r`n$($ex.Note -replace "`n", "`r`n")`r`n`r`nChange it as you like - it's kept in the Examples folder. Right-click it there > Reset to the original example to start over."
+    Set-ChainStatus $(if ($Reset) { "Example '$Name' is back to the original. Press F5 to run it." } else { "Example opened. Press F5 to run it." }) $C.Accent
 }
 
 # API tester: load an example request into the editor (not saved anywhere until you press Save).
@@ -11322,6 +11388,7 @@ function Import-ChainJson([string]$Json) {
     $taken = @($ChainUI.Chains | ForEach-Object { $_.Name })
     $n = $name; $i = 2; while ($taken -contains $n) { $n = "$name ($i)"; $i++ }
     $ch = New-ChainRecord $n
+    $ch.Folder = Get-SelectedChainFolder
     $ch.AutoCookies = $x.AutoCookies -ne $false
     $ch.Vars = @(foreach ($v in @($x.Vars)) { if ($v -and $v.Key) { [pscustomobject]@{ Key = [string]$v.Key; Value = [string]$v.Value } } })
     $map = @{}
@@ -11345,6 +11412,7 @@ function Show-ChainShareMenu($Button) {
     $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
     [void](Add-MenuItem $m 'Export to a file...' { Export-Chain } $Glyph.Save)
     [void](Add-MenuItem $m 'Copy as text (to paste in a chat or email)' { Export-Chain -Clipboard } $Glyph.Copy)
+    [void](Add-MenuItem $m 'Save all results of the last run to a folder...' { Save-ChainResults } $Glyph.Save)
     [void]$m.Items.Add('-')
     [void](Add-MenuItem $m 'Import from a file...' {
         $d = New-Object System.Windows.Forms.OpenFileDialog
@@ -11359,9 +11427,6 @@ function Show-ChainShareMenu($Button) {
 function Update-ChainPalette {
     $tv = $ChainUI.Palette
     $tv.BeginUpdate(); $tv.Nodes.Clear()
-    $x = $tv.Nodes.Add('Example chains (opens a copy)')
-    foreach ($k in (Get-ChainExamples).Keys) { $n = $x.Nodes.Add($k); $n.Tag = "ex:$k" }
-    $x.Expand()
     $xr = $tv.Nodes.Add('Example requests')
     foreach ($k in (Get-ApiExampleRequests).Keys) { $n = $xr.Nodes.Add($k); $n.Tag = "exreq:$k" }
     $t = $tv.Nodes.Add('Start from')
@@ -11444,6 +11509,11 @@ function Show-ChainStep($Node) {
         $g.Rows.Clear()
         foreach ($e in $d.Extract) { [void]$g.Rows.Add([string]$e.Var, $(if ($ChainExtractFrom -contains $e.From) { [string]$e.From } else { 'JSON path' }), [string]$e.Expr) }
         $ChainUI.EStop.Checked = [bool]$d.StopOnFail
+        $ChainUI.ECond.Text = [string]$d.Condition; $ChainUI.EAfterFail.Checked = [bool]$d.RunAfterFail
+        $ChainUI.ESave.Text = [string]$d.SaveTo; $ChainUI.ESaveWhat.SelectedIndex = $(if ($d.SaveWhat -eq 'full') { 1 } else { 0 }); $ChainUI.ESaveAppend.Checked = [bool]$d.SaveAppend
+        $jg = $ChainUI.EJumps; $jg.Rows.Clear()
+        Update-ChainGotoList
+        foreach ($j in @($d.Jumps)) { if ($j) { [void]$jg.Rows.Add([bool]($j.On -ne $false), [string]$j.When, [string]$j.Goto, $(if ([int]$j.Wait) { [string]$j.Wait } else { '' })) } }
         $ChainUI.EAuth.Text = if ($m.AuthType -and $m.AuthType -ne 'None') { "Auth: $($m.AuthType) (change it with Open in API tester)" } else { '' }
     } finally { $ChainUI.Loading = $false }
     Show-ChainResult $Node
@@ -11473,6 +11543,17 @@ function Save-ChainEditor {
         $d.Extract.Add([pscustomobject]@{ Var = $v.Trim().Trim('{', '}'); From = $(if ($row.Cells[1].Value) { [string]$row.Cells[1].Value } else { 'JSON path' }); Expr = [string]$row.Cells[2].Value })
     }
     $d.StopOnFail = $ChainUI.EStop.Checked
+    $d.Condition = $ChainUI.ECond.Text.Trim(); $d.RunAfterFail = $ChainUI.EAfterFail.Checked
+    $d.SaveTo = $ChainUI.ESave.Text.Trim(); $d.SaveWhat = $(if ($ChainUI.ESaveWhat.SelectedIndex -eq 1) { 'full' } else { 'body' }); $d.SaveAppend = $ChainUI.ESaveAppend.Checked
+    [void]$ChainUI.EJumps.EndEdit()
+    $d.Jumps = @(foreach ($row in $ChainUI.EJumps.Rows) {
+        if ($row.IsNewRow) { continue }
+        $go = [string]$row.Cells[2].Value
+        if (-not $go) { continue }
+        $w = 0; [void][int]::TryParse([string]$row.Cells[3].Value, [ref]$w)
+        [pscustomobject]@{ On = $row.Cells[0].Value -ne $false; When = ([string]$row.Cells[1].Value).Trim(); Goto = $go; Wait = $w }
+    })
+    Set-ChainNodeMarks $n $d
     $n.Title = $m.Name; $n.Method = $m.Method; $n.Url = $m.Url
     $ChainUI.Canvas.Invalidate()
 }
@@ -11486,7 +11567,7 @@ function Start-ChainEditorSave {
 # ---- running ------------------------------------------------------------------------------
 function Get-CookieHeader([string]$Url) {
     try { $h = ([Uri]$Url).Host } catch { return '' }
-    $pairs = foreach ($c in $ChainUI.Jar.Values) { if ($h -eq $c.Domain -or $h.EndsWith('.' + $c.Domain)) { "$($c.Name)=$($c.Value)" } }
+    $pairs = foreach ($cx in $ChainUI.Jar.Values) { if ($h -eq $cx.Domain -or $h.EndsWith('.' + $cx.Domain)) { "$($cx.Name)=$($cx.Value)" } }
     @($pairs) -join '; '
 }
 
@@ -11511,7 +11592,7 @@ function Get-ChainExtract($Rule, $Resp) {
     $expr = [string]$Rule.Expr
     switch ([string]$Rule.From) {
         'Header' { foreach ($x in $Resp.Headers) { if ($x[0] -eq $expr) { return $x[1] } }; return $null }
-        'Cookie' { foreach ($x in $Resp.Headers) { if ($x[0] -eq 'Set-Cookie' -and $x[1] -match "^\s*$([regex]::Escape($expr))=([^;]*)") { return $Matches[1] } }; foreach ($c in $ChainUI.Jar.Values) { if ($c.Name -eq $expr) { return $c.Value } }; return $null }
+        'Cookie' { foreach ($x in $Resp.Headers) { if ($x[0] -eq 'Set-Cookie' -and $x[1] -match "^\s*$([regex]::Escape($expr))=([^;]*)") { return $Matches[1] } }; foreach ($cx in $ChainUI.Jar.Values) { if ($cx.Name -eq $expr) { return $cx.Value } }; return $null }
         'Regex'  { $m = [regex]::Match([string]$Resp.Text, $expr); if (-not $m.Success) { return $null }; if ($m.Groups.Count -gt 1) { return $m.Groups[1].Value }; return $m.Value }
         'Status' { return [string]$Resp.Status }
         'Body'   { return [string]$Resp.Text }
@@ -11559,7 +11640,7 @@ function Start-ChainRun([string]$OnlyId = '', [string[]]$Ids = @()) {
         Reset-ChainVars                  # fresh run: no cookies, no values from before
         foreach ($n in $cv.Nodes) { $n.State = ''; $n.Info = '' }
     }
-    $ChainUI.Run = @{ Order = $order; Index = 0; Http = $null; Node = $null; Started = Get-Date; Ok = 0; Fail = 0; Skip = 0; Single = ($order.Count -eq 1 -and $partial); Only = @($order | ForEach-Object { $_.Id }); Partial = $partial }
+    $ChainUI.Run = @{ Order = $order; Index = 0; Http = $null; Node = $null; Started = Get-Date; Ok = 0; Fail = 0; Skip = 0; Single = ($order.Count -eq 1 -and $partial); Only = @($order | ForEach-Object { $_.Id }); Partial = $partial; Visits = @{}; JumpTo = $null; WaitUntil = $null }
     $ChainUI.RunBtn.Text = 'Stop'; $ChainUI.RunBtn.Glyph = $Glyph.Cancel; $ChainUI.RunBtn.Variant = 3; $ChainUI.RunBtn.Invalidate()
     Invoke-ChainNext
 }
@@ -11587,12 +11668,17 @@ function Invoke-ChainNext {
     while ($r.Index -lt $r.Order.Count) {
         $n = $r.Order[$r.Index]
         $r.Index++
-        if (-not $r.Single) {
+        $jumped = $n.Id -eq $r.JumpTo; $r.JumpTo = $null          # a "go to" target runs whatever its parents did
+        if (-not $r.Single -and -not $jumped) {
             $parents = @($cv.Links | Where-Object { $_.To -eq $n.Id -and (-not $r.Partial -or $r.Only -contains $_.From) } | ForEach-Object { $cv.Find($_.From) })
             $bad = @($parents | Where-Object { $_ -and $_.State -in 'fail', 'skip' })
-            if ($bad) { $n.State = 'skip'; $n.Info = "skipped: $($bad[0].Title) failed"; $r.Skip++; continue }
+            if ($bad -and -not $ChainUI.Data[$n.Id].RunAfterFail) { $n.State = 'skip'; $n.Info = "skipped: $($bad[0].Title) $(if ($bad[0].State -eq 'fail') { 'failed' } else { 'was skipped' })"; $r.Skip++; continue }
         }
         $d = $ChainUI.Data[$n.Id]
+        if ($d.Condition) {
+            $t = Test-ChainCondition $d.Condition
+            if (-not $t.Ok) { $n.State = 'skip'; $n.Info = "skipped - not true: $($t.Text)"; $r.Skip++; continue }
+        }
         $script:ChainVars = $ChainUI.Vars
         try { $req = ConvertTo-HttpRequest $d.Request } finally { $script:ChainVars = $null }
         $unknown = @($ApiUI.Unknown)
@@ -11602,6 +11688,8 @@ function Invoke-ChainNext {
             $ck = Get-CookieHeader $req.Url
             if ($ck) { $req.AddHeader('Cookie', $ck); $cookieNote = $ck }
         }
+        $r.Visits[$n.Id] = 1 + [int]$r.Visits[$n.Id]
+        if ($r.Visits[$n.Id] -gt 100) { $n.State = 'fail'; $n.Info = 'stopped: ran 100 times in this run'; $cv.Invalidate(); Stop-ChainRun "Stopped: step $($n.Order) ($($n.Title)) would run a 101st time - check the 'Go to' rules (an endless loop?)."; return }
         $r.Node = $n; $r.Req = $req; $r.Unknown = $unknown; $r.CookieNote = $cookieNote
         $r.Http = New-Object PowerClipHttp
         $r.Http.Start($req)
@@ -11612,6 +11700,175 @@ function Invoke-ChainNext {
         return
     }
     Stop-ChainRun
+}
+
+# ---- Conditions ("Run only if") and saving responses to files, per step.
+$ChainStepExtras = @('Condition', 'RunAfterFail', 'SaveTo', 'SaveWhat', 'SaveAppend', 'Jumps')
+
+function Set-ChainStepExtras($Data, $From) {
+    foreach ($k in $ChainStepExtras) { $v = if ($From -is [hashtable]) { $From[$k] } elseif ($From -and $From.PSObject.Properties[$k]) { $From.$k } else { $null }; if ($null -ne $v) { $Data[$k] = $v } }
+    if (-not $Data.Condition) { $Data.Condition = '' }; if (-not $Data.SaveTo) { $Data.SaveTo = '' }; if (-not $Data.SaveWhat) { $Data.SaveWhat = 'body' }
+    $Data.RunAfterFail = [bool]$Data.RunAfterFail; $Data.SaveAppend = [bool]$Data.SaveAppend
+    $Data.Jumps = @(foreach ($j in @($Data.Jumps)) { if ($j -and $j.Goto) { [pscustomobject]@{ On = $j.On -ne $false; When = [string]$j.When; Goto = [string]$j.Goto; Wait = [int]$j.Wait } } })
+}
+
+function Get-ChainStepExtras($Data) { $h = [ordered]@{}; foreach ($k in $ChainStepExtras) { $h[$k] = $Data[$k] }; $h }
+
+# {{name}} -> its value now ({{timestamp}}, {{date}}, {{time}} are always there; unknown names -> '')
+function Expand-ChainText([string]$Text) {
+    $now = Get-Date
+    [regex]::Replace($Text, '\{\{\s*([^{}\s]+)\s*\}\}', {
+        param($m)
+        $k = $m.Groups[1].Value
+        switch ($k) {
+            'timestamp' { $now.ToString('yyyyMMdd-HHmmss') }
+            'date'      { $now.ToString('yyyy-MM-dd') }
+            'time'      { $now.ToString('HH-mm-ss') }
+            default     { if ($ChainUI.Vars.ContainsKey($k)) { [string]$ChainUI.Vars[$k] } else { '' } }
+        }
+    })
+}
+
+# "{{count}} > 0 and {{role}} == admin" -> @{ Ok = $true/$false; Text = what it compared }
+function Test-ChainCondition([string]$Condition) {
+    $c = $Condition.Trim()
+    if (-not $c) { return @{ Ok = $true; Text = '' } }
+    $shown = @()
+    $anyOr = $false
+    foreach ($orPart in ($c -split '\s+or\s+')) {
+        $all = $true
+        foreach ($clause in ($orPart -split '\s+and\s+')) {
+            $cl = $clause.Trim()
+            $neg = $false
+            if ($cl -match '^(not\s+|!)(.*)$') { $neg = $true; $cl = $Matches[2].Trim() }
+            if ($cl -match '^(.*?)\s*(==|!=|>=|<=|>|<|=)\s*(.*)$' -or $cl -match '^(.*?)\s+(contains|!contains|startswith|endswith|matches)\s+(.*)$') {
+                $l = (Expand-ChainText $Matches[1]).Trim().Trim('"', "'"); $op = $Matches[2].ToLower(); $rt = (Expand-ChainText $Matches[3]).Trim().Trim('"', "'")
+                $ln = 0.0; $rn = 0.0
+                $num = [double]::TryParse($l, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$ln) -and [double]::TryParse($rt, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$rn)
+                $cmp = if ($num) { $ln.CompareTo($rn) } else { [string]::Compare($l, $rt, $true) }
+                $ok = switch ($op) {
+                    { $_ -in '==', '=' } { $cmp -eq 0 }
+                    '!=' { $cmp -ne 0 }
+                    '>' { $cmp -gt 0 } '<' { $cmp -lt 0 } '>=' { $cmp -ge 0 } '<=' { $cmp -le 0 }
+                    'contains' { $l.IndexOf($rt, [StringComparison]::OrdinalIgnoreCase) -ge 0 }
+                    '!contains' { $l.IndexOf($rt, [StringComparison]::OrdinalIgnoreCase) -lt 0 }
+                    'startswith' { $l.StartsWith($rt, [StringComparison]::OrdinalIgnoreCase) }
+                    'endswith' { $l.EndsWith($rt, [StringComparison]::OrdinalIgnoreCase) }
+                    'matches' { try { [regex]::IsMatch($l, $rt) } catch { $false } }
+                }
+                $shown += "'$l' $op '$rt'"
+            } else {
+                $v = (Expand-ChainText $cl).Trim()
+                $ok = $v -and $v -notin 'false', '0', 'null', 'no'
+                $shown += "'$v'"
+            }
+            if ($neg) { $ok = -not $ok }
+            if (-not $ok) { $all = $false }
+        }
+        if ($all) { $anyOr = $true }
+    }
+    @{ Ok = $anyOr; Text = ($shown -join ', ') }
+}
+
+# Writes a step's response to its file (when it has one); returns a short note for the card.
+function Save-ChainStepResponse($Data, $Resp, $Req, [string]$Title) {
+    if (-not $Data.SaveTo -or $Resp.Error) { return '' }
+    try {
+        $path = (Expand-ChainText $Data.SaveTo).Trim().Trim('"')
+        if (-not $path) { return '' }
+        $path = [Environment]::ExpandEnvironmentVariables($path)
+        if (-not [IO.Path]::IsPathRooted($path)) { $path = Join-Path ([Environment]::GetFolderPath('MyDocuments')) (Join-Path 'DevTools API results' $path) }
+        $dir = Split-Path -Parent $path
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+        if ($Data.SaveWhat -eq 'full') {
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.AppendLine("### $Title  -  $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))")
+            [void]$sb.AppendLine("$($Req.Method) $($Req.Url)")
+            [void]$sb.AppendLine("$($Resp.HttpVersion) $($Resp.Status) $($Resp.Reason)   $($Resp.ElapsedMs) ms")
+            foreach ($h in $Resp.Headers) { [void]$sb.AppendLine("$($h[0]): $($h[1])") }
+            [void]$sb.AppendLine()
+            [void]$sb.AppendLine($(if ($null -ne $Resp.Text) { $Resp.Text } else { "($($Resp.Body.Length) bytes of binary data)" }))
+            $text = $sb.ToString()
+            if ($Data.SaveAppend) { [IO.File]::AppendAllText($path, $text + "`r`n", (New-Object System.Text.UTF8Encoding $false)) } else { [IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding $false)) }
+        } else {
+            if ($Data.SaveAppend) {
+                $fs = [IO.File]::Open($path, 'Append', 'Write')
+                try { $fs.Write($Resp.Body, 0, $Resp.Body.Length); $nl = [byte[]](13, 10); $fs.Write($nl, 0, 2) } finally { $fs.Dispose() }
+            } else { [IO.File]::WriteAllBytes($path, $Resp.Body) }
+        }
+        $ChainUI.LastSaved = $path
+        "saved to $(Split-Path -Leaf $path)"
+    } catch { "save failed: $($_.Exception.Message)" }
+}
+
+# Every step's last response into one folder (one file per step).
+function Save-ChainResults {
+    if (-not $ChainUI.Results.Count) { Set-ChainStatus 'Run the chain first.' $C.Dim; return }
+    $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Folder for the responses (one file per step)'
+    $script:Modal = $true
+    try { if ($d.ShowDialog($ChainUI.Form) -ne 'OK') { return }; $root = $d.SelectedPath } finally { $script:Modal = $false; $d.Dispose() }
+    $dir = Join-Path $root ((($ChainUI.Current.Name -replace '[\\/:*?"<>|]', '_').Trim()) + ' ' + (Get-Date).ToString('yyyyMMdd-HHmmss'))
+    [void](New-Item -ItemType Directory -Path $dir -Force)
+    $k = 0
+    foreach ($n in @(Get-ChainOrder)) {
+        $res = $ChainUI.Results[$n.Id]
+        if (-not $res) { continue }
+        $k++
+        $file = Join-Path $dir ('{0:00} {1}.txt' -f $n.Order, (($n.Title -replace '[\\/:*?"<>|]', '_').Trim()))
+        [void](Save-ChainStepResponse @{ SaveTo = $file; SaveWhat = 'full'; SaveAppend = $false } $res.Response $res.Request $n.Title)
+    }
+    Set-ChainStatus "Saved $k responses to $dir" $C.Green
+    Start-Process explorer.exe "`"$dir`""
+}
+
+# ---- "Go to" rules: after a step ran, the first rule whose If is true sends the chain to another step
+#      (back = repeat / retry / poll, forward = skip the steps in between) or ends it.
+function Set-ChainNodeMarks($Node, $Data) {
+    $Node.Cond = [string]$Data.Condition; $Node.Save = [bool]$Data.SaveTo
+    $Node.Jumps = (@($Data.Jumps) | Where-Object { $_ -and $_.On -and $_.Goto } | ForEach-Object { "$($_.Goto)$([char]31)$($_.When)" }) -join [string][char]30
+}
+
+# The step list of the "Then go to" column (ids behind the names).
+function Update-ChainGotoList {
+    $dt = $ChainUI.GotoTable
+    if (-not $dt) { return }
+    $dt.Rows.Clear()
+    [void]$dt.Rows.Add('end', '(end the chain here)')
+    foreach ($x in @(Get-ChainOrder)) { [void]$dt.Rows.Add($x.Id, "$($x.Order). $($x.Title)") }
+}
+
+# The first switched-on rule whose If is true (an empty If is always true), or $null.
+function Get-ChainJump($Data) {
+    foreach ($j in @($Data.Jumps)) {
+        if (-not $j -or -not $j.On -or -not $j.Goto) { continue }
+        if (-not ([string]$j.When).Trim()) { return $j }
+        if ((Test-ChainCondition $j.When).Ok) { return $j }
+    }
+    $null
+}
+
+# Moves the running chain to the rule's step; returns a note for the card.
+function Invoke-ChainJump($Run, $Node, $Rule) {
+    if ($Rule.Goto -eq 'end') {
+        for ($i = $Run.Index; $i -lt $Run.Order.Count; $i++) {
+            $x = $Run.Order[$i]
+            if (-not $Run.Visits[$x.Id]) { $x.State = 'skip'; $x.Info = "skipped: step $($Node.Order) ended the chain"; $Run.Skip++ }
+        }
+        $Run.Index = $Run.Order.Count
+        return 'then: end of the chain'
+    }
+    $t = $ChainUI.Canvas.Find([string]$Rule.Goto)
+    if (-not $t) { return 'go to: that step was deleted' }
+    $idx = -1
+    for ($i = 0; $i -lt $Run.Order.Count; $i++) { if ($Run.Order[$i].Id -eq $t.Id) { $idx = $i; break } }
+    if ($idx -lt 0) { return "go to $($t.Order): not part of this run" }
+    # steps jumped over (that haven't run yet in this run) count as skipped
+    for ($i = $Run.Index; $i -lt $idx; $i++) {
+        $x = $Run.Order[$i]
+        if (-not $Run.Visits[$x.Id]) { $x.State = 'skip'; $x.Info = "skipped: step $($Node.Order) went to step $($t.Order)"; $Run.Skip++ }
+    }
+    $Run.Index = $idx; $Run.JumpTo = $t.Id
+    "then: go to $($t.Order). $($t.Title)"
 }
 
 function Complete-ChainStep {
@@ -11639,12 +11896,22 @@ function Complete-ChainStep {
     if ($set.Count) { $parts += "set: $(@($set.Keys) -join ', ')" }
     if ($missing) { $parts += "not found: $($missing -join ', ')" }
     if ($cookies) { $parts += "cookie: $($cookies -join ', ')" }
+    $ChainUI.Vars['lastStatus'] = if ($resp.Error) { '0' } else { [string]$resp.Status }
+    $saved = Save-ChainStepResponse $d $resp $r.Req $n.Title
+    if ($saved) { $parts += $saved }
+    $wait = 0
+    $jump = Get-ChainJump $d
+    if ($jump) { $parts += (Invoke-ChainJump $r $n $jump); $wait = [int]$jump.Wait }
     $n.Info = $parts -join '  -  '
     if ($failed) { $r.Fail++ } else { $r.Ok++ }
     $ChainUI.Results[$n.Id] = @{ Request = $r.Req; Response = $resp; Set = $set; Missing = $missing; Unknown = $r.Unknown; CookieSent = $r.CookieNote }
     $ChainUI.Canvas.RunningId = $null; $ChainUI.Canvas.Invalidate()
     if ($ChainUI.Canvas.SelectedNode -and $ChainUI.Canvas.SelectedNode.Id -eq $n.Id) { Show-ChainResult $n }
-    Invoke-ChainNext
+    if ($wait -gt 0 -and $r.Index -lt $r.Order.Count) {
+        $r.WaitUntil = (Get-Date).AddMilliseconds($wait)
+        Set-ChainStatus "Waiting $wait ms before step $($r.Order[$r.Index].Order)..." $C.Dim
+        $ChainUI.Timer.Start()
+    } else { Invoke-ChainNext }
 }
 
 function Set-ChainStatus([string]$Text, $Color) { if ($ChainUI.Status) { $ChainUI.Status.Text = $Text; if ($Color) { $ChainUI.Status.ForeColor = $Color } } }
@@ -11745,7 +12012,7 @@ function Copy-ChainCards {
     $ids = @($sel | ForEach-Object { $_.Id })
     $doc = [ordered]@{
         DevToolsRequestPart = 'requests'
-        Items = @(foreach ($n in $sel) { $d = $ChainUI.Data[$n.Id]; [ordered]@{ Id = $n.Id; X = [int]$n.X; Y = [int]$n.Y; Request = $d.Request; StopOnFail = [bool]$d.StopOnFail; Extract = @($d.Extract.ToArray()) } })
+        Items = @(foreach ($n in $sel) { $d = $ChainUI.Data[$n.Id]; $rec = [ordered]@{ Id = $n.Id; X = [int]$n.X; Y = [int]$n.Y; Request = $d.Request; StopOnFail = [bool]$d.StopOnFail; Extract = @($d.Extract.ToArray()) }; foreach ($kv in (Get-ChainStepExtras $d).GetEnumerator()) { $rec[$kv.Key] = $kv.Value }; $rec })
         Links = @(foreach ($l in $cv.Links) { if ($ids -contains $l.From -and $ids -contains $l.To) { [ordered]@{ From = $l.From; To = $l.To } } })
     }
     try { [System.Windows.Forms.Clipboard]::SetText((ConvertTo-Json -InputObject $doc -Depth 10)) } catch { }
@@ -11767,12 +12034,13 @@ function Invoke-ChainPaste([float]$X = -1, [float]$Y = -1) {
             foreach ($p in $it.Request.PSObject.Properties) { if ($m.PSObject.Properties[$p.Name]) { $m.($p.Name) = $p.Value } }
             $m.Id = $null
             $n = $cv.AddNode([string]$m.Name, [string]$m.Method, [string]$m.Url, ($X + [float]$it.X - $minX), ($Y + [float]$it.Y - $minY))
-            $d = New-ChainStep $m; $d.StopOnFail = $it.StopOnFail -ne $false
+            $d = New-ChainStep $m; $d.StopOnFail = $it.StopOnFail -ne $false; Set-ChainStepExtras $d $it; Set-ChainNodeMarks $n $d
             foreach ($e in @($it.Extract)) { if ($e -and $e.Var) { $d.Extract.Add([pscustomobject]@{ Var = [string]$e.Var; From = [string]$e.From; Expr = [string]$e.Expr }) } }
             $ChainUI.Data[$n.Id] = $d
             $map[[string]$it.Id] = $n.Id; $new += $n
         }
         foreach ($l in @($part.Links)) { if ($l -and $map[[string]$l.From] -and $map[[string]$l.To]) { $lk = New-Object ChainLink; $lk.From = $map[[string]$l.From]; $lk.To = $map[[string]$l.To]; $cv.Links.Add($lk) } }
+        foreach ($nn in $new) { $dd = $ChainUI.Data[$nn.Id]; foreach ($j in @($dd.Jumps)) { if ($map[[string]$j.Goto]) { $j.Goto = $map[[string]$j.Goto] } }; Set-ChainNodeMarks $nn $dd }
         $ChainUI.EditId = $null
         $cv.SelectIds([string[]]@($new | ForEach-Object { $_.Id }))
         Update-ChainOrder; Save-Chains
@@ -11900,7 +12168,7 @@ function Show-ChainResult($Node) {
     Update-ChainPick $Node
     if (-not $Node) { $o.Text = ''; return }
     $res = $ChainUI.Results[$Node.Id]
-    if (-not $res) { $o.Text = if ($Node.State -eq 'skip') { "Skipped: $($Node.Info -replace '^skipped: ', '').`r`nA step it waits for failed, so it was not sent." } else { 'Not run yet. Press Run chain (F5), or Run this step (Shift+F5) to use the variables from the last run.' }; return }
+    if (-not $res) { $o.Text = if ($Node.State -eq 'skip') { "Skipped: $($Node.Info -replace '^skipped(:| -) ?', '').`r`nIt was not sent in this run." } else { 'Not run yet. Press Run chain (F5), or Run this step (Shift+F5) to use the variables from the last run.' }; return }
     $sb = New-Object System.Text.StringBuilder
     $q = $res.Request; $p = $res.Response
     [void]$sb.AppendLine("$($q.Method) $($q.Url)")
@@ -11928,7 +12196,7 @@ function Update-ChainVarsView {
     if (-not $v) { return }
     $lines = @()
     if ($ChainUI.Vars.Count) { $lines += 'Variables:'; foreach ($k in ($ChainUI.Vars.Keys | Sort-Object)) { $val = [string]$ChainUI.Vars[$k]; $lines += "  {{$k}} = $(if ($val.Length -gt 120) { $val.Substring(0, 120) + '...' } else { $val })" } }
-    if ($ChainUI.Jar.Count) { $lines += ''; $lines += 'Cookies:'; foreach ($c in $ChainUI.Jar.Values) { $lines += "  $($c.Name) = $($c.Value)   ($($c.Domain))" } }
+    if ($ChainUI.Jar.Count) { $lines += ''; $lines += 'Cookies:'; foreach ($cx in $ChainUI.Jar.Values) { $lines += "  $($cx.Name) = $($cx.Value)   ($($cx.Domain))" } }
     if (-not $lines) { $lines = @('Run the chain to see the variables and cookies.', '', 'Start values: Variables... in the toolbar, or an environment of the API tester.') }
     $v.Text = $lines -join "`r`n"
 }
@@ -11957,14 +12225,257 @@ function Show-ChainVarsDialog {
     } finally { $script:Modal = $false; $d.Dispose() }
 }
 
+# ---- Chain folders: chains live in (nested) folders shown as a tree; the Examples folder always holds the
+#      built-in examples (opened the first time from the original, then your edited version is kept).
+$ChainFoldersFile = Join-Path $ApiDir 'chainfolders.json'
+$ChainUI.Folders = New-Object System.Collections.Generic.List[string]
+$ChainUI.Expanded = New-Object System.Collections.Generic.HashSet[string]
+$ChainUI.Collapsed = New-Object System.Collections.Generic.HashSet[string]
+
+function Initialize-ChainRecord($Chain) {
+    foreach ($p in 'Folder', 'Example') { if (-not $Chain.PSObject.Properties[$p]) { $Chain | Add-Member -NotePropertyName $p -NotePropertyValue '' } }
+    if ($null -eq $Chain.Folder) { $Chain.Folder = '' }
+    if ($null -eq $Chain.Example) { $Chain.Example = '' }
+}
+
+function Import-ChainFolders {
+    $ChainUI.Folders.Clear()
+    foreach ($x in @(Read-ApiJson $ChainFoldersFile)) { foreach ($y in @($x)) { if ($y -is [string] -and $y.Trim() -and -not $ChainUI.Folders.Contains($y)) { $ChainUI.Folders.Add($y) } } }
+    # earlier example copies ("Example - Session cookie") move into the Examples folder
+    $names = @((Get-ChainExamples).Keys)
+    foreach ($ch in $ChainUI.Chains) {
+        Initialize-ChainRecord $ch
+        if (-not $ch.Folder -and -not $ch.Example -and $ch.Name -match '^Example - (.+?)( \(\d+\))?$') {
+            $n = $Matches[1]
+            if ($names -contains $n -and -not ($ChainUI.Chains | Where-Object { $_.Example -eq $n })) { $ch.Example = $n; $ch.Name = $n; $ch.Folder = 'Examples' }
+            else { $ch.Folder = 'Example copies' }
+        }
+    }
+}
+
+function Save-ChainFolders {
+    $json = ConvertTo-Json -InputObject @($ChainUI.Folders.ToArray()) -Depth 2
+    if (-not $json) { $json = '[]' }
+    try { Write-JsonFile $ChainFoldersFile $json } catch { Write-Log "chain folders save failed: $_" }
+}
+
+function Get-ChainFolderPaths {
+    $set = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($f in $ChainUI.Folders) { [void]$set.Add($f) }
+    foreach ($cx in $ChainUI.Chains) { if ($cx.Folder) { [void]$set.Add([string]$cx.Folder) } }
+    # every parent of a nested folder exists too
+    foreach ($f in @($set)) { $parts = $f -split '/'; for ($i = 1; $i -lt $parts.Count; $i++) { [void]$set.Add(($parts[0..($i - 1)] -join '/')) } }
+    [void]$set.Remove('Examples')
+    @($set | Sort-Object)
+}
+
+function Get-SelectedChainFolder {
+    $n = if ($ChainUI.Tree) { $ChainUI.Tree.SelectedNode } else { $null }
+    if (-not $n -or -not $n.Tag) { return '' }
+    $t = $n.Tag
+    $f = switch ($t.Kind) { 'folder' { $t.Path } 'chain' { [string]$t.Chain.Folder } default { '' } }
+    if ($f -eq 'Examples') { '' } else { $f }
+}
+
+function Update-ChainTree {
+    $tv = $ChainUI.Tree
+    if (-not $tv -or $tv.IsDisposed) { return }
+    $ChainUI.TreeLoading = $true
+    $tv.BeginUpdate()
+    try {
+        $tv.Nodes.Clear()
+        $bold = New-Object System.Drawing.Font($tv.Font, [System.Drawing.FontStyle]::Bold)
+        $script:ChainTreeCurrent = $null
+        # $Parent is the tree or a folder node (never a node collection: PowerShell would unroll it)
+        $addChain = {
+            param($Parent, $Chain)
+            $n = $Parent.Nodes.Add([string]$Chain.Name)
+            $n.Tag = [pscustomobject]@{ Kind = 'chain'; Chain = $Chain }
+            if ($Chain -eq $ChainUI.Current) { $n.NodeFont = $bold; $n.ForeColor = $C.Accent; $script:ChainTreeCurrent = $n }
+        }
+        # Examples (always there)
+        $ex = $tv.Nodes.Add('Examples')
+        $ex.Tag = [pscustomobject]@{ Kind = 'folder'; Path = 'Examples'; Examples = $true }
+        foreach ($name in (Get-ChainExamples).Keys) {
+            $have = $ChainUI.Chains | Where-Object { $_.Example -eq $name } | Select-Object -First 1
+            if ($have) { & $addChain $ex $have }
+            else { $n = $ex.Nodes.Add($name); $n.Tag = [pscustomobject]@{ Kind = 'example'; Name = $name }; $n.ForeColor = $C.Dim }
+        }
+        foreach ($ch in $ChainUI.Chains) { if ($ch.Folder -eq 'Examples' -and -not $ch.Example) { & $addChain $ex $ch } }
+        # your folders, nested
+        $byPath = @{}
+        foreach ($p in Get-ChainFolderPaths) {
+            $k = $p.LastIndexOf('/')
+            $parent = if ($k -gt 0 -and $byPath.ContainsKey($p.Substring(0, $k))) { $byPath[$p.Substring(0, $k)] } else { $tv }
+            $n = $parent.Nodes.Add($(if ($k -gt 0) { $p.Substring($k + 1) } else { $p }))
+            $n.Tag = [pscustomobject]@{ Kind = 'folder'; Path = $p; Examples = $false }
+            $byPath[$p] = $n
+        }
+        foreach ($ch in @($ChainUI.Chains | Sort-Object Name)) {
+            if ($ch.Folder -eq 'Examples' -or $ch.Example) { continue }
+            $parent = if ($ch.Folder -and $byPath.ContainsKey([string]$ch.Folder)) { $byPath[[string]$ch.Folder] } else { $tv }
+            & $addChain $parent $ch
+        }
+        # open / closed as you left them (open by default)
+        $walk = $null
+        $walk = { param($Parent) foreach ($n in $Parent.Nodes) { if ($n.Tag.Kind -eq 'folder') { if (-not $ChainUI.Collapsed.Contains($n.Tag.Path)) { $n.Expand() }; & $walk $n } } }
+        & $walk $tv
+        if ($script:ChainTreeCurrent) { $tv.SelectedNode = $script:ChainTreeCurrent; $script:ChainTreeCurrent.EnsureVisible() }
+    } finally { $tv.EndUpdate(); $ChainUI.TreeLoading = $false }
+}
+
+function Open-ChainFromTree($Node) {
+    if (-not $Node -or -not $Node.Tag) { return }
+    switch ($Node.Tag.Kind) {
+        'chain' { if ($Node.Tag.Chain -ne $ChainUI.Current) { Save-ChainEditor; Save-Chains; Open-Chain $Node.Tag.Chain; Update-ChainTree } }
+        'example' { New-ChainFromExample $Node.Tag.Name }
+    }
+}
+
+function New-ChainInFolder([string]$Folder) {
+    $n = Read-TextDialog 'New chain' "Name$(if ($Folder) { "  (in $Folder)" })" 'New chain' $ChainUI.Form
+    if (-not $n) { return }
+    try {
+        Save-ChainEditor; Save-Chains
+        $chn = New-ChainRecord $n.Trim(); $chn.Folder = $Folder
+        $ChainUI.Chains.Add($chn); Open-Chain $chn; Update-ChainCombo; Save-Chains
+        Set-ChainStatus "New chain '$($chn.Name)' created. Drag requests from the left onto the canvas (or double-click them)." $C.Green
+    } catch { Set-ChainStatus "Couldn't create the chain: $($_.Exception.Message)" $C.Red; Write-Log "new chain failed: $_" }
+}
+
+function New-ChainFolder([string]$Parent) {
+    $n = Read-TextDialog 'New folder' "Folder name$(if ($Parent) { "  (inside $Parent)" })" '' $ChainUI.Form
+    if (-not $n) { return }
+    $name = ($n.Trim() -replace '[/\\]', '-')
+    if ($name -eq 'Examples' -and -not $Parent) { Set-ChainStatus "'Examples' is reserved for the built-in examples." $C.Red; return }
+    $p = if ($Parent) { "$Parent/$name" } else { $name }
+    if (-not $ChainUI.Folders.Contains($p)) { $ChainUI.Folders.Add($p) }
+    $ChainUI.Collapsed.Remove($p) | Out-Null
+    Save-ChainFolders; Update-ChainTree
+}
+
+function Rename-ChainFolder([string]$Path) {
+    $i = $Path.LastIndexOf('/')
+    $leaf = if ($i -gt 0) { $Path.Substring($i + 1) } else { $Path }
+    $n = Read-TextDialog 'Rename folder' 'Folder name' $leaf $ChainUI.Form
+    if (-not $n -or $n.Trim() -eq $leaf) { return }
+    $new = $(if ($i -gt 0) { $Path.Substring(0, $i) + '/' } else { '' }) + ($n.Trim() -replace '[/\\]', '-')
+    Set-ChainFolderPath $Path $new
+}
+
+# Renames / moves a folder with everything inside.
+function Set-ChainFolderPath([string]$Old, [string]$New) {
+    foreach ($cx in $ChainUI.Chains) { if ($cx.Folder -eq $Old -or $cx.Folder.StartsWith("$Old/")) { $cx.Folder = $New + $cx.Folder.Substring($Old.Length) } }
+    $list = @($ChainUI.Folders.ToArray())
+    $ChainUI.Folders.Clear()
+    foreach ($f in $list) { $nf = if ($f -eq $Old -or $f.StartsWith("$Old/")) { $New + $f.Substring($Old.Length) } else { $f }; if ($nf -and -not $ChainUI.Folders.Contains($nf)) { $ChainUI.Folders.Add($nf) } }
+    Save-ChainFolders; Save-Chains; Update-ChainTree
+}
+
+function Remove-ChainFolder([string]$Path) {
+    $inside = @($ChainUI.Chains | Where-Object { $_.Folder -eq $Path -or $_.Folder.StartsWith("$Path/") }).Count
+    if ([System.Windows.Forms.MessageBox]::Show($ChainUI.Form, "Delete the folder $Path?$(if ($inside) { "`n`nIts $inside chain(s) are not deleted - they move up one level." })", 'API chains', 'YesNo', 'Question') -ne 'Yes') { return }
+    $i = $Path.LastIndexOf('/')
+    $parent = if ($i -gt 0) { $Path.Substring(0, $i) } else { '' }
+    foreach ($cx in $ChainUI.Chains) {
+        if ($cx.Folder -eq $Path) { $cx.Folder = $parent }
+        elseif ($cx.Folder.StartsWith("$Path/")) { $cx.Folder = ($(if ($parent) { "$parent/" } else { '' })) + $cx.Folder.Substring($Path.Length + 1) }
+    }
+    $list = @($ChainUI.Folders.ToArray()); $ChainUI.Folders.Clear()
+    foreach ($f in $list) {
+        if ($f -eq $Path) { continue }
+        $nf = if ($f.StartsWith("$Path/")) { ($(if ($parent) { "$parent/" } else { '' })) + $f.Substring($Path.Length + 1) } else { $f }
+        if (-not $ChainUI.Folders.Contains($nf)) { $ChainUI.Folders.Add($nf) }
+    }
+    Save-ChainFolders; Save-Chains; Update-ChainTree
+}
+
+function Move-ChainToFolder($Chain, [string]$Folder) {
+    if ($Folder -eq 'Examples') { Set-ChainStatus "The Examples folder holds the built-in examples; pick another folder." $C.Red; return }
+    $Chain.Folder = $Folder
+    if ($Chain.Example) { $Chain.Example = '' }      # moved out of Examples: it's yours now (the example shows again from the original)
+    Save-Chains; Update-ChainTree
+    Set-ChainStatus "Moved '$($Chain.Name)' to $(if ($Folder) { $Folder } else { 'the top level' })." $C.Green
+}
+
+function Show-ChainTreeMenu($Menu) {
+    $Menu.Items.Clear()
+    $n = $ChainUI.Tree.SelectedNode
+    $t = if ($n) { $n.Tag } else { $null }
+    $Menu.Tag = $t
+    if (-not $t) {
+        [void](Add-MenuItem $Menu 'New chain...' { New-ChainInFolder '' } $Glyph.Add)
+        [void](Add-MenuItem $Menu 'New folder...' { New-ChainFolder '' } $Glyph.Folder)
+        return
+    }
+    switch ($t.Kind) {
+        'folder' {
+            if ($t.Examples) {
+                [void](Add-MenuItem $Menu 'Reset all examples to the originals' {
+                    if ([System.Windows.Forms.MessageBox]::Show($ChainUI.Form, 'Put every example back the way it came? Changes you made to them are lost (your own chains are not touched).', 'API chains', 'YesNo', 'Question') -ne 'Yes') { return }
+                    foreach ($cx in @($ChainUI.Chains | Where-Object { $_.Example })) { [void]$ChainUI.Chains.Remove($cx) }
+                    if ($ChainUI.Current -and -not $ChainUI.Chains.Contains($ChainUI.Current)) { $ChainUI.EditId = $null; if ($ChainUI.Chains.Count) { Open-Chain $ChainUI.Chains[0] } else { New-ChainFromExample 'Log in, then use the token' } }
+                    Save-Chains; Update-ChainTree; Set-ChainStatus 'Examples reset.' $C.Green
+                } $Glyph.Undo)
+            } else {
+                [void](Add-MenuItem $Menu 'New chain here...' { New-ChainInFolder $ChainUI.Tree.SelectedNode.Tag.Path } $Glyph.Add)
+                [void](Add-MenuItem $Menu 'New folder inside...' { New-ChainFolder $ChainUI.Tree.SelectedNode.Tag.Path } $Glyph.Folder)
+                [void](Add-MenuItem $Menu 'Rename folder...' { Rename-ChainFolder $ChainUI.Tree.SelectedNode.Tag.Path } $Glyph.Edit)
+                [void]$Menu.Items.Add('-')
+                [void](Add-MenuItem $Menu 'Delete folder...' { Remove-ChainFolder $ChainUI.Tree.SelectedNode.Tag.Path } $Glyph.Delete)
+            }
+        }
+        'example' { [void](Add-MenuItem $Menu 'Open' { New-ChainFromExample $ChainUI.Tree.SelectedNode.Tag.Name } $Glyph.Open) }
+        'chain' {
+            $chn = $t.Chain
+            [void](Add-MenuItem $Menu 'Rename...' { $chn = $ChainUI.Tree.SelectedNode.Tag.Chain; $nn = Read-TextDialog 'Rename chain' 'Name' $chn.Name $ChainUI.Form; if ($nn) { $chn.Name = $nn.Trim(); Save-Chains; Update-ChainCombo } } $Glyph.Edit)
+            [void](Add-MenuItem $Menu 'Duplicate' {
+                $chn = $ChainUI.Tree.SelectedNode.Tag.Chain
+                Save-ChainEditor; Save-Chains
+                $copy = (ConvertTo-Json -InputObject $chn -Depth 10 | ConvertFrom-Json); Initialize-ChainRecord $copy
+                $copy.Id = [guid]::NewGuid().ToString('N'); $copy.Name = "$($chn.Name) (copy)"; $copy.Example = ''
+                if ($copy.Folder -eq 'Examples') { $copy.Folder = '' }
+                $ChainUI.Chains.Add($copy); Open-Chain $copy; Update-ChainCombo; Save-Chains
+            } $Glyph.Copy)
+            $mv = New-Object System.Windows.Forms.ToolStripMenuItem('Move to folder', (New-GlyphImage $Glyph.Folder))
+            $it = $mv.DropDownItems.Add('(top level)', $null, { param($s2, $e2) Move-ChainToFolder $ChainUI.Tree.SelectedNode.Tag.Chain '' }); $it.Enabled = [bool]$chn.Folder
+            foreach ($p in Get-ChainFolderPaths) {
+                $it = $mv.DropDownItems.Add(('    ' * ($p.Split('/').Count - 1)) + ($p -split '/')[-1], $null, { param($s2, $e2) Move-ChainToFolder $ChainUI.Tree.SelectedNode.Tag.Chain $s2.Tag })
+                $it.Tag = $p; if ($chn.Folder -eq $p) { $it.Enabled = $false }
+            }
+            [void]$mv.DropDownItems.Add('-')
+            [void]$mv.DropDownItems.Add('New folder...', $null, { $chn = $ChainUI.Tree.SelectedNode.Tag.Chain; $before = @(Get-ChainFolderPaths); New-ChainFolder ''; $added = @(Get-ChainFolderPaths | Where-Object { $before -notcontains $_ }); if ($added) { Move-ChainToFolder $chn $added[0] } })
+            $mv.DropDown.Renderer = $MenuRenderer
+            [void]$Menu.Items.Add($mv)
+            if ($chn.Example) {
+                [void](Add-MenuItem $Menu 'Reset to the original example' {
+                    $chn = $ChainUI.Tree.SelectedNode.Tag.Chain
+                    if ([System.Windows.Forms.MessageBox]::Show($ChainUI.Form, "Put '$($chn.Name)' back the way it came? Your changes to it are lost.", 'API chains', 'YesNo', 'Question') -ne 'Yes') { return }
+                    New-ChainFromExample $chn.Example -Reset
+                } $Glyph.Undo)
+            }
+            [void](Add-MenuItem $Menu 'Export...' { $chn = $ChainUI.Tree.SelectedNode.Tag.Chain; if ($chn -ne $ChainUI.Current) { Save-ChainEditor; Save-Chains; Open-Chain $chn; Update-ChainTree }; Export-Chain } $Glyph.Send)
+            [void]$Menu.Items.Add('-')
+            [void](Add-MenuItem $Menu 'Delete...' {
+                $chn = $ChainUI.Tree.SelectedNode.Tag.Chain
+                if ([System.Windows.Forms.MessageBox]::Show($ChainUI.Form, "Delete the chain $($chn.Name)?$(if ($chn.Example) { "`n(The example stays available in Examples, as it came.)" })", 'API chains', 'YesNo', 'Warning') -ne 'Yes') { return }
+                [void]$ChainUI.Chains.Remove($chn)
+                if ($chn -eq $ChainUI.Current) { $ChainUI.EditId = $null; if (-not $ChainUI.Chains.Count) { $ChainUI.Chains.Add((New-ChainRecord 'My chain')) }; Open-Chain $ChainUI.Chains[0] }
+                Save-Chains; Update-ChainCombo
+            } $Glyph.Delete)
+        }
+    }
+}
+
 function Update-ChainCombo {
     $cb = $ChainUI.ChainBox
     $ChainUI.Loading = $true
     try {
         $cb.Items.Clear()
-        foreach ($c in $ChainUI.Chains) { [void]$cb.Items.Add([string]$c.Name) }
+        foreach ($cx in $ChainUI.Chains) { [void]$cb.Items.Add([string]$cx.Name) }
         if ($ChainUI.Current) { $cb.SelectedIndex = $ChainUI.Chains.IndexOf($ChainUI.Current) }
     } finally { $ChainUI.Loading = $false }
+    Update-ChainTree
 }
 
 # ---- window -------------------------------------------------------------------------------
@@ -12002,6 +12513,32 @@ function Show-ApiChains {
     $pHead = Add-ApiTab $etabs 'Headers'
     $pBody = Add-ApiTab $etabs 'Body'
     $pExt = Add-ApiTab $etabs 'Take from response'
+    $pIf = Add-ApiTab $etabs 'If & save'
+    $pGo = Add-ApiTab $etabs 'Go to'
+    $iff = New-Object System.Windows.Forms.FlowLayoutPanel
+    $iff.Dock = 'Fill'; $iff.FlowDirection = 'TopDown'; $iff.WrapContents = $false; $iff.AutoScroll = $true; $iff.BackColor = $C.Bg; $iff.Padding = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0)
+    $pIf.Controls.Add($iff)
+    New-TbLabel $iff 'Run only if  (empty = always)' -Title | Out-Null
+    $ChainUI.ECond = New-TbBox -Mono -Cue '{{count}} > 0      {{role}} == admin      {{token}}'
+    $ChainUI.ECond.Width = Px 470; $iff.Controls.Add($ChainUI.ECond)
+    $ch1 = New-TbLabel $iff "Compare with == != > < >= <= contains startsWith endsWith matches (regex); a value on its own is true when it isn't empty. Combine with and / or, negate with not. {{lastStatus}} is the status of the step that ran just before. Example: {{lastStatus}} == 401 or {{token}} == ''" -Dim
+    $ch1.MaximumSize = New-Object System.Drawing.Size((Px 470), 0)
+    $ChainUI.EAfterFail = New-CheckBox $iff 'Run even if a step before it failed or was skipped (for error branches)' $false
+    $ChainUI.EAfterFail.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, (Px 14))
+    New-TbLabel $iff 'Save the response to a file' -Title | Out-Null
+    $sfr = New-Object System.Windows.Forms.FlowLayoutPanel; $sfr.AutoSize = $true; $sfr.WrapContents = $false; $sfr.BackColor = $C.Bg
+    $ChainUI.ESave = New-TbBox -Mono -Cue 'C:\results\orders-{{timestamp}}.json    or just  users.json'
+    $ChainUI.ESave.Width = Px 380; $sfr.Controls.Add($ChainUI.ESave)
+    [void](New-Button 'Browse...' 'Pick the file' {
+        $dd = New-Object System.Windows.Forms.SaveFileDialog; $dd.Filter = 'All files|*.*|JSON|*.json|Text|*.txt'; $dd.OverwritePrompt = $false
+        $script:Modal = $true
+        try { if ($dd.ShowDialog($ChainUI.Form) -eq 'OK') { $ChainUI.ESave.Text = $dd.FileName } } finally { $script:Modal = $false; $dd.Dispose() }
+    } $sfr $Glyph.Folder 2)
+    $iff.Controls.Add($sfr)
+    $ChainUI.ESaveWhat = New-TbCombo $iff @('The body only', 'Status, headers and body') 230
+    $ChainUI.ESaveAppend = New-CheckBox $iff 'Add to the end of the file (don''t overwrite it)' $false
+    $ch2 = New-TbLabel $iff "{{timestamp}}, {{date}}, {{time}} and your {{variables}} work in the path. Without a folder it goes to Documents\DevTools API results. Saved after every run of this step." -Dim
+    $ch2.MaximumSize = New-Object System.Drawing.Size((Px 470), 0)
     $ChainUI.ETabs = $etabs
     # request tab
     $rq = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -12059,6 +12596,28 @@ function Show-ApiChains {
     $xh = New-TbBar $pExt 'Bottom'
     $xl = New-TbLabel $xh 'JSON path: $.token, $.data.items[0].id   Header: X-Csrf-Token   Cookie: session   Regex: id="(\d+)"   Then use {{token}} in later steps.  Cookies are sent along by themselves.' -Dim
     $xl.MaximumSize = New-Object System.Drawing.Size((Px 480), 0)
+    $ChainUI.GotoTable = New-Object System.Data.DataTable
+    [void]$ChainUI.GotoTable.Columns.Add('Id'); [void]$ChainUI.GotoTable.Columns.Add('Name')
+    $jg = New-KvGrid $pGo 'x' 'y' -ReadOnly
+    $jg.ReadOnly = $false; $jg.AllowUserToAddRows = $true; $jg.AllowUserToDeleteRows = $true
+    $jg.Columns.Clear()
+    $jon = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+    $jon.HeaderText = ''; $jon.AutoSizeMode = 'None'; $jon.Width = Px 34; $jon.FlatStyle = 'Flat'
+    [void]$jg.Columns.Add($jon)
+    [void]$jg.Columns.Add('When', 'If  (empty = always)')
+    $jgo = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
+    $jgo.HeaderText = 'Then go to'; $jgo.FlatStyle = 'Flat'; $jgo.DataSource = $ChainUI.GotoTable; $jgo.ValueMember = 'Id'; $jgo.DisplayMember = 'Name'
+    [void]$jg.Columns.Add($jgo)
+    [void]$jg.Columns.Add('Wait', 'Wait ms')
+    $jg.Columns[1].FillWeight = 50; $jg.Columns[2].FillWeight = 38; $jg.Columns[3].FillWeight = 12
+    $jg.add_DefaultValuesNeeded({ param($src, $e) $e.Row.Cells[0].Value = $true })
+    $jg.add_DataError({ param($src, $e) $e.ThrowException = $false })
+    $jg.add_CurrentCellDirtyStateChanged({ param($src, $e) if ($src.CurrentCell -is [System.Windows.Forms.DataGridViewCheckBoxCell] -or $src.CurrentCell -is [System.Windows.Forms.DataGridViewComboBoxCell]) { [void]$src.CommitEdit('CurrentCellChange') } })
+    Enable-GridClipboard $jg
+    $ChainUI.EJumps = $jg
+    $jh = New-TbBar $pGo 'Bottom'
+    $jl = New-TbLabel $jh "After this step has run, the first rule whose If is true decides where the chain goes next: back to a step (repeat, retry, poll until it's done), forward (the steps in between are skipped) or to the end. Same conditions as Run only if: {{lastStatus}} == 401, {{count}} >= 5, {{state}} != done. Wait ms pauses first. A step runs at most 100 times per run." -Dim
+    $jl.MaximumSize = New-Object System.Drawing.Size((Px 480), 0)
     Select-ApiTab $etabs 'Request'
     $ed.Visible = $false
 
@@ -12086,9 +12645,43 @@ function Show-ApiChains {
     $ChainUI.VarsOut = New-TbRtb -ReadOnly; $ChainUI.VarsOut.Dock = 'Fill'; $pVars.Controls.Add($ChainUI.VarsOut)
     Select-ApiTab $rtabs 'Result'
 
-    # left: palette
-    $left = New-Object System.Windows.Forms.Panel
-    $left.Dock = 'Left'; $left.Width = Px 260; $left.BackColor = $C.Panel
+    # left: chains (folders) above the request palette
+    $left = New-Object System.Windows.Forms.SplitContainer
+    $left.Dock = 'Left'; $left.Width = Px 270; $left.Orientation = 'Horizontal'; $left.SplitterWidth = 4
+    $left.BackColor = $C.Line; $left.Panel1.BackColor = $C.Panel; $left.Panel2.BackColor = $C.Panel
+    $ct = New-Object System.Windows.Forms.TreeView
+    $ct.Dock = 'Fill'; $ct.BorderStyle = 'None'; $ct.BackColor = $C.Panel; $ct.ForeColor = $C.Fore; $ct.ItemHeight = Px 26; $ct.ShowLines = $false; $ct.FullRowSelect = $true; $ct.HideSelection = $false
+    $ct.add_AfterSelect({ param($src, $e) if (-not $ChainUI.TreeLoading) { Open-ChainFromTree $e.Node } })
+    $ct.add_NodeMouseClick({ param($src, $e) $src.SelectedNode = $e.Node })
+    $ct.add_AfterCollapse({ param($src, $e) if (-not $ChainUI.TreeLoading -and $e.Node.Tag.Kind -eq 'folder') { [void]$ChainUI.Collapsed.Add($e.Node.Tag.Path) } })
+    $ct.add_AfterExpand({ param($src, $e) if (-not $ChainUI.TreeLoading -and $e.Node.Tag.Kind -eq 'folder') { [void]$ChainUI.Collapsed.Remove($e.Node.Tag.Path) } })
+    # drag a chain or folder onto a folder (DevTools' own drag, like the request list)
+    $ct.add_ItemDrag({ param($src, $e) $t = $e.Item.Tag; if ($t -and ($t.Kind -eq 'chain' -or ($t.Kind -eq 'folder' -and -not $t.Examples))) { $ChainUI.TreeDrag = $t; $src.Capture = $true; $src.Cursor = [System.Windows.Forms.Cursors]::Hand } })
+    $ct.add_MouseUp({
+        param($src, $e)
+        $d = $ChainUI.TreeDrag; $ChainUI.TreeDrag = $null
+        $src.Capture = $false; $src.Cursor = [System.Windows.Forms.Cursors]::Default
+        if (-not $d) { return }
+        $pt = $src.PointToClient([System.Windows.Forms.Cursor]::Position)
+        if (-not $src.ClientRectangle.Contains($pt)) { return }
+        $target = $src.GetNodeAt($pt)
+        $folder = if (-not $target) { '' } elseif ($target.Tag.Kind -eq 'folder') { $target.Tag.Path } elseif ($target.Tag.Kind -eq 'chain') { [string]$target.Tag.Chain.Folder } else { 'Examples' }
+        if ($d.Kind -eq 'chain') { if ($folder -ne $d.Chain.Folder) { Move-ChainToFolder $d.Chain $folder } }
+        else {
+            if ($folder -eq 'Examples' -or $folder -eq $d.Path -or $folder.StartsWith("$($d.Path)/")) { return }
+            $leaf = ($d.Path -split '/')[-1]
+            Set-ChainFolderPath $d.Path $(if ($folder) { "$folder/$leaf" } else { $leaf })
+        }
+    })
+    $ctm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $ctm.add_Opening({ param($src, $e) Show-ChainTreeMenu $src; if (-not $src.Items.Count) { $e.Cancel = $true } })
+    $ct.ContextMenuStrip = $ctm
+    $ct.add_MouseDown({ param($src, $e) if ($e.Button -eq 'Right') { $n = $src.GetNodeAt($e.Location); $ChainUI.TreeLoading = $true; $src.SelectedNode = $n; $ChainUI.TreeLoading = $false } })
+    $left.Panel1.Controls.Add($ct)
+    $cth = New-Object System.Windows.Forms.Label
+    $cth.Text = '  CHAINS  (right-click for folders)'; $cth.Dock = 'Top'; $cth.Height = Px 28; $cth.TextAlign = 'MiddleLeft'; $cth.Font = $FontSmall; $cth.ForeColor = $C.Accent
+    $left.Panel1.Controls.Add($cth)
+    $ChainUI.Tree = $ct
     $pal = New-Object System.Windows.Forms.TreeView
     $pal.Dock = 'Fill'; $pal.BorderStyle = 'None'; $pal.BackColor = $C.Panel; $pal.ForeColor = $C.Fore; $pal.ItemHeight = Px 26; $pal.ShowLines = $false; $pal.FullRowSelect = $true
     $pal.add_MouseDown({
@@ -12126,11 +12719,12 @@ function Show-ApiChains {
         Set-ChainStatus "Added: $($d.Text)" $C.Green
     })
     $pal.add_NodeMouseDoubleClick({ param($src, $e) if ($e.Node.Tag) { Add-ChainFromPalette ([string]$e.Node.Tag) } })
-    $left.Controls.Add($pal)
+    $left.Panel2.Controls.Add($pal)
     $lh = New-Object System.Windows.Forms.Label
-    $lh.Text = '  DRAG ONTO THE CANVAS (or double-click)'; $lh.Dock = 'Top'; $lh.Height = Px 30; $lh.TextAlign = 'MiddleLeft'; $lh.Font = $FontSmall; $lh.ForeColor = $C.Accent
-    $left.Controls.Add($lh)
+    $lh.Text = '  REQUESTS - DRAG ONTO THE CANVAS'; $lh.Dock = 'Top'; $lh.Height = Px 28; $lh.TextAlign = 'MiddleLeft'; $lh.Font = $FontSmall; $lh.ForeColor = $C.Accent
+    $left.Panel2.Controls.Add($lh)
     $f.Controls.Add($left)
+    $ChainUI.LeftSplit = $left
     $ChainUI.Palette = $pal
 
     # canvas
@@ -12192,18 +12786,11 @@ function Show-ApiChains {
     $top = New-Object System.Windows.Forms.FlowLayoutPanel
     $top.Dock = 'Top'; $top.AutoSize = $true; $top.WrapContents = $true; $top.BackColor = $C.Panel
     $top.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 4))
-    New-TbLabel $top 'Chain' -Dim | Out-Null
     $ChainUI.ChainBox = New-TbCombo $top @() 220
+    $ChainUI.ChainBox.Visible = $false                 # the chains tree on the left does this now
     $ChainUI.ChainBox.add_SelectedIndexChanged({ param($src, $e) if ($ChainUI.Loading -or $src.SelectedIndex -lt 0) { return }; Save-ChainEditor; Save-Chains; Open-Chain $ChainUI.Chains[$src.SelectedIndex] })
-    [void](New-Button 'New' 'New chain' {
-        $n = Read-TextDialog 'New chain' 'Name' 'New chain' $ChainUI.Form
-        if (-not $n) { return }
-        try {
-            Save-ChainEditor; Save-Chains
-            $c = New-ChainRecord $n.Trim(); $ChainUI.Chains.Add($c); Open-Chain $c; Update-ChainCombo; Save-Chains
-            Set-ChainStatus "New chain '$($c.Name)' created. Drag requests from the left onto the canvas (or double-click them)." $C.Green
-        } catch { Set-ChainStatus "Couldn't create the chain: $($_.Exception.Message)" $C.Red; Write-Log "new chain failed: $_" }
-    } $top $Glyph.Add 2)
+    [void](New-Button 'New chain' 'New chain in the selected folder' { New-ChainInFolder (Get-SelectedChainFolder) } $top $Glyph.Add 2)
+    [void](New-Button 'New folder' 'New folder (inside the selected folder)' { New-ChainFolder (Get-SelectedChainFolder) } $top $Glyph.Folder 2)
     [void](New-Button 'Rename' 'Rename this chain' { $c = $ChainUI.Current; $n = Read-TextDialog 'Rename chain' 'Name' $c.Name $ChainUI.Form; if ($n) { $c.Name = $n.Trim(); Update-ChainCombo; Save-Chains } } $top $Glyph.Edit 2)
     [void](New-Button 'Delete' 'Delete this chain' {
         $c = $ChainUI.Current
@@ -12243,14 +12830,22 @@ function Show-ApiChains {
     $ChainUI.EMethod.add_TextChanged({ Start-ChainEditorSave })
     $ChainUI.EBodyType.add_SelectedIndexChanged({ Start-ChainEditorSave })
     $ChainUI.EStop.add_CheckedChanged({ Start-ChainEditorSave })
+    foreach ($ctl in $ChainUI.ECond, $ChainUI.ESave) { $ctl.add_TextChanged({ Start-ChainEditorSave }) }
+    $ChainUI.EAfterFail.add_CheckedChanged({ Start-ChainEditorSave }); $ChainUI.ESaveAppend.add_CheckedChanged({ Start-ChainEditorSave })
+    $ChainUI.ESaveWhat.add_SelectedIndexChanged({ Start-ChainEditorSave })
     $ChainUI.EHeaders.add_CellEndEdit({ Start-ChainEditorSave })
     $ChainUI.EExtract.add_CellEndEdit({ Start-ChainEditorSave })
+    $ChainUI.EJumps.add_CellValueChanged({ Start-ChainEditorSave }); $ChainUI.EJumps.add_UserDeletedRow({ Start-ChainEditorSave })
     $ChainUI.EExtract.add_UserDeletedRow({ Start-ChainEditorSave })
     $ChainUI.EHeaders.add_UserDeletedRow({ Start-ChainEditorSave })
 
     $ChainUI.Timer = New-Object System.Windows.Forms.Timer
     $ChainUI.Timer.Interval = 100
-    $ChainUI.Timer.add_Tick({ Complete-ChainStep })
+    $ChainUI.Timer.add_Tick({
+        $r = $ChainUI.Run
+        if ($r -and $r.WaitUntil) { if ((Get-Date) -ge $r.WaitUntil) { $r.WaitUntil = $null; $ChainUI.Timer.Stop(); Invoke-ChainNext } }
+        else { Complete-ChainStep }
+    })
 
     $f.add_KeyDown({
         param($src, $e)
@@ -13347,7 +13942,7 @@ function Show-Notes {
         $i = $src.IndexFromPoint($e.Location)
         $row = Get-NoteRow $i
         if (-not $row) { return }
-        if ($e.Button -eq 'Right') { if ($src.SelectedIndex -ne $i) { $src.SelectedIndex = $i }; return }
+        if ($e.Button -eq 'Right') { if ($i -ge 0 -and $src.SelectedIndex -ne $i) { $src.SelectedIndex = $i }; return }
         if ($e.Button -ne 'Left') { return }
         if ($row.IsFolder) { $NoteUI.SelectedFolder = $row.Name; $NoteUI.ClickFolder = $row.Name; $NoteUI.DragItem = "devtools-folder:$($row.Name)" }
         else { $NoteUI.DragItem = "devtools-note:$($row.Id)" }
@@ -13400,6 +13995,13 @@ function Show-Notes {
     $lmenu.add_Opening({
         param($src, $e)
         $src.Items.Clear()
+        # what is under the mouse (empty space -> new note / folder at the top level)
+        $hit = $NoteUI.List.IndexFromPoint($NoteUI.List.PointToClient([System.Windows.Forms.Cursor]::Position))
+        if ($hit -lt 0) {
+            [void](Add-MenuItem $src 'New note' { $NoteUI.SelectedFolder = $null; [void](New-Note '' ''); $NoteUI.Title.Focus() } $Glyph.Add)
+            [void](Add-MenuItem $src 'New folder...' { [void](New-NoteFolderPrompt '') } $Glyph.Folder)
+            return
+        }
         $row = Get-NoteRow $NoteUI.List.SelectedIndex
         if (-not $row) { $e.Cancel = $true; return }
         if ($row.IsFolder) {
@@ -13423,6 +14025,7 @@ function Show-Notes {
             [void]$move.DropDownItems.Add('New folder...', $null, { $n = $NoteUI.Current; $name = New-NoteFolderPrompt $(if ($n.Folder) { $n.Folder } else { '' }); if ($name) { Move-NoteToFolder $n $name } })
             $move.DropDown.Renderer = $MenuRenderer
             [void]$src.Items.Add($move)
+            [void](Add-MenuItem $src 'New folder...' { $nn = $NoteUI.Current; [void](New-NoteFolderPrompt $(if ($nn -and $nn.Folder) { $nn.Folder } else { '' })) } $Glyph.Folder)
             [void](Add-MenuItem $src $(if ($row.Remind) { "Reminder: $(Format-ReminderTime $row.Remind)..." } else { 'Remind me...' }) { Show-NoteReminder $NoteUI.Current } $Glyph.History)
             if (-not $NoteUI.ShowingLock) {
                 if ($row.Locked) { [void](Add-MenuItem $src 'Remove the lock' { Set-NoteLock $false } $Glyph.Lock) } else { [void](Add-MenuItem $src 'Lock with the master password' { Set-NoteLock $true } $Glyph.Lock) }
@@ -15132,7 +15735,8 @@ public static class DevMouse {
 
 // ---- API chains: request cards on a canvas, joined by arrows (drag from a card's right dot to another card) ----
 public class ChainNode {
-    public string Id = Guid.NewGuid().ToString("N"), Title = "", Method = "GET", Url = "", State = "", Info = "";
+    public string Id = Guid.NewGuid().ToString("N"), Title = "", Method = "GET", Url = "", State = "", Info = "", Cond = "", Jumps = "";
+    public bool Save;
     public float X, Y;
     public int Order;
 }
@@ -15367,6 +15971,69 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
         return p;
     }
 
+    // "go to" rules (Jumps = "targetId\x1fcondition" joined by \x1e): dashed arrows below the cards
+    void DrawJumps(System.Drawing.Graphics g) {
+        using (var f = new System.Drawing.Font(Font.FontFamily, Font.Size * 0.8f))
+        using (var pen = new System.Drawing.Pen(Yellow, S(1.6f)))
+        using (var br = new System.Drawing.SolidBrush(Yellow))
+        using (var bg = new System.Drawing.SolidBrush(Back)) {
+            pen.DashStyle = System.Drawing.Drawing2D.DashStyle.Dash;
+            foreach (var n in Nodes) {
+                if (string.IsNullOrEmpty(n.Jumps)) continue;
+                var rules = n.Jumps.Split('\x1e');
+                for (int i = 0; i < rules.Length; i++) {
+                    var p = rules[i].Split('\x1f');
+                    if (p.Length < 2) continue;
+                    var r = Box(n);
+                    float dip = S(46 + 20 * i);
+                    var a = new System.Drawing.PointF(r.X + r.Width / 2 - S(10) * i, r.Bottom);
+                    string label = p[1].Trim() == "" ? "always" : "if " + p[1].Trim();
+                    if (label.Length > 34) label = label.Substring(0, 33) + "...";
+                    System.Drawing.PointF mid;
+                    if (p[0] == "end") {
+                        var e = new System.Drawing.PointF(a.X, a.Y + dip * 0.6f);
+                        g.DrawLine(pen, a, e);
+                        g.FillRectangle(br, e.X - S(7), e.Y, S(14), S(3));
+                        mid = new System.Drawing.PointF(e.X, e.Y + S(12));
+                        label += "  -> end";
+                    } else {
+                        var t = Find(p[0]);
+                        if (t == null) continue;
+                        var tr = Box(t);
+                        float dx = S(14) * (i + 1);
+                        System.Drawing.PointF d, b, c;
+                        int dir;                                   // which way the arrow head points: 1 = down, -1 = up
+                        if (tr.Y > r.Bottom) {                     // target in a lower row: bottom of this card -> top of the target
+                            a = new System.Drawing.PointF(r.X + r.Width / 2 - dx, r.Bottom);
+                            d = new System.Drawing.PointF(tr.X + tr.Width / 2 - dx, tr.Y);
+                            float h = (d.Y - a.Y) / 2;
+                            b = new System.Drawing.PointF(a.X, a.Y + h); c = new System.Drawing.PointF(d.X, d.Y - h); dir = 1;
+                        } else if (tr.Bottom < r.Y) {              // target in a higher row: top of this card -> bottom of the target
+                            a = new System.Drawing.PointF(r.X + r.Width / 2 - dx, r.Y);
+                            d = new System.Drawing.PointF(tr.X + tr.Width / 2 - dx, tr.Bottom);
+                            float h = (a.Y - d.Y) / 2;
+                            b = new System.Drawing.PointF(a.X, a.Y - h); c = new System.Drawing.PointF(d.X, d.Y + h); dir = -1;
+                        } else {                                   // same row (or itself): a loop below both cards
+                            d = new System.Drawing.PointF(tr.X + tr.Width / 2 + dx, tr.Bottom);
+                            if (t == n) { a.X -= S(30); d.X = a.X + S(60); }
+                            float low = Math.Max(a.Y, d.Y) + dip;
+                            b = new System.Drawing.PointF(a.X, low); c = new System.Drawing.PointF(d.X, low); dir = -1;
+                        }
+                        float s = S(6);
+                        var end = new System.Drawing.PointF(d.X, d.Y - dir * S(6));
+                        g.DrawBezier(pen, a, b, c, end);
+                        g.FillPolygon(br, new[] { d, new System.Drawing.PointF(d.X - s * 0.8f, d.Y - dir * s * 1.4f), new System.Drawing.PointF(d.X + s * 0.8f, d.Y - dir * s * 1.4f) });
+                        mid = new System.Drawing.PointF((a.X + 3 * b.X + 3 * c.X + d.X) / 8, (a.Y + 3 * b.Y + 3 * c.Y + d.Y) / 8);
+                    }
+                    var sz = g.MeasureString(label, f);
+                    var lr = new System.Drawing.RectangleF(mid.X - sz.Width / 2, mid.Y - sz.Height / 2, sz.Width, sz.Height);
+                    g.FillRectangle(bg, lr);
+                    g.DrawString(label, f, br, lr.X, lr.Y);
+                }
+            }
+        }
+    }
+
     void Arrow(System.Drawing.Graphics g, System.Drawing.PointF a, System.Drawing.PointF d, System.Drawing.Color col, float w) {
         System.Drawing.PointF b, c; Curve(a, d, out b, out c);
         using (var pen = new System.Drawing.Pen(col, w)) g.DrawBezier(pen, a, b, c, new System.Drawing.PointF(d.X - S(6), d.Y));
@@ -15400,6 +16067,7 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
             Arrow(g, OutPort(f), InPort(t), col, l == SelectedLink ? S(3) : S(2));
         }
         if (mode == Mode.Link && linkFrom != null) Arrow(g, OutPort(linkFrom), mouse, Accent, S(2));
+        DrawJumps(g);
 
         using (var titleF = new System.Drawing.Font(Font.FontFamily, Font.Size, System.Drawing.FontStyle.Bold))
         using (var small = new System.Drawing.Font(Font.FontFamily, Font.Size * 0.85f))
@@ -15415,6 +16083,16 @@ public class DevChainCanvas : System.Windows.Forms.Panel {
                 }
                 using (var br = new System.Drawing.SolidBrush(stateCol)) g.FillRectangle(br, r.X + S(1), r.Y + S(8), S(4), r.Height - S(16));
                 if (n.Order > 0) using (var br = new System.Drawing.SolidBrush(Dim)) g.DrawString(n.Order.ToString(), small, br, r.Right - S(22), r.Y + S(6));
+                // small marks: "if" = runs only when its condition is true, "save" = writes its response to a file
+                float mx = r.Right - S(28);
+                foreach (var mark in new[] { n.Save ? "save" : null, string.IsNullOrEmpty(n.Cond) ? null : "if" }) {
+                    if (mark == null) continue;
+                    var ms = g.MeasureString(mark, badgeF);
+                    var mr = new System.Drawing.RectangleF(mx - ms.Width - S(4), r.Y + S(8), ms.Width + S(4), ms.Height);
+                    using (var bp = Round(mr, S(3))) using (var br = new System.Drawing.SolidBrush(mark == "if" ? Yellow : Accent)) g.FillPath(br, bp);
+                    g.DrawString(mark, badgeF, System.Drawing.Brushes.White, mr.X + S(2), mr.Y);
+                    mx = mr.X - S(4);
+                }
                 var m = (n.Method ?? "GET").ToUpperInvariant();
                 var bs = g.MeasureString(m, badgeF);
                 var badge = new System.Drawing.RectangleF(r.X + S(12), r.Y + S(9), bs.Width + S(8), bs.Height + S(2));
