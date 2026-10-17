@@ -11288,7 +11288,7 @@ function New-ChainFromExample([string]$Name, [switch]$Reset) {
         if ($ex.LocalApi) { foreach ($v in @($have.Vars)) { if ($v.Key -eq 'baseUrl') { $v.Value = $ex.Vars['baseUrl'] } } }
         $ChainUI.EditId = $null
         Open-Chain $have; Update-ChainCombo
-        $ChainUI.Result.Text = "Example: $Name`r`n`r`n$($ex.Note -replace "`n", "`r`n")`r`n`r`nThis is your version of the example; right-click it in the Examples folder > Reset to the original example."
+        $ChainUI.Result.Text = "Example: $Name`r`n`r`n$($ex.Note -replace "`n", "`r`n")`r`n`r`nThis is your version of the example; right-click it under Example chains (lower left) > Reset to the original example."
         Set-ChainStatus "Example opened. Press F5 to run it." $C.Accent
         return
     }
@@ -11316,7 +11316,7 @@ function New-ChainFromExample([string]$Name, [switch]$Reset) {
     Open-Chain $ch
     Update-ChainCombo
     Invoke-ChainArrange
-    $ChainUI.Result.Text = "Example: $Name`r`n`r`n$($ex.Note -replace "`n", "`r`n")`r`n`r`nChange it as you like - it's kept in the Examples folder. Right-click it there > Reset to the original example to start over."
+    $ChainUI.Result.Text = "Example: $Name`r`n`r`n$($ex.Note -replace "`n", "`r`n")`r`n`r`nChange it as you like - it's kept under Example chains (lower left). Right-click it there > Reset to the original example to start over."
     Set-ChainStatus $(if ($Reset) { "Example '$Name' is back to the original. Press F5 to run it." } else { "Example opened. Press F5 to run it." }) $C.Accent
 }
 
@@ -11427,6 +11427,7 @@ function Show-ChainShareMenu($Button) {
 function Update-ChainPalette {
     $tv = $ChainUI.Palette
     $tv.BeginUpdate(); $tv.Nodes.Clear()
+    [void]$tv.Nodes.Add('Example chains')            # filled by Update-ChainExampleNodes
     $xr = $tv.Nodes.Add('Example requests')
     foreach ($k in (Get-ApiExampleRequests).Keys) { $n = $xr.Nodes.Add($k); $n.Tag = "exreq:$k" }
     $t = $tv.Nodes.Add('Start from')
@@ -11442,6 +11443,7 @@ function Update-ChainPalette {
     foreach ($f in $folders.Values) { $f.Expand() }
     if (-not $ApiUI.Collections.Count) { [void]$tv.Nodes.Add('(save requests in the API tester to see them here)') }
     $tv.EndUpdate()
+    Update-ChainExampleNodes
 }
 
 function Get-PaletteModel([string]$Tag) {
@@ -12265,8 +12267,106 @@ function Get-ChainFolderPaths {
     foreach ($cx in $ChainUI.Chains) { if ($cx.Folder) { [void]$set.Add([string]$cx.Folder) } }
     # every parent of a nested folder exists too
     foreach ($f in @($set)) { $parts = $f -split '/'; for ($i = 1; $i -lt $parts.Count; $i++) { [void]$set.Add(($parts[0..($i - 1)] -join '/')) } }
-    [void]$set.Remove('Examples')
-    @($set | Sort-Object)
+    @($set | Where-Object { $_ -ne 'Examples' -and $_ -ne 'Example copies' -and -not $_.StartsWith('Example copies/') } | Sort-Object)
+}
+
+# Examples and the old "Example - ..." copies live in the lower box, not in your chains.
+function Test-ChainIsExample($Chain) {
+    $f = [string]$Chain.Folder
+    [bool]$Chain.Example -or $f -eq 'Examples' -or $f -eq 'Example copies' -or $f.StartsWith('Example copies/')
+}
+
+# The "Example chains" part of the lower box (rebuilt when the open chain changes, the rest stays as it is).
+function Update-ChainExampleNodes {
+    $tv = $ChainUI.Palette
+    if (-not $tv -or $tv.IsDisposed -or -not $tv.Nodes.Count) { return }
+    $root = $tv.Nodes[0]
+    $bold = New-Object System.Drawing.Font($tv.Font, [System.Drawing.FontStyle]::Bold)
+    $oldOpen = $root.Nodes.Count -gt 0 -and ($root.Nodes | Where-Object { $_.Text -eq 'Old example copies' -and $_.IsExpanded })
+    $tv.BeginUpdate()
+    try {
+        $root.Nodes.Clear()
+        $mark = { param($n, $ch) if ($ch -and $ch -eq $ChainUI.Current) { $n.NodeFont = $bold; $n.ForeColor = $C.Accent } }
+        foreach ($name in (Get-ChainExamples).Keys) {
+            $n = $root.Nodes.Add($name); $n.Tag = "ex:$name"
+            & $mark $n ($ChainUI.Chains | Where-Object { $_.Example -eq $name } | Select-Object -First 1)
+        }
+        $others = @($ChainUI.Chains | Where-Object { (Test-ChainIsExample $_) -and -not $_.Example } | Sort-Object Name)
+        if ($others) {
+            $o = $root.Nodes.Add('Old example copies'); $o.ForeColor = $C.Dim
+            foreach ($ch in $others) { $n = $o.Nodes.Add([string]$ch.Name); $n.Tag = "chain:$($ch.Id)"; & $mark $n $ch }
+            if ($oldOpen) { $o.Expand() }
+        }
+        $root.Expand()
+    } finally { $tv.EndUpdate() }
+}
+
+# Right-click menu of the lower box (only for example chains).
+function Show-ChainPaletteMenu($Menu) {
+    $Menu.Items.Clear()
+    $n = $ChainUI.Palette.SelectedNode
+    $tag = if ($n) { [string]$n.Tag } else { '' }
+    if ($n -and $n.Text -eq 'Example chains') {
+        [void](Add-MenuItem $Menu 'Reset all examples to the originals' {
+            if ([System.Windows.Forms.MessageBox]::Show($ChainUI.Form, 'Put every example back the way it came? Changes you made to them are lost (your own chains are not touched).', 'API chains', 'YesNo', 'Question') -ne 'Yes') { return }
+            foreach ($cx in @($ChainUI.Chains | Where-Object { $_.Example })) { [void]$ChainUI.Chains.Remove($cx) }
+            if ($ChainUI.Current -and -not $ChainUI.Chains.Contains($ChainUI.Current)) { $ChainUI.EditId = $null; if ($ChainUI.Chains.Count) { Open-Chain $ChainUI.Chains[0] } else { New-ChainFromExample 'Log in, then use the token' } }
+            Save-Chains; Update-ChainCombo; Set-ChainStatus 'Examples reset.' $C.Green
+        } $Glyph.Undo)
+        return
+    }
+    if ($n -and $n.Text -eq 'Old example copies') {
+        [void](Add-MenuItem $Menu 'Delete all old example copies...' {
+            $old = @($ChainUI.Chains | Where-Object { (Test-ChainIsExample $_) -and -not $_.Example })
+            if ([System.Windows.Forms.MessageBox]::Show($ChainUI.Form, "Delete the $($old.Count) old example copies? The examples themselves stay.", 'API chains', 'YesNo', 'Warning') -ne 'Yes') { return }
+            foreach ($cx in $old) { [void]$ChainUI.Chains.Remove($cx) }
+            if (-not $ChainUI.Chains.Contains($ChainUI.Current)) { $ChainUI.EditId = $null; if (-not $ChainUI.Chains.Count) { $ChainUI.Chains.Add((New-ChainRecord 'My chain')) }; Open-Chain $ChainUI.Chains[0] }
+            Save-Chains; Update-ChainCombo; Set-ChainStatus "Deleted $($old.Count) old example copies." $C.Green
+        } $Glyph.Delete)
+        return
+    }
+    $chn = $null
+    if ($tag -like 'ex:*') { $name = $tag.Substring(3); $chn = $ChainUI.Chains | Where-Object { $_.Example -eq $name } | Select-Object -First 1 }
+    elseif ($tag -like 'chain:*') { $id = $tag.Substring(6); $chn = $ChainUI.Chains | Where-Object { $_.Id -eq $id } | Select-Object -First 1 }
+    else { return }
+    [void](Add-MenuItem $Menu 'Open' { Open-ChainPaletteNode $ChainUI.Palette.SelectedNode } $Glyph.Open)
+    [void](Add-MenuItem $Menu 'Copy to my chains' {
+        $nd = $ChainUI.Palette.SelectedNode; Open-ChainPaletteNode $nd
+        Save-ChainEditor; Save-Chains
+        $src = $ChainUI.Current
+        $copy = (ConvertTo-Json -InputObject $src -Depth 10 | ConvertFrom-Json); Initialize-ChainRecord $copy
+        $copy.Id = [guid]::NewGuid().ToString('N'); $copy.Example = ''; $copy.Folder = Get-SelectedChainFolder
+        $copy.Name = ([string]$src.Name -replace '^Example - ', '')
+        $ChainUI.Chains.Add($copy); $ChainUI.EditId = $null; Open-Chain $copy; Save-Chains; Update-ChainCombo
+        Set-ChainStatus "Copied to your chains as '$($copy.Name)'." $C.Green
+    } $Glyph.Copy)
+    if ($tag -like 'ex:*' -and $chn) {
+        [void](Add-MenuItem $Menu 'Reset to the original example' {
+            $name = ([string]$ChainUI.Palette.SelectedNode.Tag).Substring(3)
+            if ([System.Windows.Forms.MessageBox]::Show($ChainUI.Form, "Put '$name' back the way it came? Your changes to it are lost.", 'API chains', 'YesNo', 'Question') -ne 'Yes') { return }
+            New-ChainFromExample $name -Reset
+        } $Glyph.Undo)
+    }
+    if ($tag -like 'chain:*' -and $chn) {
+        [void]$Menu.Items.Add('-')
+        [void](Add-MenuItem $Menu 'Delete...' {
+            $id = ([string]$ChainUI.Palette.SelectedNode.Tag).Substring(6); $chn = $ChainUI.Chains | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+            if (-not $chn -or [System.Windows.Forms.MessageBox]::Show($ChainUI.Form, "Delete the chain $($chn.Name)?", 'API chains', 'YesNo', 'Warning') -ne 'Yes') { return }
+            [void]$ChainUI.Chains.Remove($chn)
+            if ($chn -eq $ChainUI.Current) { $ChainUI.EditId = $null; if (-not $ChainUI.Chains.Count) { $ChainUI.Chains.Add((New-ChainRecord 'My chain')) }; Open-Chain $ChainUI.Chains[0] }
+            Save-Chains; Update-ChainCombo
+        } $Glyph.Delete)
+    }
+}
+
+function Open-ChainPaletteNode($Node) {
+    if (-not $Node) { return }
+    $tag = [string]$Node.Tag
+    if ($tag -like 'ex:*') { New-ChainFromExample $tag.Substring(3); Update-ChainCombo }
+    elseif ($tag -like 'chain:*') {
+        $id = $tag.Substring(6); $chn = $ChainUI.Chains | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+        if ($chn -and $chn -ne $ChainUI.Current) { Save-ChainEditor; Save-Chains; Open-Chain $chn; Update-ChainCombo }
+    }
 }
 
 function Get-SelectedChainFolder {
@@ -12274,7 +12374,7 @@ function Get-SelectedChainFolder {
     if (-not $n -or -not $n.Tag) { return '' }
     $t = $n.Tag
     $f = switch ($t.Kind) { 'folder' { $t.Path } 'chain' { [string]$t.Chain.Folder } default { '' } }
-    if ($f -eq 'Examples') { '' } else { $f }
+    if ($f -eq 'Examples' -or $f -like 'Example copies*') { '' } else { $f }
 }
 
 function Update-ChainTree {
@@ -12293,16 +12393,7 @@ function Update-ChainTree {
             $n.Tag = [pscustomobject]@{ Kind = 'chain'; Chain = $Chain }
             if ($Chain -eq $ChainUI.Current) { $n.NodeFont = $bold; $n.ForeColor = $C.Accent; $script:ChainTreeCurrent = $n }
         }
-        # Examples (always there)
-        $ex = $tv.Nodes.Add('Examples')
-        $ex.Tag = [pscustomobject]@{ Kind = 'folder'; Path = 'Examples'; Examples = $true }
-        foreach ($name in (Get-ChainExamples).Keys) {
-            $have = $ChainUI.Chains | Where-Object { $_.Example -eq $name } | Select-Object -First 1
-            if ($have) { & $addChain $ex $have }
-            else { $n = $ex.Nodes.Add($name); $n.Tag = [pscustomobject]@{ Kind = 'example'; Name = $name }; $n.ForeColor = $C.Dim }
-        }
-        foreach ($ch in $ChainUI.Chains) { if ($ch.Folder -eq 'Examples' -and -not $ch.Example) { & $addChain $ex $ch } }
-        # your folders, nested
+        # your folders, nested (the examples are in the box below)
         $byPath = @{}
         foreach ($p in Get-ChainFolderPaths) {
             $k = $p.LastIndexOf('/')
@@ -12312,7 +12403,7 @@ function Update-ChainTree {
             $byPath[$p] = $n
         }
         foreach ($ch in @($ChainUI.Chains | Sort-Object Name)) {
-            if ($ch.Folder -eq 'Examples' -or $ch.Example) { continue }
+            if (Test-ChainIsExample $ch) { continue }
             $parent = if ($ch.Folder -and $byPath.ContainsKey([string]$ch.Folder)) { $byPath[[string]$ch.Folder] } else { $tv }
             & $addChain $parent $ch
         }
@@ -12322,6 +12413,7 @@ function Update-ChainTree {
         & $walk $tv
         if ($script:ChainTreeCurrent) { $tv.SelectedNode = $script:ChainTreeCurrent; $script:ChainTreeCurrent.EnsureVisible() }
     } finally { $tv.EndUpdate(); $ChainUI.TreeLoading = $false }
+    Update-ChainExampleNodes
 }
 
 function Open-ChainFromTree($Node) {
@@ -12689,10 +12781,11 @@ function Show-ApiChains {
         $ChainUI.PalDrag = $null
         if ($e.Button -ne 'Left') { return }
         $n = $src.GetNodeAt($e.Location)
+        if ($n -and $n.Tag -and [string]$n.Tag -match '^(ex|chain):') { $src.SelectedNode = $n; $ChainUI.PalOpen = $n; [void]$src.BeginInvoke([System.Action]{ $x = $ChainUI.PalOpen; $ChainUI.PalOpen = $null; Open-ChainPaletteNode $x }); return }
         if ($n -and $n.Tag) { $src.SelectedNode = $n; $ChainUI.PalDrag = @{ Tag = [string]$n.Tag; From = $e.Location; On = $false; Text = $n.Text } }
     })
     # the tree view reports a drag here (its MouseDown can come late); start DevTools' own drag
-    $pal.add_ItemDrag({ param($src, $e) if ($e.Item.Tag) { $src.SelectedNode = $e.Item; $ChainUI.PalDrag = @{ Tag = [string]$e.Item.Tag; From = $src.PointToClient([System.Windows.Forms.Cursor]::Position); On = $true; Text = $e.Item.Text }; $src.Capture = $true } })
+    $pal.add_ItemDrag({ param($src, $e) if ($e.Item.Tag -and [string]$e.Item.Tag -notmatch '^(ex|chain):') { $src.SelectedNode = $e.Item; $ChainUI.PalDrag = @{ Tag = [string]$e.Item.Tag; From = $src.PointToClient([System.Windows.Forms.Cursor]::Position); On = $true; Text = $e.Item.Text }; $src.Capture = $true } })
     $pal.add_MouseMove({
         param($src, $e)
         $d = $ChainUI.PalDrag
@@ -12718,13 +12811,24 @@ function Show-ApiChains {
         Add-ChainFromPalette $d.Tag ($p.X - $cv2.NodeW / 2) ($p.Y - $cv2.NodeH / 2)
         Set-ChainStatus "Added: $($d.Text)" $C.Green
     })
-    $pal.add_NodeMouseDoubleClick({ param($src, $e) if ($e.Node.Tag) { Add-ChainFromPalette ([string]$e.Node.Tag) } })
+    $pal.add_NodeMouseDoubleClick({ param($src, $e) if ($e.Node.Tag -and [string]$e.Node.Tag -notmatch '^(ex|chain):') { Add-ChainFromPalette ([string]$e.Node.Tag) } })
+    $pm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $pm.add_Opening({ param($src, $e) Show-ChainPaletteMenu $src; if (-not $src.Items.Count) { $e.Cancel = $true } })
+    $pal.ContextMenuStrip = $pm
+    $pal.add_MouseUp({ param($src, $e) if ($e.Button -eq 'Right') { $src.SelectedNode = $src.GetNodeAt($e.Location) } })
     $left.Panel2.Controls.Add($pal)
     $lh = New-Object System.Windows.Forms.Label
-    $lh.Text = '  REQUESTS - DRAG ONTO THE CANVAS'; $lh.Dock = 'Top'; $lh.Height = Px 28; $lh.TextAlign = 'MiddleLeft'; $lh.Font = $FontSmall; $lh.ForeColor = $C.Accent
+    $lh.Text = '  EXAMPLES & REQUESTS (drag onto canvas)'; $lh.AutoEllipsis = $true; $lh.UseMnemonic = $false; $lh.Dock = 'Top'; $lh.Height = Px 28; $lh.TextAlign = 'MiddleLeft'; $lh.Font = $FontSmall; $lh.ForeColor = $C.Accent
     $left.Panel2.Controls.Add($lh)
     $f.Controls.Add($left)
+    if ($ChainUI.LeftWidth) { $left.Width = $ChainUI.LeftWidth }
+    $lsp = New-Object System.Windows.Forms.Splitter
+    $lsp.Dock = 'Left'; $lsp.Width = Px 5; $lsp.BackColor = $C.Line; $lsp.MinSize = Px 160; $lsp.MinExtra = Px 300
+    $lsp.add_SplitterMoved({ $ChainUI.LeftWidth = $ChainUI.LeftSplit.Width })
+    $f.Controls.Add($lsp); $f.Controls.SetChildIndex($lsp, $f.Controls.GetChildIndex($left))   # docks right of the left panel
     $ChainUI.LeftSplit = $left
+    $ChainUI.LeftReady = $false
+    $left.add_SplitterMoved({ param($src, $e) if ($ChainUI.LeftReady -and $src.Height -gt 0) { $ChainUI.LeftRatio = $src.SplitterDistance / $src.Height } })
     $ChainUI.Palette = $pal
 
     # canvas
@@ -12866,7 +12970,9 @@ function Show-ApiChains {
     Register-ThemedWindow $f
 
     Update-ChainPalette
-    $ChainUI.Current = $ChainUI.Chains[0]
+    $ChainUI.Current = @($ChainUI.Chains | Where-Object { -not (Test-ChainIsExample $_) })[0]   # one of your chains, not an example
+    if (-not $ChainUI.Current) { $ChainUI.Current = $ChainUI.Chains[0] }
+    $f.add_Shown({ $l = $ChainUI.LeftSplit; $q = if ($ChainUI.LeftRatio) { $ChainUI.LeftRatio } else { 0.4 }; try { $l.SplitterDistance = [int]($l.Height * $q) } catch { }; $ChainUI.LeftReady = $true })
     Update-ChainCombo
     Open-Chain $ChainUI.Current
     Set-ChainStatus 'F5 runs the chain. Values taken from a response are available to the next steps as {{name}}. Examples (top bar or the list on the left) show how.' $C.Dim
