@@ -9738,7 +9738,8 @@ $ApiMethods = 'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'
 
 function Read-ApiJson([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return @() }
-    try { @(Read-DataText $Path | ConvertFrom-Json) } catch { @() }
+    # ForEach-Object: PowerShell 5.1 hands a JSON array over as one object; this gives its items one by one
+    try { @(Read-DataText $Path | ConvertFrom-Json | ForEach-Object { $_ }) } catch { @() }
 }
 
 function Save-ApiData([string]$Which) {
@@ -10762,7 +10763,7 @@ $ChainExtractFrom = @('JSON path', 'Header', 'Cookie', 'Regex', 'Status', 'Body'
 
 function Import-Chains {
     $ChainUI.Chains.Clear()
-    foreach ($x in @(Read-ApiJson $ChainFile)) { if ($x -and $x.Id) { $ChainUI.Chains.Add($x) } }
+    foreach ($x in @(Read-ApiJson $ChainFile)) { foreach ($y in @($x)) { if ($y -and $y.Id -is [string] -and $y.Id) { $ChainUI.Chains.Add($y) } } }
 }
 
 function New-ChainRecord([string]$Name) {
@@ -10797,6 +10798,7 @@ function Open-Chain($Chain) {
     try {
         Stop-ChainRun
         $ChainUI.Current = $Chain
+        if ($ChainUI.Form) { $ChainUI.Form.Text = "API chains  -  $($Chain.Name)" }
         $ChainUI.Data = @{}; $ChainUI.Results = @{}
         $cv = $ChainUI.Canvas
         $cv.Nodes.Clear(); $cv.Links.Clear(); $cv.SelectedNode = $null; $cv.SelectedLink = $null; $cv.Pan = New-Object System.Drawing.PointF(0, 0)
@@ -11764,7 +11766,15 @@ function Show-ApiChains {
     New-TbLabel $top 'Chain' -Dim | Out-Null
     $ChainUI.ChainBox = New-TbCombo $top @() 220
     $ChainUI.ChainBox.add_SelectedIndexChanged({ param($src, $e) if ($ChainUI.Loading -or $src.SelectedIndex -lt 0) { return }; Save-ChainEditor; Save-Chains; Open-Chain $ChainUI.Chains[$src.SelectedIndex] })
-    [void](New-Button 'New' 'New chain' { $n = Read-TextDialog 'New chain' 'Name' 'New chain' $ChainUI.Form; if ($n) { Save-ChainEditor; Save-Chains; $c = New-ChainRecord $n.Trim(); $ChainUI.Chains.Add($c); Open-Chain $c; Update-ChainCombo; Save-Chains } } $top $Glyph.Add 2)
+    [void](New-Button 'New' 'New chain' {
+        $n = Read-TextDialog 'New chain' 'Name' 'New chain' $ChainUI.Form
+        if (-not $n) { return }
+        try {
+            Save-ChainEditor; Save-Chains
+            $c = New-ChainRecord $n.Trim(); $ChainUI.Chains.Add($c); Open-Chain $c; Update-ChainCombo; Save-Chains
+            Set-ChainStatus "New chain '$($c.Name)' created. Drag requests from the left onto the canvas (or double-click them)." $C.Green
+        } catch { Set-ChainStatus "Couldn't create the chain: $($_.Exception.Message)" $C.Red; Write-Log "new chain failed: $_" }
+    } $top $Glyph.Add 2)
     [void](New-Button 'Rename' 'Rename this chain' { $c = $ChainUI.Current; $n = Read-TextDialog 'Rename chain' 'Name' $c.Name $ChainUI.Form; if ($n) { $c.Name = $n.Trim(); Update-ChainCombo; Save-Chains } } $top $Glyph.Edit 2)
     [void](New-Button 'Delete' 'Delete this chain' {
         $c = $ChainUI.Current
