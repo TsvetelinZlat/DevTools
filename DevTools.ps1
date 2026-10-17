@@ -10255,9 +10255,6 @@ function Copy-GridRows($Grid) {
     [void]$Grid.EndEdit()
     $cols = Get-GridDataColumns $Grid
     $cells = @($Grid.SelectedCells)
-    if ($cells.Count -eq 1 -and -not $cells[0].OwningRow.IsNewRow -and -not ($cells[0] -is [System.Windows.Forms.DataGridViewCheckBoxCell])) {
-        $v = [string]$cells[0].Value; if ($v) { Copy-TbText $v }; return
-    }
     $rows = @($cells | ForEach-Object { $_.RowIndex } | Sort-Object -Unique)
     if (-not $rows) { $rows = @(0..($Grid.Rows.Count - 1)) }
     $lines = foreach ($r in $rows) {
@@ -10290,8 +10287,9 @@ function Split-GridText([string]$Text, [int]$N) {
     })
 }
 
-function Paste-GridRows($Grid, [string]$Text = $null) {
-    if ($null -eq $Text) { try { $Text = [System.Windows.Forms.Clipboard]::GetText() } catch { $Text = '' } }
+function Paste-GridRows($Grid, [string]$Text = '') {
+    # no text given ([string] turns $null into '') -> take the clipboard
+    if (-not $Text) { try { $Text = [System.Windows.Forms.Clipboard]::GetText() } catch { $Text = '' } }
     if (-not $Text) { return }
     $cols = Get-GridDataColumns $Grid
     $rows = @(Split-GridText $Text $cols.Count)        # @(): one row stays a list of one row
@@ -10333,10 +10331,12 @@ function Paste-GridRows($Grid, [string]$Text = $null) {
 
 function Enable-GridClipboard($Grid) {
     $Grid.ClipboardCopyMode = 'Disable'
+    $Grid.SelectionMode = 'FullRowSelect'; $Grid.MultiSelect = $true
     $Grid.add_KeyDown({
         param($src, $e)
-        if ($e.Control -and $e.KeyCode -eq 'C') { Copy-GridRows $src; $e.Handled = $true }
-        elseif ($e.Control -and $e.KeyCode -eq 'V') { Paste-GridRows $src; $e.Handled = $true }
+        if ($src.IsCurrentCellInEditMode) { return }                        # typing in a cell: normal copy / paste of text
+        if ($e.Control -and $e.KeyCode -eq 'C') { Copy-GridRows $src; $e.Handled = $true; $e.SuppressKeyPress = $true }
+        elseif ($e.Control -and $e.KeyCode -eq 'V') { Paste-GridRows $src; $e.Handled = $true; $e.SuppressKeyPress = $true }
         elseif ($e.KeyCode -eq 'Delete' -and -not $src.IsCurrentCellInEditMode) {
             $rows = @($src.SelectedCells | ForEach-Object { $_.RowIndex } | Sort-Object -Unique -Descending)
             if ($rows.Count -gt 1 -or @($src.SelectedRows).Count) { foreach ($r in $rows) { if (-not $src.Rows[$r].IsNewRow) { $src.Rows.RemoveAt($r) } }; $e.Handled = $true; if ($ChainUI.Form -and ($src -eq $ChainUI.EHeaders -or $src -eq $ChainUI.EExtract)) { Start-ChainEditorSave } }
@@ -10372,7 +10372,7 @@ function Enable-GridClipboard($Grid) {
         if ($ChainUI.Form -and ($g -eq $ChainUI.EHeaders -or $g -eq $ChainUI.EExtract)) { Start-ChainEditorSave }
     } $Glyph.Delete 'Del')
     $Grid.ContextMenuStrip = $m
-    $Grid.add_CellMouseDown({ param($src, $e) if ($e.Button -eq 'Right' -and $e.RowIndex -ge 0 -and $e.ColumnIndex -ge 0) { $c = $src.Rows[$e.RowIndex].Cells[$e.ColumnIndex]; if (-not $c.Selected) { $src.ClearSelection(); $c.Selected = $true; $src.CurrentCell = $c } } })
+    $Grid.add_CellMouseDown({ param($src, $e) if ($e.Button -eq 'Right' -and $e.RowIndex -ge 0 -and $e.ColumnIndex -ge 0) { $row = $src.Rows[$e.RowIndex]; if (-not $row.Selected) { $src.ClearSelection(); $row.Selected = $true; $src.CurrentCell = $row.Cells[$e.ColumnIndex] } } })
 }
 
 function New-KvGrid($Parent, [string]$KeyTitle = 'Key', [string]$ValueTitle = 'Value', [switch]$ReadOnly) {
@@ -12610,7 +12610,8 @@ function Get-TargetNoteFolder {
 
 function New-Note([string]$Title = '', [string]$Folder = $null) {
     Save-CurrentNote
-    if ($null -eq $Folder) { $Folder = if ($NoteUI.Form) { Get-TargetNoteFolder } else { '' } }
+    # no folder given ([string] turns $null into ''): the selected folder
+    if (-not $PSBoundParameters.ContainsKey('Folder')) { $Folder = if ($NoteUI.Form) { Get-TargetNoteFolder } else { '' } }
     $note = New-NoteItem $Title '' $null $null '' $Folder
     if ($Folder) { [void](Add-NoteFolder $Folder); Show-NoteFolderPath $Folder; Save-NoteFolders }
     $NoteUI.SelectedFolder = $null
