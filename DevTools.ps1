@@ -17928,6 +17928,25 @@ Register-ToolboxPage 'regex' 'Regex tester' $Glyph.Search 'regular expression re
     $tabs = New-TabSet $split.Panel2
     $mPanel = Add-ApiTab $tabs 'Matches'
     $rPanel = Add-ApiTab $tabs 'Replace'
+    $cPanel = Add-ApiTab $tabs 'Code'
+    $hPanel = Add-ApiTab $tabs 'Cheat sheet'
+    $st.Code = New-TbRtb -ReadOnly; $st.Code.Dock = 'Fill'; $cPanel.Controls.Add($st.Code)
+    $cbar = New-TbBar $cPanel
+    New-TbLabel $cbar 'How to use this pattern in the chosen language (flags from the checkboxes)' -Dim | Out-Null
+    [void](New-Button 'Copy code' 'Copy the code' { Copy-TbText $TbUI.Pages['regex'].State.Code.Text } $cbar $Glyph.Copy 1)
+    $cPanel.Controls.SetChildIndex($cbar, $cPanel.Controls.Count - 1)
+    $cs = New-Object System.Windows.Forms.ListView
+    $cs.Dock = 'Fill'; $cs.View = 'Details'; $cs.FullRowSelect = $true; $cs.BorderStyle = 'None'; $cs.BackColor = $C.Bg; $cs.ForeColor = $C.Fore
+    [void]$cs.Columns.Add('Write', (Px (170 * $TextZoom))); [void]$cs.Columns.Add('Means  (double-click to put it into the pattern)', (Px (620 * $TextZoom)))
+    foreach ($row in $RegexCheatSheet) { $it = New-Object System.Windows.Forms.ListViewItem($row[0]); $it.Font = New-Object System.Drawing.Font('Consolas', (Fz 10)); $it.UseItemStyleForSubItems = $false; [void]$it.SubItems.Add($row[1]); [void]$cs.Items.Add($it) }
+    $cs.add_ItemActivate({
+        param($src, $e)
+        if (-not $src.SelectedItems.Count) { return }
+        $tok = ($src.SelectedItems[0].Text -split '  ')[0]
+        if ($tok -match '^\$') { $b = $TbUI.Pages['regex'].State.Replace } else { $b = $TbUI.Pages['regex'].State.Pattern }
+        $b.SelectedText = $tok; [void]$b.Focus()
+    })
+    $hPanel.Controls.Add($cs)
     $st.Matches = New-Object System.Windows.Forms.ListView
     $st.Matches.Dock = 'Fill'; $st.Matches.View = 'Details'; $st.Matches.FullRowSelect = $true; $st.Matches.BorderStyle = 'None'
     $st.Matches.BackColor = $C.Bg; $st.Matches.ForeColor = $C.Fore; $st.Matches.Font = New-Object System.Drawing.Font('Consolas', (Fz 10))
@@ -17951,6 +17970,10 @@ Register-ToolboxPage 'regex' 'Regex tester' $Glyph.Search 'regular expression re
     Select-ApiTab $tabs 'Matches'
 
     $pbar = New-TbBar $panel
+    New-TbLabel $pbar 'Language' -Dim | Out-Null
+    $st.Flavor = New-TbCombo $pbar @($RegexFlavors.Keys) 190
+    $st.Flavor.add_SelectedIndexChanged({ Update-RegexTool $TbUI.Pages['regex'].State })
+    [void](New-Button 'Examples' 'Ready-made patterns with sample text: email, URL, IP, dates, GUID, log lines, JSON ...' { param($src, $e) Show-RegexExampleMenu $src } $pbar $Glyph.Lightning 2)
     New-TbLabel $pbar 'Pattern' -Title | Out-Null
     $st.Pattern = New-TbBox -Mono -Cue '\b(\w+)@(\w+\.\w+)\b'
     $st.Pattern.Width = Px (460 * $TextZoom); $st.Pattern.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 10), 0)
@@ -17970,9 +17993,284 @@ Register-ToolboxPage 'regex' 'Regex tester' $Glyph.Search 'regular expression re
     $split.add_Resize({ param($src, $e) if ($src.Tag -and $src.Height -gt (Px 300)) { $src.Tag = $false; $src.SplitterDistance = [int]($src.Height * 0.5) } })
     $st.Text.Text = "Contact ann@example.com or bob@test.org`r`nOrder 1234 shipped on 2026-10-17"
     $st.Pattern.Text = '(\w+)@(\w+\.\w+)'
-    Set-TbStatus $st.Status '.NET regular expressions. Matching stops after 2 seconds, so a runaway pattern cannot hang the window.'
+    Set-TbStatus $st.Status 'Pick the language you write the pattern for. Matching stops after 2 seconds, so a runaway pattern cannot hang the window.'
     $st
 }
+
+function Show-RegexExampleMenu($Button) {
+    $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $ex = Get-RegexExamples
+    foreach ($k in $ex.Keys) {
+        $it = Add-MenuItem $m $k { param($src, $e) Set-RegexExample $src.Tag }
+        $it.Tag = $k
+    }
+    $m.Show($Button, 0, $Button.Height)
+}
+
+function Set-RegexExample([string]$Name) {
+            $x = (Get-RegexExamples)[$Name]
+            $s = $TbUI.Pages['regex'].State
+            $f = $RegexFlavors[[string]$s.Flavor.SelectedItem]
+            $p = $x.P
+            if ($f -in 'py', 'go') { $p = $p -replace '\(\?<(?![=!])', '(?P<' }
+            $s.Busy = $true
+            try {
+                $s.Pattern.Text = $p; $s.Text.Text = $x.T
+                $s.Opt.IgnoreCase.Checked = -not ($x.ContainsKey('I') -and -not $x.I)      # upper / lower case matters for some
+                $s.Replace.Text = if ($x.ContainsKey('R')) { if ($f -eq 'py') { $x.R -replace '\$\{(\w+)\}', '\g<$1>' } elseif ($f -eq 'js') { $x.R -replace '\$\{(\w+)\}', '$$<$1>' } else { $x.R } } else { '' }
+            } finally { $s.Busy = $false }
+            Update-RegexTool $s
+}
+
+# ---- Regex flavours: the pattern is written the way the chosen language wants it; DevTools tests it
+#      with .NET after translating the differences, and says what that language can't do.
+$RegexFlavors = [ordered]@{
+    '.NET (C#, PowerShell)'   = 'net'
+    'JavaScript'              = 'js'
+    'Python'                  = 'py'
+    'Java / Kotlin'           = 'java'
+    'PHP (PCRE)'              = 'php'
+    'Go (RE2)'                = 'go'
+    'grep -E / sed -E (POSIX)' = 'posix'
+}
+
+# -> @{ Pattern = .NET pattern; Flags = 'ims' taken from /.../flags; Notes = @(); Errors = @() }
+function Convert-RegexToNet([string]$P, [string]$F) {
+    $notes = New-Object System.Collections.Generic.List[string]
+    $errors = New-Object System.Collections.Generic.List[string]
+    $flags = ''
+    # literals with delimiters: /abc/gi (JavaScript), #abc#i or /abc/i (PHP)
+    if ($F -eq 'js' -and $P -match '^/(.+)/([dgimsuvy]*)$') { $P = $Matches[1] -replace '\\/', '/'; $flags = $Matches[2]; $notes.Add("flags /$flags taken from the literal") }
+    elseif ($F -eq 'php' -and $P.Length -gt 2 -and $P[0] -match '[/#~@%!|+]') {
+        $dl = [regex]::Escape([string]$P[0])
+        if ($P -match "^$dl(.*)$dl([imsxuADSUXJn]*)$") { $P = $Matches[1]; $flags = $Matches[2]; if ($flags) { $notes.Add("flags $flags taken from the delimiters") } }
+    }
+    $ascii = $F -in 'js', 'java', 'php', 'go', 'posix'
+    $sb = New-Object System.Text.StringBuilder
+    $inClass = $false; $classStart = 0
+    $i = 0
+    $posix = @{ alpha = 'a-zA-Z'; digit = '0-9'; alnum = 'a-zA-Z0-9'; upper = 'A-Z'; lower = 'a-z'; space = '\s'; blank = ' \t'; xdigit = '0-9A-Fa-f'; punct = '!-/:-@\[-`{-~'; word = '\w'; cntrl = '\x00-\x1f'; print = '\x20-\x7e'; graph = '\x21-\x7e' }
+    while ($i -lt $P.Length) {
+        $ch = $P[$i]
+        if ($ch -eq '\' -and $i + 1 -lt $P.Length) {
+            $nx = [string]$P[$i + 1]
+            $out = $null
+            switch -CaseSensitive ($nx) {
+                'd' { if ($ascii) { $out = $(if ($inClass) { '0-9' } else { '[0-9]' }) } }
+                'D' { if ($ascii -and -not $inClass) { $out = '[^0-9]' } }
+                'w' { if ($ascii) { $out = $(if ($inClass) { 'a-zA-Z0-9_' } else { '[a-zA-Z0-9_]' }) } }
+                'W' { if ($ascii -and -not $inClass) { $out = '[^a-zA-Z0-9_]' } }
+                'h' { if ($F -in 'php', 'java') { $out = $(if ($inClass) { ' \t' } else { '[ \t]' }) } }
+                'R' { if ($F -in 'php', 'java') { $out = '(?:\r\n|[\n\r])' } }
+                'K' { if ($F -eq 'php') { $errors.Add('\K (keep out) is PCRE only - can''t be tested here; use a lookbehind (?<=...)'); $out = '' } }
+                'Z' { if ($F -eq 'py') { $out = '\z' } }
+                'A' { if ($F -eq 'js') { $errors.Add('JavaScript has no \A - use ^ (without the m flag)') } }
+                'z' { if ($F -eq 'js') { $errors.Add('JavaScript has no \z - use $ (without the m flag)') } }
+                'G' { if ($F -in 'js', 'py', 'go') { $errors.Add("\G isn't supported in this language") } }
+                default { if ($nx -match '^[1-9]$' -and $F -eq 'go') { $errors.Add('Go (RE2) has no back-references like \1') } }
+            }
+            if ($null -ne $out) { [void]$sb.Append($out) } else { [void]$sb.Append($ch).Append($nx) }
+            $i += 2; continue
+        }
+        if ($inClass) {
+            if ($ch -eq '[' -and $i + 1 -lt $P.Length -and $P[$i + 1] -eq ':') {
+                $end = $P.IndexOf(':]', $i + 2)
+                if ($end -gt 0) {
+                    $name = $P.Substring($i + 2, $end - $i - 2)
+                    if ($posix.ContainsKey($name)) { [void]$sb.Append($posix[$name]); $i = $end + 2; continue }
+                }
+            }
+            if ($ch -eq ']' -and $i -gt $classStart) { $inClass = $false }
+            [void]$sb.Append($ch); $i++; continue
+        }
+        if ($ch -eq '[') {
+            $inClass = $true; [void]$sb.Append('['); $i++
+            if ($i -lt $P.Length -and $P[$i] -eq '^') { [void]$sb.Append('^'); $i++ }
+            if ($i -lt $P.Length -and $P[$i] -eq ']') { [void]$sb.Append('\]'); $i++ }
+            $classStart = $i
+            continue
+        }
+        if ($ch -eq '(' -and $i + 1 -lt $P.Length -and $P[$i + 1] -eq '?') {
+            $rest = $P.Substring($i)
+            if ($rest -match '^\(\?P<') { if ($F -in 'py', 'php', 'go') { [void]$sb.Append('(?<'); $i += 4; continue } else { $errors.Add('(?P<name>...) is Python / PHP / Go syntax - here write (?<name>...)') } }
+            if ($rest -match '^\(\?P=(\w+)\)') { [void]$sb.Append("\k<$($Matches[1])>"); $i += $Matches[0].Length; if ($F -eq 'go') { $errors.Add('Go (RE2) has no back-references') }; continue }
+            if ($rest -match '^\(\?(P>|R\)|\d+\)|&)') { $errors.Add('recursion ((?R), (?1), (?P>name)) is PCRE only - .NET can''t test it') }
+            if ($rest -match '^\(\?(=|!|<=|<!)' -and $F -in 'go', 'posix') { $errors.Add("$(if ($F -eq 'go') { 'Go (RE2)' } else { 'POSIX ERE' }) has no lookahead / lookbehind ((?=...), (?!...), (?<=...), (?<!...))") }
+            if ($rest -match '^\(\?>' -and $F -in 'js', 'go', 'posix') { $errors.Add('atomic groups (?>...) aren''t supported in this language') }
+            if ($rest -match '^\(\?#' -and $F -in 'js', 'go', 'posix') { $errors.Add('comments (?#...) aren''t supported in this language') }
+            if ($rest -match '^\(\?[imsx-]+[):]' -and $F -in 'js', 'posix') { $errors.Add('inline flags like (?i) aren''t supported here - use the checkboxes (flags)') }
+            if ($rest -match '^\(\?<\w+>' -and $F -eq 'posix') { $errors.Add('POSIX ERE has no named groups') }
+            if ($rest -match '^\(\?:' -and $F -eq 'posix') { $errors.Add('POSIX ERE has no (?:...) - use (...)') }
+        }
+        # quantifier modifiers: possessive (Java, PHP) / lazy (not in POSIX)
+        if ($ch -match '[*+?}]' -and $i + 1 -lt $P.Length -and -not ($ch -eq '?' -and $i -gt 0 -and $P[$i - 1] -eq '(')) {
+            $nx = $P[$i + 1]
+            if ($nx -eq '+' -and $F -in 'java', 'php') { [void]$sb.Append($ch); $i += 2; if (-not ($notes | Where-Object { $_ -like 'possessive*' })) { $notes.Add('possessive quantifiers (x++, x*+) are tested as normal greedy ones') }; continue }
+            if ($nx -eq '?' -and $F -eq 'posix') { $errors.Add('POSIX ERE has no lazy quantifiers (*?, +?)') }
+        }
+        [void]$sb.Append($ch); $i++
+    }
+    if ($F -eq 'posix' -and $P -match '\\[dws]') { $notes.Add('grep -E / sed -E don''t know \d \w \s everywhere - [[:digit:]] [[:alnum:]_] [[:space:]] always work') }
+    if ($F -eq 'go' -and $P -match '\(\?<\w+>') { $notes.Add('older Go versions need (?P<name>...)') }
+    @{ Pattern = $sb.ToString(); Flags = $flags; Notes = @($notes); Errors = @($errors) }
+}
+
+# The replacement as the language writes it -> .NET ($1, ${name}, $0)
+function Convert-RegexReplacement([string]$R, [string]$F) {
+    switch ($F) {
+        'js'    { $R = $R -replace '\$&', '$$0' -replace '\$<(\w+)>', '$${$1}' }
+        'py'    { $R = $R.Replace('$', '$$') -replace '\\g<(\w+)>', '$${$1}' -replace '\\(\d)', '$$$1' }
+        'php'   { $R = $R -replace '\\(\d)', '$$$1' }
+        'go'    { $R = $R -replace '\$([A-Za-z_]\w*)', '$${$1}' }
+        'posix' { $R = $R.Replace('$', '$$') -replace '(?<!\\)&', '$$0' -replace '\\&', '&' -replace '\\(\d)', '$$$1' }
+    }
+    $R
+}
+
+# Code that uses the pattern in the chosen language.
+function Get-RegexCode([string]$F, [string]$P, [string]$R, [bool]$I, [bool]$M, [bool]$S, [bool]$X) {
+    $q1 = { param($t) "'" + $t.Replace("'", "''") + "'" }                                   # PowerShell
+    $dq = { param($t) '"' + $t.Replace('\', '\\').Replace('"', '\"') + '"' }               # Java-style string
+    switch ($F) {
+        'net' {
+            $o = @(); if ($I) { $o += 'IgnoreCase' }; if ($M) { $o += 'Multiline' }; if ($S) { $o += 'Singleline' }; if ($X) { $o += 'IgnorePatternWhitespace' }
+            $cs = if ($o) { ($o | ForEach-Object { "RegexOptions.$_" }) -join ' | ' } else { 'RegexOptions.None' }
+            $ps = if ($o) { "'" + ($o -join ', ') + "'" } else { "'None'" }
+            @"
+// C#   (using System.Text.RegularExpressions;)
+var rx = new Regex(@"$($P.Replace('"', '""'))", $cs);
+foreach (Match m in rx.Matches(text))
+    Console.WriteLine(m.Value + "  group 1: " + m.Groups[1].Value);
+string replaced = rx.Replace(text, @"$($R.Replace('"', '""'))");
+
+# PowerShell
+`$rx = [regex]::new($(& $q1 $P), $ps)
+foreach (`$m in `$rx.Matches(`$text)) { `$m.Value; `$m.Groups[1].Value }
+`$replaced = `$rx.Replace(`$text, $(& $q1 $R))
+if (`$text -match $(& $q1 $P)) { `$Matches[0] }      # -match ignores case by default (-cmatch doesn't)
+"@
+        }
+        'js' {
+            $fl = 'g' + $(if ($I) { 'i' }) + $(if ($M) { 'm' }) + $(if ($S) { 's' })
+            $lit = $P -replace '(?<!\\)/', '\/'
+            if ($P -match '^/(.+)/([a-z]*)$') { $lit = $Matches[1]; $fl = $Matches[2]; if ($fl -notmatch 'g') { $fl = 'g' + $fl } }
+            @"
+const re = /$lit/$fl;$(if ($X) { '        // JavaScript has no x flag: remove the spaces / comments' })
+for (const m of text.matchAll(re)) {
+  console.log(m[0], 'group 1:', m[1], 'at', m.index);   // named: m.groups.name
+}
+const replaced = text.replace(re, '$($R.Replace("'", "\'"))');    // `$1, `$<name>, `$& = whole match
+const first = text.match(new RegExp(re.source, re.flags.replace('g', '')));
+"@
+        }
+        'py' {
+            $o = @(); if ($I) { $o += 're.IGNORECASE' }; if ($M) { $o += 're.MULTILINE' }; if ($S) { $o += 're.DOTALL' }; if ($X) { $o += 're.VERBOSE' }
+            $qq = if ($P.Contains("'") -and -not $P.Contains('"')) { '"' } else { "'" }
+            $pp = if ($P.EndsWith('\') -or ($P.Contains("'") -and $P.Contains('"'))) { & $dq $P } else { "r$qq$P$qq" }
+            @"
+import re
+
+rx = re.compile($pp$(if ($o) { ', ' + ($o -join ' | ') }))
+for m in rx.finditer(text):
+    print(m.group(0), 'group 1:', m.group(1) if rx.groups else None, 'at', m.start())   # named: m.group('name')
+replaced = rx.sub(r'$($R.Replace("'", "\'"))', text)      # \1, \g<name>, \g<0> = whole match
+first = rx.search(text)
+"@
+        }
+        'java' {
+            $o = @(); if ($I) { $o += 'Pattern.CASE_INSENSITIVE' }; if ($M) { $o += 'Pattern.MULTILINE' }; if ($S) { $o += 'Pattern.DOTALL' }; if ($X) { $o += 'Pattern.COMMENTS' }
+            @"
+// import java.util.regex.*;
+Pattern p = Pattern.compile($(& $dq $P)$(if ($o) { ', ' + ($o -join ' | ') }));
+Matcher m = p.matcher(text);
+while (m.find()) {
+    System.out.println(m.group() + "  group 1: " + (m.groupCount() > 0 ? m.group(1) : null));   // named: m.group("name")
+}
+String replaced = p.matcher(text).replaceAll($(& $dq $R));   // `$1, `${name}, `$0
+"@
+        }
+        'php' {
+            $body = $P; $fl = $(if ($I) { 'i' }) + $(if ($M) { 'm' }) + $(if ($S) { 's' }) + $(if ($X) { 'x' }) + 'u'
+            $lit = if ($P.Length -gt 2 -and $P[0] -match '[/#~@%!|+]' -and $P -match ('^' + [regex]::Escape([string]$P[0]) + '.*' + [regex]::Escape([string]$P[0]) + '[a-zA-Z]*$')) { $P } else { '/' + ($body -replace '(?<!\\)/', '\/') + '/' + $fl }
+            @"
+<?php
+preg_match_all('$($lit.Replace('\', '\\').Replace("'", "\'"))', `$text, `$matches, PREG_SET_ORDER);
+foreach (`$matches as `$m) {
+    echo `$m[0], ' group 1: ', `$m[1] ?? '', PHP_EOL;     // named: `$m['name']
+}
+`$replaced = preg_replace('$($lit.Replace('\', '\\').Replace("'", "\'"))', '$($R.Replace('\', '\\').Replace("'", "\'"))', `$text);   // `$1, `${1}, \1
+"@
+        }
+        'go' {
+            $fl = $(if ($I) { 'i' }) + $(if ($M) { 'm' }) + $(if ($S) { 's' })
+            $pp = $(if ($fl) { "(?$fl)" }) + $P
+            $lit = if ($pp.Contains('`')) { & $dq $pp } else { '`' + $pp + '`' }
+            @"
+// import "regexp"
+re := regexp.MustCompile($lit)$(if ($X) { '   // Go has no x flag: remove the spaces' })
+for _, m := range re.FindAllStringSubmatch(text, -1) {
+    fmt.Println(m[0], "group 1:", m[1:])          // named: re.SubexpIndex("name")
+}
+replaced := re.ReplaceAllString(text, $(if ($R.Contains('`')) { & $dq $R } else { '`' + $R + '`' }))   // `$1, `${1}, `${name}
+"@
+        }
+        'posix' {
+            $sq = { param($t) "'" + $t.Replace("'", "'\''") + "'" }
+            $ci = if ($I) { ' -i' } else { '' }
+            $sedP = $P.Replace('/', '\/'); $sedR = $R.Replace('/', '\/')
+            @"
+# lines that match / only the matching parts
+grep -E$ci $(& $sq $P) file.txt
+grep -E -o$ci $(& $sq $P) file.txt
+
+# replace (GNU sed; \1 = group 1, & = whole match)
+sed -E $(& $sq "s/$sedP/$sedR/g$(if ($I) { 'I' })") file.txt
+"@
+        }
+    }
+}
+
+# Ready-made patterns (written so they work in most languages; named groups are adapted when chosen).
+function Get-RegexExamples {
+    [ordered]@{
+        'Email address'          = @{ P = '[\w.+-]+@[\w-]+(\.[\w-]+)+'; T = "Write to ann.smith@example.com or bob+news@mail.test.org`r`nNot an email: ann@ or @test.org" }
+        'URL (http / https)'     = @{ P = 'https?://[^\s/$.?#][^\s]*'; T = "Docs: https://example.com/docs?page=2#top and http://localhost:8080/api`r`nnot: ftp://x.org" }
+        'IPv4 address'           = @{ P = '\b((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)\b'; T = "Servers 10.0.0.1, 192.168.1.254 and 8.8.8.8`r`nInvalid: 256.1.1.1 and 1.2.3" }
+        'Date YYYY-MM-DD (reorder to DD.MM.YYYY)' = @{ P = '\b(?<y>\d{4})-(?<m>\d{2})-(?<d>\d{2})\b'; T = "Released 2026-10-17, patched 2026-11-02."; R = '${d}.${m}.${y}' }
+        'Time HH:MM(:SS)'        = @{ P = '\b([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?\b'; T = "Start 09:30, end 17:45:10, invalid 25:61" }
+        'GUID / UUID'            = @{ P = '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'; T = "id=3f2504e0-4f89-11d3-9a0c-0305e82c3301 and 00000000-0000-0000-0000-000000000000" }
+        'Phone number'           = @{ P = '\+?\d{1,3}[ -]?\(?\d{2,4}\)?[ -]?\d{3,4}[ -]?\d{3,4}'; T = "Call +359 88 123 4567 or (555) 123-4567 or 0888123456" }
+        'Number (int / decimal)' = @{ P = '-?\b\d+(\.\d+)?\b'; T = "Totals: 42, -7, 3.14 and 1000.50" }
+        'Hex colour'             = @{ P = '#([0-9a-fA-F]{3}){1,2}\b'; T = "color: #fff; background: #1E90FF; border: #12345" }
+        'Words in quotes'        = @{ P = '"([^"\\]|\\.)*"|''([^''\\]|\\.)*'''; T = "say ""hello"" and 'bye', even ""with \""escape\"""" " }
+        'Repeated word'          = @{ P = '\b(\w+)\s+\1\b'; T = "This is is a test of the the repeated words." }
+        'Key = value pairs'      = @{ P = '^\s*(?<key>[\w.-]+)\s*[=:]\s*(?<value>.*?)\s*$'; T = "host = localhost`r`nport: 5432`r`n# comment`r`nuser=admin" }
+        'Log line (time, level, message)' = @{ P = '^(?<time>\d{4}-\d{2}-\d{2}[ T][\d:.]+)\s+\[?(?<level>INFO|WARN|ERROR|DEBUG)\]?\s+(?<msg>.*)$'; T = "2026-10-17 09:12:01.123 INFO Service started`r`n2026-10-17 09:12:05.456 [ERROR] Connection refused`r`nrandom line" }
+        'HTML tag'               = @{ P = '<(?<tag>[a-zA-Z][\w-]*)(?<attrs>[^>]*)>'; T = '<div class="box"><a href="/home">Home</a><br/></div>' }
+        'JSON "key": value'      = @{ P = '"(?<key>[^"]+)"\s*:\s*(?<value>"[^"]*"|-?\d+(\.\d+)?|true|false|null)'; T = '{"name": "Ann", "age": 31, "admin": false, "city": null}' }
+        'Strong password (lookaheads)' = @{ P = '^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^\w\s]).{8,}$'; T = "weakpass`r`nStr0ng!Pass`r`nNoDigits!!`r`nGood#Pass99"; I = $false }
+        'Trailing spaces (remove)' = @{ P = '[ \t]+$'; T = "line with spaces   `r`nclean line`r`ntabs`t`t"; R = '' }
+        'Empty lines (remove)'   = @{ P = '^\s*$\r?\n'; T = "first`r`n`r`n   `r`nsecond`r`n`r`nthird"; R = '' }
+        'Between two words'      = @{ P = '(?<=START).*?(?=END)'; T = "xxSTART the part you want ENDyy" }
+        'camelCase -> snake_case' = @{ P = '(?<=[a-z0-9])(?=[A-Z])'; T = "userName orderIdValue parseHTTPResponse"; R = '_'; I = $false }
+    }
+}
+
+# Tokens for the cheat sheet (double-click one to put it into the pattern).
+$RegexCheatSheet = @(
+    @('.', 'any character (except a newline, unless "dot matches newline")'), @('\d  \D', 'a digit / not a digit'),
+    @('\w  \W', 'a word character (letter, digit, _) / not one'), @('\s  \S', 'white space / not white space'),
+    @('[abc]', 'one of a, b, c'), @('[^abc]', 'anything except a, b, c'), @('[a-z0-9]', 'a range'),
+    @('^  $', 'start / end of the text (of each line with "^ $ per line")'), @('\b', 'word boundary'),
+    @('*  +  ?', '0 or more / 1 or more / 0 or 1'), @('{3}  {2,5}  {2,}', 'exactly 3 / 2 to 5 / 2 or more'),
+    @('*?  +?', 'lazy: as few as possible'), @('(abc)', 'group (captured as $1 ...)'), @('(?:abc)', 'group without capturing'),
+    @('(?<name>abc)', 'named group (Python / Go: (?P<name>abc))'), @('\1  \k<name>', 'the same text as group 1 / group "name" again'),
+    @('a|b', 'a or b'), @('(?=abc)', 'followed by abc (lookahead)'), @('(?!abc)', 'not followed by abc'),
+    @('(?<=abc)', 'preceded by abc (lookbehind)'), @('(?<!abc)', 'not preceded by abc'),
+    @('\.  \*  \\', 'a literal . * \ (escape special characters)'), @('\t  \n  \r', 'tab / newline / carriage return'),
+    @('\uFFFF  \x41', 'a character by its code'), @('(?i)', 'ignore case from here (not in JavaScript)'),
+    @('$1  ${name}  $0', 'in Replace: group 1 / group "name" / the whole match')
+)
 
 function Update-RegexTool($St) {
     $St.Busy = $true
@@ -17983,9 +18281,19 @@ function Update-RegexTool($St) {
         $rtb.SelectAll(); $rtb.SelectionBackColor = $C.Bg; $rtb.SelectionColor = $C.Fore
         $St.Matches.BeginUpdate(); $St.Matches.Items.Clear()
         $pattern = $St.Pattern.Text
+        $flv = if ($St.Flavor) { $RegexFlavors[[string]$St.Flavor.SelectedItem] } else { 'net' }
+        $lang = [string]$St.Flavor.SelectedItem
+        if ($St.Code) { $St.Code.Text = if ($pattern) { Get-RegexCode $flv $pattern $St.Replace.Text $St.Opt.IgnoreCase.Checked $St.Opt.Multiline.Checked $St.Opt.Singleline.Checked $St.Opt.IgnorePatternWhitespace.Checked } else { '' } }
         if (-not $pattern) { $St.Result.Text = $rtb.Text; Set-TbStatus $St.Status 'Type a pattern.'; return }
+        $cvt = Convert-RegexToNet $pattern $flv
+        $pattern = $cvt.Pattern
         $opts = [System.Text.RegularExpressions.RegexOptions]::None
         foreach ($k in $St.Opt.Keys) { if ($St.Opt[$k].Checked) { $opts = $opts -bor [System.Text.RegularExpressions.RegexOptions]$k } }
+        if ($cvt.Flags) {             # flags from /.../gi: they decide i, m, s, x
+            $opts = [System.Text.RegularExpressions.RegexOptions]::None
+            if ($cvt.Flags -cmatch 'i') { $opts = $opts -bor 'IgnoreCase' }; if ($cvt.Flags -cmatch 'm') { $opts = $opts -bor 'Multiline' }
+            if ($cvt.Flags -cmatch 's') { $opts = $opts -bor 'Singleline' }; if ($cvt.Flags -cmatch 'x') { $opts = $opts -bor 'IgnorePatternWhitespace' }
+        }
         try { $rx = New-Object System.Text.RegularExpressions.Regex($pattern, $opts, [TimeSpan]::FromSeconds(2)) }
         catch { Set-TbStatus $St.Status "Pattern error: $($_.Exception.InnerException.Message)" 'error'; return }
         $text = $rtb.Text
@@ -18009,8 +18317,11 @@ function Update-RegexTool($St) {
                 }
                 $n++
             }
-            $St.Result.Text = $rx.Replace($text, $St.Replace.Text)
-            Set-TbStatus $St.Status "$count match$(if ($count -ne 1) { 'es' })$(if ($count -gt 1000) { '  (first 1000 listed)' })" $(if ($count) { 'ok' } else { 'warn' })
+            $St.Result.Text = $rx.Replace($text, (Convert-RegexReplacement $St.Replace.Text $flv))
+            $msg = "$count match$(if ($count -ne 1) { 'es' })$(if ($count -gt 1000) { '  (first 1000 listed)' })"
+            if ($cvt.Errors.Count) { $msg += "  -  Not valid in ${lang}: $($cvt.Errors -join '; ')" }
+            elseif ($cvt.Notes.Count) { $msg += "  -  $($cvt.Notes -join '; ')" }
+            Set-TbStatus $St.Status $msg $(if ($cvt.Errors.Count) { 'warn' } elseif ($count) { 'ok' } else { 'warn' })
         } catch [System.Text.RegularExpressions.RegexMatchTimeoutException] {
             Set-TbStatus $St.Status 'Stopped: the pattern took longer than 2 seconds (catastrophic backtracking?)' 'error'
         } catch {
