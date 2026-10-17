@@ -11611,11 +11611,32 @@ function Get-ChainExtract($Rule, $Resp) {
 }
 
 # Starting values: the environment, then the chain's own variables.
+# Start values: the API tester's environment, then the chain's own Variables.
+function Get-ChainStartVars {
+    $h = @{}
+    $env = Get-ApiEnvironment
+    if ($env) { foreach ($v in @($env.Vars)) { if ($v -and $v.On -ne $false -and $v.Key) { $h[[string]$v.Key] = [string]$v.Value } } }
+    foreach ($v in @($ChainUI.Current.Vars)) { if ($v -and $v.Key) { $h[[string]$v.Key] = [string]$v.Value } }
+    $h
+}
+
 function Reset-ChainVars {
     $ChainUI.Vars = @{}; $ChainUI.Jar = @{}; $ChainUI.Results = @{}
-    $env = Get-ApiEnvironment
-    if ($env) { foreach ($v in @($env.Vars)) { if ($v -and $v.On -ne $false -and $v.Key) { $ChainUI.Vars[[string]$v.Key] = [string]$v.Value } } }
-    foreach ($v in @($ChainUI.Current.Vars)) { if ($v -and $v.Key) { $ChainUI.Vars[[string]$v.Key] = [string]$v.Value } }
+    $start = Get-ChainStartVars
+    foreach ($k in $start.Keys) { $ChainUI.Vars[$k] = $start[$k] }
+    $ChainUI.StartVals = $start; $ChainUI.VarsChain = if ($ChainUI.Current) { $ChainUI.Current.Id } else { '' }
+}
+
+# Brings changed start values (Variables..., environment) into the current values without losing
+# what steps have set: a value still equal to its old start value, or missing, takes the new one.
+function Sync-ChainStartVars {
+    if (-not $ChainUI.Current -or $ChainUI.VarsChain -ne $ChainUI.Current.Id -or -not $ChainUI.StartVals) { Reset-ChainVars; return }
+    $old = $ChainUI.StartVals; $new = Get-ChainStartVars
+    foreach ($k in $new.Keys) {
+        if (-not $ChainUI.Vars.ContainsKey($k) -or ($old.ContainsKey($k) -and [string]$ChainUI.Vars[$k] -eq [string]$old[$k])) { $ChainUI.Vars[$k] = $new[$k] }
+    }
+    foreach ($k in @($old.Keys)) { if (-not $new.ContainsKey($k) -and [string]$ChainUI.Vars[$k] -eq [string]$old[$k]) { [void]$ChainUI.Vars.Remove($k) } }
+    $ChainUI.StartVals = $new
 }
 
 # Runs only some cards (in chain order), with the variables and cookies of the last run.
@@ -11636,7 +11657,7 @@ function Start-ChainRun([string]$OnlyId = '', [string[]]$Ids = @()) {
     $partial = $Ids.Count -gt 0
     $order = @(if ($partial) { Get-ChainOrder | Where-Object { $Ids -contains $_.Id } } else { Get-ChainOrder })
     # a partial run keeps the last run's variables and cookies (fresh ones if there was no run yet)
-    if ($partial -and -not $ChainUI.Vars.Count) { Reset-ChainVars }
+    if ($partial) { Sync-ChainStartVars }
     if ($partial) { foreach ($n in $order) { $n.State = ''; $n.Info = '' } }
     if (-not $partial) {
         Reset-ChainVars                  # fresh run: no cookies, no values from before
@@ -11893,6 +11914,7 @@ function Complete-ChainStep {
     $failed = $resp.Error -or ($d.StopOnFail -and -not $okStatus) -or ($d.StopOnFail -and $missing)
     $n.State = if ($failed) { 'fail' } else { 'ok' }
     $parts = @()
+    if (@($r.Unknown).Count) { $parts += "no value for {{$(@($r.Unknown) -join '}}, {{')}} - add it with Variables... (top bar)" }
     $parts += if ($resp.Error) { $resp.Error } else { "$($resp.Status) $($resp.Reason)" }
     if (-not $resp.Error) { $parts += "$($resp.ElapsedMs) ms" }
     if ($set.Count) { $parts += "set: $(@($set.Keys) -join ', ')" }
@@ -12175,7 +12197,7 @@ function Show-ChainResult($Node) {
     $q = $res.Request; $p = $res.Response
     [void]$sb.AppendLine("$($q.Method) $($q.Url)")
     if ($res.CookieSent) { [void]$sb.AppendLine("Cookie sent: $($res.CookieSent)") }
-    if ($res.Unknown.Count) { [void]$sb.AppendLine("Unknown variables: {{$($res.Unknown -join '}}, {{')}}") }
+    if ($res.Unknown.Count) { [void]$sb.AppendLine("Unknown variables: {{$($res.Unknown -join '}}, {{')}}  - give them a value with Variables... in the top bar (or an API tester environment), or a 'Take from response' rule in an earlier step.") }
     [void]$sb.AppendLine()
     if ($p.Error) { [void]$sb.AppendLine("ERROR: $($p.Error)") }
     else { [void]$sb.AppendLine("$($p.HttpVersion) $($p.Status) $($p.Reason)   $($p.ElapsedMs) ms   $($p.Body.Length) bytes") }
@@ -12233,6 +12255,7 @@ function Show-ChainVarsDialog {
         if ($d.ShowDialog($ChainUI.Form) -ne 'OK') { return }
         $ch.Vars = @(foreach ($line in ($tb.Text -split "`r?`n")) { $i = $line.IndexOf('='); if ($i -gt 0) { [pscustomobject]@{ Key = $line.Substring(0, $i).Trim().Trim('{', '}'); Value = $line.Substring($i + 1).Trim() } } })
         Save-Chains
+        Sync-ChainStartVars; Update-ChainVarsView                # usable right away, also by Run this step
     } finally { $script:Modal = $false; $d.Dispose() }
 }
 
