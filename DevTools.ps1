@@ -17624,6 +17624,191 @@ public class DevHexDiffView : System.Windows.Forms.Control {
     }
 }
 
+// Hidden messages (steganography): in a picture's lowest colour bits, in invisible characters inside text,
+// or appended to any file. Optional password: AES-256-CBC + HMAC-SHA256, key from PBKDF2 (100k rounds).
+public static class DevStego {
+    static readonly byte[] Magic = { (byte)'D', (byte)'T', (byte)'S', (byte)'1' };
+
+    // payload = magic, flags (1 = encrypted), length (4 bytes), data
+    public static byte[] Pack(string message, string password) {
+        byte[] data = System.Text.Encoding.UTF8.GetBytes(message ?? "");
+        bool enc = !string.IsNullOrEmpty(password);
+        if (enc) data = Encrypt(data, password);
+        var p = new byte[9 + data.Length];
+        Array.Copy(Magic, p, 4); p[4] = (byte)(enc ? 1 : 0);
+        BitConverter.GetBytes(data.Length).CopyTo(p, 5);
+        Array.Copy(data, 0, p, 9, data.Length);
+        return p;
+    }
+    // -> the message; throws with a readable reason
+    public static string Unpack(byte[] p, string password) {
+        if (p == null || p.Length < 9 || p[0] != Magic[0] || p[1] != Magic[1] || p[2] != Magic[2] || p[3] != Magic[3]) throw new Exception("No hidden message found.");
+        int len = BitConverter.ToInt32(p, 5);
+        if (len < 0 || len > p.Length - 9) throw new Exception("The hidden message is damaged (cut off).");
+        var data = new byte[len]; Array.Copy(p, 9, data, 0, len);
+        if (p[4] == 1) {
+            if (string.IsNullOrEmpty(password)) throw new Exception("This message is locked with a password - type it and try again.");
+            data = Decrypt(data, password);
+        }
+        return System.Text.Encoding.UTF8.GetString(data);
+    }
+    public static bool IsLocked(byte[] p) { return p != null && p.Length > 4 && p[4] == 1; }
+
+    static byte[][] Keys(string password, byte[] salt) {
+        using (var kdf = new System.Security.Cryptography.Rfc2898DeriveBytes(password, salt, 100000)) {
+            return new[] { kdf.GetBytes(32), kdf.GetBytes(32) };
+        }
+    }
+    static byte[] Encrypt(byte[] data, string password) {
+        var salt = new byte[16]; var iv = new byte[16];
+        using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create()) { rng.GetBytes(salt); rng.GetBytes(iv); }
+        var k = Keys(password, salt);
+        byte[] ct;
+        using (var aes = System.Security.Cryptography.Aes.Create()) {
+            aes.Key = k[0]; aes.IV = iv; aes.Mode = System.Security.Cryptography.CipherMode.CBC; aes.Padding = System.Security.Cryptography.PaddingMode.PKCS7;
+            using (var e = aes.CreateEncryptor()) ct = e.TransformFinalBlock(data, 0, data.Length);
+        }
+        var body = new byte[32 + ct.Length];
+        Array.Copy(salt, body, 16); Array.Copy(iv, 0, body, 16, 16); Array.Copy(ct, 0, body, 32, ct.Length);
+        byte[] mac; using (var h = new System.Security.Cryptography.HMACSHA256(k[1])) mac = h.ComputeHash(body);
+        var r = new byte[body.Length + 32]; Array.Copy(body, r, body.Length); Array.Copy(mac, 0, r, body.Length, 32);
+        return r;
+    }
+    static byte[] Decrypt(byte[] blob, string password) {
+        if (blob.Length < 64) throw new Exception("The hidden message is damaged.");
+        var salt = new byte[16]; Array.Copy(blob, salt, 16);
+        var k = Keys(password, salt);
+        int bodyLen = blob.Length - 32;
+        byte[] mac; using (var h = new System.Security.Cryptography.HMACSHA256(k[1])) mac = h.ComputeHash(blob, 0, bodyLen);
+        int diff = 0; for (int i = 0; i < 32; i++) diff |= mac[i] ^ blob[bodyLen + i];
+        if (diff != 0) throw new Exception("Wrong password (or the message was changed).");
+        var iv = new byte[16]; Array.Copy(blob, 16, iv, 0, 16);
+        using (var aes = System.Security.Cryptography.Aes.Create()) {
+            aes.Key = k[0]; aes.IV = iv; aes.Mode = System.Security.Cryptography.CipherMode.CBC; aes.Padding = System.Security.Cryptography.PaddingMode.PKCS7;
+            using (var d = aes.CreateDecryptor()) return d.TransformFinalBlock(blob, 32, bodyLen - 32);
+        }
+    }
+
+    // ---- pictures: 3 bits a pixel (lowest bit of red, green, blue); see-through pixels are skipped
+    static int[] Argb(System.Drawing.Bitmap src, out int w, out int h) {
+        w = src.Width; h = src.Height;
+        using (var bmp = new System.Drawing.Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppArgb)) {
+            using (var g = System.Drawing.Graphics.FromImage(bmp)) { g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy; g.DrawImage(src, new System.Drawing.Rectangle(0, 0, w, h)); }
+            var px = new int[w * h];
+            var bd = bmp.LockBits(new System.Drawing.Rectangle(0, 0, w, h), System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            try { for (int y = 0; y < h; y++) System.Runtime.InteropServices.Marshal.Copy(bd.Scan0 + y * bd.Stride, px, y * w, w); } finally { bmp.UnlockBits(bd); }
+            return px;
+        }
+    }
+    // bytes that fit into the picture (before the 9-byte header)
+    public static int Capacity(System.Drawing.Bitmap src) {
+        int w, h; var px = Argb(src, out w, out h);
+        long bits = 0; foreach (int p in px) if (((p >> 24) & 255) == 255) bits += 3;
+        return (int)Math.Max(0, Math.Min(int.MaxValue, bits / 8 - 9));
+    }
+    public static System.Drawing.Bitmap HideInImage(System.Drawing.Bitmap src, byte[] payload) {
+        int w, h; var px = Argb(src, out w, out h);
+        long need = (long)payload.Length * 8, bit = 0;
+        for (int i = 0; i < px.Length && bit < need; i++) {
+            int p = px[i];
+            if (((p >> 24) & 255) != 255) continue;
+            for (int sh = 16; sh >= 0 && bit < need; sh -= 8) {          // red, green, blue
+                int b = (payload[bit >> 3] >> (7 - (int)(bit & 7))) & 1;
+                p = (p & ~(1 << sh)) | (b << sh);
+                bit++;
+            }
+            px[i] = p;
+        }
+        if (bit < need) throw new Exception("The message doesn't fit in this picture - use a bigger picture or a shorter message.");
+        var outBmp = new System.Drawing.Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        var bd = outBmp.LockBits(new System.Drawing.Rectangle(0, 0, w, h), System.Drawing.Imaging.ImageLockMode.WriteOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        try { for (int y = 0; y < h; y++) System.Runtime.InteropServices.Marshal.Copy(px, y * w, bd.Scan0 + y * bd.Stride, w); } finally { outBmp.UnlockBits(bd); }
+        return outBmp;
+    }
+    public static byte[] ReadFromImage(System.Drawing.Bitmap src) {
+        int w, h; var px = Argb(src, out w, out h);
+        var head = new byte[9]; var bytes = head; long bit = 0; long need = 9 * 8; bool gotHead = false;
+        for (int i = 0; i < px.Length; i++) {
+            int p = px[i];
+            if (((p >> 24) & 255) != 255) continue;
+            for (int sh = 16; sh >= 0; sh -= 8) {
+                if (bit >= need) break;
+                if (((p >> sh) & 1) == 1) bytes[bit >> 3] |= (byte)(1 << (7 - (int)(bit & 7)));
+                bit++;
+            }
+            if (bit >= need) {
+                if (gotHead) return bytes;
+                if (head[0] != Magic[0] || head[1] != Magic[1] || head[2] != Magic[2] || head[3] != Magic[3]) return null;
+                int len = BitConverter.ToInt32(head, 5);
+                if (len < 0 || len > px.Length) return null;
+                bytes = new byte[9 + len]; Array.Copy(head, bytes, 9);
+                need = (9L + len) * 8; gotHead = true;
+                if (bit >= need) return bytes;
+            }
+        }
+        return gotHead ? bytes : null;
+    }
+
+    // ---- text: two bits per invisible character, put after the first character of the cover text
+    static readonly char[] Zw = { (char)0x200B, (char)0x200C, (char)0x200D, (char)0x2060 };
+    public static string HideInText(string cover, byte[] payload) {
+        var sb = new System.Text.StringBuilder(payload.Length * 4);
+        foreach (byte b in payload) for (int sh = 6; sh >= 0; sh -= 2) sb.Append(Zw[(b >> sh) & 3]);
+        string c = cover ?? "";
+        int at = c.Length > 0 ? (char.IsHighSurrogate(c[0]) && c.Length > 1 ? 2 : 1) : 0;
+        return c.Substring(0, at) + sb.ToString() + c.Substring(at);
+    }
+    public static byte[] ReadFromText(string text) {
+        var bits = new List<int>();
+        foreach (char ch in text ?? "") { int i = Array.IndexOf(Zw, ch); if (i >= 0) bits.Add(i); }
+        if (bits.Count < 4) return null;
+        var r = new byte[bits.Count / 4];
+        for (int i = 0; i < r.Length; i++) r[i] = (byte)((bits[i * 4] << 6) | (bits[i * 4 + 1] << 4) | (bits[i * 4 + 2] << 2) | bits[i * 4 + 3]);
+        return r;
+    }
+    public static string RemoveFromText(string text) {
+        var sb = new System.Text.StringBuilder();
+        foreach (char ch in text ?? "") if (Array.IndexOf(Zw, ch) < 0) sb.Append(ch);
+        return sb.ToString();
+    }
+
+    // ---- any file: payload + its length (8 bytes) + "DTSTEGO1" at the very end
+    static readonly byte[] Tail = System.Text.Encoding.ASCII.GetBytes("DTSTEGO1");
+    public static void AppendToFile(string src, string dest, byte[] payload) {
+        if (!string.Equals(src, dest, StringComparison.OrdinalIgnoreCase)) System.IO.File.Copy(src, dest, true);
+        using (var f = new System.IO.FileStream(dest, System.IO.FileMode.Open, System.IO.FileAccess.ReadWrite)) {
+            long cut = FindTail(f);
+            f.SetLength(cut >= 0 ? cut : f.Length);                       // replace an earlier hidden message
+            f.Seek(0, System.IO.SeekOrigin.End);
+            f.Write(payload, 0, payload.Length);
+            f.Write(BitConverter.GetBytes((long)payload.Length), 0, 8);
+            f.Write(Tail, 0, Tail.Length);
+        }
+    }
+    // where the hidden part starts, or -1
+    static long FindTail(System.IO.FileStream f) {
+        if (f.Length < 16) return -1;
+        var t = new byte[16]; f.Seek(-16, System.IO.SeekOrigin.End); f.Read(t, 0, 16);
+        for (int i = 0; i < 8; i++) if (t[8 + i] != Tail[i]) return -1;
+        long len = BitConverter.ToInt64(t, 0);
+        if (len < 0 || len > f.Length - 16) return -1;
+        return f.Length - 16 - len;
+    }
+    public static byte[] ReadFromFile(string path) {
+        using (var f = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite)) {
+            long start = FindTail(f);
+            if (start < 0) return null;
+            var r = new byte[f.Length - 16 - start];
+            f.Seek(start, System.IO.SeekOrigin.Begin);
+            int got = 0; while (got < r.Length) { int n = f.Read(r, got, r.Length - got); if (n <= 0) break; got += n; }
+            return r;
+        }
+    }
+    public static void RemoveFromFile(string path) {
+        using (var f = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.ReadWrite)) { long s = FindTail(f); if (s >= 0) f.SetLength(s); }
+    }
+}
+
 // An owner-drawn list box that paints into a back buffer (no flicker when it's redrawn often).
 public class DevBufferedListBox : System.Windows.Forms.ListBox {
     public DevBufferedListBox() {
@@ -19368,6 +19553,199 @@ function Update-QrTool($St) {
     } catch {
         $ex = $_.Exception; while ($ex.InnerException) { $ex = $ex.InnerException }
         Set-TbStatus $St.Status $ex.Message 'error'
+    }
+}
+
+# ======================================================================================
+# Hide text: a secret message inside a picture, inside normal text (invisible characters) or at the end of any file.
+# ======================================================================================
+Register-ToolboxPage 'stego' 'Hide text in pictures' $Glyph.Lock 'steganography hide secret message picture image png invisible zero width text file watermark' {
+    param($panel, $st)
+    foreach ($kv in (@{ Image = $null; ImageName = '' }).GetEnumerator()) { $st[$kv.Key] = $kv.Value }
+    $st.Status = New-TbPage $panel
+    # where the message goes (one panel per kind)
+    $kh = New-Object System.Windows.Forms.Panel
+    $kh.Dock = 'Fill'; $kh.BackColor = $C.Bg
+    $panel.Controls.Add($kh)
+    $st.Kinds = @{}
+    # picture
+    $pp = New-Object System.Windows.Forms.Panel; $pp.Dock = 'Fill'; $pp.BackColor = $C.Bg
+    $st.Picture = New-Object System.Windows.Forms.PictureBox
+    $st.Picture.Dock = 'Fill'; $st.Picture.SizeMode = 'Zoom'; $st.Picture.BackColor = $C.Bg; $st.Picture.AllowDrop = $true
+    $st.Picture.add_DragEnter({ param($src, $e) $e.Effect = if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { 'Copy' } else { 'None' } })
+    $st.Picture.add_DragDrop({ param($src, $e) $f = @([string[]]$e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop))[0]; if ($f) { Set-StegoImage $TbUI.Pages['stego'].State $f } })
+    $pp.Controls.Add($st.Picture)
+    $pb = New-TbBar $pp
+    New-TbLabel $pb 'Picture' -Title | Out-Null
+    [void](New-Button 'Open picture...' 'A PNG, JPEG, BMP ... (or drop one here). The result is always saved as PNG.' {
+        $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Filter = 'Pictures|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff|All files|*.*'
+        $script:Modal = $true
+        try { if ($d.ShowDialog($TbUI.Form) -eq 'OK') { Set-StegoImage $TbUI.Pages['stego'].State $d.FileName } } finally { $script:Modal = $false; $d.Dispose() }
+    } $pb $Glyph.Open 2)
+    [void](New-Button 'Paste picture' 'Use the picture on the clipboard' { Set-StegoImage $TbUI.Pages['stego'].State '' -Clipboard } $pb $Glyph.Paste 2)
+    $st.PicInfo = New-TbLabel $pb 'Open or drop a picture.' -Dim
+    $kh.Controls.Add($pp); $st.Kinds['picture'] = $pp
+    # text
+    $tp = New-Object System.Windows.Forms.Panel; $tp.Dock = 'Fill'; $tp.BackColor = $C.Bg; $tp.Visible = $false
+    $st.Cover = New-TbBox -Multi -Cue 'The normal text people will see - the message is hidden inside it. To read a message, paste the text you received here.'
+    $st.Cover.Dock = 'Fill'; $st.Cover.WordWrap = $true; $st.Cover.ScrollBars = 'Vertical'
+    $tp.Controls.Add($st.Cover)
+    $tb = New-TbBar $tp
+    New-TbLabel $tb 'Cover text' -Title | Out-Null
+    New-TbLabel $tb 'invisible characters carry the message; it survives copy and paste in most apps (chat, email, documents)' -Dim | Out-Null
+    $kh.Controls.Add($tp); $st.Kinds['text'] = $tp
+    # any file
+    $fp = New-Object System.Windows.Forms.Panel; $fp.Dock = 'Fill'; $fp.BackColor = $C.Bg; $fp.Visible = $false; $fp.AllowDrop = $true
+    $fb = New-TbBar $fp
+    New-TbLabel $fb 'File' -Title | Out-Null
+    $st.FilePath = New-TbBox -Cue 'any file: a picture, PDF, zip, Office document ... (or drop it here)'
+    $st.FilePath.Width = Px (440 * $TextZoom); $st.FilePath.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 6), 0); $st.FilePath.AllowDrop = $true
+    $fb.Controls.Add($st.FilePath)
+    [void](New-Button 'Browse...' 'Pick the file' {
+        $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Filter = 'All files|*.*'
+        $script:Modal = $true
+        try { if ($d.ShowDialog($TbUI.Form) -eq 'OK') { $TbUI.Pages['stego'].State.FilePath.Text = $d.FileName } } finally { $script:Modal = $false; $d.Dispose() }
+    } $fb $Glyph.Open 2)
+    foreach ($ctl in $fp, $st.FilePath) {
+        $ctl.add_DragEnter({ param($src, $e) $e.Effect = if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { 'Copy' } else { 'None' } })
+        $ctl.add_DragDrop({ param($src, $e) $f = @([string[]]$e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop))[0]; if ($f) { $TbUI.Pages['stego'].State.FilePath.Text = $f } })
+    }
+    $fh = New-Object System.Windows.Forms.Label
+    $fh.Dock = 'Top'; $fh.AutoSize = $false; $fh.Height = $FontMain.Height * 4; $fh.ForeColor = $C.Dim; $fh.Padding = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0)
+    $fh.Text = 'The message is added after the end of the file, so the file still opens normally (pictures show, PDFs and zips open). Anyone who looks at the raw bytes can see something was added - use a password to keep it unreadable. Hiding again replaces the earlier message.'
+    $fp.Controls.Add($fh); $fh.BringToFront()
+    $kh.Controls.Add($fp); $st.Kinds['file'] = $fp
+
+    # actions
+    $ab = New-TbBar $panel
+    [void](New-Button 'Hide the message' 'Put the message into the picture / text / file' { Invoke-StegoHide $TbUI.Pages['stego'].State } $ab $Glyph.Lock 1)
+    [void](New-Button 'Read the message' 'Find a hidden message in the picture / text / file' { Invoke-StegoReveal $TbUI.Pages['stego'].State } $ab $Glyph.View 2)
+    [void](New-Button 'Remove it' 'Take a hidden message out of the text or file (pictures: open the original instead)' { Invoke-StegoRemove $TbUI.Pages['stego'].State } $ab $Glyph.Delete 2)
+    New-TbLabel $ab 'Password' -Dim | Out-Null
+    $st.Password = New-TbBox -Cue 'optional - encrypts it (AES-256)'
+    $st.Password.UseSystemPasswordChar = $true; $st.Password.Width = Px (220 * $TextZoom); $st.Password.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 6), 0)
+    $ab.Controls.Add($st.Password)
+    # the secret
+    $st.Secret = New-TbBox -Multi -Cue 'The secret message'
+    $st.Secret.Dock = 'Top'; $st.Secret.Height = $FontMain.Height * 5; $st.Secret.WordWrap = $true; $st.Secret.ScrollBars = 'Vertical'
+    $panel.Controls.Add($st.Secret)
+    $st.Secret.add_TextChanged({ Update-StegoInfo $TbUI.Pages['stego'].State })
+    New-TbLabel (New-TbBar $panel) 'Secret message' -Title | Out-Null
+    $sb = New-TbBar $panel
+    New-TbLabel $sb 'Hide in' -Dim | Out-Null
+    $st.Kind = New-TbCombo $sb @('A picture (saved as PNG)', 'Normal text (invisible characters)', 'Any file (added at the end)') 270
+    $st.Kind.add_SelectedIndexChanged({
+        $s = $TbUI.Pages['stego'].State
+        $k = @('picture', 'text', 'file')[$s.Kind.SelectedIndex]
+        foreach ($n in $s.Kinds.Keys) { $s.Kinds[$n].Visible = $n -eq $k }
+        Update-StegoInfo $s
+    })
+    $st.SetInput = { param($t) $s = $TbUI.Pages['stego'].State; if ($t -match '[\u200B\u200C\u200D\u2060]') { $s.Kind.SelectedIndex = 1; $s.Cover.Text = $t; Invoke-StegoReveal $s } else { $s.Secret.Text = $t } }
+    $st.Focus = { $TbUI.Pages['stego'].State.Secret.Focus() }
+    $st.Close = { $s = $TbUI.Pages['stego'].State; if ($s.Image) { $s.Picture.Image = $null; $s.Image.Dispose() } }
+    Set-TbStatus $st.Status 'Write a message, pick where to hide it, then Hide the message. To read one: open the picture / paste the text / pick the file and press Read the message.'
+    $st
+}
+
+function Get-StegoKind($S) { @('picture', 'text', 'file')[$S.Kind.SelectedIndex] }
+
+function Set-StegoImage($S, [string]$Path, [switch]$Clipboard) {
+    try {
+        if ($Clipboard) {
+            $img = [System.Windows.Forms.Clipboard]::GetImage()
+            if (-not $img) { Set-TbStatus $S.Status 'There is no picture on the clipboard.' 'error'; return }
+            $bmp = New-Object System.Drawing.Bitmap($img); $img.Dispose(); $name = 'pasted picture'
+        } else {
+            $ms = New-Object IO.MemoryStream(, [IO.File]::ReadAllBytes($Path))
+            $img = [System.Drawing.Image]::FromStream($ms); $bmp = New-Object System.Drawing.Bitmap($img); $img.Dispose(); $ms.Dispose(); $name = $Path
+        }
+    } catch { Set-TbStatus $S.Status "Can't open that picture: $($_.Exception.Message)" 'error'; return }
+    if ($S.Image) { $S.Picture.Image = $null; $S.Image.Dispose() }
+    $S.Image = $bmp; $S.ImageName = $name; $S.Picture.Image = $bmp
+    $S.Capacity = [DevStego]::Capacity($bmp)
+    Update-StegoInfo $S
+    # a picture that already carries a message says so
+    $p = $null; try { $p = [DevStego]::ReadFromImage($bmp) } catch { }
+    if ($p) { Set-TbStatus $S.Status "This picture has a hidden message$(if ([DevStego]::IsLocked($p)) { ' (locked with a password)' }) - press Read the message." 'ok' }
+    else { Set-TbStatus $S.Status "Picture loaded. It can hold about $($S.Capacity.ToString('N0')) bytes of message." }
+}
+
+function Update-StegoInfo($S) {
+    if (-not $S.PicInfo) { return }
+    $need = [Text.Encoding]::UTF8.GetByteCount($S.Secret.Text) + 9 + $(if ($S.Password.Text) { 80 } else { 0 })
+    $S.PicInfo.Text = if ($S.Image) { "$(Split-Path -Leaf $S.ImageName)  $($S.Image.Width) x $($S.Image.Height)  $Dot  room for $($S.Capacity.ToString('N0')) bytes, the message needs $need" } else { 'Open or drop a picture.' }
+    $S.PicInfo.ForeColor = if ($S.Image -and $need -gt $S.Capacity + 9) { $C.Red } else { $C.Dim }
+}
+
+function Invoke-StegoHide($S) {
+    $msg = $S.Secret.Text
+    if (-not $msg) { Set-TbStatus $S.Status 'Write the secret message first.' 'error'; return }
+    $payload = [DevStego]::Pack($msg, $S.Password.Text)
+    $lock = if ($S.Password.Text) { ', locked with your password' } else { '' }
+    try {
+        switch (Get-StegoKind $S) {
+            'picture' {
+                if (-not $S.Image) { Set-TbStatus $S.Status 'Open or paste a picture first.' 'error'; return }
+                $out = [DevStego]::HideInImage($S.Image, $payload)
+                $d = New-Object System.Windows.Forms.SaveFileDialog; $d.Filter = 'PNG picture|*.png'
+                $d.FileName = if ($S.ImageName -and (Test-Path -LiteralPath $S.ImageName)) { [IO.Path]::GetFileNameWithoutExtension($S.ImageName) + '-hidden.png' } else { 'picture-hidden.png' }
+                $script:Modal = $true
+                try { if ($d.ShowDialog($TbUI.Form) -ne 'OK') { $out.Dispose(); return }; $path = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
+                $out.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+                $S.Picture.Image = $null; $S.Image.Dispose(); $S.Image = $out; $S.ImageName = $path; $S.Picture.Image = $out
+                Update-StegoInfo $S
+                Set-TbStatus $S.Status "Hidden$lock and saved to $(Split-Path -Leaf $path) - it looks the same. Send the PNG file itself: apps that shrink or re-save pictures (most chats, JPEG) destroy the message." 'ok'
+            }
+            'text' {
+                $cover = [DevStego]::RemoveFromText($S.Cover.Text)
+                if (-not $cover.Trim()) { Set-TbStatus $S.Status 'Write the cover text first - the normal text people will see.' 'error'; return }
+                $S.Cover.Text = [DevStego]::HideInText($cover, $payload)
+                Copy-TbText $S.Cover.Text
+                Set-TbStatus $S.Status "Hidden$lock and copied - paste it anywhere; it looks like the cover text ($($payload.Length * 4) invisible characters inside)." 'ok'
+            }
+            'file' {
+                $src = $S.FilePath.Text.Trim().Trim('"')
+                if (-not $src -or -not (Test-Path -LiteralPath $src -PathType Leaf)) { Set-TbStatus $S.Status 'Pick a file first.' 'error'; return }
+                $d = New-Object System.Windows.Forms.SaveFileDialog; $d.Filter = 'All files|*.*'
+                $d.FileName = [IO.Path]::GetFileNameWithoutExtension($src) + '-hidden' + [IO.Path]::GetExtension($src)
+                $d.InitialDirectory = Split-Path -Parent $src
+                $script:Modal = $true
+                try { if ($d.ShowDialog($TbUI.Form) -ne 'OK') { return }; $path = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
+                [DevStego]::AppendToFile($src, $path, $payload)
+                Set-TbStatus $S.Status "Hidden$lock in $(Split-Path -Leaf $path); it still opens like the original." 'ok'
+            }
+        }
+    } catch {
+        $ex = $_.Exception; while ($ex.InnerException) { $ex = $ex.InnerException }
+        Set-TbStatus $S.Status $ex.Message 'error'
+    }
+}
+
+function Invoke-StegoReveal($S) {
+    try {
+        $p = switch (Get-StegoKind $S) {
+            'picture' { if (-not $S.Image) { Set-TbStatus $S.Status 'Open or paste the picture first.' 'error'; return }; [DevStego]::ReadFromImage($S.Image) }
+            'text'    { [DevStego]::ReadFromText($S.Cover.Text) }
+            'file'    { $f = $S.FilePath.Text.Trim().Trim('"'); if (-not $f -or -not (Test-Path -LiteralPath $f -PathType Leaf)) { Set-TbStatus $S.Status 'Pick the file first.' 'error'; return }; [DevStego]::ReadFromFile($f) }
+        }
+        $S.Secret.Text = [DevStego]::Unpack($p, $S.Password.Text)
+        Set-TbStatus $S.Status "Found the hidden message$(if ([DevStego]::IsLocked($p)) { ' (unlocked with the password)' })." 'ok'
+    } catch {
+        $ex = $_.Exception; while ($ex.InnerException) { $ex = $ex.InnerException }
+        Set-TbStatus $S.Status $ex.Message 'error'
+    }
+}
+
+function Invoke-StegoRemove($S) {
+    switch (Get-StegoKind $S) {
+        'text' { $S.Cover.Text = [DevStego]::RemoveFromText($S.Cover.Text); Set-TbStatus $S.Status 'Removed every invisible character from the text.' 'ok' }
+        'file' {
+            $f = $S.FilePath.Text.Trim().Trim('"')
+            if (-not $f -or -not (Test-Path -LiteralPath $f -PathType Leaf)) { Set-TbStatus $S.Status 'Pick the file first.' 'error'; return }
+            if ([System.Windows.Forms.MessageBox]::Show($TbUI.Form, "Remove the hidden message from $(Split-Path -Leaf $f)? The file is changed in place.", 'Hide text', 'YesNo', 'Question') -ne 'Yes') { return }
+            try { [DevStego]::RemoveFromFile($f); Set-TbStatus $S.Status 'Removed - the file is back to how it was.' 'ok' } catch { Set-TbStatus $S.Status $_.Exception.Message 'error' }
+        }
+        default { Set-TbStatus $S.Status 'A picture''s message is part of its pixels - open the original picture instead (or hide a new message over it).' }
     }
 }
 
