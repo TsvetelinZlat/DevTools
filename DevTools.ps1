@@ -10042,8 +10042,16 @@ function Show-ApiResponse($Resp) {
 # ---- curl import / code --------------------------------------------------------------------------
 
 function Import-ApiCurl([string]$Text) {
-    try { $curl = [PowerClipHttp]::ParseCurl($Text) }
+    try { $m = ConvertFrom-CurlCommand $Text }
     catch { $err = $_.Exception; while ($err.InnerException) { $err = $err.InnerException }; Set-ApiStatus "Couldn't read the curl command: $($err.Message)" $C.Red; return }
+    Set-ApiModel $m
+    Select-ApiTab $ApiUI.ReqTabs $(if ($m.BodyType -ne 'none') { 'Body' } elseif (@($m.Headers).Count) { 'Headers' } else { 'Params' })
+    Set-ApiStatus 'Imported from curl.' $C.Green
+}
+
+# A curl command as a request model (throws when it can't be read).
+function ConvertFrom-CurlCommand([string]$Text) {
+    $curl = [PowerClipHttp]::ParseCurl($Text)
     $m = New-ApiModel
     $m.Method = $curl.Method
     $m.Url = $curl.Url
@@ -10072,9 +10080,7 @@ function Import-ApiCurl([string]$Text) {
     if ($curl.Insecure) { $m.VerifySsl = $false }
     $m.Follow = $true
     if ($curl.TimeoutSec -gt 0) { $m.TimeoutSec = $curl.TimeoutSec }
-    Set-ApiModel $m
-    Select-ApiTab $ApiUI.ReqTabs $(if ($m.BodyType -ne 'none') { 'Body' } elseif ($headers.Count) { 'Headers' } else { 'Params' })
-    Set-ApiStatus 'Imported from curl.' $C.Green
+    $m
 }
 
 function Update-ApiCode {
@@ -11246,6 +11252,34 @@ function Get-PaletteModel([string]$Tag) {
     $null
 }
 
+# Something dropped on the canvas from another program: a link, a curl command, or chain files.
+function Add-ChainDrop($Data, [float]$X, [float]$Y) {
+    $cv = $ChainUI.Canvas
+    $cv.SelectedNode = $null
+    if ($Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
+        foreach ($f in [string[]]$Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)) {
+            $t = try { [IO.File]::ReadAllText($f) } catch { '' }
+            if ($t -match '"DevToolsChain"' -or $f -like '*.devchain.json') { [void](Import-ChainJson $t) }
+            elseif ($t.TrimStart() -match '^curl\s') { Add-ChainDrop (New-Object System.Windows.Forms.DataObject([System.Windows.Forms.DataFormats]::UnicodeText, $t)) $X $Y }
+            else { Set-ChainStatus "Can't use $(Split-Path -Leaf $f): drop a .devchain.json file, a link or a curl command." $C.Red }
+        }
+        return
+    }
+    $text = ([string]$Data.GetData([System.Windows.Forms.DataFormats]::UnicodeText)).Trim()
+    if ($text.StartsWith('devtools-chain:')) { Add-ChainFromPalette $text.Substring(15) $X $Y; return }
+    if ($text -match '"DevToolsChain"') { [void](Import-ChainJson $text); return }
+    if ($text -match '^curl\s') {
+        try { $m = ConvertFrom-CurlCommand $text } catch { Set-ChainStatus "Couldn't read that curl command." $C.Red; return }
+        $m.Name = ($m.Url -replace '^https?://[^/]+', '' -replace '\?.*$', ''); if (-not $m.Name) { $m.Name = 'From curl' }
+        [void](Add-ChainStep $m $X $Y); Set-ChainStatus 'Added a card from the curl command.' $C.Green; return
+    }
+    if ($text -match '^https?://\S+$') {
+        $m = New-ApiModel; $m.Method = 'GET'; $m.Url = $text
+        [void](Add-ChainStep $m $X $Y); Set-ChainStatus 'Added a GET card for the link.' $C.Green; return
+    }
+    Set-ChainStatus 'Drop a request from the list on the left, a link, a curl command or a .devchain.json file.' $C.Red
+}
+
 function Add-ChainFromPalette([string]$Tag, [float]$X = -1, [float]$Y = -1) {
     if ($Tag -like 'ex:*') { New-ChainFromExample $Tag.Substring(3); return }
     $t = Get-PaletteModel $Tag
@@ -11643,11 +11677,44 @@ function Show-ApiChains {
     $left.Dock = 'Left'; $left.Width = Px 260; $left.BackColor = $C.Panel
     $pal = New-Object System.Windows.Forms.TreeView
     $pal.Dock = 'Fill'; $pal.BorderStyle = 'None'; $pal.BackColor = $C.Panel; $pal.ForeColor = $C.Fore; $pal.ItemHeight = Px 26; $pal.ShowLines = $false; $pal.FullRowSelect = $true
-    $pal.add_ItemDrag({ param($src, $e) if ($e.Item.Tag) { [void]$src.DoDragDrop("devtools-chain:$($e.Item.Tag)", 'Copy') } })
+    $pal.add_MouseDown({
+        param($src, $e)
+        $ChainUI.PalDrag = $null
+        if ($e.Button -ne 'Left') { return }
+        $n = $src.GetNodeAt($e.Location)
+        if ($n -and $n.Tag) { $src.SelectedNode = $n; $ChainUI.PalDrag = @{ Tag = [string]$n.Tag; From = $e.Location; On = $false; Text = $n.Text } }
+    })
+    # the tree view reports a drag here (its MouseDown can come late); start DevTools' own drag
+    $pal.add_ItemDrag({ param($src, $e) if ($e.Item.Tag) { $src.SelectedNode = $e.Item; $ChainUI.PalDrag = @{ Tag = [string]$e.Item.Tag; From = $src.PointToClient([System.Windows.Forms.Cursor]::Position); On = $true; Text = $e.Item.Text }; $src.Capture = $true } })
+    $pal.add_MouseMove({
+        param($src, $e)
+        $d = $ChainUI.PalDrag
+        if (-not $d -or $e.Button -ne 'Left') { return }
+        if (-not $d.On -and ([Math]::Abs($e.X - $d.From.X) + [Math]::Abs($e.Y - $d.From.Y)) -gt (Px 6)) { $d.On = $true; $src.Capture = $true }
+        if ($d.On) {
+            $cv2 = $ChainUI.Canvas
+            $over = $cv2.ClientRectangle.Contains($cv2.PointToClient([System.Windows.Forms.Cursor]::Position))
+            $src.Cursor = if ($over) { [System.Windows.Forms.Cursors]::Hand } else { [System.Windows.Forms.Cursors]::No }
+            Set-ChainStatus $(if ($over) { "Release to add: $($d.Text)" } else { "Drag onto the canvas: $($d.Text)" }) $C.Accent
+        }
+    })
+    $pal.add_MouseUp({
+        param($src, $e)
+        $d = $ChainUI.PalDrag; $ChainUI.PalDrag = $null
+        $src.Cursor = [System.Windows.Forms.Cursors]::Default; $src.Capture = $false
+        if (-not $d -or -not $d.On) { return }
+        $cv2 = $ChainUI.Canvas
+        $pt = $cv2.PointToClient([System.Windows.Forms.Cursor]::Position)
+        if (-not $cv2.ClientRectangle.Contains($pt)) { Set-ChainStatus 'Not added - release it over the canvas (or double-click the item).' $C.Dim; return }
+        $p = $cv2.ToCanvas($pt)
+        $cv2.SelectedNode = $null             # dropping doesn't link by itself; drag the dot for that
+        Add-ChainFromPalette $d.Tag ($p.X - $cv2.NodeW / 2) ($p.Y - $cv2.NodeH / 2)
+        Set-ChainStatus "Added: $($d.Text)" $C.Green
+    })
     $pal.add_NodeMouseDoubleClick({ param($src, $e) if ($e.Node.Tag) { Add-ChainFromPalette ([string]$e.Node.Tag) } })
     $left.Controls.Add($pal)
     $lh = New-Object System.Windows.Forms.Label
-    $lh.Text = '  DRAG ONTO THE CANVAS'; $lh.Dock = 'Top'; $lh.Height = Px 30; $lh.TextAlign = 'MiddleLeft'; $lh.Font = $FontSmall; $lh.ForeColor = $C.Accent
+    $lh.Text = '  DRAG ONTO THE CANVAS (or double-click)'; $lh.Dock = 'Top'; $lh.Height = Px 30; $lh.TextAlign = 'MiddleLeft'; $lh.Font = $FontSmall; $lh.ForeColor = $C.Accent
     $left.Controls.Add($lh)
     $f.Controls.Add($left)
     $ChainUI.Palette = $pal
@@ -11656,14 +11723,12 @@ function Show-ApiChains {
     $cv = New-Object DevChainCanvas
     $cv.Dock = 'Fill'; $cv.UiScale = $Scale * $TextZoom; $cv.Font = $FontMain; $cv.AllowDrop = $true
     $cv.Back = $C.Bg; $cv.GridDot = $C.Line; $cv.Card = $C.Card; $cv.Fore = $C.Fore; $cv.Dim = $C.Dim; $cv.Line = $C.Line; $cv.Accent = $C.Accent; $cv.Green = $C.Green; $cv.Red = $C.Red; $cv.Yellow = $C.Yellow
-    $cv.add_DragEnter({ param($src, $e) $e.Effect = if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::UnicodeText) -and ([string]$e.Data.GetData([System.Windows.Forms.DataFormats]::UnicodeText)).StartsWith('devtools-chain:')) { 'Copy' } else { 'None' } })
+    $cv.add_DragEnter({ param($src, $e) $e.Effect = if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop) -or $e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::UnicodeText)) { [System.Windows.Forms.DragDropEffects]::Copy } else { [System.Windows.Forms.DragDropEffects]::None } })
+    $cv.add_DragOver({ param($src, $e) $e.Effect = if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop) -or $e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::UnicodeText)) { [System.Windows.Forms.DragDropEffects]::Copy } else { [System.Windows.Forms.DragDropEffects]::None } })
     $cv.add_DragDrop({
         param($src, $e)
-        $tag = ([string]$e.Data.GetData([System.Windows.Forms.DataFormats]::UnicodeText)).Substring(15)
         $p = $src.ToCanvas($src.PointToClient((New-Object System.Drawing.Point($e.X, $e.Y))))
-        $prev = $src.SelectedNode
-        $src.SelectedNode = $null            # dropping doesn't link by itself; drag the dot for that
-        Add-ChainFromPalette $tag ($p.X - $src.NodeW / 2) ($p.Y - $src.NodeH / 2)
+        Add-ChainDrop $e.Data ($p.X - $src.NodeW / 2) ($p.Y - $src.NodeH / 2)
     })
     $cv.add_SelectionChanged({ param($src, $e) Show-ChainStep $src.SelectedNode })
     $cv.add_Changed({ param($src, $e) Update-ChainOrder; Save-Chains })

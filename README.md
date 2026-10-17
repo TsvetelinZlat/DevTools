@@ -303,7 +303,7 @@ A Postman-style HTTP client. Open it with Ctrl+Shift+A in the picker, the right-
 
 Build a flow of requests on a canvas, for example: log in, then use the cookie or token in the next calls.
 
-- **Add cards**: drag a template (*Log in (JSON) -> {{token}}*, *Log in (form) -> session cookie*, *Request with Bearer {{token}}*, an empty request) or any saved request from the list on the left onto the canvas, or right-click the canvas. With a card selected, **Add request** adds the next one already linked.
+- **Add cards**: drag a template (*Log in (JSON) -> {{token}}*, *Log in (form) -> session cookie*, *Request with Bearer {{token}}*, an empty request) or any saved request from the list on the left onto the canvas (or double-click it), or right-click the canvas. You can also drop a link or a `curl` command (from a browser, an editor or a chat) to get a card for it, or a `.devchain.json` file to import a chain. With a card selected, **Add request** adds the next one already linked.
 - **Chain them**: drag from a card's blue dot (right side) to another card. The arrow means "runs after". Loops are refused. Click an arrow and press Del to remove it; Del on a card removes the card. Drag cards to move them, drag empty space to scroll, **Arrange** lines them up.
 - **Edit a card** on the right: name, method, URL, headers, body. **Open in API tester** edits everything (auth, params, form-data ...) and **Take from API tester** brings it back.
 - **Take from response**: save values into `{{variables}}` for the later steps - a JSON path (`$.token`, `$.data.items[0].id`), a response header, a cookie, a regex (first group), the status or the whole body.
