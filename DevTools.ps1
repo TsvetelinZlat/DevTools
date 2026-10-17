@@ -7503,7 +7503,7 @@ function Limit-FormToScreen($F) {
 }
 
 function Register-ThemedWindow($Window) {
-    $Window.add_Load({ param($src, $e) if ($src.WindowState -eq 'Normal' -and -not ($src -is [PowerClipToast])) { try { Limit-FormToScreen $src } catch { } } })
+    $Window.add_Load({ param($src, $e) if ($src.WindowState -eq 'Normal' -and $src.TopLevel -and -not ($src -is [PowerClipToast])) { try { Limit-FormToScreen $src } catch { } } })
     $Window.add_HandleCreated({ param($src, $e) [PowerClipTheme]::TitleBar($src.Handle, $script:IsDark) })
     $Window.add_Shown({ param($src, $e) Set-ControlTheme $src $null $script:IsDark })
     $Window.add_FormClosed({ param($src, $e) [void]$script:ThemedWindows.Remove($src) })
@@ -8440,10 +8440,18 @@ function Invoke-CompareNormalize($St) {
     if ($St.Status) { $St.Status.Text = 'Normalized  ' + ($done -join ';  ') + '   (only the view: your files and clips stay as they were)' }
 }
 
-function Show-Compare($Left = $null, $Right = $null) {
+function Show-Compare($Left = $null, $Right = $null, $HostPanel = $null) {
     $lt = if ($Left) { Get-CompareText $Left } else { '' }
     $rt = if ($Right) { Get-CompareText $Right } else { '' }
     if ($null -eq $lt -or $null -eq $rt) { Show-Message 'Only text clips and single text files can be compared.'; return }
+    if (-not $HostPanel) {          # the Text tab of a new Compare window
+        $h = Show-CompareHub ''
+        Select-ApiTab $h.Tabs 'Text'
+        $st = Show-Compare $Left $Right $h.Tabs.Panels['Text']
+        Add-CompareView $h 'Text' $st.Form; $h.TextState = $st; $st.Hub = $h
+        Update-CompareHubTitle $h
+        return $st
+    }
     Hide-Picker
 
     $st = @{
@@ -8463,6 +8471,7 @@ function Show-Compare($Left = $null, $Right = $null) {
     $cf.KeyPreview    = $true
     $cf.Tag           = $st
     $st.Form = $cf
+    $cf.TopLevel = $false; $cf.FormBorderStyle = 'None'; $cf.Dock = 'Fill'; $HostPanel.Controls.Add($cf)
 
     $view = New-Object PowerClipDiffView
     $view.UiScale = $Scale
@@ -8480,7 +8489,7 @@ function Show-Compare($Left = $null, $Right = $null) {
         $files = [string[]]$e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)
         if (-not $files) { return }
         $st = $src.FindForm().Tag
-        if ($files.Count -ge 2 -and (Test-Path -LiteralPath $files[0] -PathType Container) -and (Test-Path -LiteralPath $files[1] -PathType Container)) { Show-FolderCompare $files[0] $files[1]; return }
+        if ($files.Count -ge 2 -and $st.Hub -and (Get-CompareKind $files[0..1]) -ne 'Text') { Open-ComparePaths $st.Hub $files[0] $files[1]; return }   # folders, images, binaries
         if ($files.Count -ge 2) { Open-CompareFile $st 0 $files[0]; Open-CompareFile $st 1 $files[1]; return }
         $x = $src.PointToClient((New-Object System.Drawing.Point($e.X, $e.Y))).X
         Open-CompareFile $st $(if ($x -lt $src.ClientSize.Width / 2) { 0 } else { 1 }) $files[0]
@@ -8591,11 +8600,9 @@ function Show-Compare($Left = $null, $Right = $null) {
     Register-ThemedWindow $cf
 
     $cf.Show()
-    [PowerClipHost]::EnsureShown($cf.Handle)
     $view.SetText(0, $lt)
     $view.SetText(1, $rt)
     Update-CompareStatus $st
-    $cf.Activate()
     [void]$view.Focus()
     $st
 }
@@ -8622,12 +8629,359 @@ function Compare-Selected {
 $DirStatusText  = @('same', 'different', 'only left', 'only right', 'unreadable')
 $SkipFolderNames = @('.git', '.svn', '.hg', '.vs', 'node_modules', 'bin', 'obj')
 
-# Opens the Compare window with two files (either may be empty).
+# ---------------------------------------------------------------------------
+# Compare: one window with tabs for text, folders, images and any files (byte by byte).
+# Text and Folders are the existing compare windows, shown inside the tab (TopLevel = false).
+# ---------------------------------------------------------------------------
+$CompareImageExts = @('.png', '.jpg', '.jpeg', '.jfif', '.gif', '.bmp', '.dib', '.tif', '.tiff', '.ico', '.emf', '.wmf')
+
+function Show-CompareHub([string]$Tab = 'Text') {
+    Hide-Picker
+    $h = @{ Views = @{}; TextState = $null; FolderState = $null; ImageState = $null; FileState = $null }
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'Compare'; $f.Icon = $IconActive
+    $f.Size = New-Object System.Drawing.Size((Px 1180), (Px 780))
+    $f.MinimumSize = New-Object System.Drawing.Size((Px 640), (Px 400))
+    $f.StartPosition = 'CenterScreen'; $f.BackColor = $C.Panel; $f.ForeColor = $C.Fore; $f.Font = $FontMain; $f.KeyPreview = $true
+    $f.Tag = $h
+    $h.Form = $f
+    $set = New-TabSet $f
+    $set.Hub = $h
+    $h.Tabs = $set
+    foreach ($n in 'Text', 'Folders', 'Images', 'Files') {
+        [void](Add-ApiTab $set $n)
+        $set.Buttons[$n].add_Click({ param($src, $e) Open-CompareTab $src.Tag.Set.Hub $src.Tag.Name })
+    }
+    $tip = New-Object System.Windows.Forms.Label
+    $tip.AutoSize = $true; $tip.ForeColor = $C.Dim; $tip.Font = $FontSmall; $tip.Margin = New-Object System.Windows.Forms.Padding((Px 14), (Px 8), 0, 0)
+    $tip.Text = 'Files: any two files byte by byte (binaries, archives, executables ...). Drop two folders, images or files on any tab and the right tab opens.'
+    $set.Strip.Controls.Add($tip)
+    # closing: the text tab may ask to save its changes first
+    $f.add_FormClosing({
+        param($src, $e)
+        foreach ($v in @($src.Tag.Views.Values)) {
+            if ($v -is [System.Windows.Forms.Form] -and -not $v.IsDisposed) { $v.Close(); if (-not $v.IsDisposed) { $e.Cancel = $true; return } }
+        }
+    })
+    $f.add_FormClosed({
+        param($src, $e)
+        $hb = $src.Tag
+        foreach ($s in $hb.ImageState, $hb.FileState) { if ($s) { Close-CompareExtra $s } }
+        $src.Dispose()
+    })
+    Register-ThemedWindow $f
+    $f.Show()
+    [PowerClipHost]::EnsureShown($f.Handle)
+    $f.Activate()
+    if ($Tab) { Open-CompareTab $h $Tab }
+    $h
+}
+
+function Update-CompareHubTitle($H) {
+    if (-not $H -or $H.Form.IsDisposed) { return }
+    $v = $H.Views[$H.Tabs.Current]
+    $t = switch ($H.Tabs.Current) {
+        'Images' { if ($H.ImageState) { $H.ImageState.Title } }
+        'Files'  { if ($H.FileState) { $H.FileState.Title } }
+        default  { if ($v -is [System.Windows.Forms.Form]) { $v.Text -replace '^(Compare|Folder compare)\s*(-\s*)?', '' } }
+    }
+    $H.Form.Text = "Compare  -  $($H.Tabs.Current)$(if ($t) { "  -  $t" })"
+}
+
+# Shows a tab; its view is made the first time.
+function Open-CompareTab($H, [string]$Name) {
+    Select-ApiTab $H.Tabs $Name
+    if (-not $H.Views.ContainsKey($Name)) {
+        $panel = $H.Tabs.Panels[$Name]
+        switch ($Name) {
+            'Text'    { $st = Show-Compare $null $null $panel; Add-CompareView $H 'Text' $st.Form; $H.TextState = $st; $st.Hub = $H }
+            'Folders' { $st = Show-FolderCompare '' '' $panel; Add-CompareView $H 'Folders' $st.Form; $H.FolderState = $st; $st.Hub = $H }
+            'Images'  { $H.ImageState = New-ImageCompare $panel $H; $H.Views['Images'] = $H.ImageState.View }
+            'Files'   { $H.FileState = New-FileCompare $panel $H; $H.Views['Files'] = $H.FileState.View }
+        }
+    }
+    Update-CompareHubTitle $H
+}
+
+function Add-CompareView($H, [string]$Name, $Form) {
+    $H.Views[$Name] = $Form
+    $Form.add_TextChanged({ param($src, $e) $hb = $src.Tag.Hub; if ($hb) { Update-CompareHubTitle $hb } })
+}
+
+# What two paths are: Folders, Images, Text or Files (anything else, compared byte by byte).
+function Get-CompareKind([string[]]$Paths) {
+    $ps = @($Paths | Where-Object { $_ })
+    if (-not $ps) { return 'Text' }
+    if (@($ps | Where-Object { Test-Path -LiteralPath $_ -PathType Container }).Count -eq $ps.Count) { return 'Folders' }
+    if (@($ps | Where-Object { $CompareImageExts -contains ([IO.Path]::GetExtension($_).ToLowerInvariant()) }).Count -eq $ps.Count) { return 'Images' }
+    if (@($ps | Where-Object { Test-TextFile $_ }).Count -eq $ps.Count) { return 'Text' }
+    'Files'
+}
+
+# A file is text when its start has no zero bytes (UTF-16 with a byte order mark counts as text).
+function Test-TextFile([string]$Path) {
+    try {
+        $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        try { $buf = New-Object byte[] 8192; $n = $fs.Read($buf, 0, $buf.Length) } finally { $fs.Dispose() }
+    } catch { return $false }
+    if ($n -ge 2 -and (($buf[0] -eq 0xFF -and $buf[1] -eq 0xFE) -or ($buf[0] -eq 0xFE -and $buf[1] -eq 0xFF))) { return $true }
+    for ($i = 0; $i -lt $n; $i++) { if ($buf[$i] -eq 0) { return $false } }
+    $true
+}
+
+# Opens two paths (either may be empty) in the fitting tab of a Compare window.
+function Open-ComparePaths($H, [string]$A, [string]$B, [string]$Kind = '') {
+    if (-not $Kind) { $Kind = Get-CompareKind @($A, $B) }
+    Open-CompareTab $H $Kind
+    switch ($Kind) {
+        'Folders' { $s = $H.FolderState; $s.LeftBox.Text = $A; $s.RightBox.Text = $B; if ($A -and $B) { Start-FolderCompare $s } }
+        'Images'  { if ($A) { Set-ImageCompareSide $H.ImageState 0 $A }; if ($B) { Set-ImageCompareSide $H.ImageState 1 $B } }
+        'Text'    { if ($A) { Open-CompareFile $H.TextState 0 $A }; if ($B) { Open-CompareFile $H.TextState 1 $B } }
+        'Files'   { Set-FileCompare $H.FileState $A $B }
+    }
+}
+
+# Two files dropped on a view: both sides, or the side under the mouse.
+function Get-CompareDrop($Control, $E) {
+    $files = @([string[]]$E.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop))
+    if (-not $files) { return $null }
+    $x = $Control.PointToClient((New-Object System.Drawing.Point($E.X, $E.Y))).X
+    @{ Files = $files; Side = $(if ($x -lt $Control.ClientSize.Width / 2) { 0 } else { 1 }) }
+}
+
+function Close-CompareExtra($S) {
+    try { if ($S.Timer) { $S.Timer.Stop(); $S.Timer.Dispose() } } catch { }
+    try { if ($S.Job) { $S.Job.Cancel = $true } } catch { }
+    try { foreach ($b in $S.View.LeftImage, $S.View.RightImage, $S.View.DiffImage) { if ($b) { $b.Dispose() } } } catch { }
+}
+
+# ---- Images tab
+function New-ImageCompare($Panel, $H) {
+    $s = @{ Hub = $H; Names = @('', ''); Title = '' }
+    $v = New-Object DevImageCompareView
+    $v.Dock = 'Fill'; $v.UiScale = $Scale; $v.Font = $FontMain; $v.AllowDrop = $true
+    $v.Back = $C.Bg; $v.Fore = $C.Fore; $v.Dim = $C.Dim; $v.Line = $C.Line; $v.Accent = $C.Accent; $v.Red = $C.Red
+    $v.Tag = $s
+    $Panel.Controls.Add($v)
+    $s.View = $v
+    $v.add_DragEnter({ param($src, $e) $e.Effect = if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { 'Copy' } else { 'None' } })
+    $v.add_DragDrop({
+        param($src, $e)
+        $d = Get-CompareDrop $src $e; if (-not $d) { return }
+        $st = $src.Tag
+        if ($d.Files.Count -ge 2) {
+            if ((Get-CompareKind $d.Files[0..1]) -ne 'Images') { Open-ComparePaths $st.Hub $d.Files[0] $d.Files[1]; return }
+            Set-ImageCompareSide $st 0 $d.Files[0]; Set-ImageCompareSide $st 1 $d.Files[1]
+        } else { Set-ImageCompareSide $st $(if ($src.Mode -eq 0) { $d.Side } elseif (-not $src.LeftImage) { 0 } else { 1 }) $d.Files[0] }
+    })
+    $v.add_KeyDown({ param($src, $e) if ($e.Control -and $e.KeyCode -eq 'V') { Set-ImageCompareSide $src.Tag $(if (-not $src.LeftImage) { 0 } elseif (-not $src.RightImage) { 1 } else { 1 }) '' -Clipboard; $e.Handled = $true } })
+    $v.add_HoverChanged({ param($src, $e) Update-ImageCompareStatus $src.Tag })
+    $v.add_ViewChanged({ param($src, $e) Update-ImageCompareStatus $src.Tag })
+    $s.Status = New-Object System.Windows.Forms.Label
+    $s.Status.Dock = 'Bottom'; $s.Status.Height = $FontSmall.Height * 2 + (Px 10); $s.Status.ForeColor = $C.Dim; $s.Status.Font = $FontSmall
+    $s.Status.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 3), 0, 0)
+    $Panel.Controls.Add($s.Status)
+    $bar = New-TbBar $Panel
+    foreach ($side in 0, 1) {
+        $nm = @('Left', 'Right')[$side]
+        $b = New-Button "Open $($nm.ToLower())..." "Pick the $($nm.ToLower()) image" {
+            param($src, $e)
+            $dlg = New-Object System.Windows.Forms.OpenFileDialog
+            $dlg.Filter = 'Images|*.png;*.jpg;*.jpeg;*.jfif;*.gif;*.bmp;*.tif;*.tiff;*.ico;*.emf;*.wmf|All files|*.*'
+            $script:Modal = $true
+            try { if ($dlg.ShowDialog($src.FindForm()) -eq 'OK') { Set-ImageCompareSide $src.Tag.S $src.Tag.Side $dlg.FileName } } finally { $script:Modal = $false; $dlg.Dispose() }
+        } $bar $Glyph.Open 2
+        $b.Tag = @{ S = $s; Side = $side }
+        $b = New-Button "Paste $($nm.ToLower())" "Use the picture on the clipboard (e.g. a screenshot) as the $($nm.ToLower()) image" { param($src, $e) Set-ImageCompareSide $src.Tag.S $src.Tag.Side '' -Clipboard } $bar $Glyph.Paste 2
+        $b.Tag = @{ S = $s; Side = $side }
+    }
+    $b = New-Button 'Swap' 'Swap left and right' {
+        param($src, $e)
+        $st = $src.Tag; $v2 = $st.View
+        $t = $v2.LeftImage; $v2.LeftImage = $v2.RightImage; $v2.RightImage = $t; $st.Names = @($st.Names[1], $st.Names[0])
+        $v2.Recompute(); Update-ImageCompareStatus $st
+    } $bar $Glyph.Refresh 2; $b.Tag = $s
+    New-TbLabel $bar 'Show' -Dim | Out-Null
+    $s.ModeBox = New-TbCombo $bar @('Side by side', 'Difference (changed pixels in red)', 'Slider (drag the line)') 230
+    $s.ModeBox.Tag = $s
+    $s.ModeBox.add_SelectedIndexChanged({ param($src, $e) $src.Tag.View.Mode = $src.SelectedIndex; $src.Tag.View.Invalidate(); Update-ImageCompareStatus $src.Tag })
+    New-TbLabel $bar 'Tolerance' -Dim | Out-Null
+    $tb = New-Object System.Windows.Forms.TrackBar
+    $tb.Minimum = 0; $tb.Maximum = 64; $tb.TickStyle = 'None'; $tb.Width = Px 120; $tb.AutoSize = $false; $tb.Height = Px 28; $tb.BackColor = $C.Bg
+    $tb.Tag = $s
+    $tb.add_ValueChanged({ param($src, $e) $src.Tag.View.Tolerance = $src.Value; $src.Tag.View.Recompute(); Update-ImageCompareStatus $src.Tag })
+    $bar.Controls.Add($tb)
+    $s.TolBox = $tb
+    $b = New-Button 'Fit' 'Fit to the window (or double-click the picture)' { param($src, $e) $src.Tag.View.FitToWindow() } $bar '' 2; $b.Tag = $s
+    $b = New-Button '100%' 'Actual size' { param($src, $e) $src.Tag.View.ZoomTo(1) } $bar '' 2; $b.Tag = $s
+    Update-ImageCompareStatus $s
+    $s
+}
+
+# Loads a picture (from a file, or the clipboard) into one side.
+function Set-ImageCompareSide($S, [int]$Side, [string]$Path, [switch]$Clipboard) {
+    try {
+        if ($Clipboard) {
+            $img = [System.Windows.Forms.Clipboard]::GetImage()
+            if (-not $img) { $S.Status.Text = 'There is no picture on the clipboard.'; $S.Status.ForeColor = $C.Red; return }
+            $bmp = New-Object System.Drawing.Bitmap($img); $img.Dispose()
+            $name = "clipboard $((Get-Date).ToString('HH:mm:ss'))"
+        } else {
+            $bytes = [IO.File]::ReadAllBytes($Path)
+            $ms = New-Object IO.MemoryStream(, $bytes)
+            $img = [System.Drawing.Image]::FromStream($ms)
+            $bmp = New-Object System.Drawing.Bitmap($img); $img.Dispose(); $ms.Dispose()
+            $name = $Path
+        }
+    } catch { $S.Status.Text = "Can't open that as a picture: $($_.Exception.Message)"; $S.Status.ForeColor = $C.Red; return }
+    $v = $S.View
+    $old = if ($Side -eq 0) { $v.LeftImage } else { $v.RightImage }
+    if ($Side -eq 0) { $v.LeftImage = $bmp } else { $v.RightImage = $bmp }
+    if ($old) { $old.Dispose() }
+    $S.Names[$Side] = $name
+    $v.Recompute()
+    if ($v.LeftImage -and $v.RightImage -and $v.Mode -eq 0 -and $v.DiffPixels -gt 0) { $S.ModeBox.SelectedIndex = 1 }    # show where they differ
+    $v.FitToWindow()
+    Update-ImageCompareStatus $S
+}
+
+function Update-ImageCompareStatus($S) {
+    $v = $S.View
+    $parts = @()
+    foreach ($i in 0, 1) {
+        $b = if ($i -eq 0) { $v.LeftImage } else { $v.RightImage }
+        $n = if ($S.Names[$i]) { Split-Path -Leaf $S.Names[$i] } else { '' }
+        $parts += if ($b) { "$(@('Left', 'Right')[$i]): $n  $($b.Width) x $($b.Height)" } else { "$(@('Left', 'Right')[$i]): (none)" }
+    }
+    $line1 = $parts -join "      "
+    $res = ''; $color = $C.Dim
+    if ($v.LeftImage -and $v.RightImage) {
+        if ($v.DiffPixels -eq 0) { $res = "Identical$(if ($v.Tolerance) { " (tolerance $($v.Tolerance))" })"; $color = $C.Green }
+        else {
+            $pct = 100.0 * $v.DiffPixels / [Math]::Max(1, $v.TotalPixels)
+            $bb = $v.DiffBounds
+            $res = "$($v.DiffPixels.ToString('N0')) pixels differ ($('{0:0.###}' -f $pct)%)  in the area x $($bb.X), y $($bb.Y), $($bb.Width) x $($bb.Height)"
+            if ($v.LeftImage.Width -ne $v.RightImage.Width -or $v.LeftImage.Height -ne $v.RightImage.Height) { $res += '  -  the sizes differ' }
+            $color = $C.Red
+        }
+        $S.Title = "$(Split-Path -Leaf $S.Names[0])  <->  $(Split-Path -Leaf $S.Names[1])"
+    }
+    $zoom = "zoom $([int][Math]::Round($v.CurrentZoom * 100))%"
+    $S.Status.Text = "$line1`r`n$(if ($res) { "$res      " })$zoom$(if ($v.HoverText) { "      $($v.HoverText)" })"
+    $S.Status.ForeColor = $color
+    if ($S.Hub) { Update-CompareHubTitle $S.Hub }
+}
+
+# ---- Files tab: any two files, byte by byte
+function New-FileCompare($Panel, $H) {
+    $s = @{ Hub = $H; Paths = @('', ''); Job = $null; Title = ''; Ranges = @() }
+    $v = New-Object DevHexDiffView
+    $v.Dock = 'Fill'; $v.UiScale = $Scale; $v.Font = New-Object System.Drawing.Font('Consolas', (Fz 10)); $v.AllowDrop = $true
+    $v.Back = $C.Bg; $v.Fore = $C.Fore; $v.Dim = $C.Dim; $v.Line = $C.Line; $v.Accent = $C.Accent; $v.Red = $C.Red
+    $v.DiffBack = [PowerClipTheme]::Mix($C.Bg, $C.Red, 0.22)
+    $v.Tag = $s
+    $Panel.Controls.Add($v)
+    $s.View = $v
+    $v.add_DragEnter({ param($src, $e) $e.Effect = if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { 'Copy' } else { 'None' } })
+    $v.add_DragDrop({
+        param($src, $e)
+        $d = Get-CompareDrop $src $e; if (-not $d) { return }
+        $st = $src.Tag
+        if ($d.Files.Count -ge 2) { Set-FileCompare $st $d.Files[0] $d.Files[1] }
+        else { $p = @($st.Paths); $p[$d.Side] = $d.Files[0]; Set-FileCompare $st $p[0] $p[1] }
+    })
+    $s.Info = New-TbRtb -ReadOnly
+    $s.Info.Dock = 'Top'; $s.Info.Height = $s.Info.Font.Height * 6 + (Px 12); $s.Info.WordWrap = $true; $s.Info.ScrollBars = 'Vertical'
+    $Panel.Controls.Add($s.Info)
+    $bar = New-TbBar $Panel
+    foreach ($side in 0, 1) {
+        $nm = @('left', 'right')[$side]
+        $b = New-Button "Open $nm..." "Pick the $nm file (any kind)" {
+            param($src, $e)
+            $dlg = New-Object System.Windows.Forms.OpenFileDialog; $dlg.Filter = 'All files|*.*'
+            $script:Modal = $true
+            try { if ($dlg.ShowDialog($src.FindForm()) -eq 'OK') { $st = $src.Tag.S; $p = @($st.Paths); $p[$src.Tag.Side] = $dlg.FileName; Set-FileCompare $st $p[0] $p[1] } } finally { $script:Modal = $false; $dlg.Dispose() }
+        } $bar $Glyph.Open 2
+        $b.Tag = @{ S = $s; Side = $side }
+    }
+    $b = New-Button 'Swap' 'Swap left and right' { param($src, $e) $st = $src.Tag; Set-FileCompare $st $st.Paths[1] $st.Paths[0] } $bar $Glyph.Refresh 2; $b.Tag = $s
+    $b = New-Button 'Previous difference' 'Go to the previous place where they differ (Alt+Up)' { param($src, $e) Move-FileCompareDiff $src.Tag -1 } $bar '' 2; $b.Tag = $s
+    $b = New-Button 'Next difference' 'Go to the next place where they differ (Alt+Down)' { param($src, $e) Move-FileCompareDiff $src.Tag 1 } $bar '' 2; $b.Tag = $s
+    $b = New-Button 'Compare as text' 'Open both in the Text tab' { param($src, $e) $st = $src.Tag; Open-ComparePaths $st.Hub $st.Paths[0] $st.Paths[1] 'Text' } $bar $Glyph.Compare 2; $b.Tag = $s
+    $b = New-Button 'Copy summary' 'Copy sizes, SHA-256 hashes and the result' { param($src, $e) Copy-TbText $src.Tag.Info.Text } $bar $Glyph.Copy 2; $b.Tag = $s
+    $v.add_KeyDown({ param($src, $e) if ($e.Alt -and $e.KeyCode -eq 'Down') { Move-FileCompareDiff $src.Tag 1; $e.Handled = $true } elseif ($e.Alt -and $e.KeyCode -eq 'Up') { Move-FileCompareDiff $src.Tag -1; $e.Handled = $true } })
+    $s.Timer = New-Object System.Windows.Forms.Timer
+    $s.Timer.Interval = 150
+    $s.Timer.Tag = $s
+    $s.Timer.add_Tick({ param($src, $e) Update-FileCompareJob $src.Tag })
+    Update-FileCompareInfo $s
+    $s
+}
+
+function Set-FileCompare($S, [string]$A, [string]$B) {
+    if ($S.Job) { $S.Job.Cancel = $true; $S.Job = $null }
+    $S.Paths = @([string]$A, [string]$B); $S.Ranges = @()
+    try { $S.View.Open($A, $B) } catch { $S.Info.Text = "Can't open: $($_.Exception.Message)"; return }
+    if ($A -and $B) {
+        $j = New-Object DevBinCompare
+        $j.LeftPath = $A; $j.RightPath = $B
+        $S.Job = $j
+        $j.Start()
+        $S.Timer.Start()        # the timer shows the result (also when it's already done)
+    }
+    $S.Title = "$(if ($A) { Split-Path -Leaf $A } else { '?' })  <->  $(if ($B) { Split-Path -Leaf $B } else { '?' })"
+    Update-FileCompareInfo $S
+    if ($S.Hub) { Update-CompareHubTitle $S.Hub }
+}
+
+function Update-FileCompareJob($S) {
+    $j = $S.Job
+    if (-not $j) { $S.Timer.Stop(); return }
+    if ($j.Finished) {
+        $S.Timer.Stop()
+        $S.Ranges = @($j.RangesNow())
+        if ($S.Ranges.Count) { $S.View.GoTo($S.Ranges[0][0], $S.Ranges[0][1]); $S.Current = 0 }
+    }
+    Update-FileCompareInfo $S
+}
+
+function Update-FileCompareInfo($S) {
+    $r = $S.Info
+    $r.Clear()
+    foreach ($i in 0, 1) {
+        $p = $S.Paths[$i]
+        $len = if ($p -and (Test-Path -LiteralPath $p)) { (Get-Item -LiteralPath $p).Length } else { $null }
+        $hash = if ($S.Job -and $S.Job.Finished) { @($S.Job.LeftHash, $S.Job.RightHash)[$i] } else { '' }
+        $what = if ($p) { "$(Split-Path -Leaf $p)$(if ($null -ne $len) { "   $($len.ToString('N0')) bytes" })$(if ($hash) { "   SHA-256 $hash" })   in $(Split-Path -Parent $p)" } else { '(open a file, or drop one here)' }
+        Add-RtbLine $r "$(@('Left ', 'Right')[$i])  $what" $C.Fore
+    }
+    $j = $S.Job
+    if (-not $j) { Add-RtbLine $r 'Open two files of any kind: programs, archives, images, documents, databases ...' $C.Dim; return }
+    if (-not $j.Finished) {
+        $total = [Math]::Max($j.LeftLength, $j.RightLength)
+        Add-RtbLine $r "Comparing... $(if ($total) { [int](100 * $j.Done / $total) } else { 0 })%" $C.Dim; return
+    }
+    if ($j.Error) { Add-RtbLine $r "Error: $($j.Error)" $C.Red; return }
+    if ($j.DiffBytes -eq 0) { Add-RtbLine $r 'Identical: every byte is the same (same SHA-256).' $C.Green; return }
+    $sizeNote = if ($j.LeftLength -ne $j.RightLength) { "  The sizes differ by $([Math]::Abs($j.LeftLength - $j.RightLength).ToString('N0')) bytes." } else { '' }
+    $rs = @($j.RangesNow())
+    $places = "$($rs.Count.ToString('N0'))$(if ($j.RangesCut) { '+' })"
+    Add-RtbLine $r "Different: $($j.DiffBytes.ToString('N0')) bytes differ in $places place(s); the first at offset 0x$($rs[0][0].ToString('X')) ($($rs[0][0].ToString('N0'))).$sizeNote  Next / Previous difference (Alt+Down / Alt+Up) jumps between them." $C.Red
+}
+
+function Move-FileCompareDiff($S, [int]$Dir) {
+    if (-not $S.Ranges.Count) { return }
+    $i = if ($null -eq $S.Current) { 0 } else { $S.Current + $Dir }
+    $i = [Math]::Max(0, [Math]::Min($S.Ranges.Count - 1, $i))
+    $S.Current = $i
+    $S.View.GoTo($S.Ranges[$i][0], $S.Ranges[$i][1]); $S.View.Invalidate()
+    $S.Info.Select(0, 0)
+}
+
+# Opens two files (either may be empty) in a Compare window: text, images or byte by byte, whatever fits.
 function Show-CompareFiles([string]$LeftPath, [string]$RightPath) {
-    $st = Show-Compare
-    if (-not $st) { return }
-    if ($LeftPath) { Open-CompareFile $st 0 $LeftPath }
-    if ($RightPath) { Open-CompareFile $st 1 $RightPath }
+    $h = Show-CompareHub ''
+    Open-ComparePaths $h $LeftPath $RightPath
 }
 
 # A text box for a folder path, with a Browse button and folder drop support, in its own row.
@@ -8738,7 +9092,7 @@ function Open-FolderEntry($St, $Entry) {
     if (-not $Entry -or $Entry.IsDir) { return }
     $lp = if ($Entry.Status -ne 3) { Get-FolderSide $St $Entry 0 } else { $null }
     $rp = if ($Entry.Status -ne 2) { Get-FolderSide $St $Entry 1 } else { $null }
-    Show-CompareFiles $lp $rp
+    if ($St.Hub -and $lp -and $rp) { Open-ComparePaths $St.Hub $lp $rp } else { Show-CompareFiles $lp $rp }    # in this window's Text / Images / Files tab
 }
 
 # Copies a file or folder from one side to the other (overwriting), then compares again.
@@ -8764,7 +9118,15 @@ function Copy-FolderEntry($St, $Entry, [bool]$ToRight) {
     Start-FolderCompare $St
 }
 
-function Show-FolderCompare([string]$Left = '', [string]$Right = '') {
+function Show-FolderCompare([string]$Left = '', [string]$Right = '', $HostPanel = $null) {
+    if (-not $HostPanel) {          # the Folders tab of a new Compare window
+        $h = Show-CompareHub ''
+        Select-ApiTab $h.Tabs 'Folders'
+        $st = Show-FolderCompare $Left $Right $h.Tabs.Panels['Folders']
+        Add-CompareView $h 'Folders' $st.Form; $h.FolderState = $st; $st.Hub = $h
+        Update-CompareHubTitle $h
+        return
+    }
     Hide-Picker
     $st = @{ Job = $null }
 
@@ -8780,6 +9142,7 @@ function Show-FolderCompare([string]$Left = '', [string]$Right = '') {
     $ff.KeyPreview    = $true
     $ff.Tag           = $st
     $st.Form = $ff
+    $ff.TopLevel = $false; $ff.FormBorderStyle = 'None'; $ff.Dock = 'Fill'; $HostPanel.Controls.Add($ff)
 
     $tree = New-Object System.Windows.Forms.TreeView
     $tree.Dock = 'Fill'; $tree.BorderStyle = 'None'; $tree.BackColor = $C.Bg; $tree.ForeColor = $C.Fore
@@ -8902,9 +9265,8 @@ function Show-FolderCompare([string]$Left = '', [string]$Right = '') {
     Register-ThemedWindow $ff
 
     $ff.Show()
-    [PowerClipHost]::EnsureShown($ff.Handle)
-    $ff.Activate()
     if ($Left -and $Right) { Start-FolderCompare $st } else { [void]$st.LeftBox.Focus() }
+    $st
 }
 
 # ---------------------------------------------------------------------------
@@ -15104,8 +15466,10 @@ Register-PaletteCommand 'Notes' 'Ctrl+N in the picker' $Glyph.Notes { Show-Notes
 Register-PaletteCommand 'New note' '' $Glyph.Add { Show-Notes; [void](New-Note); $NoteUI.Title.Focus() }
 Register-PaletteCommand 'Snippets' '' $Glyph.Text { Show-Snippets } 'templates'
 Register-PaletteCommand 'New snippet' '' $Glyph.Add { New-Snippet } 'template'
-Register-PaletteCommand 'Compare text' 'Ctrl+D' $Glyph.Compare { Show-Compare } 'diff winmerge'
+Register-PaletteCommand 'Compare' 'Ctrl+D' $Glyph.Compare { Show-Compare } 'diff winmerge text folders images pictures binary hex files'
 Register-PaletteCommand 'Compare folders' '' $Glyph.Folder { Show-FolderCompare } 'diff directories'
+Register-PaletteCommand 'Compare images' '' $Glyph.Photo { [void](Show-CompareHub 'Images') } 'diff pictures screenshots pixels'
+Register-PaletteCommand 'Compare files byte by byte' '' $Glyph.Compare { [void](Show-CompareHub 'Files') } 'diff binary hex exe dll zip hash'
 Register-PaletteCommand 'Find in files' 'Ctrl+Shift+F' $Glyph.Search { Show-FindInFiles } 'grep search'
 Register-PaletteCommand 'Transform text' 'Ctrl+T' $Glyph.Code { [void](Show-Transform) } 'hex base64 hash aes encode decode'
 Register-PaletteCommand 'Network tools' 'Ctrl+Shift+N' $Glyph.Network { [void](Show-Network) } 'ping tcp nslookup dns traceroute'
@@ -16873,6 +17237,390 @@ public class DevTestApi {
             "GET  /status/{code} answers with that status\n" +
             "GET  /slow?ms=2000 answers after a delay\n" +
             "ANY  /echo         sends back what you sent: method, query, headers, cookies, body\n";
+    }
+}
+
+// Image compare: side by side (same zoom and position on both), difference (changed pixels in red over a faded
+// left image) or slider (drag the line to wipe between them). Wheel zooms, drag pans, double-click fits.
+public class DevImageCompareView : System.Windows.Forms.Control {
+    public System.Drawing.Bitmap LeftImage, RightImage, DiffImage;
+    public int Mode;                     // 0 side by side, 1 difference, 2 slider
+    public int Tolerance;                // 0..255 per channel
+    public long DiffPixels, TotalPixels;
+    public System.Drawing.Rectangle DiffBounds = System.Drawing.Rectangle.Empty;
+    public float Zoom = 1f;
+    public bool Fit = true;
+    public System.Drawing.PointF Pan;
+    public float Split = 0.5f;
+    public float UiScale = 1f;
+    public string HoverText = "";
+    public System.Drawing.Color Back = System.Drawing.Color.White, Fore = System.Drawing.Color.Black, Dim = System.Drawing.Color.Gray,
+        Line = System.Drawing.Color.Silver, Accent = System.Drawing.Color.RoyalBlue, Red = System.Drawing.Color.Red;
+    public event EventHandler ViewChanged, HoverChanged;
+
+    System.Drawing.Point last; bool dragging, splitDrag;
+
+    public DevImageCompareView() {
+        SetStyle(System.Windows.Forms.ControlStyles.AllPaintingInWmPaint | System.Windows.Forms.ControlStyles.OptimizedDoubleBuffer |
+                 System.Windows.Forms.ControlStyles.UserPaint | System.Windows.Forms.ControlStyles.ResizeRedraw | System.Windows.Forms.ControlStyles.Selectable, true);
+        TabStop = true;
+    }
+    float S(float v) { return v * UiScale; }
+    System.Drawing.Size Content { get {
+        int w = Math.Max(LeftImage != null ? LeftImage.Width : 0, RightImage != null ? RightImage.Width : 0), h = Math.Max(LeftImage != null ? LeftImage.Height : 0, RightImage != null ? RightImage.Height : 0);
+        return new System.Drawing.Size(Math.Max(1, w), Math.Max(1, h)); } }
+    // the area one image is drawn in (half the width when side by side)
+    System.Drawing.RectangleF Pane(int side) {
+        float pad = S(8);
+        if (Mode == 0) { float w = (Width - 3 * pad) / 2; return new System.Drawing.RectangleF(pad + side * (w + pad), pad, w, Height - 2 * pad); }
+        return new System.Drawing.RectangleF(pad, pad, Width - 2 * pad, Height - 2 * pad);
+    }
+    float FitZoom() { var c = Content; var p = Pane(0); return Math.Max(0.02f, Math.Min(8f, Math.Min(p.Width / c.Width, p.Height / c.Height))); }
+    float Z { get { return Fit ? FitZoom() : Zoom; } }
+    // top-left of the image inside a pane
+    System.Drawing.PointF Origin(int side) {
+        var p = Pane(side); var c = Content; float z = Z;
+        float ox = p.X + (p.Width - c.Width * z) / 2, oy = p.Y + (p.Height - c.Height * z) / 2;
+        if (!Fit) { ox += Pan.X; oy += Pan.Y; }
+        return new System.Drawing.PointF(ox, oy);
+    }
+
+    public void Recompute() {
+        if (DiffImage != null) { DiffImage.Dispose(); DiffImage = null; }
+        DiffPixels = 0; TotalPixels = 0; DiffBounds = System.Drawing.Rectangle.Empty;
+        if (LeftImage == null || RightImage == null) { Invalidate(); return; }
+        var c = Content;
+        int[] a = Pixels(LeftImage, c), b = Pixels(RightImage, c);
+        int[] d = new int[c.Width * c.Height];
+        int minX = int.MaxValue, minY = int.MaxValue, maxX = -1, maxY = -1;
+        int red = unchecked((int)0xFFFF2020);
+        for (int y = 0; y < c.Height; y++) {
+            bool inL = y < LeftImage.Height, inR = y < RightImage.Height;
+            for (int x = 0; x < c.Width; x++) {
+                int i = y * c.Width + x;
+                bool diff;
+                bool hasL = inL && x < LeftImage.Width, hasR = inR && x < RightImage.Width;
+                if (hasL != hasR) diff = true;
+                else if (!hasL) diff = false;
+                else {
+                    int p = a[i], q = b[i];
+                    if (p == q) diff = false;
+                    else {
+                        int m = 0;
+                        for (int sh = 0; sh < 32; sh += 8) { int dv = Math.Abs(((p >> sh) & 255) - ((q >> sh) & 255)); if (dv > m) m = dv; }
+                        diff = m > Tolerance;
+                    }
+                }
+                if (diff) { d[i] = red; DiffPixels++; if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
+            }
+        }
+        TotalPixels = (long)c.Width * c.Height;
+        if (maxX >= 0) DiffBounds = new System.Drawing.Rectangle(minX, minY, maxX - minX + 1, maxY - minY + 1);
+        DiffImage = new System.Drawing.Bitmap(c.Width, c.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        var bd = DiffImage.LockBits(new System.Drawing.Rectangle(0, 0, c.Width, c.Height), System.Drawing.Imaging.ImageLockMode.WriteOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        try { for (int y = 0; y < c.Height; y++) System.Runtime.InteropServices.Marshal.Copy(d, y * c.Width, bd.Scan0 + y * bd.Stride, c.Width); }
+        finally { DiffImage.UnlockBits(bd); }
+        Invalidate();
+    }
+
+    // the image as ARGB ints on a canvas of the given size (outside = 0)
+    static int[] Pixels(System.Drawing.Bitmap src, System.Drawing.Size c) {
+        using (var bmp = new System.Drawing.Bitmap(c.Width, c.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb)) {
+            using (var g = System.Drawing.Graphics.FromImage(bmp)) { g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy; g.DrawImage(src, new System.Drawing.Rectangle(0, 0, src.Width, src.Height)); }
+            var r = new int[c.Width * c.Height];
+            var bd = bmp.LockBits(new System.Drawing.Rectangle(0, 0, c.Width, c.Height), System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            try { for (int y = 0; y < c.Height; y++) System.Runtime.InteropServices.Marshal.Copy(bd.Scan0 + y * bd.Stride, r, y * c.Width, c.Width); }
+            finally { bmp.UnlockBits(bd); }
+            return r;
+        }
+    }
+
+    public void ZoomTo(float z) { var c = new System.Drawing.Point(Width / 2, Height / 2); ZoomAt(z, c); }
+    void ZoomAt(float z, System.Drawing.Point at) {
+        float old = Z;
+        z = Math.Max(0.02f, Math.Min(32f, z));
+        int side = Mode == 0 && at.X > Width / 2 ? 1 : 0;
+        var o = Origin(side);
+        float ix = (at.X - o.X) / old, iy = (at.Y - o.Y) / old;      // image point under the mouse
+        Fit = false; Zoom = z; Pan = new System.Drawing.PointF(0, 0);
+        var o2 = Origin(side);
+        Pan = new System.Drawing.PointF(at.X - ix * z - o2.X, at.Y - iy * z - o2.Y);
+        Invalidate(); if (ViewChanged != null) ViewChanged(this, EventArgs.Empty);
+    }
+    public void FitToWindow() { Fit = true; Pan = new System.Drawing.PointF(0, 0); Invalidate(); if (ViewChanged != null) ViewChanged(this, EventArgs.Empty); }
+    public float CurrentZoom { get { return Z; } }
+
+    float SplitX { get { var p = Pane(0); return p.X + p.Width * Split; } }
+
+    protected override void OnMouseDown(System.Windows.Forms.MouseEventArgs e) {
+        base.OnMouseDown(e); Focus();
+        last = e.Location;
+        if (e.Button == System.Windows.Forms.MouseButtons.Left && Mode == 2 && Math.Abs(e.X - SplitX) < S(10)) splitDrag = true;
+        else if (e.Button == System.Windows.Forms.MouseButtons.Left || e.Button == System.Windows.Forms.MouseButtons.Middle) dragging = true;
+    }
+    protected override void OnMouseMove(System.Windows.Forms.MouseEventArgs e) {
+        base.OnMouseMove(e);
+        if (splitDrag) { var p = Pane(0); Split = Math.Max(0f, Math.Min(1f, (e.X - p.X) / p.Width)); Invalidate(); }
+        else if (dragging) {
+            if (Fit) { Zoom = FitZoom(); var o = Origin(0); Fit = false; Pan = new System.Drawing.PointF(0, 0); var o2 = Origin(0); Pan = new System.Drawing.PointF(o.X - o2.X, o.Y - o2.Y); }
+            Pan = new System.Drawing.PointF(Pan.X + e.X - last.X, Pan.Y + e.Y - last.Y); last = e.Location; Invalidate();
+        }
+        Cursor = Mode == 2 && Math.Abs(e.X - SplitX) < S(10) ? System.Windows.Forms.Cursors.SizeWE : System.Windows.Forms.Cursors.Default;
+        // pixel under the mouse, on both images
+        int side = Mode == 0 && e.X > Width / 2 ? 1 : 0;
+        var org = Origin(side); float z = Z;
+        int px = (int)Math.Floor((e.X - org.X) / z), py = (int)Math.Floor((e.Y - org.Y) / z);
+        string t = "";
+        if (px >= 0 && py >= 0 && px < Content.Width && py < Content.Height) {
+            t = "x " + px + ", y " + py + "   left " + Px(LeftImage, px, py) + "   right " + Px(RightImage, px, py);
+        }
+        if (t != HoverText) { HoverText = t; if (HoverChanged != null) HoverChanged(this, EventArgs.Empty); }
+    }
+    static string Px(System.Drawing.Bitmap b, int x, int y) {
+        if (b == null || x >= b.Width || y >= b.Height) return "(none)";
+        var c = b.GetPixel(x, y);
+        return "#" + c.R.ToString("X2") + c.G.ToString("X2") + c.B.ToString("X2") + (c.A < 255 ? " a" + c.A : "");
+    }
+    protected override void OnMouseUp(System.Windows.Forms.MouseEventArgs e) { base.OnMouseUp(e); dragging = false; splitDrag = false; }
+    protected override void OnMouseWheel(System.Windows.Forms.MouseEventArgs e) { base.OnMouseWheel(e); ZoomAt(Z * (float)Math.Pow(1.2, e.Delta / 120.0), e.Location); }
+    protected override void OnMouseDoubleClick(System.Windows.Forms.MouseEventArgs e) { base.OnMouseDoubleClick(e); FitToWindow(); }
+
+    void DrawImg(System.Drawing.Graphics g, System.Drawing.Bitmap b, int side, float alpha) {
+        if (b == null) return;
+        var o = Origin(side); float z = Z;
+        var dest = new System.Drawing.RectangleF(o.X, o.Y, b.Width * z, b.Height * z);
+        g.InterpolationMode = z >= 2 ? System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor : System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+        g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
+        if (alpha >= 1f) { g.DrawImage(b, dest); return; }
+        var cm = new System.Drawing.Imaging.ColorMatrix(); cm.Matrix33 = alpha;
+        using (var ia = new System.Drawing.Imaging.ImageAttributes()) {
+            ia.SetColorMatrix(cm);
+            g.DrawImage(b, new[] { dest.Location, new System.Drawing.PointF(dest.Right, dest.Top), new System.Drawing.PointF(dest.Left, dest.Bottom) },
+                new System.Drawing.RectangleF(0, 0, b.Width, b.Height), System.Drawing.GraphicsUnit.Pixel, ia);
+        }
+    }
+    void Checker(System.Drawing.Graphics g, System.Drawing.RectangleF r) {
+        float s = S(8);
+        using (var a = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(40, 128, 128, 128)))
+            for (float y = r.Top; y < r.Bottom; y += s) for (float x = r.Left; x < r.Right; x += s)
+                if (((int)((x - r.Left) / s) + (int)((y - r.Top) / s)) % 2 == 0) g.FillRectangle(a, x, y, Math.Min(s, r.Right - x), Math.Min(s, r.Bottom - y));
+    }
+    void Hint(System.Drawing.Graphics g, System.Drawing.RectangleF r, string text) {
+        using (var br = new System.Drawing.SolidBrush(Dim)) {
+            var sf = new System.Drawing.StringFormat { Alignment = System.Drawing.StringAlignment.Center, LineAlignment = System.Drawing.StringAlignment.Center };
+            g.DrawString(text, Font, br, r, sf);
+        }
+    }
+
+    protected override void OnPaint(System.Windows.Forms.PaintEventArgs e) {
+        var g = e.Graphics;
+        g.Clear(Back);
+        var c = Content; float z = Z;
+        if (Mode == 0) {
+            for (int side = 0; side < 2; side++) {
+                var p = Pane(side);
+                var b = side == 0 ? LeftImage : RightImage;
+                var st = g.Save();
+                g.SetClip(p);
+                if (b == null) Hint(g, p, (side == 0 ? "Left" : "Right") + " image: Open..., paste (Ctrl+V) or drop a file here");
+                else { var o = Origin(side); Checker(g, new System.Drawing.RectangleF(o.X, o.Y, b.Width * z, b.Height * z)); DrawImg(g, b, side, 1f); }
+                g.Restore(st);
+                using (var pen = new System.Drawing.Pen(Line)) g.DrawRectangle(pen, p.X, p.Y, p.Width - 1, p.Height - 1);
+            }
+            return;
+        }
+        var pane = Pane(0);
+        if (LeftImage == null || RightImage == null) { Hint(g, pane, "Open two images to compare them (Open..., paste with Ctrl+V, or drop two files)"); return; }
+        var o0 = Origin(0);
+        Checker(g, new System.Drawing.RectangleF(o0.X, o0.Y, c.Width * z, c.Height * z));
+        if (Mode == 1) {
+            DrawImg(g, LeftImage, 0, 0.3f);
+            if (DiffImage != null) {
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor; g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
+                g.DrawImage(DiffImage, new System.Drawing.RectangleF(o0.X, o0.Y, c.Width * z, c.Height * z));
+            }
+            if (!DiffBounds.IsEmpty) using (var pen = new System.Drawing.Pen(Accent, S(1.5f)) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dash })
+                g.DrawRectangle(pen, o0.X + DiffBounds.X * z - S(3), o0.Y + DiffBounds.Y * z - S(3), DiffBounds.Width * z + S(6), DiffBounds.Height * z + S(6));
+        } else {
+            DrawImg(g, RightImage, 0, 1f);
+            float sx = SplitX;
+            var st = g.Save();
+            g.SetClip(new System.Drawing.RectangleF(pane.X, pane.Y, sx - pane.X, pane.Height));
+            DrawImg(g, LeftImage, 0, 1f);
+            g.Restore(st);
+            using (var pen = new System.Drawing.Pen(Accent, S(2))) g.DrawLine(pen, sx, pane.Y, sx, pane.Bottom);
+            using (var br = new System.Drawing.SolidBrush(Accent)) g.FillEllipse(br, sx - S(7), pane.Y + pane.Height / 2 - S(7), S(14), S(14));
+            using (var f = new System.Drawing.Font(Font.FontFamily, Font.Size * 0.85f)) using (var br = new System.Drawing.SolidBrush(Fore)) {
+                g.DrawString("left", f, br, sx - S(36), pane.Y + S(4)); g.DrawString("right", f, br, sx + S(6), pane.Y + S(4));
+            }
+        }
+    }
+}
+
+// Byte-by-byte compare of two files of any kind, on a background thread: hashes, the differing ranges.
+public class DevBinCompare {
+    public string LeftPath, RightPath;
+    public long LeftLength, RightLength, DiffBytes, Done;
+    public string LeftHash = "", RightHash = "", Error = "";
+    public List<long[]> Ranges = new List<long[]>();      // { start, length }
+    public bool Finished, Cancel, RangesCut;
+    public int MaxRanges = 100000;
+
+    public void Start() { var t = new System.Threading.Thread(Run); t.IsBackground = true; t.Start(); }
+
+    void Run() {
+        try {
+            using (var a = new System.IO.FileStream(LeftPath, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete, 1 << 16))
+            using (var b = new System.IO.FileStream(RightPath, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete, 1 << 16))
+            using (var ha = System.Security.Cryptography.SHA256.Create())
+            using (var hb = System.Security.Cryptography.SHA256.Create()) {
+                LeftLength = a.Length; RightLength = b.Length;
+                var ba = new byte[1 << 20]; var bb = new byte[1 << 20];
+                long pos = 0; long runStart = -1;
+                while (!Cancel) {
+                    int na = Fill(a, ba), nb = Fill(b, bb);
+                    if (na == 0 && nb == 0) break;
+                    if (na > 0) ha.TransformBlock(ba, 0, na, null, 0);
+                    if (nb > 0) hb.TransformBlock(bb, 0, nb, null, 0);
+                    int n = Math.Max(na, nb);
+                    for (int i = 0; i < n; i++) {
+                        bool diff = i >= na || i >= nb || ba[i] != bb[i];
+                        if (diff) { DiffBytes++; if (runStart < 0) runStart = pos + i; }
+                        else if (runStart >= 0) { AddRange(runStart, pos + i - runStart); runStart = -1; }
+                    }
+                    pos += n; Done = pos;
+                }
+                if (runStart >= 0) AddRange(runStart, pos - runStart);
+                ha.TransformFinalBlock(new byte[0], 0, 0); hb.TransformFinalBlock(new byte[0], 0, 0);
+                LeftHash = BitConverter.ToString(ha.Hash).Replace("-", ""); RightHash = BitConverter.ToString(hb.Hash).Replace("-", "");
+            }
+        } catch (Exception ex) { Error = ex.Message; }
+        Finished = true;
+    }
+    static int Fill(System.IO.Stream s, byte[] buf) { int got = 0; while (got < buf.Length) { int r = s.Read(buf, got, buf.Length - got); if (r <= 0) break; got += r; } return got; }
+    void AddRange(long start, long len) {
+        lock (Ranges) { if (Ranges.Count < MaxRanges) Ranges.Add(new long[] { start, len }); else RangesCut = true; }
+    }
+    public long[][] RangesNow() { lock (Ranges) return Ranges.ToArray(); }
+}
+
+// Two files as hex side by side (16 bytes a row); bytes that differ are marked. Reads only the rows on screen.
+public class DevHexDiffView : System.Windows.Forms.Control {
+    System.IO.FileStream fa, fb;
+    long lenA, lenB;
+    System.Windows.Forms.VScrollBar bar = new System.Windows.Forms.VScrollBar();
+    public float UiScale = 1f;
+    public long MarkStart = -1, MarkLength;
+    public System.Drawing.Color Back = System.Drawing.Color.White, Fore = System.Drawing.Color.Black, Dim = System.Drawing.Color.Gray,
+        Line = System.Drawing.Color.Silver, Accent = System.Drawing.Color.RoyalBlue, Red = System.Drawing.Color.Red, DiffBack = System.Drawing.Color.MistyRose;
+    public event EventHandler Scrolled;
+
+    public DevHexDiffView() {
+        SetStyle(System.Windows.Forms.ControlStyles.AllPaintingInWmPaint | System.Windows.Forms.ControlStyles.OptimizedDoubleBuffer |
+                 System.Windows.Forms.ControlStyles.UserPaint | System.Windows.Forms.ControlStyles.ResizeRedraw | System.Windows.Forms.ControlStyles.Selectable, true);
+        bar.Dock = System.Windows.Forms.DockStyle.Right;
+        bar.Scroll += (s, e) => { Invalidate(); if (Scrolled != null) Scrolled(this, EventArgs.Empty); };
+        Controls.Add(bar);
+        TabStop = true;
+    }
+    float S(float v) { return v * UiScale; }
+    long Rows { get { return (Math.Max(lenA, lenB) + 15) / 16; } }
+    int RowH { get { return Font.Height + 2; } }
+    int VisibleRows { get { return Math.Max(1, (Height - RowH - 4) / RowH); } }
+    public long TopRow { get { return bar.Value; } }
+
+    public void Open(string a, string b) {
+        Close();
+        if (!string.IsNullOrEmpty(a)) { fa = new System.IO.FileStream(a, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete); lenA = fa.Length; }
+        if (!string.IsNullOrEmpty(b)) { fb = new System.IO.FileStream(b, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete); lenB = fb.Length; }
+        bar.Value = 0; UpdateBar(); Invalidate();
+    }
+    public void Close() { if (fa != null) fa.Dispose(); if (fb != null) fb.Dispose(); fa = fb = null; lenA = lenB = 0; MarkStart = -1; }
+    protected override void Dispose(bool disposing) { if (disposing) Close(); base.Dispose(disposing); }
+    void UpdateBar() {
+        long rows = Rows;
+        bar.Minimum = 0; bar.LargeChange = VisibleRows; bar.SmallChange = 1;
+        bar.Maximum = (int)Math.Min(int.MaxValue - 1, Math.Max(0, rows - 1));
+        bar.Enabled = rows > VisibleRows;
+    }
+    protected override void OnResize(EventArgs e) { base.OnResize(e); UpdateBar(); }
+    protected override void OnMouseWheel(System.Windows.Forms.MouseEventArgs e) { base.OnMouseWheel(e); ScrollTo(bar.Value - e.Delta / 120 * 3); }
+    protected override void OnMouseDown(System.Windows.Forms.MouseEventArgs e) { base.OnMouseDown(e); Focus(); }
+    protected override bool IsInputKey(System.Windows.Forms.Keys k) { return k == System.Windows.Forms.Keys.Up || k == System.Windows.Forms.Keys.Down || base.IsInputKey(k); }
+    protected override void OnKeyDown(System.Windows.Forms.KeyEventArgs e) {
+        base.OnKeyDown(e);
+        switch (e.KeyCode) {
+            case System.Windows.Forms.Keys.Down: ScrollTo(bar.Value + 1); break;
+            case System.Windows.Forms.Keys.Up: ScrollTo(bar.Value - 1); break;
+            case System.Windows.Forms.Keys.PageDown: ScrollTo(bar.Value + VisibleRows); break;
+            case System.Windows.Forms.Keys.PageUp: ScrollTo(bar.Value - VisibleRows); break;
+            case System.Windows.Forms.Keys.Home: if (e.Control) ScrollTo(0); break;
+            case System.Windows.Forms.Keys.End: if (e.Control) ScrollTo(int.MaxValue); break;
+        }
+    }
+    public void ScrollTo(long row) {
+        long max = Math.Max(0, Math.Min((long)bar.Maximum, Rows - VisibleRows + 1));
+        bar.Value = (int)Math.Max(0, Math.Min(max, row)); Invalidate();
+        if (Scrolled != null) Scrolled(this, EventArgs.Empty);
+    }
+    // shows the byte at offset a few rows from the top and marks the range
+    public void GoTo(long offset, long length) { MarkStart = offset; MarkLength = length; ScrollTo(offset / 16 - 2); }
+
+    static int Read(System.IO.FileStream f, long len, long pos, byte[] buf) {
+        if (f == null || pos >= len) return 0;
+        f.Position = pos; int got = 0, want = (int)Math.Min(buf.Length, len - pos);
+        while (got < want) { int r = f.Read(buf, got, want - got); if (r <= 0) break; got += r; }
+        return got;
+    }
+
+    protected override void OnPaint(System.Windows.Forms.PaintEventArgs e) {
+        var g = e.Graphics;
+        g.Clear(Back);
+        if (fa == null && fb == null) {
+            using (var br = new System.Drawing.SolidBrush(Dim)) g.DrawString("Open two files of any kind (or drop them here) to compare them byte by byte.", Font, br, S(10), S(10));
+            return;
+        }
+        var flags = System.Windows.Forms.TextFormatFlags.NoPadding | System.Windows.Forms.TextFormatFlags.NoPrefix;
+        int cw = System.Windows.Forms.TextRenderer.MeasureText(g, "0000000000", Font, System.Drawing.Size.Empty, flags).Width / 10;
+        int rh = RowH;
+        int xOff = (int)S(8), xA = xOff + cw * 12, colW = cw * 3, asciiW = cw * 17;
+        bool ascii = xA + 2 * (colW * 16 + cw + asciiW) + cw * 2 <= ClientSize.Width - bar.Width;   // the text columns only when they fit
+        if (!ascii) asciiW = 0;
+        int xAa = xA + colW * 16 + cw, xB = xAa + asciiW + cw * 2, xBa = xB + colW * 16 + cw;
+        // header
+        System.Windows.Forms.TextRenderer.DrawText(g, "offset", Font, new System.Drawing.Point(xOff, 2), Dim, flags);
+        System.Windows.Forms.TextRenderer.DrawText(g, "left  (" + lenA.ToString("N0") + " bytes)", Font, new System.Drawing.Point(xA, 2), Dim, flags);
+        System.Windows.Forms.TextRenderer.DrawText(g, "right  (" + lenB.ToString("N0") + " bytes)", Font, new System.Drawing.Point(xB, 2), Dim, flags);
+        using (var pen = new System.Drawing.Pen(Line)) { g.DrawLine(pen, 0, rh + 2, Width, rh + 2); g.DrawLine(pen, xB - cw, 0, xB - cw, Height); }
+        var a = new byte[16]; var b = new byte[16];
+        using (var diffBr = new System.Drawing.SolidBrush(DiffBack))
+        using (var markBr = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(60, Accent))) {
+            for (int r = 0; r < VisibleRows; r++) {
+                long row = TopRow + r;
+                if (row >= Rows) break;
+                long pos = row * 16;
+                int na = Read(fa, lenA, pos, a), nb = Read(fb, lenB, pos, b);
+                int y = rh + 4 + r * rh;
+                if (MarkStart >= 0 && pos + 16 > MarkStart && pos < MarkStart + MarkLength) g.FillRectangle(markBr, 0, y, Width, rh);
+                System.Windows.Forms.TextRenderer.DrawText(g, pos.ToString("X10"), Font, new System.Drawing.Point(xOff, y), Dim, flags);
+                for (int i = 0; i < 16; i++) {
+                    bool hasA = i < na, hasB = i < nb;
+                    if (!hasA && !hasB) break;
+                    bool diff = hasA != hasB || a[i] != b[i];
+                    for (int side = 0; side < 2; side++) {
+                        bool has = side == 0 ? hasA : hasB; byte v = side == 0 ? a[i] : b[i];
+                        int hx = (side == 0 ? xA : xB) + i * colW, ax = (side == 0 ? xAa : xBa) + i * cw;
+                        if (diff) { g.FillRectangle(diffBr, hx - 1, y, colW - cw + 2, rh); if (ascii) g.FillRectangle(diffBr, ax, y, cw, rh); }
+                        if (!has) continue;
+                        var col = diff ? Red : Fore;
+                        System.Windows.Forms.TextRenderer.DrawText(g, v.ToString("X2"), Font, new System.Drawing.Point(hx, y), col, flags);
+                        if (!ascii) continue;
+                        char ch = v >= 32 && v < 127 ? (char)v : '.';
+                        System.Windows.Forms.TextRenderer.DrawText(g, ch.ToString(), Font, new System.Drawing.Point(ax, y), diff ? Red : Dim, flags);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -23087,8 +23835,7 @@ $btnClear  = New-Button 'Clear all' 'Delete all clips except the pinned ones'  {
 
 # Header: every tool is one click away (each also has a keyboard shortcut)
 $btnNotes     = New-IconButton $Glyph.Notes    'Notes'   'Notes  (Ctrl+N)'                                    { Hide-Picker; Show-Notes } $tools
-$btnDiff      = New-IconButton $Glyph.Compare  'Diff'    'Compare text  (Ctrl+D)  -  select two clips first to compare them' { Compare-Selected } $tools
-$btnFolders   = New-IconButton $Glyph.Folder   'Folders' 'Compare folders'                                    { Show-FolderCompare } $tools
+$btnDiff      = New-IconButton $Glyph.Compare  'Compare' 'Compare  (Ctrl+D): text, folders, images or any files  -  select two clips first to compare them' { Compare-Selected } $tools
 $btnFind      = New-IconButton $Glyph.Search   'Find'    'Find in files  (Ctrl+Shift+F)'                      { Show-FindInFiles } $tools
 $btnTransform = New-IconButton $Glyph.Code     'Hex'     'Transform text: hex, Base64, hashes, AES ...  (Ctrl+T)' { Open-TransformFromPicker } $tools
 $btnNetwork   = New-IconButton $Glyph.Network  'Net'     'Network tools: ping, TCP port test, nslookup  (Ctrl+Shift+N)' { Open-NetworkFromPicker } $tools
@@ -23397,8 +24144,7 @@ $miOpen = Add-MenuItem $trayMenu 'Open DevTools' { Show-Picker } $Glyph.Paste 'C
 $miOpen.Font = New-Object System.Drawing.Font($miOpen.Font, [System.Drawing.FontStyle]::Bold)
 [void]$trayMenu.Items.Add('-')
 [void](Add-MenuItem $trayMenu 'Notes' { Show-Notes } $Glyph.Notes)
-[void](Add-MenuItem $trayMenu 'Compare text' { Show-Compare } $Glyph.Compare)
-[void](Add-MenuItem $trayMenu 'Compare folders' { Show-FolderCompare } $Glyph.Folder)
+[void](Add-MenuItem $trayMenu 'Compare (text, folders, images, files)' { Show-Compare } $Glyph.Compare)
 [void](Add-MenuItem $trayMenu 'Find in files' { Show-FindInFiles } $Glyph.Search)
 [void](Add-MenuItem $trayMenu 'Transform text' { [void](Show-Transform) } $Glyph.Code)
 [void](Add-MenuItem $trayMenu 'Network tools' { [void](Show-Network) } $Glyph.Network)

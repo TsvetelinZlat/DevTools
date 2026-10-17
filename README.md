@@ -51,7 +51,7 @@ Press **Ctrl+Shift+V** anywhere to open the picker. It opens at the mouse. Press
 The window has three parts:
 
 - **Quick access** (the strip of round bubbles on the left): your own links, files, programs and folders. Click one to open it, Ctrl+click copies its link / path, right-click to rename, change, move or remove it. Add one with the **+** bubble (a link, a file, a folder, or what's on the clipboard) or drop files, folders or links from the browser onto the strip.
-- **Top bar**: icons for every tool (Notes, Compare text, Compare folders, Find in files, Transform, Network tools, API tester, Secrets, Toolbox, Command palette), then Pause / Resume, Settings and Exit. Hover an icon to see its name and shortcut.
+- **Top bar**: icons for every tool (Notes, Compare, Find in files, Transform, Network tools, API tester, Secrets, Toolbox, Command palette), then Pause / Resume, Settings and Exit. Hover an icon to see its name and shortcut.
 - **Search box and filter chips** (All, Text, Images, Files, Pinned).
 - **The list**: each clip shows when it was copied, its size and the app it came from, plus a badge such as JSON, JWT or URL when DevTools recognises it.
 - **Bottom bar**: Paste, Copy, Actions (smart actions), Pin, Edit, Delete for the selected clip, and Clear all.
@@ -92,7 +92,7 @@ Results that are copied land in the history like any other copy.
 
 **Ctrl+Shift+Space** anywhere (or **Ctrl+K** in the picker, the grid icon, or the tray menu). Type a few letters and press Enter. It finds:
 
-- every tool and action (Compare text, Settings, Theme: dark, Back up now, Lock secrets, Exit ...)
+- every tool and action (Compare, Settings, Theme: dark, Back up now, Lock secrets, Exit ...)
 - every Toolbox page (JSON, JWT decoder, Regex tester ...)
 - snippets (Enter pastes it into the app you came from)
 - notes (opens it), saved API requests (opens it), and your recent clips (pastes it)
@@ -194,7 +194,11 @@ Open with the gear icon, **Ctrl+,** or the tray menu.
 
 ## Compare (like WinMerge)
 
-Open it any time from the tray menu (**Compare text**) or the picker (**Compare** button / Ctrl+D). It starts empty. Both sides are editors: click into either side and type or paste, and the comparison updates as you type. You can also fill a side with:
+One window for everything you compare, with four tabs: **Text**, **Folders**, **Images** and **Files** (any two files, byte by byte). Open it from the tray menu (**Compare**), the picker (**Compare** button / Ctrl+D) or the palette (*Compare*, *Compare folders*, *Compare images*, *Compare files byte by byte*). Drop two folders, two pictures or two files of any kind on any tab and the right tab opens for them: folders go to Folders, pictures to Images, text files to Text, everything else (programs, archives, PDFs, databases ...) to Files.
+
+### Text
+
+The Text tab starts empty. Both sides are editors: click into either side and type or paste, and the comparison updates as you type. You can also fill a side with:
 
 - **Open...** (Ctrl+O): pick a file, or drop a file onto the left or right half (drop two files to fill both sides)
 - **From clipboard**: replace the whole side with the clipboard text, or with a text file you copied in Explorer
@@ -226,17 +230,31 @@ Close the window with its X button; it asks to save unsaved changes. (Esc does n
 
 **Save** writes a side back to where it came from: a file is overwritten, a clip is updated. Text you pasted or typed is saved with **Save as...** to a new file. **Copy all** puts a whole side on the clipboard.
 
-## Compare folders
+### Folders
 
-Open it from the tray menu (**Compare folders**) or its icon in the picker's top bar, or drop two folders onto the Compare window. Pick the two folders (Browse, or drop a folder onto each box) and press **Compare** (F5).
+The **Folders** tab of the Compare window (or *Compare folders* in the palette, or drop two folders onto the Compare window). Pick the two folders (Browse, or drop a folder onto each box) and press **Compare** (F5).
 
 The result is one tree of both folders. Each file and folder shows whether it's **same**, **different** (yellow), **only left** (red) or **only right** (green), with the file sizes on both sides and, for folders, how many differences are inside. The status bar sums it up.
 
-- Double-click a file (or press Enter) to open it in the text Compare window.
+- Double-click a file (or press Enter) to compare it: text files open in the Text tab, pictures in Images, anything else in Files (byte by byte).
 - Right-click: copy a file or folder to the other side (overwrites, then compares again), open either one, or show it in Explorer.
 - **Expand differences** opens every folder that has differences; **Only show differences** hides identical files.
 - **Compare file contents** compares files byte by byte. Turn it off to compare only size and date, which is faster for huge folders.
 - `.git`, `.svn`, `.hg`, `.vs`, `node_modules`, `bin` and `obj` are skipped unless you untick that box.
+
+### Images
+
+Open two pictures (**Open left...** / **Open right...**), paste one from the clipboard (**Paste left** / **Paste right**, or Ctrl+V: a screenshot works), or drop them. PNG, JPEG, GIF, BMP, TIFF, ICO, EMF and WMF. Three ways to look at them:
+
+- **Side by side**: both at the same zoom and position.
+- **Difference**: the left picture faded, with every pixel that differs in red and a dashed box around the changed area. Opens by itself when two pictures differ.
+- **Slider**: one picture over the other; drag the line to wipe between them.
+
+The status line says how many pixels differ (and what percentage), where the changed area is, and whether the sizes differ. **Tolerance** ignores tiny colour changes (e.g. from JPEG compression). Pointing at a pixel shows its position and colour on both sides. Mouse wheel zooms, drag moves the picture, double-click or **Fit** fits it to the window, **100%** shows actual size.
+
+### Files (byte by byte)
+
+Compares any two files, whatever they are: programs, DLLs, archives, PDFs, Office files, databases, images. You get both sizes and SHA-256 hashes, whether they are identical, how many bytes differ in how many places and where the first difference is. Below, both files are shown as hex side by side (with the text next to it when the window is wide enough), the differing bytes in red. **Next difference** / **Previous difference** (Alt+Down / Alt+Up) jump between the places that differ. Big files are fine: the compare runs in the background and only the visible rows are read. **Compare as text** opens the two files in the Text tab; **Copy summary** copies the sizes, hashes and result.
 
 ## Find in files
 
