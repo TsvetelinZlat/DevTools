@@ -11527,22 +11527,39 @@ function Get-ChainExtract($Rule, $Resp) {
     }
 }
 
-function Start-ChainRun([string]$OnlyId = '') {
+# Starting values: the environment, then the chain's own variables.
+function Reset-ChainVars {
+    $ChainUI.Vars = @{}; $ChainUI.Jar = @{}; $ChainUI.Results = @{}
+    $env = Get-ApiEnvironment
+    if ($env) { foreach ($v in @($env.Vars)) { if ($v -and $v.On -ne $false -and $v.Key) { $ChainUI.Vars[[string]$v.Key] = [string]$v.Value } } }
+    foreach ($v in @($ChainUI.Current.Vars)) { if ($v -and $v.Key) { $ChainUI.Vars[[string]$v.Key] = [string]$v.Value } }
+}
+
+# Runs only some cards (in chain order), with the variables and cookies of the last run.
+function Start-ChainRunSelected {
+    $cv = $ChainUI.Canvas
+    $ids = @($cv.Selection | ForEach-Object { $_.Id })
+    if (-not $ids) { Set-ChainStatus 'Select the cards to run first (click, Ctrl+click or drag a box).' $C.Dim; return }
+    Start-ChainRun '' $ids
+}
+
+function Start-ChainRun([string]$OnlyId = '', [string[]]$Ids = @()) {
     if ($ChainUI.Run) { Stop-ChainRun; return }
     Save-ChainEditor
     $cv = $ChainUI.Canvas
     if (-not $cv.Nodes.Count) { Set-ChainStatus 'Add some requests first.' $C.Red; return }
     Update-ChainOrder
-    $order = @(if ($OnlyId) { $cv.Find($OnlyId) } else { Get-ChainOrder })
-    if (-not $OnlyId) {
-        # fresh run: environment, then the chain's own variables; no cookies yet
-        $ChainUI.Vars = @{}; $ChainUI.Jar = @{}; $ChainUI.Results = @{}
-        $env = Get-ApiEnvironment
-        if ($env) { foreach ($v in @($env.Vars)) { if ($v -and $v.On -ne $false -and $v.Key) { $ChainUI.Vars[[string]$v.Key] = [string]$v.Value } } }
-        foreach ($v in @($ChainUI.Current.Vars)) { if ($v -and $v.Key) { $ChainUI.Vars[[string]$v.Key] = [string]$v.Value } }
+    if ($OnlyId) { $Ids = @($OnlyId) }
+    $partial = $Ids.Count -gt 0
+    $order = @(if ($partial) { Get-ChainOrder | Where-Object { $Ids -contains $_.Id } } else { Get-ChainOrder })
+    # a partial run keeps the last run's variables and cookies (fresh ones if there was no run yet)
+    if ($partial -and -not $ChainUI.Vars.Count) { Reset-ChainVars }
+    if ($partial) { foreach ($n in $order) { $n.State = ''; $n.Info = '' } }
+    if (-not $partial) {
+        Reset-ChainVars                  # fresh run: no cookies, no values from before
         foreach ($n in $cv.Nodes) { $n.State = ''; $n.Info = '' }
     }
-    $ChainUI.Run = @{ Order = $order; Index = 0; Http = $null; Node = $null; Started = Get-Date; Ok = 0; Fail = 0; Skip = 0; Single = [bool]$OnlyId }
+    $ChainUI.Run = @{ Order = $order; Index = 0; Http = $null; Node = $null; Started = Get-Date; Ok = 0; Fail = 0; Skip = 0; Single = ($order.Count -eq 1 -and $partial); Only = @($order | ForEach-Object { $_.Id }); Partial = $partial }
     $ChainUI.RunBtn.Text = 'Stop'; $ChainUI.RunBtn.Glyph = $Glyph.Cancel; $ChainUI.RunBtn.Variant = 3; $ChainUI.RunBtn.Invalidate()
     Invoke-ChainNext
 }
@@ -11557,7 +11574,7 @@ function Stop-ChainRun([string]$Why = '') {
     if ($ChainUI.RunBtn -and -not $ChainUI.RunBtn.IsDisposed) { $ChainUI.RunBtn.Text = 'Run chain'; $ChainUI.RunBtn.Glyph = $Glyph.Play; $ChainUI.RunBtn.Variant = 1; $ChainUI.RunBtn.Invalidate() }
     $secs = ((Get-Date) - $r.Started).TotalSeconds
     if ($ChainUI.Form) {
-        $msg = if ($Why) { $Why } else { "Done in $('{0:0.0}' -f $secs) s:  $($r.Ok) ok, $($r.Fail) failed, $($r.Skip) skipped" }
+        $msg = if ($Why) { $Why } else { "$(if ($r.Partial) { "Ran $(@($r.Only).Count) selected card(s)" } else { 'Done' }) in $('{0:0.0}' -f $secs) s:  $($r.Ok) ok, $($r.Fail) failed, $($r.Skip) skipped" }
         Set-ChainStatus $msg $(if ($r.Fail -or $Why) { $C.Red } else { $C.Green })
         Update-ChainVarsView
         if ($ChainUI.Canvas.SelectedNode) { Show-ChainResult $ChainUI.Canvas.SelectedNode }
@@ -11571,7 +11588,7 @@ function Invoke-ChainNext {
         $n = $r.Order[$r.Index]
         $r.Index++
         if (-not $r.Single) {
-            $parents = @($cv.Links | Where-Object { $_.To -eq $n.Id } | ForEach-Object { $cv.Find($_.From) })
+            $parents = @($cv.Links | Where-Object { $_.To -eq $n.Id -and (-not $r.Partial -or $r.Only -contains $_.From) } | ForEach-Object { $cv.Find($_.From) })
             $bad = @($parents | Where-Object { $_ -and $_.State -in 'fail', 'skip' })
             if ($bad) { $n.State = 'skip'; $n.Info = "skipped: $($bad[0].Title) failed"; $r.Skip++; continue }
         }
@@ -12131,7 +12148,7 @@ function Show-ApiChains {
         param($src, $e)
         Show-ChainStep $src.SelectedNode
         $k = $src.Selection.Count
-        if ($k -gt 1) { Set-ChainStatus "$k cards selected  -  drag one to move them together, Del deletes them, Ctrl+C copies them (with their arrows)." $C.Accent }
+        if ($k -gt 1) { Set-ChainStatus "$k cards selected  -  Shift+F5 runs only these, drag one to move them together, Del deletes them, Ctrl+C copies them." $C.Accent }
         elseif ($ChainUI.Status -and $ChainUI.Status.Text -match '^\d+ cards selected') { Set-ChainStatus 'Ctrl+click or drag a box on empty space to select several cards.' $C.Dim }
     })
     $cv.add_Changed({ param($src, $e) Update-ChainOrder; Save-Chains })
@@ -12155,6 +12172,7 @@ function Show-ApiChains {
             [void](Add-MenuItem $src $(if ($pp -and $pp.DevToolsRequestPart -eq 'requests') { "Paste the $(@($pp.Items).Count) copied cards here" } elseif ($pp) { 'Paste the copied request here' } else { 'Paste (curl command / link) here' }) { param($s2, $e2) $p = $s2.Owner.Tag; $ChainUI.Canvas.SelectedNode = $null; Invoke-ChainPaste ($p.X) ($p.Y) } $Glyph.Paste 'Ctrl+V')
         }
         if ($cv2.Selection.Count -gt 1) {
+            [void](Add-MenuItem $src "Run the $($cv2.Selection.Count) selected cards" { Start-ChainRunSelected } $Glyph.Play 'Shift+F5')
             [void](Add-MenuItem $src "Copy $($cv2.Selection.Count) cards" { Copy-ChainCards } $Glyph.Copy 'Ctrl+C')
             [void](Add-MenuItem $src "Delete $($cv2.Selection.Count) cards" { $ChainUI.Canvas.RemoveSelected() } $Glyph.Delete 'Del')
             [void](Add-MenuItem $src 'Select all' { $ChainUI.Canvas.SelectAll() } '' 'Ctrl+A')
@@ -12196,6 +12214,7 @@ function Show-ApiChains {
         Open-Chain $ChainUI.Chains[0]; Update-ChainCombo; Save-Chains
     } $top $Glyph.Delete 2)
     $ChainUI.RunBtn = New-Button 'Run chain' 'Run every step in order (F5). Steps after a failed step are skipped.' { Start-ChainRun } $top $Glyph.Play 1
+    [void](New-Button 'Run selected' 'Run only the selected cards, in chain order, with the variables and cookies of the last run (Shift+F5)' { Start-ChainRunSelected } $top $Glyph.Play 2)
     [void](New-Button 'Variables...' 'Start values for {{variables}}, e.g. baseUrl, user, password' { Show-ChainVarsDialog } $top $Glyph.Code 2)
     New-TbLabel $top '  Environment' -Dim | Out-Null
     $ChainUI.EnvBox = New-TbCombo $top @(@('(none)') + @($ApiUI.Environments | ForEach-Object { [string]$_.Name })) 150
@@ -12235,7 +12254,7 @@ function Show-ApiChains {
 
     $f.add_KeyDown({
         param($src, $e)
-        if ($e.KeyCode -eq 'F5' -and $e.Shift) { $n = $ChainUI.Canvas.SelectedNode; if ($n) { Start-ChainRun $n.Id }; $e.Handled = $true }
+        if ($e.KeyCode -eq 'F5' -and $e.Shift) { Start-ChainRunSelected; $e.Handled = $true }
         elseif ($e.KeyCode -eq 'F5') { Start-ChainRun; $e.Handled = $true }
         elseif ($ChainUI.Canvas.Focused -and $e.Control -and $e.KeyCode -eq 'C' -and $ChainUI.Canvas.Selection.Count) {
             Copy-ChainCards
