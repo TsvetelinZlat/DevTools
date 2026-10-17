@@ -19198,8 +19198,10 @@ function Show-HostAlert($T, [bool]$Down) {
     $title.Font = New-Object System.Drawing.Font($UiFont, (Fz 11), [System.Drawing.FontStyle]::Bold); $title.ForeColor = $accent
     $title.Text = if ($Down) { "$label is DOWN" } else { "$label is back up" }
     $body = New-Object System.Windows.Forms.Label
-    $body.AutoSize = $false; $body.Dock = 'Top'; $body.Height = $FontSmall.Height * 2 + (Px 4); $body.Font = $FontSmall; $body.ForeColor = $C.Dim
+    $body.AutoSize = $false; $body.Dock = 'Top'; $body.Font = $FontSmall; $body.ForeColor = $C.Dim
     $body.Text = if ($Down) { "$target - $($T.Detail)`n$((Get-Date).ToString('HH:mm:ss'))" } else { "$target answers again ($($T.LatencyMs) ms)`n$((Get-Date).ToString('HH:mm:ss'))" }
+    $bodyW = (Px 380) - (Px 28)
+    $body.Height = [System.Windows.Forms.TextRenderer]::MeasureText($body.Text, $FontSmall, (New-Object System.Drawing.Size($bodyW, 0)), [System.Windows.Forms.TextFormatFlags]'WordBreak').Height + (Px 6)
     $btns = New-Object System.Windows.Forms.FlowLayoutPanel
     $btns.Dock = 'Bottom'; $btns.Height = $FontButton.Height + (Px 12); $btns.WrapContents = $false; $btns.BackColor = $C.Card
     $btns.Margin = New-Object System.Windows.Forms.Padding(0)
@@ -19217,6 +19219,10 @@ function Show-HostAlert($T, [bool]$Down) {
     [void](& $mk 'Silence' 'No more alerts for this host until you turn them back on (Host monitor, right-click)' { param($src, $e) $x = $src.Tag; Set-HostSilence $x.Tag.Host ([datetime]::MaxValue); Close-HostAlert $x } 2)
     [void](& $mk 'Open' 'Open the host monitor' { param($src, $e) $x = $src.Tag; Close-HostAlert $x; Show-Toolbox 'hosts' } 2)
     [void](& $mk 'Close' '' { param($src, $e) Close-HostAlert $src.Tag } 2)
+    # tall enough for the title, the text and the buttons (nothing cut off)
+    $bh = 0; foreach ($bb in $btns.Controls) { $bh = [Math]::Max($bh, $bb.PreferredSize.Height + $bb.Margin.Vertical) }
+    $btns.Height = $bh + (Px 2)
+    $f.ClientSize = New-Object System.Drawing.Size($f.ClientSize.Width, ($f.Padding.Top + $title.Height + $body.Height + (Px 6) + $btns.Height + $f.Padding.Bottom))
     $f.add_Paint({
         param($src, $e)
         $b = New-Object System.Drawing.SolidBrush $(if ($src.Tag.Down) { $C.Red } else { $C.Green })
