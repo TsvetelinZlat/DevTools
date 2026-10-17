@@ -6734,6 +6734,7 @@ $script:BackupKeep = 10           # how many backups to keep
 $script:BackupLast = $null
 $script:HostInterval = 30         # host monitor: seconds between checks
 $script:HostNotify = $true         # host monitor: notify when a host goes down / comes back
+$script:Favorites = @('tool:Notes', 'tool:Compare', 'tool:API tester')   # starred tools: picker top bar, top of the Toolbox and tray
 $script:SyncDir = ''                # sync between PCs: shared folder ('' = off)
 $script:TimeZones = @('UTC', 'Pacific Standard Time', 'Eastern Standard Time', 'GMT Standard Time', 'Central Europe Standard Time', 'India Standard Time', 'Tokyo Standard Time')
 $script:Pomodoro = @{ Work = 25; Short = 5; Long = 15; Every = 4 }
@@ -6825,7 +6826,7 @@ function Save-Settings {
         Theme = $script:Theme; Accent = $script:Accent; TextSize = $script:TextSize
         VaultLockMin = $script:VaultLockMin; VaultClearSec = $script:VaultClearSec; IgnoreApps = @($script:IgnoreApps)
         BackupDir = $script:BackupDir; BackupHours = $script:BackupHours; BackupKeep = $script:BackupKeep
-        HostInterval = $script:HostInterval; HostNotify = $script:HostNotify
+        HostInterval = $script:HostInterval; HostNotify = $script:HostNotify; Favorites = @($script:Favorites)
         SyncDir = $script:SyncDir; SyncLast = $(if ($script:SyncLast) { $script:SyncLast.ToString('o') } else { $null }); ExpiryRules = @($script:ExpiryRules)
         TimeZones = @($script:TimeZones); Pomodoro = $script:Pomodoro; Hotkeys = $script:Hotkeys; Mouse = $script:MouseCfg; GitRepos = @($script:GitRepos)
         BackupLast = $(if ($script:BackupLast) { $script:BackupLast.ToString('o') } else { $null }) })
@@ -6858,6 +6859,7 @@ function Import-Data {
             if ($s.Hotkeys) { $script:Hotkeys = @{}; foreach ($p in $s.Hotkeys.PSObject.Properties) { if ($p.Value) { $script:Hotkeys[$p.Name] = [string]$p.Value } } }
             if ($s.Pomodoro) { foreach ($k in 'Work', 'Short', 'Long', 'Every') { if ([int]$s.Pomodoro.$k -gt 0) { $script:Pomodoro[$k] = [int]$s.Pomodoro.$k } } }
             if ($null -ne $s.HostNotify) { $script:HostNotify = [bool]$s.HostNotify }
+            if ($null -ne $s.Favorites) { $script:Favorites = @($s.Favorites | Where-Object { $_ }) }
             if ($null -ne $s.BackupHours) { $script:BackupHours = [int]$s.BackupHours }
             if ([int]$s.BackupKeep -gt 0) { $script:BackupKeep = [int]$s.BackupKeep }
             if ($s.BackupLast) { try { $script:BackupLast = [datetime]::Parse([string]$s.BackupLast, $null, [Globalization.DateTimeStyles]::RoundtripKind).ToLocalTime() } catch { } }
@@ -7388,6 +7390,7 @@ $Glyph = @{     # icon font code points (Segoe Fluent Icons / MDL2 Assets)
     Send = [string][char]0xE724; Refresh = [string][char]0xE72C; Undo = [string][char]0xE7A7; Filter = [string][char]0xE71C
     Sun = [string][char]0xE706; Moon = [string][char]0xE708; Color = [string][char]0xE790; History = [string][char]0xE81C; Cancel = [string][char]0xE711
     Lock = [string][char]0xE72E; View = [string][char]0xE7B3; Apps = [string][char]0xE71D; Toolbox = [string][char]0xE90F; Lightning = [string][char]0xE945
+    StarOn = [string][char]0xE735; StarOff = [string][char]0xE734
 }
 
 $C = @{}
@@ -18003,7 +18006,7 @@ public static class DevNoteFormat {
 $TbUI = @{ Form = $null; Pages = [ordered]@{}; Current = $null }
 
 function Register-ToolboxPage([string]$Key, [string]$Title, [string]$Icon, [string]$Words, [scriptblock]$Build) {
-    $TbUI.Pages[$Key] = [pscustomobject]@{ Key = $Key; Title = $Title; Icon = $Icon; Build = $Build; Panel = $null; State = $null }
+    $TbUI.Pages[$Key] = [pscustomobject]@{ Key = $Key; Title = $Title; Icon = $Icon; Build = $Build; Panel = $null; State = $null; Words = $Words }
     $k = $Key
     Register-PaletteCommand $Title 'Toolbox' $Icon ([scriptblock]::Create("Show-Toolbox '$k'")) $Words
 }
@@ -18092,10 +18095,147 @@ function Copy-TbText([string]$Text) {
     try { [System.Windows.Forms.Clipboard]::SetText($Text) } catch { }
 }
 
+# ---- Tool groups: the one list of where every tool belongs. The Toolbox sidebar, the tray menu and the
+#      command palette are all built from it. An entry is a Toolbox page ('page:key') or a command-palette
+#      action by its title ('Short label=Palette title' shows a shorter name).
+$ToolGroups = [ordered]@{
+    'Clipboard & notes'     = @('Clipboard history', 'Notes', 'Snippets', 'Secrets', 'Paste stack=Paste stack: collect what I copy next')
+    'Text & data'           = @('Transform=Transform text', 'page:json', 'page:regex', 'page:jwt', 'page:markdown', 'page:numbers', 'page:units', 'page:cron', 'page:time', 'page:gen')
+    'Encode & share'        = @('page:qr', 'page:stego', 'page:codeimg')
+    'Files'                 = @('Compare', 'Find in files', 'page:hash', 'page:log')
+    'Web & API'             = @('API tester', 'API chains', 'Test API=Test API: start / stop')
+    'Network'               = @('Network tools', 'page:dns', 'page:subnet', 'page:hosts', 'page:ports', 'page:cert', 'page:certmake')
+    'System'                = @('page:env', 'page:procs', 'Git')
+    'Screen & productivity' = @('Screenshot=Take a screenshot', 'Text from a picture (OCR)=Copy text from the clipboard picture (OCR)', 'Edit clipboard picture=Edit the picture on the clipboard', 'page:color', 'page:record', 'page:timer', 'Reminder=New reminder...', 'page:mouse')
+}
+
+# One row per tool: Group, Title, Icon, and either Page (a Toolbox page) or Action (opens its own window / does it).
+function Get-ToolRows {
+    $seen = @{}
+    foreach ($g in $ToolGroups.Keys) {
+        foreach ($e in $ToolGroups[$g]) {
+            if ($e -like 'page:*') {
+                $p = $TbUI.Pages[$e.Substring(5)]
+                if ($p) { $seen[$p.Key] = $true; [pscustomobject]@{ Id = "page:$($p.Key)"; Group = $g; Title = $p.Title; Icon = $p.Icon; Page = $p.Key; Action = $null; Words = $p.Words; Cmd = $null } }
+            } else {
+                if ($e -match '^(.+?)=(.+)$') { $label = $Matches[1]; $cmd = $Matches[2] } else { $label = $e; $cmd = $e }
+                $c = $script:PaletteCommands | Where-Object { $_.Title -eq $cmd } | Select-Object -First 1
+                if ($c) { [pscustomobject]@{ Id = "tool:$label"; Group = $g; Title = $label; Icon = $c.Icon; Page = $null; Action = $c.Action; Words = "$cmd $($c.Words)"; Cmd = $c } }
+            }
+        }
+    }
+    foreach ($p in $TbUI.Pages.Values) {          # a page nobody placed yet still shows up
+        if (-not $seen[$p.Key]) { [pscustomobject]@{ Id = "page:$($p.Key)"; Group = 'More'; Title = $p.Title; Icon = $p.Icon; Page = $p.Key; Action = $null; Words = $p.Words; Cmd = $null } }
+    }
+}
+
+# From the picker some tools use the selected clip(s): Compare compares two selected clips, and so on.
+$PickerToolActions = @{
+    'tool:Notes' = { Hide-Picker; Show-Notes }; 'tool:Compare' = { Compare-Selected }; 'tool:API tester' = { Open-ApiFromPicker }
+    'tool:Transform' = { Open-TransformFromPicker }; 'tool:Network tools' = { Open-NetworkFromPicker }
+}
+
+function Invoke-ToolRow($Row, [switch]$FromPicker) {
+    if ($FromPicker -and $PickerToolActions.ContainsKey($Row.Id)) { & $PickerToolActions[$Row.Id]; return }
+    if ($Row.Page) { Show-Toolbox $Row.Page } else { & $Row.Action $null }
+}
+
+# ---- Favourites: starred tools (in the order they were starred)
+function Get-FavoriteRows {
+    $rows = @(Get-ToolRows)
+    foreach ($id in $script:Favorites) { $r = $rows | Where-Object { $_.Id -eq $id } | Select-Object -First 1; if ($r) { $r } }
+}
+function Test-Favorite($Row) { $Row -and $Row.Id -and ($script:Favorites -contains $Row.Id) }
+function Switch-Favorite($Row) {
+    if (-not $Row -or -not $Row.Id) { return }
+    if ($script:Favorites -contains $Row.Id) { $script:Favorites = @($script:Favorites | Where-Object { $_ -ne $Row.Id }) }
+    else { $script:Favorites = @($script:Favorites) + $Row.Id }
+    Save-Settings
+    Update-Favorites
+}
+# everywhere favourites show: the Toolbox sidebar, the picker's top bar, the tray menu (rebuilt when it opens)
+function Update-Favorites {
+    if ($TbUI.List) { Update-ToolboxSidebar $(if ($TbUI.Search) { $TbUI.Search.Text } else { '' }) }
+    Update-FavoriteButtons
+}
+
+# The picker's top bar: one icon per favourite, before Toolbox and All.
+function Update-FavoriteButtons {
+    if (-not $tools) { return }
+    foreach ($b in @($script:FavButtons)) { if ($b) { $tools.Controls.Remove($b); [void]$script:IconTips.Remove($b); $b.Dispose() } }
+    $script:FavButtons = @()
+    $i = 0
+    foreach ($r in @(Get-FavoriteRows | Select-Object -First 12)) {
+        $b = New-IconButton $r.Icon ($r.Title.Substring(0, [Math]::Min(6, $r.Title.Length))) "$($r.Title)  -  favourite (right-click: remove from favourites)" { param($src, $e) Invoke-ToolRow $src.Tag -FromPicker } $tools
+        $b.Tag = $r
+        $cm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+        $it = Add-MenuItem $cm 'Remove from favourites' { param($s2, $e2) Switch-Favorite $s2.Owner.Tag } $Glyph.StarOff
+        $cm.Tag = $r
+        $b.ContextMenuStrip = $cm
+        $tools.Controls.SetChildIndex($b, $i)
+        $script:FavButtons += $b
+        $i++
+    }
+}
+
+# The palette shows each tool's group (and its keys) next to it.
+function Set-PaletteGroups {
+    foreach ($r in @(Get-ToolRows)) {
+        $c = if ($r.Cmd) { $r.Cmd } else { $script:PaletteCommands | Where-Object { $_.Title -eq $r.Title -and $_.Sub -eq 'Toolbox' } | Select-Object -First 1 }
+        if (-not $c -or $c.Grouped) { continue }
+        $c.Sub = if ($c.Sub -and $c.Sub -ne 'Toolbox') { "$($r.Group)  -  $($c.Sub)" } else { $r.Group }
+        $c | Add-Member -NotePropertyName Grouped -NotePropertyValue $true -Force
+    }
+}
+
+# Tray menu: one submenu per group.
+function Add-ToolGroupMenus($Menu) {
+    $rows = @(Get-ToolRows)
+    foreach ($g in @($rows | ForEach-Object { $_.Group } | Select-Object -Unique)) {
+        $sub = New-Object System.Windows.Forms.ToolStripMenuItem($g)
+        $sub.DropDown.Renderer = $MenuRenderer
+        foreach ($r in @($rows | Where-Object { $_.Group -eq $g })) {
+            $it = $sub.DropDownItems.Add($r.Title, (New-GlyphImage $r.Icon), { param($s2, $e2) Invoke-ToolRow $s2.Tag })
+            $it.Tag = $r
+        }
+        [void]$Menu.Items.Add($sub)
+    }
+}
+
+# Toolbox sidebar: group headings, the tools under them (those that open their own window have an arrow),
+# filtered by the search box.
+function Update-ToolboxSidebar([string]$Filter = '') {
+    $l = $TbUI.List
+    if (-not $l) { return }
+    $f = $Filter.Trim()
+    $all = @(Get-ToolRows)
+    $favs = @(Get-FavoriteRows | ForEach-Object { $x = $_.PSObject.Copy(); $x.Group = 'Favourites'; $x })
+    $rows = @(@($favs) + @($all) | Where-Object { -not $f -or "$($_.Title) $($_.Group) $($_.Words)" -like "*$f*" })
+    $TbUI.Rows = New-Object System.Collections.Generic.List[object]
+    $g = $null
+    foreach ($r in $rows) {
+        if ($r.Group -ne $g) { $g = $r.Group; $TbUI.Rows.Add([pscustomobject]@{ Header = $g }) }
+        $TbUI.Rows.Add($r)
+    }
+    $TbUI.Sidebar = $true
+    $l.BeginUpdate()
+    try {
+        $l.Items.Clear()
+        for ($i = 0; $i -lt $TbUI.Rows.Count; $i++) { [void]$l.Items.Add($i) }
+        $l.SelectedIndex = Get-ToolboxRowIndex $TbUI.Current
+    } finally { $l.EndUpdate(); $TbUI.Sidebar = $false }
+}
+
+function Get-ToolboxRowIndex([string]$Key) {
+    if (-not $TbUI.Rows -or -not $Key) { return -1 }
+    for ($i = 0; $i -lt $TbUI.Rows.Count; $i++) { if ($TbUI.Rows[$i].Page -eq $Key) { return $i } }
+    -1
+}
+
 function Show-Toolbox([string]$Page = '', $InputText = $null) {
     Hide-Picker
     if (-not $TbUI.Form -or $TbUI.Form.IsDisposed) { New-ToolboxForm }
-    if (-not $Page) { $Page = if ($TbUI.Current) { $TbUI.Current } else { @($TbUI.Pages.Keys)[0] } }
+    if (-not $Page) { $Page = if ($TbUI.Current) { $TbUI.Current } else { @(Get-ToolRows | Where-Object { $_.Page })[0].Page } }
     Select-ToolboxPage $Page
     if ($null -ne $InputText -and $TbUI.Pages[$Page].State.SetInput) { & $TbUI.Pages[$Page].State.SetInput ([string]$InputText) }
     if ($TbUI.Form.WindowState -eq 'Minimized') { $TbUI.Form.WindowState = 'Normal' }
@@ -18128,8 +18268,8 @@ function Select-ToolboxPage([string]$Key) {
     }
     foreach ($x in $TbUI.Pages.Values) { if ($x.Panel) { $x.Panel.Visible = ($x.Key -eq $Key) } }
     $TbUI.Current = $Key
-    $idx = @($TbUI.Pages.Keys).IndexOf($Key)
-    if ($TbUI.List.SelectedIndex -ne $idx) { $TbUI.List.SelectedIndex = $idx }
+    $idx = Get-ToolboxRowIndex $Key
+    if ($TbUI.List.SelectedIndex -ne $idx) { $TbUI.Sidebar = $true; try { $TbUI.List.SelectedIndex = $idx } finally { $TbUI.Sidebar = $false } }
     $TbUI.Form.Text = "Toolbox  -  $($p.Title)"
     if ($p.State.Focus) { & $p.State.Focus }
 }
@@ -18145,17 +18285,42 @@ function New-ToolboxForm {
     $hostPanel.Dock = 'Fill'; $hostPanel.BackColor = $C.Bg
     $f.Controls.Add($hostPanel)
     $TbUI.Host = $hostPanel
-    $list = New-Object System.Windows.Forms.ListBox
-    $list.Dock = 'Left'; $list.Width = Px (210 * $TextZoom); $list.BorderStyle = 'None'; $list.DrawMode = 'OwnerDrawFixed'; $list.IntegralHeight = $false
-    $list.ItemHeight = $FontMain.Height + (Px 18); $list.BackColor = $C.Panel; $list.ForeColor = $C.Fore
-    foreach ($k in $TbUI.Pages.Keys) { [void]$list.Items.Add($k) }
+    $side = New-Object System.Windows.Forms.Panel
+    $side.Dock = 'Left'; $side.Width = Px (240 * $TextZoom); $side.BackColor = $C.Panel
+    $list = New-Object DevBufferedListBox
+    $list.Dock = 'Fill'; $list.BorderStyle = 'None'; $list.DrawMode = 'OwnerDrawFixed'; $list.IntegralHeight = $false
+    $list.ItemHeight = $FontMain.Height + (Px 14); $list.BackColor = $C.Panel; $list.ForeColor = $C.Fore
+    $side.Controls.Add($list)
+    $sp = New-Object System.Windows.Forms.Panel
+    $sp.Dock = 'Top'; $sp.Height = $FontMain.Height + (Px 22); $sp.BackColor = $C.Panel; $sp.Padding = New-Object System.Windows.Forms.Padding((Px 10), (Px 8), (Px 10), (Px 4))
+    $search = New-TbBox -Cue 'Search  (right-click: star)'
+    $search.Dock = 'Fill'
+    $sp.Controls.Add($search)
+    $side.Controls.Add($sp)
+    $TbUI.Search = $search
+    $search.add_TextChanged({ param($src, $e) Update-ToolboxSidebar $src.Text })
+    $search.add_KeyDown({
+        param($src, $e)
+        if ($e.KeyCode -eq 'Escape') { $src.Text = ''; $e.SuppressKeyPress = $true }
+        elseif ($e.KeyCode -eq 'Return') {
+            $first = @($TbUI.Rows | Where-Object { -not $_.Header })[0]
+            if ($first) { Invoke-ToolRow $first }
+            $e.SuppressKeyPress = $true
+        }
+        elseif ($e.KeyCode -eq 'Down') { [void]$TbUI.List.Focus(); $e.SuppressKeyPress = $true }
+    })
     $list.add_DrawItem({
         param($src, $e)
-        if ($e.Index -lt 0) { return }
-        $p = $TbUI.Pages[[string]$src.Items[$e.Index]]
+        if ($e.Index -lt 0 -or $e.Index -ge $TbUI.Rows.Count) { return }
+        $p = $TbUI.Rows[$e.Index]
         $g = $e.Graphics; $r = $e.Bounds
-        $sel = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
+        $sel = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0 -and -not $p.Header
         $b = New-Object System.Drawing.SolidBrush $C.Panel; $g.FillRectangle($b, $r); $b.Dispose()
+        if ($p.Header) {
+            [System.Windows.Forms.TextRenderer]::DrawText($g, $p.Header.ToUpperInvariant(), $FontSmall, (New-Object System.Drawing.Rectangle(($r.X + (Px 16)), ($r.Y + (Px 6)), ($r.Width - (Px 16)), ($r.Height - (Px 6)))), $C.Accent,
+                [System.Windows.Forms.TextFormatFlags]'Bottom, Left, NoPrefix, SingleLine, EndEllipsis')
+            return
+        }
         if ($sel) {
             $g.SmoothingMode = 'AntiAlias'
             $path = [PowerClipTheme]::Round((New-Object System.Drawing.RectangleF(($r.X + (Px 6)), ($r.Y + (Px 2)), ($r.Width - (Px 12)), ($r.Height - (Px 4)))), (Px 6))
@@ -18169,20 +18334,58 @@ function New-ToolboxForm {
                 [System.Windows.Forms.TextFormatFlags]'VerticalCenter, HorizontalCenter, NoPrefix, SingleLine, NoPadding')
             $x += Px 30
         }
-        [System.Windows.Forms.TextRenderer]::DrawText($g, $p.Title, $FontMain, (New-Object System.Drawing.Rectangle($x, $r.Y, ($r.Right - $x), $r.Height)), $C.Fore, $TextFlags)
+        $right = $r.Right
+        if ((Test-Favorite $p) -and $FontIconSmall) {      # starred
+            [System.Windows.Forms.TextRenderer]::DrawText($g, $Glyph.StarOn, $FontIconSmall, (New-Object System.Drawing.Rectangle(($right - (Px 30)), $r.Y, (Px 20), $r.Height)), $C.Yellow,
+                [System.Windows.Forms.TextFormatFlags]'VerticalCenter, HorizontalCenter, NoPrefix, SingleLine, NoPadding')
+            $right -= Px 26
+        }
+        if ($p.Action -and $FontIconSmall) {       # opens its own window
+            [System.Windows.Forms.TextRenderer]::DrawText($g, $Glyph.Open, $FontIconSmall, (New-Object System.Drawing.Rectangle(($right - (Px 30)), $r.Y, (Px 20), $r.Height)), $C.Dim,
+                [System.Windows.Forms.TextFormatFlags]'VerticalCenter, HorizontalCenter, NoPrefix, SingleLine, NoPadding')
+            $right -= Px 32
+        }
+        [System.Windows.Forms.TextRenderer]::DrawText($g, $p.Title, $FontMain, (New-Object System.Drawing.Rectangle($x, $r.Y, ($right - $x), $r.Height)), $C.Fore, $TextFlags)
     })
-    $list.add_SelectedIndexChanged({ param($src, $e) if ($src.SelectedIndex -ge 0) { $k = [string]$src.SelectedItem; if ($k -ne $TbUI.Current) { Select-ToolboxPage $k } } })
-    $f.Controls.Add($list)
+    # pages show on the right; tools with their own window open with a click; headings can't be picked
+    $list.add_SelectedIndexChanged({
+        param($src, $e)
+        if ($TbUI.Sidebar -or $src.SelectedIndex -lt 0) { return }
+        $row = $TbUI.Rows[$src.SelectedIndex]
+        if ($row.Page) { if ($row.Page -ne $TbUI.Current) { Select-ToolboxPage $row.Page } }
+        else { $TbUI.Sidebar = $true; try { $src.SelectedIndex = Get-ToolboxRowIndex $TbUI.Current } finally { $TbUI.Sidebar = $false } }
+    })
+    $list.add_MouseClick({ param($src, $e) if ($e.Button -ne 'Left') { return }; $i = $src.IndexFromPoint($e.Location); if ($i -ge 0 -and $i -lt $TbUI.Rows.Count -and $TbUI.Rows[$i].Action) { Invoke-ToolRow $TbUI.Rows[$i] } })
+    # right-click a tool: add to / remove from favourites
+    $fm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $fm.add_Opening({
+        param($src, $e)
+        $src.Items.Clear()
+        $l = $TbUI.List
+        $i = $l.IndexFromPoint($l.PointToClient([System.Windows.Forms.Cursor]::Position))
+        if ($i -lt 0 -or $i -ge $TbUI.Rows.Count -or $TbUI.Rows[$i].Header) { $e.Cancel = $true; return }
+        $r = $TbUI.Rows[$i]; $src.Tag = $r
+        if (Test-Favorite $r) { [void](Add-MenuItem $src 'Remove from favourites' { param($s2, $e2) Switch-Favorite $s2.Owner.Tag } $Glyph.StarOff) }
+        else { [void](Add-MenuItem $src 'Add to favourites (top of this list, picker top bar, tray menu)' { param($s2, $e2) Switch-Favorite $s2.Owner.Tag } $Glyph.StarOn) }
+        [void](Add-MenuItem $src 'Open' { param($s2, $e2) Invoke-ToolRow $s2.Owner.Tag } $Glyph.Open)
+    })
+    $list.ContextMenuStrip = $fm
+    $f.Controls.Add($side)
     $TbUI.List = $list
+    Update-ToolboxSidebar
     $f.add_KeyDown({
         param($src, $e)
-        if ($e.Control -and $e.KeyCode -eq 'PageDown') { $TbUI.List.SelectedIndex = ($TbUI.List.SelectedIndex + 1) % $TbUI.List.Items.Count; $e.SuppressKeyPress = $true }
-        elseif ($e.Control -and $e.KeyCode -eq 'PageUp') { $TbUI.List.SelectedIndex = ($TbUI.List.SelectedIndex - 1 + $TbUI.List.Items.Count) % $TbUI.List.Items.Count; $e.SuppressKeyPress = $true }
+        if ($e.Control -and $e.KeyCode -in 'PageDown', 'PageUp') {       # next / previous page
+            $keys = @($TbUI.Rows | Where-Object { $_.Page } | ForEach-Object { $_.Page })
+            if ($keys) { $i = [array]::IndexOf($keys, $TbUI.Current); $i = if ($e.KeyCode -eq 'PageDown') { ($i + 1) % $keys.Count } else { ($i - 1 + $keys.Count) % $keys.Count }; Select-ToolboxPage $keys[$i] }
+            $e.SuppressKeyPress = $true
+        }
+        elseif ($e.Control -and $e.KeyCode -eq 'F' -and $e.Shift) { [void]$TbUI.Search.Focus(); $e.SuppressKeyPress = $true }
     })
     $f.add_FormClosed({
         param($src, $e)
         foreach ($p in $TbUI.Pages.Values) { if ($p.State -and $p.State.Close) { try { & $p.State.Close } catch { } }; $p.Panel = $null; $p.State = $null }
-        $TbUI.Form = $null; $TbUI.Current = $null
+        $TbUI.Form = $null; $TbUI.Current = $null; $TbUI.List = $null; $TbUI.Rows = $null
         $src.Dispose()
     })
     Register-ThemedWindow $f
@@ -24224,14 +24427,7 @@ $btnDelete = New-Button 'Delete' 'Delete the selected clips (Del)'             {
 $btnClear  = New-Button 'Clear all' 'Delete all clips except the pinned ones'  { Clear-Unpinned } $buttons $Glyph.Clear 3
 
 # Header: every tool is one click away (each also has a keyboard shortcut)
-$btnNotes     = New-IconButton $Glyph.Notes    'Notes'   'Notes  (Ctrl+N)'                                    { Hide-Picker; Show-Notes } $tools
-$btnDiff      = New-IconButton $Glyph.Compare  'Compare' 'Compare  (Ctrl+D): text, folders, images or any files  -  select two clips first to compare them' { Compare-Selected } $tools
-$btnFind      = New-IconButton $Glyph.Search   'Find'    'Find in files  (Ctrl+Shift+F)'                      { Show-FindInFiles } $tools
-$btnTransform = New-IconButton $Glyph.Code     'Hex'     'Transform text: hex, Base64, hashes, AES ...  (Ctrl+T)' { Open-TransformFromPicker } $tools
-$btnNetwork   = New-IconButton $Glyph.Network  'Net'     'Network tools: ping, TCP port test, nslookup  (Ctrl+Shift+N)' { Open-NetworkFromPicker } $tools
-$btnApi       = New-IconButton $Glyph.Globe    'API'     'API tester  (Ctrl+Shift+A)'                         { Open-ApiFromPicker } $tools
-$btnVault     = New-IconButton $Glyph.Lock     'Secrets' 'Secrets: encrypted passwords and keys  (Ctrl+Shift+S)' { Show-Vault } $tools
-$btnToolbox   = New-IconButton $Glyph.Toolbox  'Tools'   'Toolbox: JSON, JWT, regex, cron, generators, QR, colour, hashes, ports, certificates, host monitor  (Ctrl+B)' { Show-Toolbox } $tools
+$btnToolbox   = New-IconButton $Glyph.Toolbox  'Tools'   'Toolbox: every tool, in groups - star the ones you use to put them here  (Ctrl+B)' { Show-Toolbox } $tools
 $btnPalette   = New-IconButton $Glyph.Apps     'All'     'Command palette: every tool, action, note and snippet  (Ctrl+K, or Ctrl+Shift+Space anywhere)' { Show-Palette } $tools
 $toolSep = New-Object System.Windows.Forms.Label
 $toolSep.AutoSize = $false; $toolSep.Width = 1; $toolSep.Height = Px 22; $toolSep.BackColor = $C.Line
@@ -24240,6 +24436,8 @@ $tools.Controls.Add($toolSep)
 $btnPause     = New-IconButton $Glyph.Pause    'Pause'   'Pause capturing'                                    { Set-Paused (-not $script:Paused); $list.Focus() } $tools
 $btnSettings  = New-IconButton $Glyph.Settings 'Settings' 'Settings: theme, accent colour, limits ...  (Ctrl+,)' { Show-Settings } $tools
 $btnExit      = New-IconButton $Glyph.Power    'Exit'    'Exit DevTools  (Ctrl+Q)'                      { Exit-App } $tools 3
+$script:FavButtons = @()
+Update-FavoriteButtons            # the starred tools, first in the bar
 
 # Filter chips
 $script:Filter = 'All'
@@ -24533,23 +24731,27 @@ $trayMenu.Renderer = $MenuRenderer
 $miOpen = Add-MenuItem $trayMenu 'Open DevTools' { Show-Picker } $Glyph.Paste 'Ctrl+Shift+V'
 $miOpen.Font = New-Object System.Drawing.Font($miOpen.Font, [System.Drawing.FontStyle]::Bold)
 [void]$trayMenu.Items.Add('-')
-[void](Add-MenuItem $trayMenu 'Notes' { Show-Notes } $Glyph.Notes)
-[void](Add-MenuItem $trayMenu 'Compare (text, folders, images, files)' { Show-Compare } $Glyph.Compare)
-[void](Add-MenuItem $trayMenu 'Find in files' { Show-FindInFiles } $Glyph.Search)
-[void](Add-MenuItem $trayMenu 'Transform text' { [void](Show-Transform) } $Glyph.Code)
-[void](Add-MenuItem $trayMenu 'Network tools' { [void](Show-Network) } $Glyph.Network)
-[void](Add-MenuItem $trayMenu 'API tester' { Show-ApiTester } $Glyph.Globe)
-[void](Add-MenuItem $trayMenu 'Secrets' { Show-Vault } $Glyph.Lock)
-[void](Add-MenuItem $trayMenu 'Snippets' { Show-Snippets } $Glyph.Text)
-[void](Add-MenuItem $trayMenu 'Toolbox' { Show-Toolbox } $Glyph.Toolbox)
+$trayFavSep = New-Object System.Windows.Forms.ToolStripSeparator
+[void]$trayMenu.Items.Add($trayFavSep)
+$trayMenu.add_Opening({
+    foreach ($x in @($trayMenu.Items | Where-Object { $_.Tag -is [pscustomobject] -and $_.Tag.Id })) { $trayMenu.Items.Remove($x); $x.Dispose() }
+    $at = $trayMenu.Items.IndexOf($trayFavSep)
+    foreach ($r in @(Get-FavoriteRows)) {
+        $it = New-Object System.Windows.Forms.ToolStripMenuItem($r.Title, (New-GlyphImage $r.Icon), { param($s2, $e2) Invoke-ToolRow $s2.Tag })
+        $it.Tag = $r
+        $trayMenu.Items.Insert($at, $it); $at++
+    }
+    $trayFavSep.Visible = @(Get-FavoriteRows).Count -gt 0
+})
+[void](Add-MenuItem $trayMenu 'Toolbox (every tool)' { Show-Toolbox } $Glyph.Toolbox)
+[void](Add-MenuItem $trayMenu 'Command palette' { Show-Palette } $Glyph.Apps 'Ctrl+Shift+Space')
+[void]$trayMenu.Items.Add('-')
+Set-PaletteGroups
+Add-ToolGroupMenus $trayMenu
+[void]$trayMenu.Items.Add('-')
 [void](Add-MenuItem $trayMenu 'Take screenshot' { Start-ScreenCapture } $Glyph.Photo 'Ctrl+Shift+X')
-[void](Add-MenuItem $trayMenu 'New reminder...' { New-QuickReminder } $Glyph.History)
-[void](Add-MenuItem $trayMenu 'Git...' { Show-Git } $Glyph.Code)
 $miMover = Add-MenuItem $trayMenu 'Keep me active (mouse mover)' { Switch-MouseMover } $Glyph.Apps
 $trayMenu.add_Opening({ $miMover.Checked = [bool]$Mouse.Mover })
-[void](Add-MenuItem $trayMenu 'Paste stack (collect, then paste in order)' { Start-PasteStack } $Glyph.Paste)
-[void](Add-MenuItem $trayMenu 'Edit clipboard picture' { Edit-ClipboardImage } $Glyph.Photo)
-[void](Add-MenuItem $trayMenu 'Command palette' { Show-Palette } $Glyph.Apps 'Ctrl+Shift+Space')
 [void]$trayMenu.Items.Add('-')
 $miPause = Add-MenuItem $trayMenu 'Pause capturing' { Set-Paused (-not $script:Paused) } $Glyph.Pause
 [void](Add-MenuItem $trayMenu 'Settings...' { Show-Settings } $Glyph.Settings)
