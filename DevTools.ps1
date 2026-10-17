@@ -10425,6 +10425,8 @@ function Show-ApiTester([string]$Text = '') {
     # request tabs
     $rt = New-TabSet $split.Panel1
     $ApiUI.ReqTabs = $rt
+    $cpb = New-Button 'Copy / paste' 'Copy this request (or its headers / body / auth) and paste into another request or a chain card' { param($src, $e) Show-ApiCopyMenu $src } $rt.Strip $Glyph.Copy 2
+    $cpb.Margin = New-Object System.Windows.Forms.Padding((Px 16), 0, 0, 0)
     $p = Add-ApiTab $rt 'Params'
     $ApiUI.ParamGrid = New-KvGrid $p 'Query parameter' 'Value'
     $p = Add-ApiTab $rt 'Headers'
@@ -11500,9 +11502,210 @@ function Complete-ChainStep {
 
 function Set-ChainStatus([string]$Text, $Color) { if ($ChainUI.Status) { $ChainUI.Status.Text = $Text; if ($Color) { $ChainUI.Status.ForeColor = $Color } } }
 
+# ---- Copying between requests: whole requests or their headers / body / auth go through the clipboard as
+#      a small JSON note ({"DevToolsRequestPart": ...}), so they can be pasted into another card, another
+#      chain or the API tester (and shared as text).
+$RequestPartFields = @{
+    headers = @('Headers')
+    body    = @('BodyType', 'Body', 'Form')
+    auth    = @('AuthType', 'Token', 'User', 'Password', 'KeyName', 'KeyValue', 'KeyIn')
+}
+
+function Copy-RequestPart([string]$Kind, $Model, $Extract = $null) {
+    $doc = [ordered]@{ DevToolsRequestPart = $Kind }
+    if ($Kind -eq 'request') { $doc.Request = $Model; $doc.Extract = @($Extract) }
+    else { foreach ($f in $RequestPartFields[$Kind]) { $doc[$f] = $Model.$f } }
+    try { [System.Windows.Forms.Clipboard]::SetText((ConvertTo-Json -InputObject $doc -Depth 8)) } catch { }
+}
+
+# The request part on the clipboard, or $null.
+function Get-RequestPart {
+    $t = ''
+    try { $t = [System.Windows.Forms.Clipboard]::GetText() } catch { }
+    if ($t -notmatch '"DevToolsRequestPart"') { return $null }
+    try { $x = $t | ConvertFrom-Json } catch { return $null }
+    if (-not $x.DevToolsRequestPart) { return $null }
+    $x
+}
+
+# Puts a copied part into a model: headers are added (same name replaced), body and auth replaced.
+function Set-RequestPart($Model, $Part, [string]$Kind = '') {
+    if (-not $Kind) { $Kind = [string]$Part.DevToolsRequestPart }
+    $src = if ($Part.DevToolsRequestPart -eq 'request') { $Part.Request } else { $Part }
+    switch ($Kind) {
+        'headers' {
+            $list = New-Object System.Collections.Generic.List[object]
+            foreach ($h in @($Model.Headers)) { if ($h -and $h.Key) { $list.Add($h) } }
+            foreach ($h in @($src.Headers)) {
+                if (-not $h -or -not $h.Key) { continue }
+                foreach ($old in @($list.ToArray())) { if ($old.Key -eq $h.Key) { [void]$list.Remove($old) } }
+                $list.Add([pscustomobject]@{ On = ($h.On -ne $false); Key = [string]$h.Key; Value = [string]$h.Value })
+            }
+            $Model.Headers = $list.ToArray()
+        }
+        default { foreach ($f in $RequestPartFields[$Kind]) { if ($src.PSObject.Properties[$f]) { $Model.$f = $src.$f } } }
+    }
+}
+
+function New-ModelFromPart($Part) {
+    $m = New-ApiModel
+    foreach ($p in $Part.Request.PSObject.Properties) { if ($m.PSObject.Properties[$p.Name]) { $m.($p.Name) = $p.Value } }
+    $m.Id = $null
+    $m
+}
+
+# Chains: a submenu "Copy" and one "Paste" for the selected card.
+function Add-ChainCopyMenu($Menu, $Node) {
+    $d = $ChainUI.Data[$Node.Id]
+    $cp = New-Object System.Windows.Forms.ToolStripMenuItem('Copy', (New-GlyphImage $Glyph.Copy))
+    foreach ($k in @(@('request', 'the whole request (Ctrl+C)'), @('headers', 'headers'), @('body', 'body'), @('auth', 'auth'))) {
+        $it = $cp.DropDownItems.Add($k[1], $null, { param($s2, $e2) Save-ChainEditor; $n = $ChainUI.Canvas.SelectedNode; Copy-RequestPart $s2.Tag $ChainUI.Data[$n.Id].Request $ChainUI.Data[$n.Id].Extract.ToArray(); Set-ChainStatus "Copied the $($s2.Text -replace ' \(Ctrl\+C\)', ''). Paste it on another card (right-click > Paste), in another chain or in the API tester." $C.Green })
+        $it.Tag = $k[0]
+    }
+    $cp.DropDown.Renderer = $MenuRenderer
+    [void]$Menu.Items.Add($cp)
+    $part = Get-RequestPart
+    if ($part) {
+        $kinds = if ($part.DevToolsRequestPart -eq 'request') { @('headers', 'body', 'auth') } else { @([string]$part.DevToolsRequestPart) }
+        $ps = New-Object System.Windows.Forms.ToolStripMenuItem('Paste into this card', (New-GlyphImage $Glyph.Paste))
+        foreach ($k in $kinds) {
+            $it = $ps.DropDownItems.Add($(switch ($k) { 'headers' { 'headers (added)' } 'body' { 'body (replaces)' } default { 'auth (replaces)' } }), $null, {
+                param($s2, $e2)
+                Save-ChainEditor
+                $n = $ChainUI.Canvas.SelectedNode; $pp = Get-RequestPart; if (-not $pp) { return }
+                Set-RequestPart $ChainUI.Data[$n.Id].Request $pp $s2.Tag
+                $ChainUI.EditId = $null; Show-ChainStep $n; Save-Chains
+                Set-ChainStatus "Pasted the $($s2.Tag) into $($n.Title)." $C.Green
+            })
+            $it.Tag = $k
+        }
+        $ps.DropDown.Renderer = $MenuRenderer
+        [void]$Menu.Items.Add($ps)
+    }
+}
+
+# Ctrl+V on the canvas (or right-click > Paste): a copied request, a curl command, a link or a chain.
+function Invoke-ChainPaste([float]$X = -1, [float]$Y = -1) {
+    $part = Get-RequestPart
+    if ($part -and $part.DevToolsRequestPart -eq 'request') {
+        $cv = $ChainUI.Canvas; $cv.SelectedNode = $null
+        $n = Add-ChainStep (New-ModelFromPart $part) $X $Y
+        foreach ($r in @($part.Extract)) { if ($r -and $r.Var) { $ChainUI.Data[$n.Id].Extract.Add([pscustomobject]@{ Var = [string]$r.Var; From = [string]$r.From; Expr = [string]$r.Expr }) } }
+        $ChainUI.EditId = $null; Show-ChainStep $n; Save-Chains
+        Set-ChainStatus "Pasted the request as a new card: $($n.Title)." $C.Green
+        return
+    }
+    $t = ''; try { $t = [System.Windows.Forms.Clipboard]::GetText() } catch { }
+    if (-not $t.Trim()) { Set-ChainStatus 'The clipboard is empty. Copy a card (Ctrl+C), a curl command or a link first.' $C.Dim; return }
+    $cv = $ChainUI.Canvas
+    if ($X -lt 0) { $p = $cv.ToCanvas((New-Object System.Drawing.Point((Px 60), (Px 60)))); $X = $p.X; $Y = $p.Y }
+    Add-ChainDrop (New-Object System.Windows.Forms.DataObject([System.Windows.Forms.DataFormats]::UnicodeText, $t)) $X $Y
+}
+
+# ---- "Pick a value": the last response of a step as a tree; double-click a value to use it in other steps.
+function Update-ChainPick($Node) {
+    $tv = $ChainUI.Pick
+    if (-not $tv) { return }
+    $tv.BeginUpdate(); $tv.Nodes.Clear()
+    $res = if ($Node) { $ChainUI.Results[$Node.Id] } else { $null }
+    if (-not $res -or $res.Response.Error) {
+        [void]$tv.Nodes.Add($(if ($Node) { 'Run this step first; then its response shows here.' } else { 'Select a card that has run.' }))
+        $tv.EndUpdate(); return
+    }
+    $p = $res.Response
+    if ($p.Text) {
+        $root = $null
+        try { $root = [DevJson]::Parse($p.Text) } catch { }
+        if ($null -ne $root) {
+            $b = $tv.Nodes.Add("Body  $([DevJson]::Short($root, 40))")
+            $b.Tag = [pscustomobject]@{ V = $root; Steps = @() }
+            Add-JsonTreeChildren $b.Nodes $root @()
+            $b.Expand()
+            foreach ($c in $b.Nodes) { if ($c.Nodes.Count -and $b.Nodes.Count -le 6) { $c.Expand() } }
+        } else {
+            $b = $tv.Nodes.Add("Body (not JSON - use a Regex rule)  $([string]$p.Text.Substring(0, [Math]::Min(60, $p.Text.Length)) -replace '\s+', ' ')")
+        }
+    }
+    $h = $tv.Nodes.Add('Headers')
+    foreach ($x in $p.Headers) { if ($x[0] -ne 'Set-Cookie') { $n = $h.Nodes.Add("$($x[0]) : $($x[1])"); $n.Tag = [pscustomobject]@{ Kind = 'Header'; Name = $x[0]; Value = $x[1] } } }
+    $ck = $tv.Nodes.Add('Cookies')
+    foreach ($x in $p.Headers) { if ($x[0] -eq 'Set-Cookie' -and $x[1] -match '^\s*([^=;]+)=([^;]*)') { $n = $ck.Nodes.Add("$($Matches[1]) = $($Matches[2])"); $n.Tag = [pscustomobject]@{ Kind = 'Cookie'; Name = $Matches[1].Trim(); Value = $Matches[2] } } }
+    $st = $tv.Nodes.Add("Status : $($p.Status)"); $st.Tag = [pscustomobject]@{ Kind = 'Status'; Name = 'status'; Value = [string]$p.Status }
+    $tv.EndUpdate()
+}
+
+# variable name from a key: "access_token" -> accessToken, "X-CSRF-Token" -> xCsrfToken
+function Get-VarName([string]$Key) {
+    $parts = @($Key -split '[^A-Za-z0-9]+' | Where-Object { $_ })
+    if (-not $parts) { return 'value' }
+    $s = $parts[0].Substring(0, 1).ToLower() + $(if ($parts[0].Length -gt 1) { $(if ($parts[0] -cmatch '^[A-Z0-9]+$') { $parts[0].Substring(1).ToLower() } else { $parts[0].Substring(1) }) })
+    foreach ($w in $parts | Select-Object -Skip 1) { $s += $w.Substring(0, 1).ToUpper() + $(if ($w.Length -gt 1) { $(if ($w -cmatch '^[A-Z0-9]+$') { $w.Substring(1).ToLower() } else { $w.Substring(1) }) }) }
+    if ($s -match '^\d') { $s = "v$s" }
+    $s
+}
+
+# Makes the "Take from response" rule for the picked value, sets the variable now, copies {{name}}.
+function Add-ChainPick($TreeNode, [switch]$ValueOnly) {
+    $node = $ChainUI.Canvas.SelectedNode
+    $tag = $TreeNode.Tag
+    if (-not $node -or -not $tag) { return }
+    if ($tag.PSObject.Properties['Steps']) {
+        $steps = @($tag.Steps)
+        if (-not $steps.Count) { $rule = 'Body'; $expr = ''; $suggest = 'body' }
+        else {
+            $rule = 'JSON path'; $expr = '$' + (Get-StepCode 'path' $steps '')
+            $lastKey = @($steps | Where-Object { $_.K } | Select-Object -Last 1).K
+            $suggest = Get-VarName $(if ($lastKey) { $lastKey } else { 'item' })
+        }
+        $value = if ($tag.V -is [string]) { $tag.V } else { [DevJson]::Write($tag.V, -1, $false) }
+    } else {
+        $rule = $tag.Kind; $expr = $(if ($tag.Kind -eq 'Status') { '' } else { $tag.Name }); $suggest = Get-VarName $tag.Name; $value = $tag.Value
+    }
+    if ($ValueOnly) { Copy-TbText $value; Set-ChainStatus 'Value copied.' $C.Green; return }
+    $d = $ChainUI.Data[$node.Id]
+    $existing = @($d.Extract | Where-Object { $_.From -eq $rule -and $_.Expr -eq $expr } | Select-Object -First 1)
+    $name = if ($existing) { $existing[0].Var } else { Read-TextDialog 'Use this value in other steps' "Save it as the variable (then write {{name}} where you need it)`n$rule $expr" $suggest $ChainUI.Form }
+    if (-not $name) { return }
+    $name = $name.Trim().Trim('{', '}').Trim()
+    Save-ChainEditor
+    if (-not $existing) { $d.Extract.Add([pscustomobject]@{ Var = $name; From = $rule; Expr = $expr }) }
+    $ChainUI.Vars[$name] = [string]$value
+    $ChainUI.EditId = $null; Show-ChainStep $node; Save-Chains
+    Update-ChainVarsView
+    Copy-TbText "{{$name}}"
+    Set-ChainStatus "{{$name}} is copied - paste it (Ctrl+V) into the URL, a header or the body of a later step. It's filled from this step's response on every run." $C.Green
+}
+
+# API tester: copy / paste request parts and whole requests (the same clipboard notes as in chains).
+function Show-ApiCopyMenu($Button) {
+    $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    foreach ($k in @(@('request', 'Copy the whole request'), @('headers', 'Copy the headers'), @('body', 'Copy the body'), @('auth', 'Copy the auth'))) {
+        $it = Add-MenuItem $m $k[1] { param($src, $e) Copy-RequestPart $src.Tag (Get-ApiModel); Set-ApiStatus "Copied. Paste it in another request here, or on a card in API chains." $C.Green } $Glyph.Copy
+        $it.Tag = $k[0]
+    }
+    $part = Get-RequestPart
+    if ($part) {
+        [void]$m.Items.Add('-')
+        $kinds = if ($part.DevToolsRequestPart -eq 'request') { @('request', 'headers', 'body', 'auth') } else { @([string]$part.DevToolsRequestPart) }
+        foreach ($k in $kinds) {
+            $label = switch ($k) { 'request' { 'Paste the whole request (replaces this one)' } 'headers' { 'Paste headers (added)' } 'body' { 'Paste body (replaces)' } default { 'Paste auth (replaces)' } }
+            $it = Add-MenuItem $m $label {
+                param($src, $e)
+                $pp = Get-RequestPart; if (-not $pp) { return }
+                if ($src.Tag -eq 'request') { $nm = New-ModelFromPart $pp; Set-ApiModel $nm }
+                else { $cur = Get-ApiModel; Set-RequestPart $cur $pp $src.Tag; Set-ApiModel $cur -Bind:([bool]$ApiUI.CurrentId) }
+                Set-ApiStatus "Pasted the $($src.Tag)." $C.Green
+            } $Glyph.Paste
+            $it.Tag = $k
+        }
+    }
+    $m.Show($Button, (New-Object System.Drawing.Point(0, $Button.Height)))
+}
+
 function Show-ChainResult($Node) {
     $o = $ChainUI.Result
     if (-not $o) { return }
+    Update-ChainPick $Node
     if (-not $Node) { $o.Text = ''; return }
     $res = $ChainUI.Results[$Node.Id]
     if (-not $res) { $o.Text = if ($Node.State -eq 'skip') { "Skipped: $($Node.Info -replace '^skipped: ', '').`r`nA step it waits for failed, so it was not sent." } else { 'Not run yet. Press Run chain (F5), or Run this step (Shift+F5) to use the variables from the last run.' }; return }
@@ -11669,7 +11872,23 @@ function Show-ApiChains {
     # result + variables
     $rtabs = New-TabSet $right.Panel2
     $pRes = Add-ApiTab $rtabs 'Result'
+    $pPick = Add-ApiTab $rtabs 'Pick a value'
     $pVars = Add-ApiTab $rtabs 'Variables & cookies'
+    $pk = New-Object System.Windows.Forms.TreeView
+    $pk.Dock = 'Fill'; $pk.BorderStyle = 'None'; $pk.BackColor = $C.Bg; $pk.ForeColor = $C.Fore; $pk.HideSelection = $false
+    $pk.Font = New-Object System.Drawing.Font('Consolas', (Fz 10))
+    $pk.add_BeforeExpand({ param($src, $e) if ($e.Node.Nodes.Count -eq 1 -and $e.Node.Nodes[0].Text -eq '') { $e.Node.Nodes.Clear(); Add-JsonTreeChildren $e.Node.Nodes $e.Node.Tag.V $e.Node.Tag.Steps } })
+    $pk.add_NodeMouseDoubleClick({ param($src, $e) if ($e.Node.Tag) { Add-ChainPick $e.Node } })
+    $pkm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    [void](Add-MenuItem $pkm 'Use in other steps as {{variable}}' { $n = $ChainUI.Pick.SelectedNode; if ($n) { Add-ChainPick $n } } $Glyph.Add 'double-click')
+    [void](Add-MenuItem $pkm 'Copy the value' { $n = $ChainUI.Pick.SelectedNode; if ($n) { Add-ChainPick $n -ValueOnly } } $Glyph.Copy)
+    $pk.ContextMenuStrip = $pkm
+    $pk.add_NodeMouseClick({ param($src, $e) if ($e.Button -eq 'Right') { $src.SelectedNode = $e.Node } })
+    $pPick.Controls.Add($pk)
+    $pkh = New-TbBar $pPick 'Bottom'
+    $pkl = New-TbLabel $pkh 'Double-click a value (token, id ...): the rule to take it is made for you and {{name}} is copied - paste it into a later step.' -Dim
+    $pkl.MaximumSize = New-Object System.Drawing.Size((Px 480), 0)
+    $ChainUI.Pick = $pk
     $ChainUI.Result = New-TbRtb -ReadOnly; $ChainUI.Result.Dock = 'Fill'; $ChainUI.Result.WordWrap = $true; $pRes.Controls.Add($ChainUI.Result)
     $ChainUI.VarsOut = New-TbRtb -ReadOnly; $ChainUI.VarsOut.Dock = 'Fill'; $pVars.Controls.Add($ChainUI.VarsOut)
     Select-ApiTab $rtabs 'Result'
@@ -11748,8 +11967,14 @@ function Show-ApiChains {
         foreach ($m in $ApiUI.Collections) { $it = $add.DropDownItems.Add("$($m.Method)  $($m.Folder) / $($m.Name)", $null, { param($s2, $e2) $p = $s2.OwnerItem.Owner.Tag; Add-ChainFromPalette $s2.Tag ($p.X) ($p.Y) }); $it.Tag = "req:$($m.Id)" }
         $add.DropDown.Renderer = $MenuRenderer
         [void]$src.Items.Add($add)
+        $pp = Get-RequestPart
+        $clipText = ''; try { $clipText = [System.Windows.Forms.Clipboard]::GetText() } catch { }
+        if (($pp -and $pp.DevToolsRequestPart -eq 'request') -or $clipText -match '^\s*(curl\s|https?://)') {
+            [void](Add-MenuItem $src $(if ($pp) { 'Paste the copied request here' } else { 'Paste (curl command / link) here' }) { param($s2, $e2) $p = $s2.Owner.Tag; $ChainUI.Canvas.SelectedNode = $null; Invoke-ChainPaste ($p.X) ($p.Y) } $Glyph.Paste 'Ctrl+V')
+        }
         if ($cv2.SelectedNode) {
             [void](Add-MenuItem $src 'Run this step' { Start-ChainRun $ChainUI.Canvas.SelectedNode.Id } $Glyph.Play)
+            Add-ChainCopyMenu $src $cv2.SelectedNode
             [void](Add-MenuItem $src 'Duplicate' { $n = $ChainUI.Canvas.SelectedNode; $m = $ChainUI.Data[$n.Id].Request | ConvertTo-Json -Depth 6 | ConvertFrom-Json; $sel = $ChainUI.Canvas.SelectedNode; $ChainUI.Canvas.SelectedNode = $null; $x = Add-ChainStep $m ($sel.X + (Px 30)) ($sel.Y + (Px 100)); foreach ($r in $ChainUI.Data[$sel.Id].Extract) { $ChainUI.Data[$x.Id].Extract.Add($r) }; Save-Chains } $Glyph.Copy)
             [void](Add-MenuItem $src 'Delete' { $ChainUI.Canvas.RemoveSelected() } $Glyph.Delete 'Del')
         } elseif ($cv2.SelectedLink) { [void](Add-MenuItem $src 'Delete arrow' { $ChainUI.Canvas.RemoveSelected() } $Glyph.Delete 'Del') }
@@ -11826,6 +12051,17 @@ function Show-ApiChains {
         param($src, $e)
         if ($e.KeyCode -eq 'F5' -and $e.Shift) { $n = $ChainUI.Canvas.SelectedNode; if ($n) { Start-ChainRun $n.Id }; $e.Handled = $true }
         elseif ($e.KeyCode -eq 'F5') { Start-ChainRun; $e.Handled = $true }
+        elseif ($ChainUI.Canvas.Focused -and $e.Control -and $e.KeyCode -eq 'C' -and $ChainUI.Canvas.SelectedNode) {
+            Save-ChainEditor; $n = $ChainUI.Canvas.SelectedNode
+            Copy-RequestPart 'request' $ChainUI.Data[$n.Id].Request $ChainUI.Data[$n.Id].Extract.ToArray()
+            Set-ChainStatus "Copied $($n.Title). Ctrl+V pastes it as a new card (here or in another chain); the API tester can paste it too." $C.Green
+            $e.Handled = $true; $e.SuppressKeyPress = $true
+        }
+        elseif ($ChainUI.Canvas.Focused -and $e.Control -and $e.KeyCode -eq 'V') {
+            $sel = $ChainUI.Canvas.SelectedNode
+            if ($sel) { $ChainUI.Canvas.SelectedNode = $null; Invoke-ChainPaste ($sel.X + (Px 30)) ($sel.Y + $ChainUI.Canvas.NodeH + (Px 30)) } else { Invoke-ChainPaste }
+            $e.Handled = $true; $e.SuppressKeyPress = $true
+        }
     })
     $f.add_FormClosing({ Save-ChainEditor; Save-Chains; Stop-ChainRun })
     $f.add_FormClosed({ param($src, $e) $ChainUI.Form = $null; $ChainUI.Canvas = $null; $ChainUI.EditId = $null; $ChainUI.Timer.Dispose(); $ChainUI.SaveTimer.Dispose(); $src.Dispose() })
