@@ -9645,6 +9645,910 @@ $TransformOps = foreach ($o in [PowerClipTransform]::Ops) {
     [pscustomobject]@{ Group = $p[0]; Name = $p[1]; Key = $p[2]; Default = $p[3] }
 }
 
+# ---- Code guides for Transform: how to do the selected operation in other languages. {T} = the input as a
+#      string literal of that language, {K} = the key / password; hashes use one template with {A}.
+$TransformLangs = [ordered]@{ 'C#' = 'cs'; 'PowerShell' = 'ps'; 'Python' = 'py'; 'JavaScript (Node.js)' = 'js'; 'Java' = 'java'; 'Go' = 'go'; 'Bash' = 'sh'; 'PHP' = 'php' }
+$TransformCode = @{}
+function Add-TransformCode([string]$Op, [hashtable]$Code) { $TransformCode[$Op] = $Code }
+
+Add-TransformCode 'Text to hex' @{
+    cs = 'using System.Text;
+string hex = Convert.ToHexString(Encoding.UTF8.GetBytes({T})).ToLowerInvariant();   // .NET 5+
+// older .NET: BitConverter.ToString(bytes).Replace("-", "").ToLowerInvariant()
+Console.WriteLine(hex);'
+    ps = '$hex = -join ([Text.Encoding]::UTF8.GetBytes({T}) | ForEach-Object { $_.ToString(''x2'') })
+$hex'
+    py = 'hex_text = {T}.encode("utf-8").hex()
+print(hex_text)'
+    js = 'const hex = Buffer.from({T}, "utf8").toString("hex");
+console.log(hex);'
+    java = 'import java.nio.charset.StandardCharsets;
+import java.util.HexFormat;   // Java 17+
+
+String hex = HexFormat.of().formatHex({T}.getBytes(StandardCharsets.UTF_8));
+System.out.println(hex);'
+    go = 'import ("encoding/hex"; "fmt")
+
+fmt.Println(hex.EncodeToString([]byte({T})))'
+    sh = 'printf ''%s'' {T} | xxd -p | tr -d ''\n''      # or: | od -An -tx1 | tr -d '' \n'''
+    php = '<?php
+echo bin2hex({T});'
+}
+Add-TransformCode 'Hex to text' @{
+    cs = 'using System.Text;
+string text = Encoding.UTF8.GetString(Convert.FromHexString({T}));   // .NET 5+
+Console.WriteLine(text);'
+    ps = '$hex = {T}
+$bytes = [byte[]]($hex -replace ''[^0-9a-fA-F]'', '''' -split ''(..)'' -ne '''' | ForEach-Object { [Convert]::ToByte($_, 16) })
+[Text.Encoding]::UTF8.GetString($bytes)'
+    py = 'text = bytes.fromhex({T}).decode("utf-8")
+print(text)'
+    js = 'const text = Buffer.from({T}, "hex").toString("utf8");
+console.log(text);'
+    java = 'import java.nio.charset.StandardCharsets;
+import java.util.HexFormat;   // Java 17+
+
+String text = new String(HexFormat.of().parseHex({T}), StandardCharsets.UTF_8);
+System.out.println(text);'
+    go = 'import ("encoding/hex"; "fmt")
+
+b, err := hex.DecodeString({T})
+if err != nil { panic(err) }
+fmt.Println(string(b))'
+    sh = 'printf ''%s'' {T} | xxd -r -p'
+    php = '<?php
+echo hex2bin({T});'
+}
+Add-TransformCode 'Text to binary' @{
+    cs = 'using System.Text;
+string bits = string.Join(" ", Encoding.UTF8.GetBytes({T}).Select(b => Convert.ToString(b, 2).PadLeft(8, ''0'')));
+Console.WriteLine(bits);'
+    ps = '([Text.Encoding]::UTF8.GetBytes({T}) | ForEach-Object { [Convert]::ToString($_, 2).PadLeft(8, ''0'') }) -join '' '''
+    py = 'bits = " ".join(f"{b:08b}" for b in {T}.encode("utf-8"))
+print(bits)'
+    js = 'const bits = [...Buffer.from({T}, "utf8")].map(b => b.toString(2).padStart(8, "0")).join(" ");
+console.log(bits);'
+    java = 'StringBuilder sb = new StringBuilder();
+for (byte b : {T}.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+    sb.append(String.format("%8s", Integer.toBinaryString(b & 0xFF)).replace('' '', ''0'')).append('' '');
+System.out.println(sb.toString().trim());'
+    go = 'for _, b := range []byte({T}) { fmt.Printf("%08b ", b) }'
+    sh = 'printf ''%s'' {T} | xxd -b -c1 | awk ''{ printf "%s%s", (NR > 1 ? " " : ""), $2 } END { print "" }'''
+    php = '<?php
+echo implode(" ", array_map(fn($c) => str_pad(decbin(ord($c)), 8, "0", STR_PAD_LEFT), str_split({T})));'
+}
+Add-TransformCode 'Binary to text' @{
+    cs = 'using System.Text;
+var bytes = {T}.Split(new[] { '' '' }, StringSplitOptions.RemoveEmptyEntries).Select(s => Convert.ToByte(s, 2)).ToArray();
+Console.WriteLine(Encoding.UTF8.GetString(bytes));'
+    ps = '[Text.Encoding]::UTF8.GetString([byte[]]({T} -split ''\s+'' -ne '''' | ForEach-Object { [Convert]::ToByte($_, 2) }))'
+    py = 'text = bytes(int(b, 2) for b in {T}.split()).decode("utf-8")
+print(text)'
+    js = 'const text = Buffer.from({T}.trim().split(/\s+/).map(b => parseInt(b, 2))).toString("utf8");
+console.log(text);'
+    java = 'String[] parts = {T}.trim().split("\\s+");
+byte[] bytes = new byte[parts.length];
+for (int i = 0; i < parts.length; i++) bytes[i] = (byte) Integer.parseInt(parts[i], 2);
+System.out.println(new String(bytes, java.nio.charset.StandardCharsets.UTF_8));'
+    go = 'var out []byte
+for _, s := range strings.Fields({T}) { v, _ := strconv.ParseUint(s, 2, 8); out = append(out, byte(v)) }
+fmt.Println(string(out))'
+    sh = 'for b in $(printf ''%s'' {T}); do printf "\\x$(printf %x $((2#$b)))"; done; echo'
+    php = '<?php
+echo implode("", array_map(fn($b) => chr(bindec($b)), preg_split(''/\s+/'', trim({T}))));'
+}
+Add-TransformCode 'Base64 encode' @{
+    cs = 'using System.Text;
+string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes({T}));
+Console.WriteLine(b64);'
+    ps = '[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes({T}))'
+    py = 'import base64
+
+print(base64.b64encode({T}.encode("utf-8")).decode("ascii"))'
+    js = 'console.log(Buffer.from({T}, "utf8").toString("base64"));
+// in a browser: btoa(String.fromCharCode(...new TextEncoder().encode(text)))'
+    java = 'import java.util.Base64;
+
+String b64 = Base64.getEncoder().encodeToString({T}.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+System.out.println(b64);'
+    go = 'import ("encoding/base64"; "fmt")
+
+fmt.Println(base64.StdEncoding.EncodeToString([]byte({T})))'
+    sh = 'printf ''%s'' {T} | base64 -w0      # macOS: base64 (no -w0)'
+    php = '<?php
+echo base64_encode({T});'
+}
+Add-TransformCode 'Base64 decode' @{
+    cs = 'using System.Text;
+string text = Encoding.UTF8.GetString(Convert.FromBase64String({T}));
+Console.WriteLine(text);'
+    ps = '[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String({T}))'
+    py = 'import base64
+
+print(base64.b64decode({T}).decode("utf-8"))'
+    js = 'console.log(Buffer.from({T}, "base64").toString("utf8"));'
+    java = 'import java.util.Base64;
+
+String text = new String(Base64.getDecoder().decode({T}), java.nio.charset.StandardCharsets.UTF_8);
+System.out.println(text);'
+    go = 'import ("encoding/base64"; "fmt")
+
+b, err := base64.StdEncoding.DecodeString({T})
+if err != nil { panic(err) }
+fmt.Println(string(b))'
+    sh = 'printf ''%s'' {T} | base64 -d'
+    php = '<?php
+echo base64_decode({T});'
+}
+Add-TransformCode 'Base64URL encode' @{
+    cs = 'using System.Text;
+string b64url = Convert.ToBase64String(Encoding.UTF8.GetBytes({T})).TrimEnd(''='').Replace(''+'', ''-'').Replace(''/'', ''_'');
+Console.WriteLine(b64url);   // .NET 9+: System.Buffers.Text.Base64Url.EncodeToString(bytes)'
+    ps = '[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes({T})).TrimEnd(''='').Replace(''+'', ''-'').Replace(''/'', ''_'')'
+    py = 'import base64
+
+print(base64.urlsafe_b64encode({T}.encode("utf-8")).decode("ascii").rstrip("="))'
+    js = 'console.log(Buffer.from({T}, "utf8").toString("base64url"));'
+    java = 'import java.util.Base64;
+
+String s = Base64.getUrlEncoder().withoutPadding().encodeToString({T}.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+System.out.println(s);'
+    go = 'import ("encoding/base64"; "fmt")
+
+fmt.Println(base64.RawURLEncoding.EncodeToString([]byte({T})))'
+    sh = 'printf ''%s'' {T} | base64 -w0 | tr ''+/'' ''-_'' | tr -d ''='''
+    php = '<?php
+echo rtrim(strtr(base64_encode({T}), ''+/'', ''-_''), ''='');'
+}
+Add-TransformCode 'Base64URL decode' @{
+    cs = 'using System.Text;
+string s = {T}.Replace(''-'', ''+'').Replace(''_'', ''/'');
+s = s.PadRight(s.Length + (4 - s.Length % 4) % 4, ''='');
+Console.WriteLine(Encoding.UTF8.GetString(Convert.FromBase64String(s)));'
+    ps = '$s = {T}.Replace(''-'', ''+'').Replace(''_'', ''/''); $s += ''='' * ((4 - $s.Length % 4) % 4)
+[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s))'
+    py = 'import base64
+
+s = {T}
+print(base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)).decode("utf-8"))'
+    js = 'console.log(Buffer.from({T}, "base64url").toString("utf8"));'
+    java = 'import java.util.Base64;
+
+System.out.println(new String(Base64.getUrlDecoder().decode({T}), java.nio.charset.StandardCharsets.UTF_8));'
+    go = 'b, err := base64.RawURLEncoding.DecodeString(strings.TrimRight({T}, "="))
+if err != nil { panic(err) }
+fmt.Println(string(b))'
+    sh = 's=$(printf ''%s'' {T} | tr ''_-'' ''/+''); while [ $(( ${#s} % 4 )) -ne 0 ]; do s="$s="; done
+printf ''%s'' "$s" | base64 -d'
+    php = '<?php
+$s = strtr({T}, ''-_'', ''+/'');
+echo base64_decode($s . str_repeat(''='', (4 - strlen($s) % 4) % 4));'
+}
+Add-TransformCode 'Base32 encode' @{
+    cs = '// no Base32 in .NET itself - a small function (RFC 4648, with = padding):
+static string Base32(byte[] data) {
+    const string abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    var sb = new System.Text.StringBuilder(); int buffer = 0, bits = 0;
+    foreach (byte b in data) { buffer = (buffer << 8) | b; bits += 8; while (bits >= 5) { sb.Append(abc[(buffer >> (bits - 5)) & 31]); bits -= 5; } }
+    if (bits > 0) sb.Append(abc[(buffer << (5 - bits)) & 31]);
+    while (sb.Length % 8 != 0) sb.Append(''='');
+    return sb.ToString();
+}
+Console.WriteLine(Base32(System.Text.Encoding.UTF8.GetBytes({T})));'
+    ps = '$abc = ''ABCDEFGHIJKLMNOPQRSTUVWXYZ234567''; $buf = 0; $bits = 0; $out = ''''
+foreach ($b in [Text.Encoding]::UTF8.GetBytes({T})) { $buf = (($buf -shl 8) -bor $b) -band 0xFFFF; $bits += 8; while ($bits -ge 5) { $out += $abc[($buf -shr ($bits - 5)) -band 31]; $bits -= 5 } }
+if ($bits) { $out += $abc[($buf -shl (5 - $bits)) -band 31] }
+$out.PadRight([Math]::Ceiling($out.Length / 8) * 8, ''='')'
+    py = 'import base64
+
+print(base64.b32encode({T}.encode("utf-8")).decode("ascii"))'
+    js = '// npm i hi-base32   (or write it like the C# version)
+const base32 = require("hi-base32");
+console.log(base32.encode({T}));'
+    java = '// Apache Commons Codec: org.apache.commons.codec.binary.Base32
+String s = new org.apache.commons.codec.binary.Base32().encodeToString({T}.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+System.out.println(s);'
+    go = 'import ("encoding/base32"; "fmt")
+
+fmt.Println(base32.StdEncoding.EncodeToString([]byte({T})))'
+    sh = 'printf ''%s'' {T} | base32 -w0'
+    php = '<?php
+// composer require christian-riesen/base32  (or a small function like the C# one)
+echo \Base32\Base32::encode({T});'
+}
+Add-TransformCode 'Base32 decode' @{
+    cs = '// the reverse of Base32() - read 5 bits per letter:
+static byte[] FromBase32(string s) {
+    const string abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    var outp = new List<byte>(); int buffer = 0, bits = 0;
+    foreach (char c in s.TrimEnd(''='').ToUpperInvariant()) { buffer = (buffer << 5) | abc.IndexOf(c); bits += 5; if (bits >= 8) { outp.Add((byte)(buffer >> (bits - 8))); bits -= 8; } }
+    return outp.ToArray();
+}
+Console.WriteLine(System.Text.Encoding.UTF8.GetString(FromBase32({T})));'
+    ps = '$abc = ''ABCDEFGHIJKLMNOPQRSTUVWXYZ234567''; $buf = 0; $bits = 0; $bytes = @()
+foreach ($c in {T}.TrimEnd(''='').ToUpper().ToCharArray()) { $buf = (($buf -shl 5) -bor $abc.IndexOf($c)) -band 0xFFFF; $bits += 5; if ($bits -ge 8) { $bytes += [byte](($buf -shr ($bits - 8)) -band 255); $bits -= 8 } }
+[Text.Encoding]::UTF8.GetString([byte[]]$bytes)'
+    py = 'import base64
+
+print(base64.b32decode({T}).decode("utf-8"))'
+    js = 'const base32 = require("hi-base32");   // npm i hi-base32
+console.log(base32.decode({T}));'
+    java = 'byte[] b = new org.apache.commons.codec.binary.Base32().decode({T});
+System.out.println(new String(b, java.nio.charset.StandardCharsets.UTF_8));'
+    go = 'b, err := base32.StdEncoding.DecodeString({T})
+if err != nil { panic(err) }
+fmt.Println(string(b))'
+    sh = 'printf ''%s'' {T} | base32 -d'
+    php = '<?php
+echo \Base32\Base32::decode({T});'
+}
+Add-TransformCode 'URL encode' @{
+    cs = 'Console.WriteLine(Uri.EscapeDataString({T}));   // spaces -> %20'
+    ps = '[Uri]::EscapeDataString({T})'
+    py = 'from urllib.parse import quote
+
+print(quote({T}, safe=""))      # quote_plus() gives + for spaces (forms)'
+    js = 'console.log(encodeURIComponent({T}));'
+    java = 'import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+
+// URLEncoder is for forms (space -> +); replace "+" with "%20" for a path or query value
+System.out.println(URLEncoder.encode({T}, StandardCharsets.UTF_8).replace("+", "%20"));'
+    go = 'import ("fmt"; "net/url")
+
+fmt.Println(url.PathEscape({T}))   // url.QueryEscape uses + for spaces'
+    sh = 'jq -rn --arg v {T} ''$v|@uri''        # or: python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''''))" {T}'
+    php = '<?php
+echo rawurlencode({T});   // urlencode() uses + for spaces'
+}
+Add-TransformCode 'URL decode' @{
+    cs = 'Console.WriteLine(Uri.UnescapeDataString({T}.Replace("+", " ")));'
+    ps = '[Uri]::UnescapeDataString({T}.Replace(''+'', '' ''))'
+    py = 'from urllib.parse import unquote_plus
+
+print(unquote_plus({T}))'
+    js = 'console.log(decodeURIComponent({T}.replace(/\+/g, " ")));'
+    java = 'System.out.println(java.net.URLDecoder.decode({T}, java.nio.charset.StandardCharsets.UTF_8));'
+    go = 's, err := url.QueryUnescape({T})
+if err != nil { panic(err) }
+fmt.Println(s)'
+    sh = 'python3 -c "import urllib.parse,sys;print(urllib.parse.unquote_plus(sys.argv[1]))" {T}'
+    php = '<?php
+echo urldecode({T});'
+}
+Add-TransformCode 'HTML encode' @{
+    cs = 'Console.WriteLine(System.Net.WebUtility.HtmlEncode({T}));'
+    ps = '[System.Net.WebUtility]::HtmlEncode({T})'
+    py = 'import html
+
+print(html.escape({T}))'
+    js = 'const enc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/''/g, "&#39;");
+console.log(enc({T}));'
+    java = '// Apache Commons Text: org.apache.commons.text.StringEscapeUtils
+System.out.println(org.apache.commons.text.StringEscapeUtils.escapeHtml4({T}));'
+    go = 'import ("fmt"; "html")
+
+fmt.Println(html.EscapeString({T}))'
+    sh = 'python3 -c "import html,sys;print(html.escape(sys.argv[1]))" {T}'
+    php = '<?php
+echo htmlspecialchars({T}, ENT_QUOTES);'
+}
+Add-TransformCode 'HTML decode' @{
+    cs = 'Console.WriteLine(System.Net.WebUtility.HtmlDecode({T}));'
+    ps = '[System.Net.WebUtility]::HtmlDecode({T})'
+    py = 'import html
+
+print(html.unescape({T}))'
+    js = '// npm i he   (handles every named entity)
+console.log(require("he").decode({T}));'
+    java = 'System.out.println(org.apache.commons.text.StringEscapeUtils.unescapeHtml4({T}));'
+    go = 'fmt.Println(html.UnescapeString({T}))'
+    sh = 'python3 -c "import html,sys;print(html.unescape(sys.argv[1]))" {T}'
+    php = '<?php
+echo html_entity_decode({T}, ENT_QUOTES | ENT_HTML5);'
+}
+Add-TransformCode 'JSON string escape' @{
+    cs = 'using System.Text.Json;
+Console.WriteLine(JsonSerializer.Serialize({T}));   // with the quotes around it'
+    ps = '{T} | ConvertTo-Json      # with the quotes around it'
+    py = 'import json
+
+print(json.dumps({T}, ensure_ascii=False))'
+    js = 'console.log(JSON.stringify({T}));'
+    java = '// Jackson: com.fasterxml.jackson.databind.ObjectMapper
+System.out.println(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString({T}));'
+    go = 'b, _ := json.Marshal({T})
+fmt.Println(string(b))'
+    sh = 'jq -n --arg v {T} ''$v'''
+    php = '<?php
+echo json_encode({T}, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);'
+}
+Add-TransformCode 'JSON string unescape' @{
+    cs = 'using System.Text.Json;
+string s = JsonSerializer.Deserialize<string>("\"" + {T} + "\"");
+Console.WriteLine(s);'
+    ps = '"`"$({T})`"" | ConvertFrom-Json'
+    py = 'import json
+
+print(json.loads(''"'' + {T} + ''"''))'
+    js = 'console.log(JSON.parse(''"'' + {T} + ''"''));'
+    java = 'String s = new com.fasterxml.jackson.databind.ObjectMapper().readValue("\"" + {T} + "\"", String.class);
+System.out.println(s);'
+    go = 'var s string
+if err := json.Unmarshal([]byte("\"" + {T} + "\""), &s); err != nil { panic(err) }
+fmt.Println(s)'
+    sh = 'jq -rn --arg v {T} ''"\"" + $v + "\"" | fromjson'''
+    php = '<?php
+echo json_decode(''"'' . {T} . ''"'');'
+}
+Add-TransformCode 'Unicode escape (\uXXXX)' @{
+    cs = 'var sb = new System.Text.StringBuilder();
+foreach (char c in {T}) sb.Append(c < 128 ? c.ToString() : "\\u" + ((int)c).ToString("x4"));
+Console.WriteLine(sb);'
+    ps = '-join ({T}.ToCharArray() | ForEach-Object { if ([int]$_ -lt 128) { $_ } else { ''\u{0:x4}'' -f [int]$_ } })'
+    py = 'print({T}.encode("unicode_escape").decode("ascii"))     # or json.dumps(text) for \uXXXX'
+    js = 'console.log({T}.replace(/[^\x00-\x7f]/g, c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")));'
+    java = 'StringBuilder sb = new StringBuilder();
+for (char c : {T}.toCharArray()) sb.append(c < 128 ? String.valueOf(c) : String.format("\\u%04x", (int) c));
+System.out.println(sb);'
+    go = 'fmt.Println(strconv.QuoteToASCII({T}))'
+    sh = 'printf ''%s'' {T} | python3 -c "import sys;print(sys.stdin.read().encode(''unicode_escape'').decode())"'
+    php = '<?php
+echo trim(json_encode({T}), ''"'');'
+}
+Add-TransformCode 'Unicode unescape' @{
+    cs = 'string s = System.Text.RegularExpressions.Regex.Unescape({T});
+Console.WriteLine(s);'
+    ps = '[regex]::Unescape({T})'
+    py = 'import re
+
+print(re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), {T}))'
+    js = 'console.log({T}.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16))));'
+    java = '// Apache Commons Text
+System.out.println(org.apache.commons.text.StringEscapeUtils.unescapeJava({T}));'
+    go = 's, err := strconv.Unquote(`"` + {T} + `"`)
+if err != nil { panic(err) }
+fmt.Println(s)'
+    sh = 'printf ''%b\n'' {T}      # bash understands \uXXXX in printf %b'
+    php = '<?php
+echo json_decode(''"'' . {T} . ''"'');'
+}
+
+# hashes: one template, {A} = the algorithm in that language
+$HashNames = @{
+    'MD5'     = @{ cs = 'MD5'; ps = 'MD5'; py = 'md5'; js = 'md5'; java = 'MD5'; go = 'md5'; sh = 'md5sum'; php = 'md5' }
+    'SHA-1'   = @{ cs = 'SHA1'; ps = 'SHA1'; py = 'sha1'; js = 'sha1'; java = 'SHA-1'; go = 'sha1'; sh = 'sha1sum'; php = 'sha1' }
+    'SHA-256' = @{ cs = 'SHA256'; ps = 'SHA256'; py = 'sha256'; js = 'sha256'; java = 'SHA-256'; go = 'sha256'; sh = 'sha256sum'; php = 'sha256' }
+    'SHA-384' = @{ cs = 'SHA384'; ps = 'SHA384'; py = 'sha384'; js = 'sha384'; java = 'SHA-384'; go = 'sha512'; sh = 'sha384sum'; php = 'sha384' }
+    'SHA-512' = @{ cs = 'SHA512'; ps = 'SHA512'; py = 'sha512'; js = 'sha512'; java = 'SHA-512'; go = 'sha512'; sh = 'sha512sum'; php = 'sha512' }
+}
+$HashCode = @{
+    cs = 'using System.Security.Cryptography;
+using System.Text;
+
+byte[] hash = {A}.HashData(Encoding.UTF8.GetBytes({T}));           // .NET 5+
+Console.WriteLine(Convert.ToHexString(hash).ToLowerInvariant());
+// a file: {A}.HashData(File.OpenRead(path))'
+    ps = '$hash = [Security.Cryptography.{A}]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes({T}))
+-join ($hash | ForEach-Object { $_.ToString(''x2'') })
+# a file: (Get-FileHash -Algorithm {A} .\file.zip).Hash'
+    py = 'import hashlib
+
+print(hashlib.{A}({T}.encode("utf-8")).hexdigest())
+# a file: hashlib.file_digest(open("file.zip", "rb"), "{A}").hexdigest()   (Python 3.11+)'
+    js = 'const crypto = require("crypto");
+
+console.log(crypto.createHash("{A}").update({T}, "utf8").digest("hex"));'
+    java = 'import java.security.MessageDigest;
+import java.util.HexFormat;
+
+byte[] hash = MessageDigest.getInstance("{A}").digest({T}.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+System.out.println(HexFormat.of().formatHex(hash));'
+    go = 'import ("crypto/{A}"; "encoding/hex"; "fmt")
+
+sum := {A}.Sum{GOSUM}([]byte({T}))
+fmt.Println(hex.EncodeToString(sum[:]))'
+    sh = 'printf ''%s'' {T} | {A} | cut -d'' '' -f1
+# a file: {A} file.zip'
+    php = '<?php
+echo hash(''{A}'', {T});
+// a file: hash_file(''{A}'', ''file.zip'')'
+}
+foreach ($h in $HashNames.Keys) {
+    $code = @{}
+    foreach ($l in $HashCode.Keys) {
+        $t = $HashCode[$l].Replace('{A}', $HashNames[$h][$l])
+        if ($l -eq 'go') { $t = $t.Replace('{GOSUM}', $(switch ($h) { 'MD5' { '' } 'SHA-1' { '' } 'SHA-256' { '256' } 'SHA-384' { '384' } 'SHA-512' { '512' } })) }
+        $code[$l] = $t
+    }
+    Add-TransformCode $h $code
+}
+Add-TransformCode 'CRC32' @{
+    cs = 'using System.IO.Hashing;   // NuGet: System.IO.Hashing
+uint crc = Crc32.HashToUInt32(System.Text.Encoding.UTF8.GetBytes({T}));
+Console.WriteLine(crc.ToString("x8"));'
+    ps = '# PowerShell has no CRC32; a small table-based version:
+$table = foreach ($n in 0..255) { $c = [uint32]$n; 1..8 | ForEach-Object { $c = if ($c -band 1) { 0xEDB88320 -bxor ($c -shr 1) } else { $c -shr 1 } }; $c }
+$crc = [uint32]::MaxValue
+foreach ($b in [Text.Encoding]::UTF8.GetBytes({T})) { $crc = $table[($crc -bxor $b) -band 0xFF] -bxor ($crc -shr 8) }
+''{0:x8}'' -f ($crc -bxor [uint32]::MaxValue)'
+    py = 'import zlib
+
+print(format(zlib.crc32({T}.encode("utf-8")), "08x"))'
+    js = 'const zlib = require("zlib");      // Node 20.15+ / 22.2+
+console.log(zlib.crc32({T}).toString(16).padStart(8, "0"));'
+    java = 'java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+crc.update({T}.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+System.out.println(String.format("%08x", crc.getValue()));'
+    go = 'import ("fmt"; "hash/crc32")
+
+fmt.Printf("%08x\n", crc32.ChecksumIEEE([]byte({T})))'
+    sh = 'printf ''%s'' {T} | gzip -c | tail -c8 | od -An -tx4 -N4 | tr -d '' ''    # or: crc32 <(printf ''%s'' text)'
+    php = '<?php
+echo hash(''crc32b'', {T});'
+}
+Add-TransformCode 'HMAC-SHA256' @{
+    cs = 'using System.Security.Cryptography;
+using System.Text;
+
+byte[] mac = HMACSHA256.HashData(Encoding.UTF8.GetBytes({K}), Encoding.UTF8.GetBytes({T}));   // .NET 6+
+Console.WriteLine(Convert.ToHexString(mac).ToLowerInvariant());'
+    ps = '$h = New-Object Security.Cryptography.HMACSHA256 (, [Text.Encoding]::UTF8.GetBytes({K}))
+-join ($h.ComputeHash([Text.Encoding]::UTF8.GetBytes({T})) | ForEach-Object { $_.ToString(''x2'') })'
+    py = 'import hmac, hashlib
+
+print(hmac.new({K}.encode("utf-8"), {T}.encode("utf-8"), hashlib.sha256).hexdigest())'
+    js = 'const crypto = require("crypto");
+
+console.log(crypto.createHmac("sha256", {K}).update({T}, "utf8").digest("hex"));'
+    java = 'import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+
+Mac mac = Mac.getInstance("HmacSHA256");
+mac.init(new SecretKeySpec({K}.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+System.out.println(java.util.HexFormat.of().formatHex(mac.doFinal({T}.getBytes(StandardCharsets.UTF_8))));'
+    go = 'import ("crypto/hmac"; "crypto/sha256"; "encoding/hex"; "fmt")
+
+m := hmac.New(sha256.New, []byte({K}))
+m.Write([]byte({T}))
+fmt.Println(hex.EncodeToString(m.Sum(nil)))'
+    sh = 'printf ''%s'' {T} | openssl dgst -sha256 -hmac {K} -r | cut -d'' '' -f1'
+    php = '<?php
+echo hash_hmac(''sha256'', {T}, {K});'
+}
+
+# AES: the same format as DevTools, so either side can open what the other wrote:
+#   Base64( "PC1" | salt 16 | iv 16 | HMAC-SHA256 32 | AES-256-CBC ciphertext )
+#   keys = PBKDF2-SHA256(password, salt, 200,000 rounds, 64 bytes): first 32 = AES key, last 32 = HMAC key
+#   HMAC over "PC1" | salt | iv | ciphertext
+$AesHeader = @{ cs = '//'; ps = '#'; py = '#'; js = '//'; java = '//'; go = '//'; sh = '#'; php = '//' }
+$AesNote = 'Same format as DevTools (AES-256-CBC, PBKDF2-SHA256 200,000 rounds, HMAC-SHA256),{N}{C} so text from DevTools opens here and the other way round:{N}{C} Base64( "PC1" + salt(16) + iv(16) + hmac(32) + ciphertext ); keys = PBKDF2(password, salt) -> 64 bytes,{N}{C} first 32 = AES key, last 32 = HMAC key; the HMAC covers "PC1" + salt + iv + ciphertext.'
+$AesCode = @{
+    cs = 'using System.Security.Cryptography;
+using System.Text;
+
+static (byte[] enc, byte[] mac) Keys(string pw, byte[] salt) {
+    byte[] k = Rfc2898DeriveBytes.Pbkdf2(pw, salt, 200000, HashAlgorithmName.SHA256, 64);   // .NET 6+
+    return (k[..32], k[32..]);
+}
+static string Encrypt(string text, string pw) {
+    byte[] salt = RandomNumberGenerator.GetBytes(16), iv = RandomNumberGenerator.GetBytes(16);
+    var (ek, mk) = Keys(pw, salt);
+    using var aes = Aes.Create(); aes.Key = ek;
+    byte[] cipher = aes.EncryptCbc(Encoding.UTF8.GetBytes(text), iv);
+    byte[] head = [.. "PC1"u8, .. salt, .. iv];
+    byte[] mac = HMACSHA256.HashData(mk, [.. head, .. cipher]);
+    return Convert.ToBase64String([.. head, .. mac, .. cipher]);
+}
+static string Decrypt(string b64, string pw) {
+    byte[] all = Convert.FromBase64String(b64);
+    byte[] salt = all[3..19], iv = all[19..35], mac = all[35..67], cipher = all[67..];
+    var (ek, mk) = Keys(pw, salt);
+    if (!CryptographicOperations.FixedTimeEquals(mac, HMACSHA256.HashData(mk, [.. all[..35], .. cipher])))
+        throw new CryptographicException("Wrong password, or the text was changed.");
+    using var aes = Aes.Create(); aes.Key = ek;
+    return Encoding.UTF8.GetString(aes.DecryptCbc(cipher, iv));
+}
+{CALL}'
+    ps = 'function Get-AesKeys([string]$Password, [byte[]]$Salt) {
+    $k = (New-Object Security.Cryptography.Rfc2898DeriveBytes($Password, $Salt, 200000, [Security.Cryptography.HashAlgorithmName]::SHA256)).GetBytes(64)
+    , @($k[0..31], $k[32..63])
+}
+function Protect-Text([string]$Text, [string]$Password) {
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create(); $salt = New-Object byte[] 16; $iv = New-Object byte[] 16; $rng.GetBytes($salt); $rng.GetBytes($iv)
+    $k = Get-AesKeys $Password $salt
+    $aes = [Security.Cryptography.Aes]::Create(); $aes.Key = [byte[]]$k[0]; $aes.IV = $iv
+    $plain = [Text.Encoding]::UTF8.GetBytes($Text); $cipher = $aes.CreateEncryptor().TransformFinalBlock($plain, 0, $plain.Length)
+    $head = [byte[]](0x50, 0x43, 0x31) + $salt + $iv
+    $mac = (New-Object Security.Cryptography.HMACSHA256 (, [byte[]]$k[1])).ComputeHash([byte[]]($head + $cipher))
+    [Convert]::ToBase64String([byte[]]($head + $mac + $cipher))
+}
+function Unprotect-Text([string]$Data, [string]$Password) {
+    $all = [Convert]::FromBase64String($Data)
+    $salt = [byte[]]$all[3..18]; $iv = [byte[]]$all[19..34]; $mac = [byte[]]$all[35..66]; $cipher = [byte[]]$all[67..($all.Length - 1)]
+    $k = Get-AesKeys $Password $salt
+    $expect = (New-Object Security.Cryptography.HMACSHA256 (, [byte[]]$k[1])).ComputeHash([byte[]]($all[0..34] + $cipher))
+    if ([Convert]::ToBase64String($expect) -ne [Convert]::ToBase64String($mac)) { throw ''Wrong password, or the text was changed.'' }
+    $aes = [Security.Cryptography.Aes]::Create(); $aes.Key = [byte[]]$k[0]; $aes.IV = $iv
+    [Text.Encoding]::UTF8.GetString($aes.CreateDecryptor().TransformFinalBlock($cipher, 0, $cipher.Length))
+}
+{CALL}'
+    py = 'import base64, hashlib, hmac, os
+from cryptography.hazmat.primitives import padding                     # pip install cryptography
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+def _keys(pw, salt):
+    k = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 200000, 64)
+    return k[:32], k[32:]
+
+def encrypt(text, pw):
+    salt, iv = os.urandom(16), os.urandom(16)
+    ek, mk = _keys(pw, salt)
+    p = padding.PKCS7(128).padder(); data = p.update(text.encode("utf-8")) + p.finalize()
+    e = Cipher(algorithms.AES(ek), modes.CBC(iv)).encryptor(); cipher = e.update(data) + e.finalize()
+    head = b"PC1" + salt + iv
+    mac = hmac.new(mk, head + cipher, hashlib.sha256).digest()
+    return base64.b64encode(head + mac + cipher).decode("ascii")
+
+def decrypt(b64, pw):
+    a = base64.b64decode(b64)
+    salt, iv, mac, cipher = a[3:19], a[19:35], a[35:67], a[67:]
+    ek, mk = _keys(pw, salt)
+    if not hmac.compare_digest(mac, hmac.new(mk, a[:35] + cipher, hashlib.sha256).digest()):
+        raise ValueError("Wrong password, or the text was changed.")
+    d = Cipher(algorithms.AES(ek), modes.CBC(iv)).decryptor()
+    u = padding.PKCS7(128).unpadder()
+    return (u.update(d.update(cipher) + d.finalize()) + u.finalize()).decode("utf-8")
+
+{CALL}'
+    js = 'const crypto = require("crypto");
+
+const keys = (pw, salt) => { const k = crypto.pbkdf2Sync(pw, salt, 200000, 64, "sha256"); return [k.subarray(0, 32), k.subarray(32)]; };
+
+function encrypt(text, pw) {
+  const salt = crypto.randomBytes(16), iv = crypto.randomBytes(16), [ek, mk] = keys(pw, salt);
+  const c = crypto.createCipheriv("aes-256-cbc", ek, iv);
+  const cipher = Buffer.concat([c.update(text, "utf8"), c.final()]);
+  const head = Buffer.concat([Buffer.from("PC1"), salt, iv]);
+  const mac = crypto.createHmac("sha256", mk).update(Buffer.concat([head, cipher])).digest();
+  return Buffer.concat([head, mac, cipher]).toString("base64");
+}
+
+function decrypt(b64, pw) {
+  const a = Buffer.from(b64, "base64");
+  const salt = a.subarray(3, 19), iv = a.subarray(19, 35), mac = a.subarray(35, 67), cipher = a.subarray(67);
+  const [ek, mk] = keys(pw, salt);
+  const expect = crypto.createHmac("sha256", mk).update(Buffer.concat([a.subarray(0, 35), cipher])).digest();
+  if (!crypto.timingSafeEqual(mac, expect)) throw new Error("Wrong password, or the text was changed.");
+  const d = crypto.createDecipheriv("aes-256-cbc", ek, iv);
+  return Buffer.concat([d.update(cipher), d.final()]).toString("utf8");
+}
+
+{CALL}'
+    java = 'import javax.crypto.*;
+import javax.crypto.spec.*;
+import java.nio.charset.StandardCharsets;
+import java.security.*;
+import java.util.*;
+
+static byte[] keys(String pw, byte[] salt) throws Exception {
+    var spec = new PBEKeySpec(pw.toCharArray(), salt, 200000, 512);
+    return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();   // 64 bytes
+}
+static byte[] hmac(byte[] key, byte[]... parts) throws Exception {
+    Mac m = Mac.getInstance("HmacSHA256"); m.init(new SecretKeySpec(key, "HmacSHA256"));
+    for (byte[] p : parts) m.update(p);
+    return m.doFinal();
+}
+static String encrypt(String text, String pw) throws Exception {
+    var rnd = new SecureRandom(); byte[] salt = new byte[16], iv = new byte[16]; rnd.nextBytes(salt); rnd.nextBytes(iv);
+    byte[] k = keys(pw, salt);
+    Cipher c = Cipher.getInstance("AES/CBC/PKCS5Padding");
+    c.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(k, 0, 32, "AES"), new IvParameterSpec(iv));
+    byte[] cipher = c.doFinal(text.getBytes(StandardCharsets.UTF_8));
+    byte[] head = new byte[35]; head[0] = ''P''; head[1] = ''C''; head[2] = ''1''; System.arraycopy(salt, 0, head, 3, 16); System.arraycopy(iv, 0, head, 19, 16);
+    byte[] mac = hmac(Arrays.copyOfRange(k, 32, 64), head, cipher);
+    var out = new java.io.ByteArrayOutputStream(); out.write(head); out.write(mac); out.write(cipher);
+    return Base64.getEncoder().encodeToString(out.toByteArray());
+}
+static String decrypt(String b64, String pw) throws Exception {
+    byte[] a = Base64.getDecoder().decode(b64);
+    byte[] salt = Arrays.copyOfRange(a, 3, 19), iv = Arrays.copyOfRange(a, 19, 35), mac = Arrays.copyOfRange(a, 35, 67), cipher = Arrays.copyOfRange(a, 67, a.length);
+    byte[] k = keys(pw, salt);
+    if (!MessageDigest.isEqual(mac, hmac(Arrays.copyOfRange(k, 32, 64), Arrays.copyOfRange(a, 0, 35), cipher)))
+        throw new GeneralSecurityException("Wrong password, or the text was changed.");
+    Cipher c = Cipher.getInstance("AES/CBC/PKCS5Padding");
+    c.init(Cipher.DECRYPT_MODE, new SecretKeySpec(k, 0, 32, "AES"), new IvParameterSpec(iv));
+    return new String(c.doFinal(cipher), StandardCharsets.UTF_8);
+}
+{CALL}'
+    go = 'import (
+    "bytes"; "crypto/aes"; "crypto/cipher"; "crypto/hmac"; "crypto/rand"; "crypto/sha256"
+    "encoding/base64"; "errors"; "fmt"
+    "golang.org/x/crypto/pbkdf2"      // go get golang.org/x/crypto/pbkdf2  (Go 1.24+: crypto/pbkdf2)
+)
+
+func keys(pw string, salt []byte) ([]byte, []byte) { k := pbkdf2.Key([]byte(pw), salt, 200000, 64, sha256.New); return k[:32], k[32:] }
+
+func encrypt(text, pw string) string {
+    salt, iv := make([]byte, 16), make([]byte, 16); rand.Read(salt); rand.Read(iv)
+    ek, mk := keys(pw, salt)
+    pad := 16 - len(text)%16; plain := append([]byte(text), bytes.Repeat([]byte{byte(pad)}, pad)...)
+    block, _ := aes.NewCipher(ek); ct := make([]byte, len(plain)); cipher.NewCBCEncrypter(block, iv).CryptBlocks(ct, plain)
+    head := append(append([]byte("PC1"), salt...), iv...)
+    m := hmac.New(sha256.New, mk); m.Write(head); m.Write(ct)
+    return base64.StdEncoding.EncodeToString(append(append(head, m.Sum(nil)...), ct...))
+}
+
+func decrypt(b64, pw string) (string, error) {
+    a, err := base64.StdEncoding.DecodeString(b64); if err != nil { return "", err }
+    salt, iv, mac, ct := a[3:19], a[19:35], a[35:67], a[67:]
+    ek, mk := keys(pw, salt)
+    m := hmac.New(sha256.New, mk); m.Write(a[:35]); m.Write(ct)
+    if !hmac.Equal(mac, m.Sum(nil)) { return "", errors.New("wrong password, or the text was changed") }
+    block, _ := aes.NewCipher(ek); plain := make([]byte, len(ct)); cipher.NewCBCDecrypter(block, iv).CryptBlocks(plain, ct)
+    return string(plain[:len(plain)-int(plain[len(plain)-1])]), nil
+}
+{CALL}'
+    sh = '# needs OpenSSL 3 (openssl kdf) and xxd
+aes_keys() { openssl kdf -keylen 64 -kdfopt digest:SHA256 -kdfopt pass:"$1" -kdfopt hexsalt:"$2" -kdfopt iter:200000 PBKDF2 | tr -d '':'' | tr ''A-F'' ''a-f''; }
+
+encrypt() {   # $1 text, $2 password
+  local salt iv k ct mac
+  salt=$(openssl rand -hex 16); iv=$(openssl rand -hex 16); k=$(aes_keys "$2" "$salt")
+  ct=$(printf ''%s'' "$1" | openssl enc -aes-256-cbc -K "${k:0:64}" -iv "$iv" | xxd -p | tr -d ''\n'')
+  mac=$(printf ''%s'' "504331$salt$iv$ct" | xxd -r -p | openssl dgst -sha256 -mac HMAC -macopt hexkey:"${k:64:64}" -r | cut -d'' '' -f1)
+  printf ''%s'' "504331$salt$iv$mac$ct" | xxd -r -p | base64 -w0; echo
+}
+
+decrypt() {   # $1 base64, $2 password
+  local a salt iv mac ct k check
+  a=$(printf ''%s'' "$1" | base64 -d | xxd -p | tr -d ''\n'')
+  salt=${a:6:32}; iv=${a:38:32}; mac=${a:70:64}; ct=${a:134}
+  k=$(aes_keys "$2" "$salt")
+  check=$(printf ''%s'' "${a:0:70}$ct" | xxd -r -p | openssl dgst -sha256 -mac HMAC -macopt hexkey:"${k:64:64}" -r | cut -d'' '' -f1)
+  [ "$check" = "$mac" ] || { echo ''Wrong password, or the text was changed.'' >&2; return 1; }
+  printf ''%s'' "$ct" | xxd -r -p | openssl enc -d -aes-256-cbc -K "${k:0:64}" -iv "$iv"; echo
+}
+
+{CALL}'
+    php = '<?php
+function aes_keys($pw, $salt) { $k = hash_pbkdf2(''sha256'', $pw, $salt, 200000, 64, true); return [substr($k, 0, 32), substr($k, 32)]; }
+
+function encrypt($text, $pw) {
+    $salt = random_bytes(16); $iv = random_bytes(16); [$ek, $mk] = aes_keys($pw, $salt);
+    $ct = openssl_encrypt($text, ''aes-256-cbc'', $ek, OPENSSL_RAW_DATA, $iv);
+    $head = ''PC1'' . $salt . $iv;
+    return base64_encode($head . hash_hmac(''sha256'', $head . $ct, $mk, true) . $ct);
+}
+
+function decrypt($b64, $pw) {
+    $a = base64_decode($b64);
+    $salt = substr($a, 3, 16); $iv = substr($a, 19, 16); $mac = substr($a, 35, 32); $ct = substr($a, 67);
+    [$ek, $mk] = aes_keys($pw, $salt);
+    if (!hash_equals(hash_hmac(''sha256'', substr($a, 0, 35) . $ct, $mk, true), $mac)) throw new Exception(''Wrong password, or the text was changed.'');
+    return openssl_decrypt($ct, ''aes-256-cbc'', $ek, OPENSSL_RAW_DATA, $iv);
+}
+
+{CALL}'
+}
+$AesCalls = @{
+    enc = @{ cs = 'Console.WriteLine(Encrypt({T}, {K}));'; ps = 'Protect-Text {T} {K}'; py = 'print(encrypt({T}, {K}))'; js = 'console.log(encrypt({T}, {K}));'
+             java = 'System.out.println(encrypt({T}, {K}));'; go = 'fmt.Println(encrypt({T}, {K}))'; sh = 'encrypt {T} {K}'; php = 'echo encrypt({T}, {K});' }
+    dec = @{ cs = 'Console.WriteLine(Decrypt({T}, {K}));'; ps = 'Unprotect-Text {T} {K}'; py = 'print(decrypt({T}, {K}))'; js = 'console.log(decrypt({T}, {K}));'
+             java = 'System.out.println(decrypt({T}, {K}));'; go = 's, err := decrypt({T}, {K}); if err != nil { panic(err) }; fmt.Println(s)'; sh = 'decrypt {T} {K}'; php = 'echo decrypt({T}, {K});' }
+}
+foreach ($pair in @(@('AES-256 encrypt', 'enc'), @('AES-256 decrypt', 'dec'))) {
+    $code = @{}
+    foreach ($l in $AesCode.Keys) {
+        $cmt = $AesHeader[$l]
+        $code[$l] = "$cmt " + $AesNote.Replace('{N}', "`n").Replace('{C}', $cmt) + "`n`n" + $AesCode[$l].Replace('{CALL}', $AesCalls[$pair[1]][$l])
+    }
+    Add-TransformCode $pair[0] $code
+}
+Add-TransformCode 'Windows protect (only you can open it)' @{
+    cs = 'using System.Security.Cryptography;   // Windows only (DPAPI); NuGet System.Security.Cryptography.ProtectedData on .NET Core
+byte[] data = ProtectedData.Protect(System.Text.Encoding.UTF8.GetBytes({T}), null, DataProtectionScope.CurrentUser);
+Console.WriteLine(Convert.ToBase64String(data));'
+    ps = 'Add-Type -AssemblyName System.Security
+[Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Protect([Text.Encoding]::UTF8.GetBytes({T}), $null, ''CurrentUser''))
+# or for passwords: ConvertTo-SecureString {T} -AsPlainText -Force | ConvertFrom-SecureString'
+    py = 'import base64, win32crypt          # pip install pywin32 (Windows only)
+
+blob = win32crypt.CryptProtectData({T}.encode("utf-8"), None, None, None, None, 0)
+print(base64.b64encode(blob).decode())'
+    js = '// Windows DPAPI isn''t built into Node - npm i @primno/dpapi
+const { Dpapi } = require("@primno/dpapi");
+console.log(Buffer.from(Dpapi.protectData(Buffer.from({T}), null, "CurrentUser")).toString("base64"));'
+    java = '// No DPAPI in Java itself; use JNA (com.sun.jna.platform.win32.Crypt32Util)
+byte[] blob = com.sun.jna.platform.win32.Crypt32Util.cryptProtectData({T}.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+System.out.println(java.util.Base64.getEncoder().encodeToString(blob));'
+    go = '// github.com/billgraziano/dpapi (Windows only)
+s, err := dpapi.Encrypt({T})
+if err != nil { panic(err) }
+fmt.Println(s)'
+    sh = '# DPAPI is Windows only - from Git Bash / WSL call PowerShell:
+powershell -NoProfile -Command "Add-Type -AssemblyName System.Security; [Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Protect([Text.Encoding]::UTF8.GetBytes(''$TEXT''), $null, ''CurrentUser''))"'
+    php = '<?php
+// No DPAPI in PHP; on Windows run PowerShell (see the PowerShell tab) with shell_exec().'
+}
+Add-TransformCode 'Windows unprotect' @{
+    cs = 'byte[] plain = ProtectedData.Unprotect(Convert.FromBase64String({T}), null, DataProtectionScope.CurrentUser);   // only the same Windows user
+Console.WriteLine(System.Text.Encoding.UTF8.GetString(plain));'
+    ps = 'Add-Type -AssemblyName System.Security
+[Text.Encoding]::UTF8.GetString([Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String({T}), $null, ''CurrentUser''))'
+    py = 'import base64, win32crypt
+
+_, data = win32crypt.CryptUnprotectData(base64.b64decode({T}), None, None, None, 0)
+print(data.decode("utf-8"))'
+    js = 'const { Dpapi } = require("@primno/dpapi");
+console.log(Buffer.from(Dpapi.unprotectData(Buffer.from({T}, "base64"), null, "CurrentUser")).toString("utf8"));'
+    java = 'byte[] plain = com.sun.jna.platform.win32.Crypt32Util.cryptUnprotectData(java.util.Base64.getDecoder().decode({T}));
+System.out.println(new String(plain, java.nio.charset.StandardCharsets.UTF_8));'
+    go = 's, err := dpapi.Decrypt({T})   // github.com/billgraziano/dpapi
+if err != nil { panic(err) }
+fmt.Println(s)'
+    sh = 'powershell -NoProfile -Command "Add-Type -AssemblyName System.Security; [Text.Encoding]::UTF8.GetString([Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String(''$DATA''), $null, ''CurrentUser''))"'
+    php = '<?php
+// No DPAPI in PHP; on Windows run PowerShell (see the PowerShell tab) with shell_exec().'
+}
+Add-TransformCode 'XOR with key (to hex)' @{
+    cs = 'byte[] d = System.Text.Encoding.UTF8.GetBytes({T}), k = System.Text.Encoding.UTF8.GetBytes({K});
+for (int i = 0; i < d.Length; i++) d[i] ^= k[i % k.Length];
+Console.WriteLine(Convert.ToHexString(d).ToLowerInvariant());'
+    ps = '$d = [Text.Encoding]::UTF8.GetBytes({T}); $k = [Text.Encoding]::UTF8.GetBytes({K})
+-join (0..($d.Length - 1) | ForEach-Object { ($d[$_] -bxor $k[$_ % $k.Length]).ToString(''x2'') })'
+    py = 'd, k = {T}.encode(), {K}.encode()
+print(bytes(b ^ k[i % len(k)] for i, b in enumerate(d)).hex())'
+    js = 'const d = Buffer.from({T}), k = Buffer.from({K});
+console.log(Buffer.from(d.map((b, i) => b ^ k[i % k.length])).toString("hex"));'
+    java = 'byte[] d = {T}.getBytes(), k = {K}.getBytes();
+for (int i = 0; i < d.length; i++) d[i] ^= k[i % k.length];
+System.out.println(java.util.HexFormat.of().formatHex(d));'
+    go = 'd, k := []byte({T}), []byte({K})
+for i := range d { d[i] ^= k[i%len(k)] }
+fmt.Println(hex.EncodeToString(d))'
+    sh = 'python3 -c "import sys;d,k=sys.argv[1].encode(),sys.argv[2].encode();print(bytes(b^k[i%len(k)] for i,b in enumerate(d)).hex())" {T} {K}'
+    php = '<?php
+$d = {T}; $k = {K}; $o = '''';
+for ($i = 0; $i < strlen($d); $i++) $o .= $d[$i] ^ $k[$i % strlen($k)];
+echo bin2hex($o);'
+}
+Add-TransformCode 'ROT13' @{
+    cs = 'string Rot13(string s) => new string(s.Select(c => char.IsLetter(c) ? (char)((char.IsUpper(c) ? ''A'' : ''a'') + (c - (char.IsUpper(c) ? ''A'' : ''a'') + 13) % 26) : c).ToArray());
+Console.WriteLine(Rot13({T}));'
+    ps = '-join ({T}.ToCharArray() | ForEach-Object { $b = if ($_ -cmatch ''[a-z]'') { 97 } elseif ($_ -cmatch ''[A-Z]'') { 65 } else { 0 }; if ($b) { [char]((([int]$_ - $b + 13) % 26) + $b) } else { $_ } })'
+    py = 'import codecs
+
+print(codecs.encode({T}, "rot_13"))'
+    js = 'console.log({T}.replace(/[a-z]/gi, c => String.fromCharCode((c <= "Z" ? 65 : 97) + (c.charCodeAt(0) - (c <= "Z" ? 65 : 97) + 13) % 26)));'
+    java = 'StringBuilder sb = new StringBuilder();
+for (char c : {T}.toCharArray()) { char b = Character.isUpperCase(c) ? ''A'' : ''a''; sb.append(Character.isLetter(c) ? (char) (b + (c - b + 13) % 26) : c); }
+System.out.println(sb);'
+    go = 'fmt.Println(strings.Map(func(r rune) rune {
+    switch { case r >= ''a'' && r <= ''z'': return ''a'' + (r-''a''+13)%26; case r >= ''A'' && r <= ''Z'': return ''A'' + (r-''A''+13)%26 }
+    return r }, {T}))'
+    sh = 'printf ''%s\n'' {T} | tr ''A-Za-z'' ''N-ZA-Mn-za-m'''
+    php = '<?php
+echo str_rot13({T});'
+}
+Add-TransformCode 'Number to hex / binary / octal' @{
+    cs = 'long n = long.Parse({T});
+Console.WriteLine($"hex {n:x}  binary {Convert.ToString(n, 2)}  octal {Convert.ToString(n, 8)}");'
+    ps = '$n = [long]{T}
+''hex {0:x}  binary {1}  octal {2}'' -f $n, [Convert]::ToString($n, 2), [Convert]::ToString($n, 8)'
+    py = 'n = int({T})
+print(f"hex {n:x}  binary {n:b}  octal {n:o}")'
+    js = 'const n = BigInt({T});
+console.log(`hex ${n.toString(16)}  binary ${n.toString(2)}  octal ${n.toString(8)}`);'
+    java = 'long n = Long.parseLong({T});
+System.out.println("hex " + Long.toHexString(n) + "  binary " + Long.toBinaryString(n) + "  octal " + Long.toOctalString(n));'
+    go = 'n, _ := strconv.ParseInt({T}, 10, 64)
+fmt.Printf("hex %x  binary %b  octal %o\n", n, n, n)'
+    sh = 'n={T}; printf ''hex %x  octal %o\n'' $n $n; echo "binary $(echo "obase=2;$n" | bc)"'
+    php = '<?php
+$n = (int){T};
+echo "hex " . dechex($n) . "  binary " . decbin($n) . "  octal " . decoct($n);'
+}
+Add-TransformCode 'Hex to decimal' @{
+    cs = 'Console.WriteLine(Convert.ToInt64({T}.Replace("0x", ""), 16));'
+    ps = '[Convert]::ToInt64({T}.Replace(''0x'', ''''), 16)'
+    py = 'print(int({T}, 16))'
+    js = 'console.log(BigInt("0x" + {T}.replace(/^0x/, "")).toString());'
+    java = 'System.out.println(Long.parseLong({T}.replace("0x", ""), 16));'
+    go = 'n, _ := strconv.ParseInt(strings.TrimPrefix({T}, "0x"), 16, 64)
+fmt.Println(n)'
+    sh = 'echo $((16#{RAW}))'
+    php = '<?php
+echo hexdec({T});'
+}
+Add-TransformCode 'Unix time to date' @{
+    cs = 'var date = DateTimeOffset.FromUnixTimeSeconds(long.Parse({T}));
+Console.WriteLine(date.ToString("o"));            // UTC; .ToLocalTime() for your time zone'
+    ps = '[DateTimeOffset]::FromUnixTimeSeconds([long]{T}).ToString(''o'')      # UTC; .ToLocalTime() for your time zone'
+    py = 'from datetime import datetime, timezone
+
+print(datetime.fromtimestamp(int({T}), tz=timezone.utc).isoformat())'
+    js = 'console.log(new Date(Number({T}) * 1000).toISOString());'
+    java = 'System.out.println(java.time.Instant.ofEpochSecond(Long.parseLong({T})));'
+    go = 'sec, _ := strconv.ParseInt({T}, 10, 64)
+fmt.Println(time.Unix(sec, 0).UTC().Format(time.RFC3339))'
+    sh = 'date -u -d @{RAW} --iso-8601=seconds      # macOS: date -u -r {RAW}'
+    php = '<?php
+echo gmdate(''c'', (int){T});'
+}
+Add-TransformCode 'Date to Unix time' @{
+    cs = 'Console.WriteLine(DateTimeOffset.Parse({T}).ToUnixTimeSeconds());'
+    ps = '[DateTimeOffset]::Parse({T}).ToUnixTimeSeconds()'
+    py = 'from datetime import datetime
+
+print(int(datetime.fromisoformat({T}).timestamp()))'
+    js = 'console.log(Math.floor(Date.parse({T}) / 1000));'
+    java = 'System.out.println(java.time.OffsetDateTime.parse({T}).toEpochSecond());'
+    go = 't, err := time.Parse(time.RFC3339, {T})
+if err != nil { panic(err) }
+fmt.Println(t.Unix())'
+    sh = 'date -d {T} +%s      # macOS: date -j -f ''%Y-%m-%d'' {T} +%s'
+    php = '<?php
+echo strtotime({T});'
+}
+
+# A value written as a string literal of that language.
+function ConvertTo-CodeLiteral([string]$Value, [string]$Lang) {
+    switch ($Lang) {
+        'ps' { return "'" + $Value.Replace("'", "''") + "'" }
+        'sh' { return "'" + $Value.Replace("'", "'\''") + "'" }
+        'php' { return "'" + $Value.Replace('\', '\\').Replace("'", "\'") + "'" }
+        'go' { if ($Value -notmatch '[`\r]') { return '`' + $Value + '`' } }
+    }
+    $sb = New-Object System.Text.StringBuilder '"'
+    foreach ($ch in $Value.ToCharArray()) {
+        switch ($ch) {
+            '\' { [void]$sb.Append('\\') } '"' { [void]$sb.Append('\"') } "`n" { [void]$sb.Append('\n') } "`r" { [void]$sb.Append('\r') } "`t" { [void]$sb.Append('\t') }
+            default { if ([int]$ch -lt 32) { [void]$sb.Append(('\u{0:x4}' -f [int]$ch)) } else { [void]$sb.Append($ch) } }
+        }
+    }
+    [void]$sb.Append('"')
+    $sb.ToString()
+}
+
+# The code guide for an operation in a language, filled with the input (and key).
+function Get-TransformCode([string]$Op, [string]$Lang, [string]$Text, [string]$Key, [string]$Output) {
+    $tc = $TransformCode[$Op]
+    if (-not $tc -or -not $tc[$Lang]) { return $null }
+    $sample = if ($Text.Length -gt 300) { 'your text' } elseif ($Text) { $Text } else { 'Hello, world!' }
+    $isPw = $Op -like 'AES*'
+    $k = if ($isPw) { 'your password' } elseif ($Key) { $Key } else { 'your key' }
+    $t = $tc[$Lang].Replace('{RAW}', ($sample -replace '[^\w.:+-]', '')).Replace('{T}', (ConvertTo-CodeLiteral $sample $Lang)).Replace('{K}', (ConvertTo-CodeLiteral $k $Lang))
+    $cm = if ($Lang -in 'ps', 'py', 'sh') { '#' } else { '//' }
+    # what DevTools gives for it (not where the code prints it another way: hex without spaces, ISO dates, JSON with quotes)
+    if ($Output -and $Output.Length -le 300 -and $Output -notmatch "`n" -and -not $isPw -and $Op -notin 'Windows protect (only you can open it)', 'Text to hex', 'XOR with key (to hex)', 'Unix time to date', 'JSON string escape', 'Date to Unix time') { $t += "`n`n$cm -> $Output" }
+    $t
+}
+
+# The Code view: the guide for the selected operation in the chosen language, coloured.
+function Update-TransformCode($St) {
+    if (-not $St.ShowCode -or -not $St.ShowCode.Checked -or -not $St.Op) { return }
+    $lang = $TransformLangs[[string]$St.CodeLang.SelectedItem]
+    $t = Get-TransformCode $St.Op.Name $lang $St.Input.Text $St.Key.Text $St.Output.Text
+    if (-not $t) { $t = "There's no code guide for ""$($St.Op.Name)"" yet.`n`nCode guides are there for every Encode, Hash and Encrypt operation (and number / time conversions):`npick one on the left." ; $lang = '' }
+    Set-RtbCode $St.Code ($t -replace "`r`n", "`n") $lang
+}
+
+function Set-RtbCode($Rtb, [string]$Text, [string]$Lang) {
+    [PowerClipTheme]::Redraw($Rtb.Handle, $false)
+    try {
+        $Rtb.Text = $Text
+        $Rtb.SelectAll(); $Rtb.SelectionColor = $C.Fore
+        if ($Lang) {
+            $col = @{ 1 = $C.Accent; 2 = $C.Orange; 3 = $C.Dim; 4 = $C.Purple; 5 = $C.Green }
+            foreach ($tk in [DevCode]::Tokens($Text, $Lang)) { $Rtb.Select($tk[0], $tk[1]); $Rtb.SelectionColor = $col[[int]$tk[2]] }
+        }
+        $Rtb.Select(0, 0)
+    } finally { [PowerClipTheme]::Redraw($Rtb.Handle, $true); $Rtb.Invalidate() }
+}
+
 function Update-TransformList($St) {
     $q = $St.Search.Text.Trim()
     $St.View.Clear()
@@ -9701,6 +10605,7 @@ function Invoke-Transform($St) {
         $St.Status.ForeColor = $C.Red
         $St.Status.Text = $err.Message
     }
+    Update-TransformCode $St
 }
 
 # Big inputs are transformed a moment after typing stops; small ones right away.
@@ -9749,6 +10654,10 @@ function Show-Transform([string]$Text = '') {
         $st[$which] = $rtb
     }
     $st.Output.ReadOnly = $true
+    $st.Code = New-Object System.Windows.Forms.RichTextBox
+    $st.Code.Dock = 'Fill'; $st.Code.BorderStyle = 'None'; $st.Code.BackColor = $C.Bg; $st.Code.ForeColor = $C.Fore; $st.Code.Font = $mono
+    $st.Code.ReadOnly = $true; $st.Code.DetectUrls = $false; $st.Code.WordWrap = $false; $st.Code.Visible = $false
+    $st.Output.Parent.Controls.Add($st.Code)
 
     $outBar = New-Object System.Windows.Forms.FlowLayoutPanel
     $outBar.Dock = 'Top'; $outBar.Height = Px 38; $outBar.WrapContents = $false; $outBar.BackColor = $C.Panel
@@ -9756,13 +10665,20 @@ function Show-Transform([string]$Text = '') {
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text = 'Output'; $lbl.AutoSize = $false; $lbl.Width = Px 70; $lbl.Height = Px 30; $lbl.TextAlign = 'MiddleLeft'; $lbl.ForeColor = $C.Dim
     $outBar.Controls.Add($lbl)
-    [void](New-Button 'Copy' 'Copy the output (Ctrl+Shift+C)' { param($src, $e) $t = $src.FindForm().Tag.Output.Text; if ($t) { [System.Windows.Forms.Clipboard]::SetText($t) } } $outBar)
+    [void](New-Button 'Copy' 'Copy the output - or the code when it is shown (Ctrl+Shift+C)' { param($src, $e) $s2 = $src.FindForm().Tag; $t = if ($s2.ShowCode.Checked) { $s2.Code.Text } else { $s2.Output.Text }; if ($t) { [System.Windows.Forms.Clipboard]::SetText($t) } } $outBar)
     [void](New-Button 'Use as input' 'Move the output into the input, to chain another step (Ctrl+Enter)' {
         param($src, $e)
         $st = $src.FindForm().Tag
         if ($st.Output.Text) { $st.Input.Text = $st.Output.Text }
     } $outBar)
     $st.Again = New-Button 'Run again' 'New random result' { param($src, $e) Invoke-Transform $src.FindForm().Tag } $outBar
+    # how to do it in code: C#, PowerShell, Python, JavaScript, Java, Go, Bash, PHP
+    $st.ShowCode = New-CheckBox $outBar 'Show code in' $false 'Show how to do this operation in a programming language (filled with your input)'
+    $st.CodeLang = New-TbCombo $outBar @($TransformLangs.Keys) 170
+    $st.CodeLang.SelectedIndex = [Math]::Max(0, @($TransformLangs.Keys).IndexOf([string]$script:TransformCodeLang))
+    $st.ShowCode.Tag = $st; $st.CodeLang.Tag = $st
+    $st.ShowCode.add_CheckedChanged({ param($src, $e) $s2 = $src.Tag; $s2.Code.Visible = $src.Checked; $s2.Output.Visible = -not $src.Checked; if ($src.Checked) { $s2.Code.BringToFront(); Update-TransformCode $s2 } })
+    $st.CodeLang.add_SelectedIndexChanged({ param($src, $e) $script:TransformCodeLang = [string]$src.SelectedItem; $s2 = $src.Tag; if (-not $s2.ShowCode.Checked) { $s2.ShowCode.Checked = $true } else { Update-TransformCode $s2 } })
     $split.Panel2.Controls.Add($outBar)
 
     $keyRow = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -22940,7 +23856,7 @@ Register-ToolboxPage 'hosts' 'Host monitor' $Glyph.Globe 'monitor uptime ping se
         if ($row.Header) { Draw-HostFolderRow $g $r $row $sel; return }
         $t = $row.Host
         $b = New-Object System.Drawing.SolidBrush $(if ($sel) { $C.Sel } else { $C.Bg }); $g.FillRectangle($b, $r); $b.Dispose()
-        if ($row.Folder) { $r = New-Object System.Drawing.Rectangle(($r.X + (Px 22)), $r.Y, ($r.Width - (Px 22)), $r.Height) }
+        if ($row.Depth) { $ind = $row.Depth * (Px 22); $r = New-Object System.Drawing.Rectangle(($r.X + $ind), $r.Y, ($r.Width - $ind), $r.Height) }
         $g.SmoothingMode = 'AntiAlias'
         $dotColor = switch ($t.Status) { 'up' { $C.Green } 'down' { $C.Red } default { $C.Dim } }
         $b = New-Object System.Drawing.SolidBrush $dotColor; $d = Px 12
@@ -22998,10 +23914,20 @@ Register-ToolboxPage 'hosts' 'Host monitor' $Glyph.Globe 'monitor uptime ping se
             [void](Add-MenuItem $src $(if ($script:HostCollapsed -contains $row.Folder) { 'Open' } else { 'Close' }) { param($s2, $e2) Switch-HostFolderOpen $s2.Owner.Tag } $Glyph.Folder)
             [void](Add-MenuItem $src 'Move up  (Alt+Up)' { Move-HostItem -1 } $Glyph.Undo)
             [void](Add-MenuItem $src 'Move down  (Alt+Down)' { Move-HostItem 1 } $Glyph.Refresh)
+            [void](Add-MenuItem $src 'New folder inside...' { param($s2, $e2) New-HostFolder $null $s2.Owner.Tag } $Glyph.Folder)
             [void](Add-MenuItem $src 'Rename folder...' { param($s2, $e2) Rename-HostFolder $s2.Owner.Tag } $Glyph.Edit)
+            $mvf = New-Object System.Windows.Forms.ToolStripMenuItem('Move into', (New-GlyphImage $Glyph.Folder))
+            $mvf.DropDown.Renderer = $MenuRenderer
+            $it = $mvf.DropDownItems.Add('(top level)', $null, { param($s2, $e2) $f = $s2.OwnerItem.Owner.Tag; Rename-HostFolderPath $f ($f -split '/')[-1]; Save-HostLayout; Update-HostsPage $null "f:$(($f -split '/')[-1])" }); $it.Enabled = $row.Folder.Contains('/')
+            foreach ($p in @(Get-HostFolderPaths)) {
+                if ($p -eq $row.Folder -or $p.StartsWith("$($row.Folder)/") -or $p -eq (Get-HostFolderParent $row.Folder)) { continue }
+                $it = $mvf.DropDownItems.Add(('    ' * ($p.Split('/').Count - 1)) + ($p -split '/')[-1], $null, { param($s2, $e2) $f = $s2.OwnerItem.Owner.Tag; $n = "$($s2.Tag)/$(($f -split '/')[-1])"; Rename-HostFolderPath $f $n; Save-HostLayout; Update-HostsPage $null "f:$n" })
+                $it.Tag = $p
+            }
+            [void]$src.Items.Add($mvf)
             [void]$src.Items.Add('-')
-            [void](Add-MenuItem $src 'Delete folder (keeps the hosts)...' { param($s2, $e2) Remove-HostFolder $s2.Owner.Tag } $Glyph.Delete)
-            [void](Add-MenuItem $src 'New folder...' { New-HostFolder } $Glyph.Folder)
+            [void](Add-MenuItem $src 'Delete folder (keeps what is inside)...' { param($s2, $e2) Remove-HostFolder $s2.Owner.Tag } $Glyph.Delete)
+            [void](Add-MenuItem $src 'New top-level folder...' { New-HostFolder } $Glyph.Folder)
             return
         }
         $t = $row.Host
@@ -23011,9 +23937,9 @@ Register-ToolboxPage 'hosts' 'Host monitor' $Glyph.Globe 'monitor uptime ping se
         $mv = New-Object System.Windows.Forms.ToolStripMenuItem('Move to folder', (New-GlyphImage $Glyph.Folder))
         $mv.DropDown.Renderer = $MenuRenderer
         $it = $mv.DropDownItems.Add('(no folder)', $null, { param($s2, $e2) Set-HostFolder $s2.OwnerItem.Owner.Tag '' }); $it.Enabled = [bool]$t.Folder
-        foreach ($f in @($script:HostFolders)) { $it = $mv.DropDownItems.Add($f, $null, { param($s2, $e2) Set-HostFolder $s2.OwnerItem.Owner.Tag $s2.Text }); $it.Enabled = $f -ne $t.Folder }
+        foreach ($f in @(Get-HostFolderPaths)) { $it = $mv.DropDownItems.Add(('    ' * ($f.Split('/').Count - 1)) + ($f -split '/')[-1], $null, { param($s2, $e2) Set-HostFolder $s2.OwnerItem.Owner.Tag $s2.Tag }); $it.Tag = $f; $it.Enabled = $f -ne $t.Folder }
         [void]$mv.DropDownItems.Add('-')
-        [void]$mv.DropDownItems.Add('New folder...', $null, { param($s2, $e2) New-HostFolder $s2.OwnerItem.Owner.Tag })
+        [void]$mv.DropDownItems.Add('New folder...', $null, { param($s2, $e2) New-HostFolder $s2.OwnerItem.Owner.Tag $s2.OwnerItem.Owner.Tag.Folder })
         [void]$src.Items.Add($mv)
         [void]$src.Items.Add('-')
         if (Test-HostSilenced $t) { [void](Add-MenuItem $src "Turn alerts back on ($(Get-HostSilenceText $t))" { param($s2, $e2) Set-HostSilence $s2.Owner.Tag $null } $Glyph.Play) }
@@ -23041,7 +23967,7 @@ Register-ToolboxPage 'hosts' 'Host monitor' $Glyph.Globe 'monitor uptime ping se
     } $bar $Glyph.Delete)
     [void](New-Button '' 'Move the selected host or folder up  (Alt+Up)' { Move-HostItem -1 } $bar ([string][char]0xE70E) 2)
     [void](New-Button '' 'Move the selected host or folder down  (Alt+Down)' { Move-HostItem 1 } $bar ([string][char]0xE70D) 2)
-    [void](New-Button 'New folder' 'A folder for hosts (e.g. Production, Databases); right-click a host > Move to folder' { New-HostFolder } $bar $Glyph.Folder 2)
+    [void](New-Button 'New folder' 'A folder for hosts (inside the selected folder); right-click a host > Move to folder' { $rw = Get-HostSel; New-HostFolder $null $(if ($rw -and $rw.Header) { $rw.Folder } else { '' }) } $bar $Glyph.Folder 2)
     [void](New-Button 'Check now' 'Check every server right away' { $HostMon.CheckNow = $true } $bar $Glyph.Refresh 2)
     New-TbLabel $bar 'Every' -Dim | Out-Null
     $st.Every = New-TbCombo $bar @('10 seconds', '30 seconds', '1 minute', '5 minutes') 120
@@ -23056,17 +23982,35 @@ Register-ToolboxPage 'hosts' 'Host monitor' $Glyph.Globe 'monitor uptime ping se
 
 # ---- Host folders and order: hosts keep the order of the list; folders (in their own order, open or closed)
 #      hold some of them. The page shows hosts without a folder first, then each folder with a summary.
+function Get-HostFolderParent([string]$Path) { $i = $Path.LastIndexOf('/'); if ($i -gt 0) { $Path.Substring(0, $i) } else { '' } }
+
+# Every folder path (parents included), in the user's order.
+function Get-HostFolderPaths {
+    $list = New-Object System.Collections.Generic.List[string]
+    $add = { param($p) $parts = $p -split '/'; for ($k = 1; $k -le $parts.Count; $k++) { $q = ($parts[0..($k - 1)] -join '/'); if ($q -and -not $list.Contains($q)) { $list.Add($q) } } }
+    foreach ($f in @($script:HostFolders)) { if ($f) { & $add $f } }
+    foreach ($t in $script:HostTargets) { if ($t.Folder) { & $add $t.Folder } }
+    $script:HostFolders = @($list)
+    @($list)
+}
+
 function Get-HostRows {
-    $folders = New-Object System.Collections.Generic.List[string]
-    foreach ($f in @($script:HostFolders)) { if ($f -and -not $folders.Contains($f)) { $folders.Add($f) } }
-    foreach ($t in $script:HostTargets) { if ($t.Folder -and -not $folders.Contains($t.Folder)) { $folders.Add($t.Folder) } }
-    $script:HostFolders = @($folders)
-    foreach ($t in $script:HostTargets) { if (-not $t.Folder) { [pscustomobject]@{ Header = $false; Host = $t; Folder = '' } } }
-    foreach ($f in $folders) {
-        $hosts = @($script:HostTargets | Where-Object { $_.Folder -eq $f })
-        [pscustomobject]@{ Header = $true; Folder = $f; Hosts = $hosts; Host = $null }
-        if ($script:HostCollapsed -notcontains $f) { foreach ($t in $hosts) { [pscustomobject]@{ Header = $false; Host = $t; Folder = $f } } }
+    $paths = @(Get-HostFolderPaths)
+    foreach ($t in $script:HostTargets) { if (-not $t.Folder) { [pscustomobject]@{ Header = $false; Host = $t; Folder = ''; Depth = 0 } } }
+    $walk = $null
+    $walk = {
+        param($Parent, $Depth)
+        foreach ($f in $paths) {
+            if ((Get-HostFolderParent $f) -ne $Parent) { continue }
+            $all = @($script:HostTargets | Where-Object { $_.Folder -eq $f -or $_.Folder.StartsWith("$f/") })
+            [pscustomobject]@{ Header = $true; Folder = $f; Name = ($f -split '/')[-1]; Hosts = $all; Host = $null; Depth = $Depth }
+            if ($script:HostCollapsed -notcontains $f) {
+                foreach ($t in $script:HostTargets) { if ($t.Folder -eq $f) { [pscustomobject]@{ Header = $false; Host = $t; Folder = $f; Depth = $Depth + 1 } } }
+                & $walk $f ($Depth + 1)
+            }
+        }
     }
+    & $walk '' 0
 }
 
 function Get-HostSel {
@@ -23104,9 +24048,11 @@ function Move-HostItem([int]$Dir) {
     $row = Get-HostSel
     if (-not $row) { return }
     if ($row.Header) {
-        $f = @($script:HostFolders); $i = [array]::IndexOf($f, $row.Folder); $j = $i + $Dir
-        if ($i -lt 0 -or $j -lt 0 -or $j -ge $f.Count) { return }
-        $f[$i] = $f[$j]; $f[$j] = $row.Folder; $script:HostFolders = $f
+        $f = @(Get-HostFolderPaths); $par = Get-HostFolderParent $row.Folder
+        $sib = @(for ($k = 0; $k -lt $f.Count; $k++) { if ((Get-HostFolderParent $f[$k]) -eq $par) { $k } })
+        $p = [array]::IndexOf($sib, [array]::IndexOf($f, $row.Folder)); $q = $p + $Dir
+        if ($p -lt 0 -or $q -lt 0 -or $q -ge $sib.Count) { return }
+        $a = $sib[$p]; $b = $sib[$q]; $x = $f[$a]; $f[$a] = $f[$b]; $f[$b] = $x; $script:HostFolders = $f
         Save-HostLayout; Update-HostsPage $null "f:$($row.Folder)"
         return
     }
@@ -23125,30 +24071,45 @@ function Set-HostFolder($T, [string]$Folder) {
     Save-HostLayout; Update-HostsPage $null "h:$($T.Id)"
 }
 
-function New-HostFolder($MoveHost = $null) {
-    $name = Read-TextDialog 'New folder' 'Folder name (e.g. Production, Databases)' '' $TbUI.Form
+function New-HostFolder($MoveHost = $null, [string]$Parent = '') {
+    $name = Read-TextDialog 'New folder' $(if ($Parent) { "Folder name (inside $($Parent.Replace('/', ' > ')))" } else { 'Folder name (e.g. Production, Databases)' }) '' $TbUI.Form
     if (-not $name) { return }
-    $name = $name.Trim()
+    $name = ($name.Trim() -replace '[/\\]', '-')
+    if ($Parent) { $name = "$Parent/$name" }
+    if ($Parent -and $script:HostCollapsed -contains $Parent) { $script:HostCollapsed = @($script:HostCollapsed | Where-Object { $_ -ne $Parent }) }
     if (@($script:HostFolders) -notcontains $name) { $script:HostFolders = @($script:HostFolders) + $name }
     if ($MoveHost) { Set-HostFolder $MoveHost $name } else { Save-HostLayout; Update-HostsPage $null "f:$name" }
 }
 
+# A folder path renamed: the folder, its subfolders and the hosts in all of them.
+function Rename-HostFolderPath([string]$Old, [string]$New) {
+    $map = { param($p) if ($p -eq $Old) { $New } elseif ($p.StartsWith("$Old/")) { $New + $p.Substring($Old.Length) } else { $p } }
+    foreach ($t in $script:HostTargets) { if ($t.Folder) { $t.Folder = & $map $t.Folder } }
+    $script:HostFolders = @(@(Get-HostFolderPaths) | ForEach-Object { & $map $_ } | Select-Object -Unique)
+    $script:HostCollapsed = @($script:HostCollapsed | ForEach-Object { & $map $_ })
+}
+
 function Rename-HostFolder([string]$Folder) {
-    $name = Read-TextDialog 'Rename folder' 'New name' $Folder $TbUI.Form
-    if (-not $name -or $name.Trim() -eq $Folder) { return }
-    $name = $name.Trim()
-    foreach ($t in $script:HostTargets) { if ($t.Folder -eq $Folder) { $t.Folder = $name } }
-    $script:HostFolders = @($script:HostFolders | ForEach-Object { if ($_ -eq $Folder) { $name } else { $_ } } | Select-Object -Unique)
-    $script:HostCollapsed = @($script:HostCollapsed | ForEach-Object { if ($_ -eq $Folder) { $name } else { $_ } })
+    $leaf = ($Folder -split '/')[-1]
+    $name = Read-TextDialog 'Rename folder' 'New name' $leaf $TbUI.Form
+    if (-not $name -or $name.Trim() -eq $leaf) { return }
+    $par = Get-HostFolderParent $Folder
+    $name = ($name.Trim() -replace '[/\\]', '-'); if ($par) { $name = "$par/$name" }
+    Rename-HostFolderPath $Folder $name
     Save-HostLayout; Update-HostsPage $null "f:$name"
 }
 
 function Remove-HostFolder([string]$Folder) {
-    $n = @($script:HostTargets | Where-Object { $_.Folder -eq $Folder }).Count
-    if ($n -and [System.Windows.Forms.MessageBox]::Show($TbUI.Form, "Delete the folder '$Folder'? Its $n host(s) stay, without a folder.", 'Host monitor', 'YesNo', 'Question') -ne 'Yes') { return }
-    foreach ($t in $script:HostTargets) { if ($t.Folder -eq $Folder) { $t.Folder = '' } }
-    $script:HostFolders = @($script:HostFolders | Where-Object { $_ -ne $Folder })
+    $n = @($script:HostTargets | Where-Object { $_.Folder -eq $Folder -or $_.Folder.StartsWith("$Folder/") }).Count
+    $par = Get-HostFolderParent $Folder
+    if ($n -and [System.Windows.Forms.MessageBox]::Show($TbUI.Form, "Delete the folder '$($Folder.Replace('/', ' > '))'? Its $n host(s) and subfolders move up one level.", 'Host monitor', 'YesNo', 'Question') -ne 'Yes') { return }
+    $paths = @(Get-HostFolderPaths)
+    $script:HostFolders = @($paths | Where-Object { $_ -ne $Folder })
     $script:HostCollapsed = @($script:HostCollapsed | Where-Object { $_ -ne $Folder })
+    # what was inside goes to the parent: "A/B/C" without "B" -> "A/C"
+    $up = { param($p) if ($p -eq $Folder) { $par } elseif ($p.StartsWith("$Folder/")) { $(if ($par) { "$par/" } else { '' }) + $p.Substring($Folder.Length + 1) } else { $p } }
+    foreach ($t in $script:HostTargets) { if ($t.Folder) { $t.Folder = & $up $t.Folder } }
+    $script:HostFolders = @($script:HostFolders | ForEach-Object { & $up $_ } | Where-Object { $_ } | Select-Object -Unique)
     Save-HostLayout; Update-HostsPage
 }
 
@@ -23163,7 +24124,7 @@ function Draw-HostFolderRow($G, $R, $Row, [bool]$Sel) {
     $open = $script:HostCollapsed -notcontains $Row.Folder
     $hosts = @($Row.Hosts)
     $down = @($hosts | Where-Object { $_.Status -eq 'down' }).Count; $up = @($hosts | Where-Object { $_.Status -eq 'up' }).Count
-    $x = $R.X + (Px 10)
+    $x = $R.X + (Px 10) + $Row.Depth * (Px 22)
     if ($FontIconSmall) {
         [System.Windows.Forms.TextRenderer]::DrawText($G, $(if ($open) { [string][char]0xE70D } else { [string][char]0xE76C }), $FontIconSmall, (New-Object System.Drawing.Rectangle($x, $R.Y, (Px 20), $R.Height)), $C.Dim, [System.Windows.Forms.TextFormatFlags]'VerticalCenter, HorizontalCenter, NoPrefix, SingleLine')
     }
@@ -23175,8 +24136,8 @@ function Draw-HostFolderRow($G, $R, $Row, [bool]$Sel) {
     $G.SmoothingMode = 'Default'
     $x += Px 20
     if (-not $script:HostFolderFont) { $script:HostFolderFont = New-Object System.Drawing.Font($FontMain, [System.Drawing.FontStyle]::Bold) }
-    $w = [System.Windows.Forms.TextRenderer]::MeasureText($Row.Folder, $script:HostFolderFont).Width
-    [System.Windows.Forms.TextRenderer]::DrawText($G, $Row.Folder, $script:HostFolderFont, (New-Object System.Drawing.Rectangle($x, $R.Y, ($w + (Px 4)), $R.Height)), $C.Fore, [System.Windows.Forms.TextFormatFlags]'VerticalCenter, Left, NoPrefix, SingleLine')
+    $w = [System.Windows.Forms.TextRenderer]::MeasureText($Row.Name, $script:HostFolderFont).Width
+    [System.Windows.Forms.TextRenderer]::DrawText($G, $Row.Name, $script:HostFolderFont, (New-Object System.Drawing.Rectangle($x, $R.Y, ($w + (Px 4)), $R.Height)), $C.Fore, [System.Windows.Forms.TextFormatFlags]'VerticalCenter, Left, NoPrefix, SingleLine')
     $sum = if (-not $hosts.Count) { 'empty - right-click a host > Move to folder' } else { "$($hosts.Count) host$(if ($hosts.Count -ne 1) { 's' })  $Dot  $up up$(if ($down) { "  $Dot  $down DOWN" })" }
     [System.Windows.Forms.TextRenderer]::DrawText($G, $sum, $FontSmall, (New-Object System.Drawing.Rectangle(($x + $w + (Px 14)), $R.Y, ($R.Right - $x - $w - (Px 20)), $R.Height)), $(if ($down) { $C.Red } else { $C.Dim }), [System.Windows.Forms.TextFormatFlags]'VerticalCenter, Left, NoPrefix, SingleLine, EndEllipsis')
     $G.DrawLine($LinePen, $R.X, $R.Bottom - 1, $R.Right, $R.Bottom - 1)
