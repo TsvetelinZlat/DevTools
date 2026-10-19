@@ -5268,8 +5268,9 @@ public class DevCertCheck {
 // Host monitor: keeps checking a list of hosts (ping, or a TCP port) on a background thread.
 // ======================================================================================
 public class DevHostTarget {
-    public string Id, Name, Host;
+    public string Id, Name, Host, Folder = "";
     public int Port;                         // 0 = ping
+    public string Ports = "";                // several TCP ports ("22, 80, 443"): all of them must answer
     public string Status = "unknown";        // up / down / unknown
     public long LatencyMs = -1;
     public DateTime LastCheck, LastChange;
@@ -5317,16 +5318,47 @@ public class DevHostMonitor {
         }
     }
 
+    // the ports to check: "22, 80, 443" or the single Port (none = ping)
+    static List<int> PortList(DevHostTarget t) {
+        var r = new List<int>();
+        foreach (var p in (t.Ports ?? "").Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries)) { int n; if (int.TryParse(p, out n) && n > 0 && n < 65536 && !r.Contains(n)) r.Add(n); }
+        if (r.Count == 0 && t.Port > 0) r.Add(t.Port);
+        return r;
+    }
+    // one TCP port: ms, or -1 with why
+    long Connect(string host, int port, out string why) {
+        why = "";
+        try {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            using (var c = new TcpClient()) {
+                var ar = c.BeginConnect(host, port, null, null);
+                if (!ar.AsyncWaitHandle.WaitOne(TimeoutMs)) { why = "timed out"; return -1; }
+                c.EndConnect(ar);
+                return Math.Max(1, sw.ElapsedMilliseconds);
+            }
+        } catch (Exception ex) {
+            var se = (ex as SocketException) ?? (ex.InnerException as SocketException);
+            why = se != null && se.SocketErrorCode == SocketError.ConnectionRefused ? "refused" : se != null && se.SocketErrorCode == SocketError.HostNotFound ? "unknown host" : (ex.InnerException != null ? ex.InnerException.Message : ex.Message);
+            return -1;
+        }
+    }
+
     void Check(DevHostTarget t) {
         long ms = -1; string detail = "";
+        var ports = PortList(t);
         try {
-            if (t.Port > 0) {
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                using (var c = new TcpClient()) {
-                    var ar = c.BeginConnect(t.Host, t.Port, null, null);
-                    if (ar.AsyncWaitHandle.WaitOne(TimeoutMs)) { c.EndConnect(ar); ms = Math.Max(1, sw.ElapsedMilliseconds); } else detail = "timed out";
-                }
-            } else {
+            if (ports.Count > 1) {
+                // every port at the same time; up only when all of them answer
+                var res = new long[ports.Count]; var why = new string[ports.Count];
+                var ths = new List<Thread>();
+                for (int i = 0; i < ports.Count; i++) { int k = i; var th = new Thread(() => { string w; res[k] = Connect(t.Host, ports[k], out w); why[k] = w; }) { IsBackground = true }; th.Start(); ths.Add(th); }
+                foreach (var th in ths) th.Join(TimeoutMs + 2000);
+                var bad = new List<string>(); long worst = 0;
+                for (int i = 0; i < ports.Count; i++) { if (res[i] < 0) bad.Add(ports[i] + " " + (why[i] ?? "no answer")); else worst = Math.Max(worst, res[i]); }
+                if (bad.Count == 0) ms = worst; else detail = "port " + string.Join(", ", bad) + (bad.Count < ports.Count ? "  (" + (ports.Count - bad.Count) + " of " + ports.Count + " up)" : "");
+            } else if (ports.Count == 1) {
+                ms = Connect(t.Host, ports[0], out detail);
+            } else {                                  // no port: ping
                 using (var p = new Ping()) {
                     var r = p.Send(t.Host, TimeoutMs);
                     if (r.Status == IPStatus.Success) ms = r.RoundtripTime; else detail = r.Status.ToString();
@@ -6891,7 +6923,7 @@ function Save-Settings {
         Theme = $script:Theme; Accent = $script:Accent; TextSize = $script:TextSize
         VaultLockMin = $script:VaultLockMin; VaultClearSec = $script:VaultClearSec; IgnoreApps = @($script:IgnoreApps)
         BackupDir = $script:BackupDir; BackupHours = $script:BackupHours; BackupKeep = $script:BackupKeep
-        HostInterval = $script:HostInterval; HostNotify = $script:HostNotify; Favorites = @($script:Favorites)
+        HostInterval = $script:HostInterval; HostNotify = $script:HostNotify; Favorites = @($script:Favorites); HostFolders = @($script:HostFolders); HostCollapsed = @($script:HostCollapsed)
         SyncDir = $script:SyncDir; SyncLast = $(if ($script:SyncLast) { $script:SyncLast.ToString('o') } else { $null }); ExpiryRules = @($script:ExpiryRules)
         TimeZones = @($script:TimeZones); Pomodoro = $script:Pomodoro; Hotkeys = $script:Hotkeys; Mouse = $script:MouseCfg; GitRepos = @($script:GitRepos)
         BackupLast = $(if ($script:BackupLast) { $script:BackupLast.ToString('o') } else { $null }) })
@@ -6925,6 +6957,8 @@ function Import-Data {
             if ($s.Pomodoro) { foreach ($k in 'Work', 'Short', 'Long', 'Every') { if ([int]$s.Pomodoro.$k -gt 0) { $script:Pomodoro[$k] = [int]$s.Pomodoro.$k } } }
             if ($null -ne $s.HostNotify) { $script:HostNotify = [bool]$s.HostNotify }
             if ($null -ne $s.Favorites) { $script:Favorites = @($s.Favorites | Where-Object { $_ }) }
+            if ($null -ne $s.HostFolders) { $script:HostFolders = @($s.HostFolders | Where-Object { $_ }) }
+            if ($null -ne $s.HostCollapsed) { $script:HostCollapsed = @($s.HostCollapsed | Where-Object { $_ }) }
             if ($null -ne $s.BackupHours) { $script:BackupHours = [int]$s.BackupHours }
             if ([int]$s.BackupKeep -gt 0) { $script:BackupKeep = [int]$s.BackupKeep }
             if ($s.BackupLast) { try { $script:BackupLast = [datetime]::Parse([string]$s.BackupLast, $null, [Globalization.DateTimeStyles]::RoundtripKind).ToLocalTime() } catch { } }
@@ -22665,6 +22699,8 @@ function Update-CertCheck($St) {
 $HostsFile = Join-Path $DataDir 'hosts.json'
 $HostMon = New-Object DevHostMonitor
 $script:HostTargets = New-Object System.Collections.Generic.List[object]
+if ($null -eq $script:HostFolders) { $script:HostFolders = @() }
+if ($null -eq $script:HostCollapsed) { $script:HostCollapsed = @() }
 
 function Import-MonitoredHosts {
     if (-not (Test-Path $HostsFile)) { return }
@@ -22673,7 +22709,7 @@ function Import-MonitoredHosts {
             if (-not $x.Host) { continue }
             $t = New-Object DevHostTarget
             $t.Id = if ($x.Id) { [string]$x.Id } else { [guid]::NewGuid().ToString('N') }
-            $t.Name = [string]$x.Name; $t.Host = [string]$x.Host; $t.Port = [int]$x.Port
+            $t.Name = [string]$x.Name; $t.Host = [string]$x.Host; $t.Port = [int]$x.Port; $t.Ports = [string]$x.Ports; $t.Folder = [string]$x.Folder
             if ($x.SilencedUntil) { try { $script:HostSilence[$t.Id] = [datetime]::Parse([string]$x.SilencedUntil, $null, [Globalization.DateTimeStyles]::RoundtripKind) } catch { } }
             $script:HostTargets.Add($t)
         }
@@ -22725,7 +22761,7 @@ function Close-HostAlert($F) {
 
 function Show-HostAlert($T, [bool]$Down) {
     $label = if ($T.Name) { $T.Name } else { $T.Host }
-    $target = "$($T.Host)$(if ($T.Port) { ":$($T.Port)" } else { ' (ping)' })"
+    $target = Get-HostTargetText $T
     $accent = if ($Down) { $C.Red } else { $C.Green }
     $f = New-Object PowerClipToast
     $f.BackColor = $C.Card; $f.ForeColor = $C.Fore; $f.Font = $FontMain
@@ -22796,7 +22832,7 @@ function Save-MonitoredHosts {
     if ($script:NoSave) { return }
     $json = ConvertTo-Json -InputObject @($script:HostTargets | ForEach-Object {
         $u = $script:HostSilence[$_.Id]
-        [ordered]@{ Id = $_.Id; Name = $_.Name; Host = $_.Host; Port = $_.Port; SilencedUntil = $(if ($u) { $u.ToString('o') } else { $null }) } }) -Depth 3
+        [ordered]@{ Id = $_.Id; Name = $_.Name; Host = $_.Host; Port = $_.Port; Ports = [string]$_.Ports; Folder = [string]$_.Folder; SilencedUntil = $(if ($u) { $u.ToString('o') } else { $null }) } }) -Depth 3
     try { Write-JsonFile $HostsFile $json } catch { Write-Log "hosts save failed: $_" }
 }
 
@@ -22827,14 +22863,21 @@ $HostWatch.add_Tick({
         # redraw only the rows whose state changed since the last look
         $l = $p.State.List
         if (-not $p.State.Sig) { $p.State.Sig = @{} }
-        for ($i = 0; $i -lt $script:HostTargets.Count -and $i -lt $l.Items.Count; $i++) {
-            $t = $script:HostTargets[$i]
-            $sig = "$($t.Status)|$($t.LatencyMs)|$($t.LastCheck.Ticks)|$($t.Recent.Count)|$(Get-HostSilenceText $t)"
-            if ($p.State.Sig[$t.Id] -ne $sig) { $p.State.Sig[$t.Id] = $sig; $l.Invalidate($l.GetItemRectangle($i)) }
+        $rows = @($p.State.Rows)
+        for ($i = 0; $i -lt $rows.Count -and $i -lt $l.Items.Count; $i++) {
+            $rw = $rows[$i]
+            if ($rw.Header) { $key = "f:$($rw.Folder)"; $sig = (@($rw.Hosts) | ForEach-Object { $_.Status }) -join ',' }
+            else { $t = $rw.Host; $key = $t.Id; $sig = "$($t.Status)|$($t.LatencyMs)|$($t.LastCheck.Ticks)|$($t.Recent.Count)|$(Get-HostSilenceText $t)" }
+            if ($p.State.Sig[$key] -ne $sig) { $p.State.Sig[$key] = $sig; $l.Invalidate($l.GetItemRectangle($i)) }
         }
     }
 })
 $HostWatch.Start()
+
+# "server:443", "server: 22, 80, 443" or "server (ping)"
+function Get-HostTargetText($T) {
+    if ($T.Ports) { "$($T.Host): $($T.Ports)" } elseif ($T.Port) { "$($T.Host):$($T.Port)" } else { "$($T.Host) (ping)" }
+}
 
 function Show-HostDialog($Target) {
     $d = New-Object System.Windows.Forms.Form
@@ -22847,12 +22890,12 @@ function Show-HostDialog($Target) {
     [void]$tbl.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100)))
     $boxes = @{}
     $r = 0
-    foreach ($f in @(@('Name', 'e.g. Web server'), @('Host', 'server name or IP'), @('Port', '0 = ping; or a TCP port like 443'))) {
+    foreach ($f in @(@('Name', 'e.g. Web server'), @('Host', 'server name or IP'), @('Port(s)', '0 = ping;  443;  or several: 22, 80, 443'))) {
         $l = New-Object System.Windows.Forms.Label; $l.Text = $f[0]; $l.AutoSize = $true; $l.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), (Px 10), 0)
         $b = New-TbBox -Cue $f[1]; $b.Dock = 'Fill'; $b.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), 0, (Px 4))
         $tbl.Controls.Add($l, 0, $r); $tbl.Controls.Add($b, 1, $r); $boxes[$f[0]] = $b; $r++
     }
-    if ($Target) { $boxes.Name.Text = $Target.Name; $boxes.Host.Text = $Target.Host; $boxes.Port.Text = [string]$Target.Port } else { $boxes.Port.Text = '0' }
+    if ($Target) { $boxes.Name.Text = $Target.Name; $boxes.Host.Text = $Target.Host; $boxes['Port(s)'].Text = $(if ($Target.Ports) { $Target.Ports } else { [string]$Target.Port }) } else { $boxes['Port(s)'].Text = '0' }
     $btns = New-Object System.Windows.Forms.FlowLayoutPanel
     $btns.FlowDirection = 'RightToLeft'; $btns.Dock = 'Fill'
     $cancel = New-Object PowerClipButton; $cancel.Text = 'Cancel'; $cancel.Font = $FontButton; $cancel.AutoSize = $true; $cancel.DialogResult = 'Cancel'
@@ -22868,8 +22911,9 @@ function Show-HostDialog($Target) {
     if ($res -eq 'OK' -and $boxes.Host.Text.Trim()) {
         $hostText = $boxes.Host.Text.Trim(); $port = 0
         if ($hostText -match '^(?:[a-z]+://)?([^/:\s]+)(?::(\d+))?') { $hostText = $Matches[1]; if ($Matches[2]) { $port = [int]$Matches[2] } }
-        [int]::TryParse($boxes.Port.Text.Trim(), [ref]$port) | Out-Null
-        $out = @{ Name = $boxes.Name.Text.Trim(); Host = $hostText; Port = [Math]::Max(0, [Math]::Min(65535, $port)) }
+        $plist = @($boxes['Port(s)'].Text -split '[,;\s]+' | ForEach-Object { $n = 0; if ([int]::TryParse($_, [ref]$n) -and $n -gt 0 -and $n -lt 65536) { $n } } | Select-Object -Unique)
+        if ($plist.Count -ge 1) { $port = $plist[0] } elseif ($boxes['Port(s)'].Text.Trim() -eq '0') { $port = 0 }
+        $out = @{ Name = $boxes.Name.Text.Trim(); Host = $hostText; Port = [Math]::Max(0, [Math]::Min(65535, $port)); Ports = $(if ($plist.Count -gt 1) { $plist -join ', ' } else { '' }) }
     }
     $d.Dispose()
     $out
@@ -22879,22 +22923,31 @@ Register-ToolboxPage 'hosts' 'Host monitor' $Glyph.Globe 'monitor uptime ping se
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $list = New-Object DevBufferedListBox
-    $list.Dock = 'Fill'; $list.BorderStyle = 'None'; $list.DrawMode = 'OwnerDrawFixed'; $list.IntegralHeight = $false
+    $list.Dock = 'Fill'; $list.BorderStyle = 'None'; $list.DrawMode = 'OwnerDrawVariable'; $list.IntegralHeight = $false
     $list.ItemHeight = $FontMain.Height + $FontSmall.Height + (Px 22); $list.BackColor = $C.Bg; $list.ForeColor = $C.Fore
+    $list.add_MeasureItem({
+        param($src, $e)
+        $s2 = $TbUI.Pages['hosts'].State
+        $e.ItemHeight = if ($s2.Rows -and $e.Index -lt $s2.Rows.Count -and $s2.Rows[$e.Index].Header) { $FontMain.Height + (Px 16) } else { $FontMain.Height + $FontSmall.Height + (Px 22) }
+    })
     $list.add_DrawItem({
         param($src, $e)
-        if ($e.Index -lt 0 -or $e.Index -ge $script:HostTargets.Count) { return }
-        $t = $script:HostTargets[$e.Index]
+        $s2 = $TbUI.Pages['hosts'].State
+        if ($e.Index -lt 0 -or -not $s2.Rows -or $e.Index -ge $s2.Rows.Count) { return }
+        $row = $s2.Rows[$e.Index]
         $g = $e.Graphics; $r = $e.Bounds
         $sel = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
+        if ($row.Header) { Draw-HostFolderRow $g $r $row $sel; return }
+        $t = $row.Host
         $b = New-Object System.Drawing.SolidBrush $(if ($sel) { $C.Sel } else { $C.Bg }); $g.FillRectangle($b, $r); $b.Dispose()
+        if ($row.Folder) { $r = New-Object System.Drawing.Rectangle(($r.X + (Px 22)), $r.Y, ($r.Width - (Px 22)), $r.Height) }
         $g.SmoothingMode = 'AntiAlias'
         $dotColor = switch ($t.Status) { 'up' { $C.Green } 'down' { $C.Red } default { $C.Dim } }
         $b = New-Object System.Drawing.SolidBrush $dotColor; $d = Px 12
         $g.FillEllipse($b, ($r.X + (Px 14)), ($r.Y + [int](($r.Height - $d) / 2)), $d, $d); $b.Dispose()
         $x = $r.X + (Px 38)
         $name = if ($t.Name) { $t.Name } else { $t.Host }
-        $target = "$($t.Host)$(if ($t.Port) { ":$($t.Port)" } else { '  (ping)' })"
+        $target = Get-HostTargetText $t
         [System.Windows.Forms.TextRenderer]::DrawText($g, $name, $FontMain, (New-Object System.Drawing.Rectangle($x, ($r.Y + (Px 6)), (Px 300), ($FontMain.Height + 2))), $C.Fore, $TextFlags)
         # latency + state text
         $state = switch ($t.Status) { 'up' { "$($t.LatencyMs) ms" } 'down' { "DOWN  $($t.Detail)" } default { 'checking...' } }
@@ -22903,11 +22956,11 @@ Register-ToolboxPage 'hosts' 'Host monitor' $Glyph.Globe 'monitor uptime ping se
         if ($mute) { $target += "   - $mute" }
         [System.Windows.Forms.TextRenderer]::DrawText($g, $target, $FontSmall, (New-Object System.Drawing.Rectangle($x, ($r.Y + (Px 8) + $FontMain.Height), (Px 300), ($FontSmall.Height + 2))), $(if ($mute) { $C.Yellow } else { $C.Dim }), $TextFlags)
         $sx = $r.X + (Px 350)
-        [System.Windows.Forms.TextRenderer]::DrawText($g, $state, $FontMain, (New-Object System.Drawing.Rectangle($sx, ($r.Y + (Px 6)), (Px 220), ($FontMain.Height + 2))), $dotColor, $TextFlags)
+        [System.Windows.Forms.TextRenderer]::DrawText($g, $state, $FontMain, (New-Object System.Drawing.Rectangle($sx, ($r.Y + (Px 6)), (Px 340), ($FontMain.Height + 2))), $dotColor, $TextFlags)
         [System.Windows.Forms.TextRenderer]::DrawText($g, $since, $FontSmall, (New-Object System.Drawing.Rectangle($sx, ($r.Y + (Px 8) + $FontMain.Height), (Px 220), ($FontSmall.Height + 2))), $C.Dim, $TextFlags)
         # sparkline of recent latencies (red ticks = failures)
         $hist = @($t.Recent.ToArray())
-        $gx = $r.X + (Px 590); $gw = [Math]::Max((Px 80), $r.Right - $gx - (Px 16)); $gy = $r.Y + (Px 8); $gh = $r.Height - (Px 16)
+        $gx = $r.X + (Px 710); $gw = [Math]::Max((Px 80), $r.Right - $gx - (Px 16)); $gy = $r.Y + (Px 8); $gh = $r.Height - (Px 16)
         if ($hist.Count -gt 1 -and $gw -gt 20) {
             $max = [Math]::Max(10, ($hist | Measure-Object -Maximum).Maximum)
             $step = $gw / 39.0
@@ -22922,15 +22975,47 @@ Register-ToolboxPage 'hosts' 'Host monitor' $Glyph.Globe 'monitor uptime ping se
         $g.SmoothingMode = 'Default'
         $g.DrawLine($LinePen, $r.X, $r.Bottom - 1, $r.Right, $r.Bottom - 1)
     })
-    $list.add_DoubleClick({ Edit-MonitoredHost })
+    $list.add_DoubleClick({ $rw = Get-HostSel; if ($rw -and -not $rw.Header) { Edit-MonitoredHost } })
+    $list.add_MouseClick({ param($src, $e) if ($e.Button -ne 'Left') { return }; $i = $src.IndexFromPoint($e.Location); $s2 = $TbUI.Pages['hosts'].State; if ($i -ge 0 -and $i -lt $s2.Rows.Count -and $s2.Rows[$i].Header) { Switch-HostFolderOpen $s2.Rows[$i].Folder } })
+    $list.add_KeyDown({
+        param($src, $e)
+        if ($e.Alt -and $e.KeyCode -eq 'Up') { Move-HostItem -1; $e.Handled = $true; $e.SuppressKeyPress = $true }
+        elseif ($e.Alt -and $e.KeyCode -eq 'Down') { Move-HostItem 1; $e.Handled = $true; $e.SuppressKeyPress = $true }
+        elseif ($e.KeyCode -eq 'Delete') { $rw = Get-HostSel; if ($rw -and $rw.Header) { Remove-HostFolder $rw.Folder } }
+    })
     $hm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
     $hm.add_Opening({
         param($src, $e)
         $src.Items.Clear()
-        $i = $TbUI.Pages['hosts'].State.List.SelectedIndex
-        if ($i -lt 0) { $e.Cancel = $true; return }
-        $t = $script:HostTargets[$i]
+        $row = Get-HostSel
+        if (-not $row) {
+            [void](Add-MenuItem $src 'New folder...' { New-HostFolder } $Glyph.Folder)
+            return
+        }
+        if ($row.Header) {
+            $src.Tag = $row.Folder
+            [void](Add-MenuItem $src 'Add a host here...' { param($s2, $e2) Add-MonitoredHost $s2.Owner.Tag } $Glyph.Add)
+            [void](Add-MenuItem $src $(if ($script:HostCollapsed -contains $row.Folder) { 'Open' } else { 'Close' }) { param($s2, $e2) Switch-HostFolderOpen $s2.Owner.Tag } $Glyph.Folder)
+            [void](Add-MenuItem $src 'Move up  (Alt+Up)' { Move-HostItem -1 } $Glyph.Undo)
+            [void](Add-MenuItem $src 'Move down  (Alt+Down)' { Move-HostItem 1 } $Glyph.Refresh)
+            [void](Add-MenuItem $src 'Rename folder...' { param($s2, $e2) Rename-HostFolder $s2.Owner.Tag } $Glyph.Edit)
+            [void]$src.Items.Add('-')
+            [void](Add-MenuItem $src 'Delete folder (keeps the hosts)...' { param($s2, $e2) Remove-HostFolder $s2.Owner.Tag } $Glyph.Delete)
+            [void](Add-MenuItem $src 'New folder...' { New-HostFolder } $Glyph.Folder)
+            return
+        }
+        $t = $row.Host
         $src.Tag = $t
+        [void](Add-MenuItem $src 'Move up  (Alt+Up)' { Move-HostItem -1 } $Glyph.Undo)
+        [void](Add-MenuItem $src 'Move down  (Alt+Down)' { Move-HostItem 1 } $Glyph.Refresh)
+        $mv = New-Object System.Windows.Forms.ToolStripMenuItem('Move to folder', (New-GlyphImage $Glyph.Folder))
+        $mv.DropDown.Renderer = $MenuRenderer
+        $it = $mv.DropDownItems.Add('(no folder)', $null, { param($s2, $e2) Set-HostFolder $s2.OwnerItem.Owner.Tag '' }); $it.Enabled = [bool]$t.Folder
+        foreach ($f in @($script:HostFolders)) { $it = $mv.DropDownItems.Add($f, $null, { param($s2, $e2) Set-HostFolder $s2.OwnerItem.Owner.Tag $s2.Text }); $it.Enabled = $f -ne $t.Folder }
+        [void]$mv.DropDownItems.Add('-')
+        [void]$mv.DropDownItems.Add('New folder...', $null, { param($s2, $e2) New-HostFolder $s2.OwnerItem.Owner.Tag })
+        [void]$src.Items.Add($mv)
+        [void]$src.Items.Add('-')
         if (Test-HostSilenced $t) { [void](Add-MenuItem $src "Turn alerts back on ($(Get-HostSilenceText $t))" { param($s2, $e2) Set-HostSilence $s2.Owner.Tag $null } $Glyph.Play) }
         else {
             [void](Add-MenuItem $src 'Silence for 1 hour' { param($s2, $e2) Set-HostSilence $s2.Owner.Tag ((Get-Date).AddHours(1)) } $Glyph.Pause)
@@ -22942,22 +23027,21 @@ Register-ToolboxPage 'hosts' 'Host monitor' $Glyph.Globe 'monitor uptime ping se
         [void](Add-MenuItem $src 'Edit...' { Edit-MonitoredHost } $Glyph.Edit)
     })
     $list.ContextMenuStrip = $hm
-    $list.add_MouseDown({ param($src, $e) if ($e.Button -eq 'Right') { $i = $src.IndexFromPoint($e.Location); if ($i -ge 0) { $src.SelectedIndex = $i } } })
+    $list.add_MouseDown({ param($src, $e) if ($e.Button -eq 'Right') { $i = $src.IndexFromPoint($e.Location); if ($i -ge 0) { $src.SelectedIndex = $i } else { $src.ClearSelected() } } })
     $panel.Controls.Add($list)
     $st.List = $list
     $bar = New-TbBar $panel
-    [void](New-Button 'Add' 'Add a server to watch' {
-        $r = Show-HostDialog $null
-        if (-not $r) { return }
-        $t = New-Object DevHostTarget; $t.Id = [guid]::NewGuid().ToString('N'); $t.Name = $r.Name; $t.Host = $r.Host; $t.Port = $r.Port
-        $script:HostTargets.Add($t); Save-MonitoredHosts; Sync-HostMonitor; Update-HostsPage
-    } $bar $Glyph.Add 1)
-    [void](New-Button 'Edit' 'Edit the selected server' { Edit-MonitoredHost } $bar $Glyph.Edit)
-    [void](New-Button 'Remove' 'Stop watching the selected server' {
-        $s = $TbUI.Pages['hosts'].State; $i = $s.List.SelectedIndex
-        if ($i -lt 0) { return }
-        $script:HostTargets.RemoveAt($i); Save-MonitoredHosts; Sync-HostMonitor; Update-HostsPage
+    [void](New-Button 'Add' 'Add a server to watch (into the selected folder)' { $rw = Get-HostSel; Add-MonitoredHost $(if ($rw) { $rw.Folder } else { '' }) } $bar $Glyph.Add 1)
+    [void](New-Button 'Edit' 'Edit the selected server (or rename the folder)' { Edit-MonitoredHost } $bar $Glyph.Edit)
+    [void](New-Button 'Remove' 'Stop watching the selected server (or delete the folder, keeping its hosts)' {
+        $rw = Get-HostSel
+        if (-not $rw) { return }
+        if ($rw.Header) { Remove-HostFolder $rw.Folder; return }
+        [void]$script:HostTargets.Remove($rw.Host); Save-MonitoredHosts; Sync-HostMonitor; Update-HostsPage
     } $bar $Glyph.Delete)
+    [void](New-Button '' 'Move the selected host or folder up  (Alt+Up)' { Move-HostItem -1 } $bar ([string][char]0xE70E) 2)
+    [void](New-Button '' 'Move the selected host or folder down  (Alt+Down)' { Move-HostItem 1 } $bar ([string][char]0xE70D) 2)
+    [void](New-Button 'New folder' 'A folder for hosts (e.g. Production, Databases); right-click a host > Move to folder' { New-HostFolder } $bar $Glyph.Folder 2)
     [void](New-Button 'Check now' 'Check every server right away' { $HostMon.CheckNow = $true } $bar $Glyph.Refresh 2)
     New-TbLabel $bar 'Every' -Dim | Out-Null
     $st.Every = New-TbCombo $bar @('10 seconds', '30 seconds', '1 minute', '5 minutes') 120
@@ -22970,24 +23054,150 @@ Register-ToolboxPage 'hosts' 'Host monitor' $Glyph.Globe 'monitor uptime ping se
     $st
 }
 
-function Update-HostsPage($St = $null) {
+# ---- Host folders and order: hosts keep the order of the list; folders (in their own order, open or closed)
+#      hold some of them. The page shows hosts without a folder first, then each folder with a summary.
+function Get-HostRows {
+    $folders = New-Object System.Collections.Generic.List[string]
+    foreach ($f in @($script:HostFolders)) { if ($f -and -not $folders.Contains($f)) { $folders.Add($f) } }
+    foreach ($t in $script:HostTargets) { if ($t.Folder -and -not $folders.Contains($t.Folder)) { $folders.Add($t.Folder) } }
+    $script:HostFolders = @($folders)
+    foreach ($t in $script:HostTargets) { if (-not $t.Folder) { [pscustomobject]@{ Header = $false; Host = $t; Folder = '' } } }
+    foreach ($f in $folders) {
+        $hosts = @($script:HostTargets | Where-Object { $_.Folder -eq $f })
+        [pscustomobject]@{ Header = $true; Folder = $f; Hosts = $hosts; Host = $null }
+        if ($script:HostCollapsed -notcontains $f) { foreach ($t in $hosts) { [pscustomobject]@{ Header = $false; Host = $t; Folder = $f } } }
+    }
+}
+
+function Get-HostSel {
+    $s = $TbUI.Pages['hosts'].State
+    if (-not $s -or -not $s.Rows) { return $null }
+    $i = $s.List.SelectedIndex
+    if ($i -ge 0 -and $i -lt $s.Rows.Count) { $s.Rows[$i] } else { $null }
+}
+
+# Rebuilds the list; Select = 'h:<host id>' or 'f:<folder>' to select that row again.
+function Update-HostsPage($St = $null, [string]$Select = '') {
     if (-not $St) { $St = $TbUI.Pages['hosts'].State }
     if (-not $St) { return }
+    if (-not $Select) { $cur = Get-HostSel; if ($cur) { $Select = if ($cur.Header) { "f:$($cur.Folder)" } else { "h:$($cur.Host.Id)" } } }
+    $St.Rows = @(Get-HostRows)
+    $St.Sig = @{}
     $l = $St.List
-    $l.BeginUpdate(); $l.Items.Clear()
-    foreach ($t in $script:HostTargets) { [void]$l.Items.Add($t.Host) }
-    $l.EndUpdate()
+    $l.BeginUpdate()
+    try {
+        $l.Items.Clear()
+        for ($i = 0; $i -lt $St.Rows.Count; $i++) { [void]$l.Items.Add($i) }
+        for ($i = 0; $i -lt $St.Rows.Count; $i++) {
+            $rw = $St.Rows[$i]
+            if (($rw.Header -and $Select -eq "f:$($rw.Folder)") -or (-not $rw.Header -and $Select -eq "h:$($rw.Host.Id)")) { $l.SelectedIndex = $i; break }
+        }
+    } finally { $l.EndUpdate() }
     $n = $script:HostTargets.Count
-    Set-TbStatus $St.Status $(if ($n) { "Watching $n server(s) in the background, also while this window is closed." } else { 'Add the servers you care about; they are checked in the background and you get a notification when one goes down.' })
+    Set-TbStatus $St.Status $(if ($n) { "Watching $n server(s), also while this window is closed.  Alt+Up / Down moves the selection; right-click for folders." } else { 'Add the servers you care about; they are checked in the background and you get a notification when one goes down.' })
+}
+
+function Save-HostLayout { Save-MonitoredHosts; Save-Settings }
+
+# Moves the selected host (within its folder) or folder one place up (-1) or down (1).
+function Move-HostItem([int]$Dir) {
+    $row = Get-HostSel
+    if (-not $row) { return }
+    if ($row.Header) {
+        $f = @($script:HostFolders); $i = [array]::IndexOf($f, $row.Folder); $j = $i + $Dir
+        if ($i -lt 0 -or $j -lt 0 -or $j -ge $f.Count) { return }
+        $f[$i] = $f[$j]; $f[$j] = $row.Folder; $script:HostFolders = $f
+        Save-HostLayout; Update-HostsPage $null "f:$($row.Folder)"
+        return
+    }
+    $t = $row.Host
+    $same = @(for ($k = 0; $k -lt $script:HostTargets.Count; $k++) { if ([string]$script:HostTargets[$k].Folder -eq [string]$t.Folder) { $k } })
+    $p = [array]::IndexOf($same, $script:HostTargets.IndexOf($t)); $q = $p + $Dir
+    if ($p -lt 0 -or $q -lt 0 -or $q -ge $same.Count) { return }
+    $a = $same[$p]; $b = $same[$q]
+    $x = $script:HostTargets[$a]; $script:HostTargets[$a] = $script:HostTargets[$b]; $script:HostTargets[$b] = $x
+    Save-HostLayout; Update-HostsPage $null "h:$($t.Id)"
+}
+
+function Set-HostFolder($T, [string]$Folder) {
+    $T.Folder = $Folder
+    if ($Folder -and $script:HostCollapsed -contains $Folder) { $script:HostCollapsed = @($script:HostCollapsed | Where-Object { $_ -ne $Folder }) }
+    Save-HostLayout; Update-HostsPage $null "h:$($T.Id)"
+}
+
+function New-HostFolder($MoveHost = $null) {
+    $name = Read-TextDialog 'New folder' 'Folder name (e.g. Production, Databases)' '' $TbUI.Form
+    if (-not $name) { return }
+    $name = $name.Trim()
+    if (@($script:HostFolders) -notcontains $name) { $script:HostFolders = @($script:HostFolders) + $name }
+    if ($MoveHost) { Set-HostFolder $MoveHost $name } else { Save-HostLayout; Update-HostsPage $null "f:$name" }
+}
+
+function Rename-HostFolder([string]$Folder) {
+    $name = Read-TextDialog 'Rename folder' 'New name' $Folder $TbUI.Form
+    if (-not $name -or $name.Trim() -eq $Folder) { return }
+    $name = $name.Trim()
+    foreach ($t in $script:HostTargets) { if ($t.Folder -eq $Folder) { $t.Folder = $name } }
+    $script:HostFolders = @($script:HostFolders | ForEach-Object { if ($_ -eq $Folder) { $name } else { $_ } } | Select-Object -Unique)
+    $script:HostCollapsed = @($script:HostCollapsed | ForEach-Object { if ($_ -eq $Folder) { $name } else { $_ } })
+    Save-HostLayout; Update-HostsPage $null "f:$name"
+}
+
+function Remove-HostFolder([string]$Folder) {
+    $n = @($script:HostTargets | Where-Object { $_.Folder -eq $Folder }).Count
+    if ($n -and [System.Windows.Forms.MessageBox]::Show($TbUI.Form, "Delete the folder '$Folder'? Its $n host(s) stay, without a folder.", 'Host monitor', 'YesNo', 'Question') -ne 'Yes') { return }
+    foreach ($t in $script:HostTargets) { if ($t.Folder -eq $Folder) { $t.Folder = '' } }
+    $script:HostFolders = @($script:HostFolders | Where-Object { $_ -ne $Folder })
+    $script:HostCollapsed = @($script:HostCollapsed | Where-Object { $_ -ne $Folder })
+    Save-HostLayout; Update-HostsPage
+}
+
+function Switch-HostFolderOpen([string]$Folder) {
+    if ($script:HostCollapsed -contains $Folder) { $script:HostCollapsed = @($script:HostCollapsed | Where-Object { $_ -ne $Folder }) }
+    else { $script:HostCollapsed = @($script:HostCollapsed) + $Folder }
+    Save-Settings; Update-HostsPage $null "f:$Folder"
+}
+
+function Draw-HostFolderRow($G, $R, $Row, [bool]$Sel) {
+    $b = New-Object System.Drawing.SolidBrush $(if ($Sel) { $C.Sel } else { $C.Panel }); $G.FillRectangle($b, $R); $b.Dispose()
+    $open = $script:HostCollapsed -notcontains $Row.Folder
+    $hosts = @($Row.Hosts)
+    $down = @($hosts | Where-Object { $_.Status -eq 'down' }).Count; $up = @($hosts | Where-Object { $_.Status -eq 'up' }).Count
+    $x = $R.X + (Px 10)
+    if ($FontIconSmall) {
+        [System.Windows.Forms.TextRenderer]::DrawText($G, $(if ($open) { [string][char]0xE70D } else { [string][char]0xE76C }), $FontIconSmall, (New-Object System.Drawing.Rectangle($x, $R.Y, (Px 20), $R.Height)), $C.Dim, [System.Windows.Forms.TextFormatFlags]'VerticalCenter, HorizontalCenter, NoPrefix, SingleLine')
+    }
+    $x += Px 26
+    $G.SmoothingMode = 'AntiAlias'
+    $dc = if ($down) { $C.Red } elseif ($hosts.Count -and $up -eq $hosts.Count) { $C.Green } else { $C.Dim }
+    $b = New-Object System.Drawing.SolidBrush $dc; $d = Px 10
+    $G.FillEllipse($b, $x, ($R.Y + [int](($R.Height - $d) / 2)), $d, $d); $b.Dispose()
+    $G.SmoothingMode = 'Default'
+    $x += Px 20
+    if (-not $script:HostFolderFont) { $script:HostFolderFont = New-Object System.Drawing.Font($FontMain, [System.Drawing.FontStyle]::Bold) }
+    $w = [System.Windows.Forms.TextRenderer]::MeasureText($Row.Folder, $script:HostFolderFont).Width
+    [System.Windows.Forms.TextRenderer]::DrawText($G, $Row.Folder, $script:HostFolderFont, (New-Object System.Drawing.Rectangle($x, $R.Y, ($w + (Px 4)), $R.Height)), $C.Fore, [System.Windows.Forms.TextFormatFlags]'VerticalCenter, Left, NoPrefix, SingleLine')
+    $sum = if (-not $hosts.Count) { 'empty - right-click a host > Move to folder' } else { "$($hosts.Count) host$(if ($hosts.Count -ne 1) { 's' })  $Dot  $up up$(if ($down) { "  $Dot  $down DOWN" })" }
+    [System.Windows.Forms.TextRenderer]::DrawText($G, $sum, $FontSmall, (New-Object System.Drawing.Rectangle(($x + $w + (Px 14)), $R.Y, ($R.Right - $x - $w - (Px 20)), $R.Height)), $(if ($down) { $C.Red } else { $C.Dim }), [System.Windows.Forms.TextFormatFlags]'VerticalCenter, Left, NoPrefix, SingleLine, EndEllipsis')
+    $G.DrawLine($LinePen, $R.X, $R.Bottom - 1, $R.Right, $R.Bottom - 1)
+}
+
+function Add-MonitoredHost([string]$Folder = '') {
+    $r = Show-HostDialog $null
+    if (-not $r) { return }
+    $t = New-Object DevHostTarget; $t.Id = [guid]::NewGuid().ToString('N'); $t.Name = $r.Name; $t.Host = $r.Host; $t.Port = $r.Port; $t.Ports = $r.Ports; $t.Folder = $Folder
+    if ($Folder -and $script:HostCollapsed -contains $Folder) { $script:HostCollapsed = @($script:HostCollapsed | Where-Object { $_ -ne $Folder }) }
+    $script:HostTargets.Add($t); Save-MonitoredHosts; Sync-HostMonitor; Update-HostsPage $null "h:$($t.Id)"
 }
 
 function Edit-MonitoredHost {
-    $s = $TbUI.Pages['hosts'].State; $i = $s.List.SelectedIndex
-    if ($i -lt 0) { return }
-    $t = $script:HostTargets[$i]
+    $row = Get-HostSel
+    if (-not $row) { return }
+    if ($row.Header) { Rename-HostFolder $row.Folder; return }
+    $t = $row.Host
     $r = Show-HostDialog $t
     if (-not $r) { return }
-    $t.Name = $r.Name; $t.Host = $r.Host; $t.Port = $r.Port; $t.Status = 'unknown'; $t.Recent.Clear()
+    $t.Name = $r.Name; $t.Host = $r.Host; $t.Port = $r.Port; $t.Ports = $r.Ports; $t.Status = 'unknown'; $t.Recent.Clear()
     Save-MonitoredHosts; Sync-HostMonitor; Update-HostsPage
 }
 
