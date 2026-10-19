@@ -10138,14 +10138,14 @@ static string Encrypt(string text, string pw) {
     using var aes = Aes.Create(); aes.Key = ek;
     byte[] cipher = aes.EncryptCbc(Encoding.UTF8.GetBytes(text), iv);
     byte[] head = [.. "PC1"u8, .. salt, .. iv];
-    byte[] mac = HMACSHA256.HashData(mk, [.. head, .. cipher]);
+    byte[] mac = HMACSHA256.HashData(mk, head.Concat(cipher).ToArray());
     return Convert.ToBase64String([.. head, .. mac, .. cipher]);
 }
 static string Decrypt(string b64, string pw) {
     byte[] all = Convert.FromBase64String(b64);
     byte[] salt = all[3..19], iv = all[19..35], mac = all[35..67], cipher = all[67..];
     var (ek, mk) = Keys(pw, salt);
-    if (!CryptographicOperations.FixedTimeEquals(mac, HMACSHA256.HashData(mk, [.. all[..35], .. cipher])))
+    if (!CryptographicOperations.FixedTimeEquals(mac, HMACSHA256.HashData(mk, all[..35].Concat(cipher).ToArray())))
         throw new CryptographicException("Wrong password, or the text was changed.");
     using var aes = Aes.Create(); aes.Key = ek;
     return Encoding.UTF8.GetString(aes.DecryptCbc(cipher, iv));
@@ -10494,6 +10494,807 @@ fmt.Println(t.Unix())'
 echo strtotime({T});'
 }
 
+& {
+# More code guides: decimal bytes, ciphers, fun, case, lines, format, extract, numbers, info, generate.
+# {LIT:...:LIT} = a value (a regex) written as a literal; the word regex that splits a line into words (also at camelCase humps); {MORSE} / {NATO} / {FLIPFROM} / {FLIPTO}
+# are filled in as string literals of the language.
+Add-TransformCode 'Text to decimal bytes' @{
+    cs = 'Console.WriteLine(string.Join(" ", System.Text.Encoding.UTF8.GetBytes({T})));'
+    ps = '[Text.Encoding]::UTF8.GetBytes({T}) -join '' '''
+    py = 'print(" ".join(str(b) for b in {T}.encode("utf-8")))'
+    js = 'console.log([...Buffer.from({T}, "utf8")].join(" "));'
+    java = 'byte[] b = {T}.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+StringBuilder sb = new StringBuilder();
+for (byte x : b) sb.append(sb.length() > 0 ? " " : "").append(x & 0xFF);
+System.out.println(sb);'
+    go = 'parts := []string{}
+for _, b := range []byte({T}) { parts = append(parts, strconv.Itoa(int(b))) }
+fmt.Println(strings.Join(parts, " "))'
+    sh = 'printf ''%s'' {T} | od -An -tu1 -v | tr -s '' \n'' '' '' | sed ''s/^ //; s/ $//''; echo'
+    php = '<?php
+echo implode(" ", unpack("C*", {T}));'
+}
+Add-TransformCode 'Decimal bytes to text' @{
+    cs = 'var bytes = {T}.Split(new[] { '' '', '','' }, StringSplitOptions.RemoveEmptyEntries).Select(byte.Parse).ToArray();
+Console.WriteLine(System.Text.Encoding.UTF8.GetString(bytes));'
+    ps = '[Text.Encoding]::UTF8.GetString([byte[]]({T} -split ''[\s,]+'' -ne ''''))'
+    py = 'print(bytes(int(n) for n in {T}.replace(",", " ").split()).decode("utf-8"))'
+    js = 'console.log(Buffer.from({T}.split(/[\s,]+/).filter(Boolean).map(Number)).toString("utf8"));'
+    java = 'String[] p = {T}.trim().split("[\\s,]+");
+byte[] b = new byte[p.length];
+for (int i = 0; i < p.length; i++) b[i] = (byte) Integer.parseInt(p[i]);
+System.out.println(new String(b, java.nio.charset.StandardCharsets.UTF_8));'
+    go = 'var out []byte
+for _, s := range strings.FieldsFunc({T}, func(r rune) bool { return r == '' '' || r == '','' }) { n, _ := strconv.Atoi(s); out = append(out, byte(n)) }
+fmt.Println(string(out))'
+    sh = 'for n in $(printf ''%s'' {T} | tr '','' '' ''); do printf "\\$(printf %o "$n")"; done; echo'
+    php = '<?php
+echo implode("", array_map("chr", preg_split(''/[\s,]+/'', trim({T}))));'
+}
+Add-TransformCode 'XOR hex with key (to text)' @{
+    cs = 'byte[] d = Convert.FromHexString({T}.Replace(" ", "")), k = System.Text.Encoding.UTF8.GetBytes({K});
+for (int i = 0; i < d.Length; i++) d[i] ^= k[i % k.Length];
+Console.WriteLine(System.Text.Encoding.UTF8.GetString(d));'
+    ps = '$hex = {T} -replace ''\s'', ''''; $k = [Text.Encoding]::UTF8.GetBytes({K})
+$d = [byte[]](0..($hex.Length / 2 - 1) | ForEach-Object { [Convert]::ToByte($hex.Substring($_ * 2, 2), 16) -bxor $k[$_ % $k.Length] })
+[Text.Encoding]::UTF8.GetString($d)'
+    py = 'd, k = bytes.fromhex({T}), {K}.encode()
+print(bytes(b ^ k[i % len(k)] for i, b in enumerate(d)).decode("utf-8"))'
+    js = 'const d = Buffer.from({T}.replace(/\s/g, ""), "hex"), k = Buffer.from({K});
+console.log(Buffer.from(d.map((b, i) => b ^ k[i % k.length])).toString("utf8"));'
+    java = 'byte[] d = java.util.HexFormat.of().parseHex({T}.replace(" ", "")), k = {K}.getBytes();
+for (int i = 0; i < d.length; i++) d[i] ^= k[i % k.length];
+System.out.println(new String(d, java.nio.charset.StandardCharsets.UTF_8));'
+    go = 'd, _ := hex.DecodeString(strings.ReplaceAll({T}, " ", ""))
+k := []byte({K})
+for i := range d { d[i] ^= k[i%len(k)] }
+fmt.Println(string(d))'
+    sh = 'python3 -c "import sys;d,k=bytes.fromhex(sys.argv[1]),sys.argv[2].encode();print(bytes(b^k[i%len(k)] for i,b in enumerate(d)).decode())" {T} {K}'
+    php = '<?php
+$d = hex2bin(str_replace('' '', '''', {T})); $k = {K}; $o = '''';
+for ($i = 0; $i < strlen($d); $i++) $o .= $d[$i] ^ $k[$i % strlen($k)];
+echo $o;'
+}
+Add-TransformCode 'ROT47' @{
+    cs = 'Console.WriteLine(new string({T}.Select(c => c >= 33 && c <= 126 ? (char)(33 + (c - 33 + 47) % 94) : c).ToArray()));'
+    ps = '-join ({T}.ToCharArray() | ForEach-Object { $n = [int]$_; if ($n -ge 33 -and $n -le 126) { [char](33 + ($n - 33 + 47) % 94) } else { $_ } })'
+    py = 'print("".join(chr(33 + (ord(c) - 33 + 47) % 94) if 33 <= ord(c) <= 126 else c for c in {T}))'
+    js = 'console.log({T}.replace(/[!-~]/g, c => String.fromCharCode(33 + (c.charCodeAt(0) - 33 + 47) % 94)));'
+    java = 'StringBuilder sb = new StringBuilder();
+for (char c : {T}.toCharArray()) sb.append(c >= 33 && c <= 126 ? (char) (33 + (c - 33 + 47) % 94) : c);
+System.out.println(sb);'
+    go = 'fmt.Println(strings.Map(func(r rune) rune { if r >= 33 && r <= 126 { return 33 + (r-33+47)%94 }; return r }, {T}))'
+    sh = 'printf ''%s\n'' {T} | tr ''!-~'' ''P-~!-O'''
+    php = '<?php
+echo strtr({T}, ''!"#$%&\''()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~'', ''PQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~!"#$%&\''()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNO'');'
+}
+Add-TransformCode 'Caesar shift' @{
+    cs = 'int shift = (({KN} % 26) + 26) % 26;
+string Shift(string s) => new string(s.Select(c => c >= ''a'' && c <= ''z'' ? (char)(''a'' + (c - ''a'' + shift) % 26) : c >= ''A'' && c <= ''Z'' ? (char)(''A'' + (c - ''A'' + shift) % 26) : c).ToArray());
+Console.WriteLine(Shift({T}));'
+    ps = '$shift = (({KN} % 26) + 26) % 26
+-join ({T}.ToCharArray() | ForEach-Object { $b = if ($_ -cmatch ''[a-z]'') { 97 } elseif ($_ -cmatch ''[A-Z]'') { 65 } else { 0 }; if ($b) { [char]((([int]$_ - $b + $shift) % 26) + $b) } else { $_ } })'
+    py = 'shift = {KN} % 26
+
+def move(c):
+    if "a" <= c <= "z": return chr((ord(c) - 97 + shift) % 26 + 97)
+    if "A" <= c <= "Z": return chr((ord(c) - 65 + shift) % 26 + 65)
+    return c
+
+print("".join(move(c) for c in {T}))'
+    js = 'const shift = (({KN} % 26) + 26) % 26;
+console.log({T}.replace(/[a-z]/gi, c => { const b = c <= "Z" ? 65 : 97; return String.fromCharCode(b + (c.charCodeAt(0) - b + shift) % 26); }));'
+    java = 'int shift = (({KN} % 26) + 26) % 26;
+StringBuilder sb = new StringBuilder();
+for (char c : {T}.toCharArray()) { if (c >= ''a'' && c <= ''z'') c = (char) (''a'' + (c - ''a'' + shift) % 26); else if (c >= ''A'' && c <= ''Z'') c = (char) (''A'' + (c - ''A'' + shift) % 26); sb.append(c); }
+System.out.println(sb);'
+    go = 'shift := rune((({KN} % 26) + 26) % 26)
+fmt.Println(strings.Map(func(r rune) rune {
+    switch { case r >= ''a'' && r <= ''z'': return ''a'' + (r-''a''+shift)%26; case r >= ''A'' && r <= ''Z'': return ''A'' + (r-''A''+shift)%26 }
+    return r }, {T}))'
+    sh = 's={KN}; a=abcdefghijklmnopqrstuvwxyz; A=${a^^}
+printf ''%s\n'' {T} | tr "a-zA-Z" "${a:$s}${a:0:$s}${A:$s}${A:0:$s}"'
+    php = '<?php
+$s = (({KN} % 26) + 26) % 26;
+echo preg_replace_callback(''/[a-z]/i'', fn($m) => chr((($b = ctype_upper($m[0]) ? 65 : 97)) + (ord($m[0]) - $b + $s) % 26), {T});'
+}
+Add-TransformCode 'Morse code encode' @{
+    cs = '// the table: each entry is a character followed by its code
+var map = {MORSE}.Split('' '').ToDictionary(p => p[0], p => p.Substring(1));
+var words = {T}.ToUpperInvariant().Split(new[] { '' '', ''\n'', ''\t'' }, StringSplitOptions.RemoveEmptyEntries)
+    .Select(w => string.Join(" ", w.Where(map.ContainsKey).Select(c => map[c]))).Where(w => w.Length > 0);
+Console.WriteLine(string.Join(" / ", words));'
+    ps = '$map = @{}; foreach ($p in {MORSE}.Split('' '')) { $map[[string]$p[0]] = $p.Substring(1) }      # character, then its code
+$words = foreach ($w in {T}.ToUpper() -split ''\s+'') { ($w.ToCharArray() | Where-Object { $map.ContainsKey([string]$_) } | ForEach-Object { $map[[string]$_] }) -join '' '' }
+($words -ne '''') -join '' / '''
+    py = 'MORSE = {p[0]: p[1:] for p in {MORSE}.split()}      # character, then its code
+words = (" ".join(MORSE[c] for c in w if c in MORSE) for w in {T}.upper().split())
+print(" / ".join(w for w in words if w))'
+    js = 'const MORSE = Object.fromEntries({MORSE}.split(" ").map(p => [p[0], p.slice(1)]));     // character, then its code
+console.log({T}.toUpperCase().split(/\s+/).map(w => [...w].filter(c => MORSE[c]).map(c => MORSE[c]).join(" ")).filter(Boolean).join(" / "));'
+    java = 'var map = new java.util.HashMap<Character, String>();
+for (String p : {MORSE}.split(" ")) map.put(p.charAt(0), p.substring(1));      // character, then its code
+var words = new StringJoiner(" / ");
+for (String w : {T}.toUpperCase().trim().split("\\s+")) {
+    var sb = new StringJoiner(" ");
+    for (char c : w.toCharArray()) if (map.containsKey(c)) sb.add(map.get(c));
+    if (sb.length() > 0) words.add(sb.toString());
+}
+System.out.println(words);'
+    go = 'm := map[rune]string{}
+for _, p := range strings.Fields({MORSE}) { m[rune(p[0])] = p[1:] }      // character, then its code
+var words []string
+for _, w := range strings.Fields(strings.ToUpper({T})) {
+    var l []string
+    for _, c := range w { if v, ok := m[c]; ok { l = append(l, v) } }
+    if len(l) > 0 { words = append(words, strings.Join(l, " ")) }
+}
+fmt.Println(strings.Join(words, " / "))'
+    sh = 'python3 -c ''import sys
+M = {p[0]: p[1:] for p in sys.argv[2].split()}
+w = (" ".join(M[c] for c in x if c in M) for x in sys.argv[1].upper().split())
+print(" / ".join(x for x in w if x))'' {T} {MORSE}'
+    php = '<?php
+foreach (explode('' '', {MORSE}) as $p) $m[$p[0]] = substr($p, 1);      // character, then its code
+$words = array_map(fn($w) => implode('' '', array_filter(array_map(fn($c) => $m[$c] ?? null, str_split($w)))), preg_split(''/\s+/'', strtoupper(trim({T}))));
+echo implode('' / '', array_filter($words));'
+}
+Add-TransformCode 'Morse code decode' @{
+    cs = 'var map = {MORSE}.Split('' '').ToDictionary(p => p.Substring(1), p => p[0]);      // character, then its code
+var words = System.Text.RegularExpressions.Regex.Split({T}.Trim(), @"\s*/\s*|\s{3,}")     // words: " / " or 3+ spaces
+    .Select(w => new string(w.Split(new[] { '' '' }, StringSplitOptions.RemoveEmptyEntries).Select(c => map.TryGetValue(c, out var ch) ? ch : ''?'').ToArray()));
+Console.WriteLine(string.Join(" ", words));'
+    ps = '$map = @{}; foreach ($p in {MORSE}.Split('' '')) { $map[$p.Substring(1)] = [string]$p[0] }      # character, then its code
+(({T}.Trim() -split ''\s*/\s*|\s{3,}'') | ForEach-Object { -join (($_ -split '' '' -ne '''') | ForEach-Object { if ($map.ContainsKey($_)) { $map[$_] } else { ''?'' } }) }) -join '' '''
+    py = 'import re
+
+CODE = {p[1:]: p[0] for p in {MORSE}.split()}      # character, then its code
+words = re.split(r"\s*/\s*|\s{3,}", {T}.strip())      # words: " / " or 3+ spaces
+print(" ".join("".join(CODE.get(c, "?") for c in w.split()) for w in words))'
+    js = 'const CODE = Object.fromEntries({MORSE}.split(" ").map(p => [p.slice(1), p[0]]));     // character, then its code
+console.log({T}.trim().split(/\s*\/\s*|\s{3,}/).map(w => w.split(" ").filter(Boolean).map(c => CODE[c] ?? "?").join("")).join(" "));'
+    java = 'var map = new java.util.HashMap<String, Character>();
+for (String p : {MORSE}.split(" ")) map.put(p.substring(1), p.charAt(0));      // character, then its code
+var words = new StringJoiner(" ");
+for (String w : {T}.trim().split("\\s*/\\s*|\\s{3,}")) {
+    var sb = new StringBuilder();
+    for (String c : w.trim().split(" +")) if (!c.isEmpty()) sb.append(map.getOrDefault(c, ''?''));
+    words.add(sb);
+}
+System.out.println(words);'
+    go = 'm := map[string]string{}
+for _, p := range strings.Fields({MORSE}) { m[p[1:]] = p[:1] }      // character, then its code
+var words []string
+for _, w := range regexp.MustCompile(`\s*/\s*|\s{3,}`).Split(strings.TrimSpace({T}), -1) {
+    s := ""
+    for _, c := range strings.Fields(w) { if v, ok := m[c]; ok { s += v } else { s += "?" } }
+    words = append(words, s)
+}
+fmt.Println(strings.Join(words, " "))'
+    sh = 'python3 -c ''import sys, re
+C = {p[1:]: p[0] for p in sys.argv[2].split()}
+print(" ".join("".join(C.get(c, "?") for c in w.split()) for w in re.split(r"\s*/\s*|\s{3,}", sys.argv[1].strip())))'' {T} {MORSE}'
+    php = '<?php
+foreach (explode('' '', {MORSE}) as $p) $m[substr($p, 1)] = $p[0];      // character, then its code
+$words = preg_split(''~\s*/\s*|\s{3,}~'', trim({T}));
+echo implode('' '', array_map(fn($w) => implode('''', array_map(fn($c) => $m[$c] ?? ''?'', preg_split(''/ +/'', trim($w)))), $words));'
+}
+Add-TransformCode 'NATO phonetic alphabet' @{
+    cs = 'string[] nato = {NATO}.Split('' ''), digits = "Zero One Two Three Four Five Six Seven Eight Nine".Split('' '');
+var parts = {T}.ToUpperInvariant().Select(c => c >= ''A'' && c <= ''Z'' ? nato[c - ''A''] : char.IsDigit(c) ? digits[c - ''0''] : c == '' '' ? "(space)" : c.ToString());
+Console.WriteLine(string.Join(" ", parts));'
+    ps = '$nato = {NATO}.Split('' ''); $digits = ''Zero One Two Three Four Five Six Seven Eight Nine''.Split('' '')
+({T}.ToUpper().ToCharArray() | ForEach-Object { if ($_ -match ''[A-Z]'') { $nato[[int]$_ - 65] } elseif ($_ -match ''\d'') { $digits[[int]$_ - 48] } elseif ($_ -eq '' '') { ''(space)'' } else { $_ } }) -join '' '''
+    py = 'NATO = {NATO}.split(); DIGITS = "Zero One Two Three Four Five Six Seven Eight Nine".split()
+print(" ".join(NATO[ord(c) - 65] if "A" <= c <= "Z" else DIGITS[int(c)] if c.isdigit() else "(space)" if c == " " else c for c in {T}.upper()))'
+    js = 'const NATO = {NATO}.split(" "), DIGITS = "Zero One Two Three Four Five Six Seven Eight Nine".split(" ");
+console.log([...{T}.toUpperCase()].map(c => /[A-Z]/.test(c) ? NATO[c.charCodeAt(0) - 65] : /\d/.test(c) ? DIGITS[+c] : c === " " ? "(space)" : c).join(" "));'
+    java = 'String[] nato = {NATO}.split(" "), digits = "Zero One Two Three Four Five Six Seven Eight Nine".split(" ");
+var out = new StringJoiner(" ");
+for (char c : {T}.toUpperCase().toCharArray()) out.add(c >= ''A'' && c <= ''Z'' ? nato[c - ''A''] : Character.isDigit(c) ? digits[c - ''0''] : c == '' '' ? "(space)" : String.valueOf(c));
+System.out.println(out);'
+    go = 'nato, digits := strings.Fields({NATO}), strings.Fields("Zero One Two Three Four Five Six Seven Eight Nine")
+var out []string
+for _, c := range strings.ToUpper({T}) { switch { case c >= ''A'' && c <= ''Z'': out = append(out, nato[c-''A'']); case c >= ''0'' && c <= ''9'': out = append(out, digits[c-''0'']); case c == '' '': out = append(out, "(space)"); default: out = append(out, string(c)) } }
+fmt.Println(strings.Join(out, " "))'
+    sh = 'python3 -c "import sys;N=sys.argv[2].split();D=''Zero One Two Three Four Five Six Seven Eight Nine''.split();print('' ''.join(N[ord(c)-65] if ''A''<=c<=''Z'' else D[int(c)] if c.isdigit() else ''(space)'' if c==chr(32) else c for c in sys.argv[1].upper()))" {T} {NATO}'
+    php = '<?php
+$n = explode('' '', {NATO}); $d = explode('' '', ''Zero One Two Three Four Five Six Seven Eight Nine'');
+echo implode('' '', array_map(fn($c) => ctype_upper($c) ? $n[ord($c) - 65] : (ctype_digit($c) ? $d[(int)$c] : ($c === '' '' ? ''(space)'' : $c)), str_split(strtoupper({T}))));'
+}
+Add-TransformCode 'Reverse text' @{
+    cs = 'using System.Globalization;
+var e = StringInfo.GetTextElementEnumerator({T}); var parts = new List<string>();
+while (e.MoveNext()) parts.Add(e.GetTextElement());      // keeps emoji and accents whole
+parts.Reverse();
+Console.WriteLine(string.Concat(parts));'
+    ps = '$a = {T}.ToCharArray(); [array]::Reverse($a); -join $a'
+    py = 'print({T}[::-1])'
+    js = 'console.log([...new Intl.Segmenter().segment({T})].map(s => s.segment).reverse().join(""));'
+    java = 'System.out.println(new StringBuilder({T}).reverse());'
+    go = 'r := []rune({T})
+for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 { r[i], r[j] = r[j], r[i] }
+fmt.Println(string(r))'
+    sh = 'printf ''%s\n'' {T} | rev      # util-linux; or: python3 -c "import sys; print(sys.argv[1][::-1])" ...'
+    php = '<?php
+echo implode('''', array_reverse(mb_str_split({T})));'
+}
+Add-TransformCode 'Upside-down text' @{
+    cs = 'const string from = {FLIPFROM}, to = {FLIPTO};
+var arr = {T}.ToCharArray(); Array.Reverse(arr);
+Console.WriteLine(new string(arr.Select(c => from.IndexOf(c) is var i && i >= 0 ? to[i] : c).ToArray()));'
+    ps = '$from = {FLIPFROM}; $to = {FLIPTO}
+$a = {T}.ToCharArray(); [array]::Reverse($a)
+-join ($a | ForEach-Object { $i = $from.IndexOf($_); if ($i -ge 0) { $to[$i] } else { $_ } })'
+    py = 'table = str.maketrans({FLIPFROM}, {FLIPTO})
+print({T}[::-1].translate(table))'
+    js = 'const from = [...{FLIPFROM}], to = [...{FLIPTO}];
+console.log([...{T}].reverse().map(c => { const i = from.indexOf(c); return i >= 0 ? to[i] : c; }).join(""));'
+    java = 'String from = {FLIPFROM}, to = {FLIPTO};
+StringBuilder sb = new StringBuilder();
+for (char c : new StringBuilder({T}).reverse().toString().toCharArray()) { int i = from.indexOf(c); sb.append(i >= 0 ? to.charAt(i) : c); }
+System.out.println(sb);'
+    go = 'from, to := []rune({FLIPFROM}), []rune({FLIPTO})
+r := []rune({T}); var out []rune
+for i := len(r) - 1; i >= 0; i-- { c := r[i]; for k, f := range from { if f == c { c = to[k]; break } }; out = append(out, c) }
+fmt.Println(string(out))'
+    sh = 'python3 -c "import sys;print(sys.argv[1][::-1].translate(str.maketrans(sys.argv[2],sys.argv[3])))" {T} {FLIPFROM} {FLIPTO}'
+    php = '<?php
+$from = mb_str_split({FLIPFROM}); $to = mb_str_split({FLIPTO});
+echo implode('''', array_map(fn($c) => ($i = array_search($c, $from, true)) !== false ? $to[$i] : $c, array_reverse(mb_str_split({T}))));'
+}
+Add-TransformCode 'Leet speak' @{
+    cs = 'var map = new Dictionary<char, char> { [''a''] = ''4'', [''e''] = ''3'', [''i''] = ''1'', [''o''] = ''0'', [''s''] = ''5'', [''t''] = ''7'', [''b''] = ''8'', [''g''] = ''9'' };
+Console.WriteLine(new string({T}.Select(c => map.TryGetValue(char.ToLowerInvariant(c), out var r) ? r : c).ToArray()));'
+    ps = '$map = @{ a = ''4''; e = ''3''; i = ''1''; o = ''0''; s = ''5''; t = ''7''; b = ''8''; g = ''9'' }
+-join ({T}.ToCharArray() | ForEach-Object { $k = ([string]$_).ToLower(); if ($map.ContainsKey($k)) { $map[$k] } else { $_ } })'
+    py = 'table = str.maketrans("aeiostbgAEIOSTBG", "4310578943105789")
+print({T}.translate(table))'
+    js = 'const map = { a: "4", e: "3", i: "1", o: "0", s: "5", t: "7", b: "8", g: "9" };
+console.log({T}.replace(/[aeiostbg]/gi, c => map[c.toLowerCase()]));'
+    java = 'System.out.println({T}.replaceAll("(?i)a", "4").replaceAll("(?i)e", "3").replaceAll("(?i)i", "1").replaceAll("(?i)o", "0")
+    .replaceAll("(?i)s", "5").replaceAll("(?i)t", "7").replaceAll("(?i)b", "8").replaceAll("(?i)g", "9"));'
+    go = 'r := strings.NewReplacer("a", "4", "A", "4", "e", "3", "E", "3", "i", "1", "I", "1", "o", "0", "O", "0", "s", "5", "S", "5", "t", "7", "T", "7", "b", "8", "B", "8", "g", "9", "G", "9")
+fmt.Println(r.Replace({T}))'
+    sh = 'printf ''%s\n'' {T} | tr ''aeiostbgAEIOSTBG'' ''4310578943105789'''
+    php = '<?php
+echo strtr({T}, ''aeiostbgAEIOSTBG'', ''4310578943105789'');'
+}
+# ---- case
+$CaseCode = @{
+    'UPPER CASE' = @{ cs = 'Console.WriteLine({T}.ToUpperInvariant());'; ps = '{T}.ToUpper()'; py = 'print({T}.upper())'; js = 'console.log({T}.toUpperCase());'
+                     java = 'System.out.println({T}.toUpperCase());'; go = 'fmt.Println(strings.ToUpper({T}))'; sh = 'printf ''%s\n'' {T} | tr ''[:lower:]'' ''[:upper:]''      # bash 4: ${text^^}'; php = '<?php
+echo mb_strtoupper({T});' }
+    'lower case' = @{ cs = 'Console.WriteLine({T}.ToLowerInvariant());'; ps = '{T}.ToLower()'; py = 'print({T}.lower())'; js = 'console.log({T}.toLowerCase());'
+                     java = 'System.out.println({T}.toLowerCase());'; go = 'fmt.Println(strings.ToLower({T}))'; sh = 'printf ''%s\n'' {T} | tr ''[:upper:]'' ''[:lower:]''      # bash 4: ${text,,}'; php = '<?php
+echo mb_strtolower({T});' }
+    'Title Case' = @{ cs = 'Console.WriteLine(System.Globalization.CultureInfo.InvariantCulture.TextInfo.ToTitleCase({T}.ToLowerInvariant()));'
+                     ps = '(Get-Culture).TextInfo.ToTitleCase({T}.ToLower())'; py = 'import re
+
+print(re.sub(r"(^|\s)(\S)", lambda m: m.group(1) + m.group(2).upper(), {T}.lower()))      # str.title() would give "Don''T"'
+                     js = 'console.log({T}.toLowerCase().replace(/(^|\s)\S/g, c => c.toUpperCase()));'
+                     java = 'StringBuilder sb = new StringBuilder(); boolean up = true;
+for (char c : {T}.toLowerCase().toCharArray()) { sb.append(up ? Character.toUpperCase(c) : c); up = Character.isWhitespace(c); }
+System.out.println(sb);'
+                     go = 'words := strings.Fields(strings.ToLower({T}))
+for i, w := range words { words[i] = strings.ToUpper(w[:1]) + w[1:] }
+fmt.Println(strings.Join(words, " "))'
+                     sh = 'printf ''%s\n'' {T} | sed -E ''s/.*/\L&/; s/(^|[[:space:]])([a-z])/\1\u\2/g''      # GNU sed'
+                     php = '<?php
+echo mb_convert_case({T}, MB_CASE_TITLE);' }
+    'iNVERT cASE' = @{ cs = 'Console.WriteLine(new string({T}.Select(c => char.IsUpper(c) ? char.ToLowerInvariant(c) : char.ToUpperInvariant(c)).ToArray()));'
+                      ps = '-join ({T}.ToCharArray() | ForEach-Object { if ([char]::IsUpper($_)) { [char]::ToLower($_) } else { [char]::ToUpper($_) } })'
+                      py = 'print({T}.swapcase())'; js = 'console.log([...{T}].map(c => c === c.toUpperCase() ? c.toLowerCase() : c.toUpperCase()).join(""));'
+                      java = 'StringBuilder sb = new StringBuilder();
+for (char c : {T}.toCharArray()) sb.append(Character.isUpperCase(c) ? Character.toLowerCase(c) : Character.toUpperCase(c));
+System.out.println(sb);'
+                      go = 'fmt.Println(strings.Map(func(r rune) rune { if unicode.IsUpper(r) { return unicode.ToLower(r) }; return unicode.ToUpper(r) }, {T}))'
+                      sh = 'printf ''%s\n'' {T} | tr ''a-zA-Z'' ''A-Za-z''      # bash 4: ${text~~}'
+                      php = '<?php
+echo strtolower({T}) ^ strtoupper({T}) ^ {T};   // ASCII letters' }
+    'Sentence case' = @{ cs = 'var sb = new System.Text.StringBuilder({T}.ToLowerInvariant()); bool start = true;
+for (int i = 0; i < sb.Length; i++) { if (start && char.IsLetter(sb[i])) { sb[i] = char.ToUpperInvariant(sb[i]); start = false; } else if (".!?\n".IndexOf(sb[i]) >= 0) start = true; }
+Console.WriteLine(sb);'
+                        ps = '[regex]::Replace({T}.ToLower(), ''(^|[.!?\n]\s*)(\p{L})'', { param($m) $m.Groups[1].Value + $m.Groups[2].Value.ToUpper() })'
+                        py = 'import re
+
+print(re.sub(r"(^|[.!?\n]\s*)(\w)", lambda m: m.group(1) + m.group(2).upper(), {T}.lower()))'
+                        js = 'console.log({T}.toLowerCase().replace(/(^|[.!?\n]\s*)(\p{L})/gu, (_, a, b) => a + b.toUpperCase()));'
+                        java = 'var m = java.util.regex.Pattern.compile("(^|[.!?\\n]\\s*)(\\p{L})").matcher({T}.toLowerCase());
+System.out.println(m.replaceAll(r -> r.group(1) + r.group(2).toUpperCase()));'
+                        go = 're := regexp.MustCompile(`(^|[.!?\n]\s*)(\pL)`)
+fmt.Println(re.ReplaceAllStringFunc(strings.ToLower({T}), strings.ToUpper))   // upper-cases the punctuation too (harmless)'
+                        sh = 'printf ''%s\n'' {T} | sed -E ''s/.*/\L&/; s/(^|[.!?][[:space:]]*)([a-z])/\1\u\2/g''      # GNU sed'
+                        php = '<?php
+echo preg_replace_callback(''/(^|[.!?\n]\s*)(\pL)/u'', fn($m) => $m[1] . mb_strtoupper($m[2]), mb_strtolower({T}));' }
+}
+foreach ($k in $CaseCode.Keys) { Add-TransformCode $k $CaseCode[$k] }
+# camelCase and friends: split into words (also at humps), then join
+$IdentCode = @{
+    cs = 'using System.Text.RegularExpressions;
+var words = Regex.Matches({T}, {LIT:[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+:LIT}).Select(m => m.Value.ToLowerInvariant()).ToList();
+string Cap(string w) => char.ToUpperInvariant(w[0]) + w.Substring(1);
+Console.WriteLine({CS});'
+    ps = '$words = @([regex]::Matches({T}, {LIT:[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+:LIT}) | ForEach-Object { $_.Value.ToLower() })
+function Cap([string]$w) { $w.Substring(0, 1).ToUpper() + $w.Substring(1) }
+{PS}'
+    py = 'import re
+
+words = [w.lower() for w in re.findall({LIT:[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+:LIT}, {T})]
+print({PY})'
+    js = 'const words = ({T}.match(new RegExp({LIT:[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+:LIT}, "g")) || []).map(w => w.toLowerCase());
+const cap = w => w[0].toUpperCase() + w.slice(1);
+console.log({JS});'
+    java = 'var m = java.util.regex.Pattern.compile({LIT:[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+:LIT}).matcher({T});
+var words = new java.util.ArrayList<String>();
+while (m.find()) words.add(m.group().toLowerCase());
+{JAVA}'
+    go = '// Go''s regexp has no look-ahead, so an acronym before a word ("XMLHttp") stays one word
+re := regexp.MustCompile({LIT:[A-Z]?[a-z]+|[A-Z]+|\d+:LIT})
+words := re.FindAllString({T}, -1)
+for i := range words { words[i] = strings.ToLower(words[i]) }
+{GO}'
+    sh = 'python3 -c "import re,sys;w=[x.lower() for x in re.findall(sys.argv[2],sys.argv[1])];print({SH})" {T} {LIT:[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+:LIT}'
+    php = '<?php
+preg_match_all({LIT:/[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+/:LIT}, {T}, $m);
+$words = array_map(''strtolower'', $m[0]);
+echo {PHP};'
+}
+$IdentJoin = @{
+    'camelCase' = @{ CS = 'string.Concat(words.Select((w, i) => i == 0 ? w : Cap(w)))'; PS = '-join ($words | ForEach-Object -Begin { $i = 0 } { if ($i++) { Cap $_ } else { $_ } })'; PY = 'words[0] + "".join(w.title() for w in words[1:])'
+                     JS = 'words.map((w, i) => i ? cap(w) : w).join("")'; JAVA = 'StringBuilder sb = new StringBuilder();
+for (int i = 0; i < words.size(); i++) { String w = words.get(i); sb.append(i == 0 ? w : Character.toUpperCase(w.charAt(0)) + w.substring(1)); }
+System.out.println(sb);'; GO = 'for i := 1; i < len(words); i++ { words[i] = strings.ToUpper(words[i][:1]) + words[i][1:] }
+fmt.Println(strings.Join(words, ""))'; SH = 'w[0]+''''.join(x.title() for x in w[1:])'; PHP = 'lcfirst(implode('''', array_map(''ucfirst'', $words)))' }
+    'PascalCase' = @{ CS = 'string.Concat(words.Select(Cap))'; PS = '-join ($words | ForEach-Object { Cap $_ })'; PY = '"".join(w.title() for w in words)'
+                      JS = 'words.map(cap).join("")'; JAVA = 'StringBuilder sb = new StringBuilder();
+for (String w : words) sb.append(Character.toUpperCase(w.charAt(0))).append(w.substring(1));
+System.out.println(sb);'; GO = 'for i := range words { words[i] = strings.ToUpper(words[i][:1]) + words[i][1:] }
+fmt.Println(strings.Join(words, ""))'; SH = '''''.join(x.title() for x in w)'; PHP = 'implode('''', array_map(''ucfirst'', $words))' }
+    'snake_case' = @{ CS = 'string.Join("_", words)'; PS = '$words -join ''_'''; PY = '"_".join(words)'; JS = 'words.join("_")'; JAVA = 'System.out.println(String.join("_", words));'
+                      GO = 'fmt.Println(strings.Join(words, "_"))'; SH = '''_''.join(w)'; PHP = 'implode(''_'', $words)' }
+    'kebab-case' = @{ CS = 'string.Join("-", words)'; PS = '$words -join ''-'''; PY = '"-".join(words)'; JS = 'words.join("-")'; JAVA = 'System.out.println(String.join("-", words));'
+                      GO = 'fmt.Println(strings.Join(words, "-"))'; SH = '''-''.join(w)'; PHP = 'implode(''-'', $words)' }
+    'CONSTANT_CASE' = @{ CS = 'string.Join("_", words).ToUpperInvariant()'; PS = '($words -join ''_'').ToUpper()'; PY = '"_".join(words).upper()'; JS = 'words.join("_").toUpperCase()'
+                         JAVA = 'System.out.println(String.join("_", words).toUpperCase());'; GO = 'fmt.Println(strings.ToUpper(strings.Join(words, "_")))'; SH = '''_''.join(w).upper()'; PHP = 'strtoupper(implode(''_'', $words))' }
+}
+foreach ($k in $IdentJoin.Keys) {
+    $code = @{}
+    foreach ($l in $IdentCode.Keys) {
+        $t = $IdentCode[$l]
+        foreach ($p in $IdentJoin[$k].Keys) { $t = $t.Replace("{$p}", $IdentJoin[$k][$p]) }
+        $code[$l] = $t
+    }
+    Add-TransformCode $k $code
+}
+# ---- lines
+$LinesCode = @{
+    'Sort lines A-Z' = @('var lines = {T}.Split(''\n'').Select(l => l.TrimEnd(''\r'')).OrderBy(l => l, StringComparer.CurrentCultureIgnoreCase);
+Console.WriteLine(string.Join("\n", lines));', '{T} -split ''\r?\n'' | Sort-Object', 'print("\n".join(sorted({T}.splitlines(), key=str.lower)))',
+                         'console.log({T}.split(/\r?\n/).sort((a, b) => a.localeCompare(b)).join("\n"));', 'var lines = new java.util.ArrayList<>(java.util.Arrays.asList({T}.split("\\r?\\n")));
+lines.sort(String.CASE_INSENSITIVE_ORDER);
+System.out.println(String.join("\n", lines));', 'lines := strings.Split({T}, "\n")
+sort.Slice(lines, func(i, j int) bool { return strings.ToLower(lines[i]) < strings.ToLower(lines[j]) })
+fmt.Println(strings.Join(lines, "\n"))', 'printf ''%s\n'' {T} | sort -f', '<?php
+$l = preg_split(''/\R/'', {T}); natcasesort($l); echo implode("\n", $l);')
+    'Sort lines Z-A' = @('var lines = {T}.Split(''\n'').Select(l => l.TrimEnd(''\r'')).OrderByDescending(l => l, StringComparer.CurrentCultureIgnoreCase);
+Console.WriteLine(string.Join("\n", lines));', '{T} -split ''\r?\n'' | Sort-Object -Descending', 'print("\n".join(sorted({T}.splitlines(), key=str.lower, reverse=True)))',
+                         'console.log({T}.split(/\r?\n/).sort((a, b) => b.localeCompare(a)).join("\n"));', 'var lines = new java.util.ArrayList<>(java.util.Arrays.asList({T}.split("\\r?\\n")));
+lines.sort(String.CASE_INSENSITIVE_ORDER.reversed());
+System.out.println(String.join("\n", lines));', 'lines := strings.Split({T}, "\n")
+sort.Slice(lines, func(i, j int) bool { return strings.ToLower(lines[i]) > strings.ToLower(lines[j]) })
+fmt.Println(strings.Join(lines, "\n"))', 'printf ''%s\n'' {T} | sort -fr', '<?php
+$l = preg_split(''/\R/'', {T}); natcasesort($l); echo implode("\n", array_reverse($l));')
+    'Sort lines by length' = @('var lines = {T}.Split(''\n'').Select(l => l.TrimEnd(''\r'')).OrderBy(l => l.Length);   // OrderBy keeps equal ones in order
+Console.WriteLine(string.Join("\n", lines));', '$l = @({T} -split ''\r?\n''); $i = 0
+$l | ForEach-Object { [pscustomobject]@{ Line = $_; N = $i++ } } | Sort-Object { $_.Line.Length }, N | ForEach-Object Line      # equal lengths keep their order', 'print("\n".join(sorted({T}.splitlines(), key=len)))',
+                               'console.log({T}.split(/\r?\n/).sort((a, b) => a.length - b.length).join("\n"));', 'var lines = new java.util.ArrayList<>(java.util.Arrays.asList({T}.split("\\r?\\n")));
+lines.sort(java.util.Comparator.comparingInt(String::length));
+System.out.println(String.join("\n", lines));', 'lines := strings.Split({T}, "\n")
+sort.SliceStable(lines, func(i, j int) bool { return len(lines[i]) < len(lines[j]) })
+fmt.Println(strings.Join(lines, "\n"))', 'printf ''%s\n'' {T} | awk ''{ print length, NR, $0 }'' | sort -n -k1,1 -k2,2 | cut -d'' '' -f3-', '<?php
+$l = preg_split(''/\R/'', {T}); usort($l, fn($a, $b) => strlen($a) <=> strlen($b)); echo implode("\n", $l);')
+    'Reverse lines' = @('Console.WriteLine(string.Join("\n", {T}.Split(''\n'').Select(l => l.TrimEnd(''\r'')).Reverse()));', '$l = {T} -split ''\r?\n''; [array]::Reverse($l); $l', 'print("\n".join(reversed({T}.splitlines())))',
+                        'console.log({T}.split(/\r?\n/).reverse().join("\n"));', 'var lines = java.util.Arrays.asList({T}.split("\\r?\\n"));
+java.util.Collections.reverse(lines);
+System.out.println(String.join("\n", lines));', 'lines := strings.Split({T}, "\n")
+for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 { lines[i], lines[j] = lines[j], lines[i] }
+fmt.Println(strings.Join(lines, "\n"))', 'printf ''%s\n'' {T} | tac      # macOS: tail -r', '<?php
+echo implode("\n", array_reverse(preg_split(''/\R/'', {T})));')
+    'Shuffle lines' = @('var lines = {T}.Split(''\n'').Select(l => l.TrimEnd(''\r'')).ToArray();
+Random.Shared.Shuffle(lines);                          // .NET 8+
+Console.WriteLine(string.Join("\n", lines));', '{T} -split ''\r?\n'' | Get-Random -Shuffle      # PowerShell 7; 5.1: Get-Random -Count ([int]::MaxValue)', 'import random
+
+lines = {T}.splitlines(); random.shuffle(lines)
+print("\n".join(lines))', 'const lines = {T}.split(/\r?\n/);
+for (let i = lines.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [lines[i], lines[j]] = [lines[j], lines[i]]; }
+console.log(lines.join("\n"));', 'var lines = java.util.Arrays.asList({T}.split("\\r?\\n"));
+java.util.Collections.shuffle(lines);
+System.out.println(String.join("\n", lines));', 'lines := strings.Split({T}, "\n")
+rand.Shuffle(len(lines), func(i, j int) { lines[i], lines[j] = lines[j], lines[i] })
+fmt.Println(strings.Join(lines, "\n"))', 'printf ''%s\n'' {T} | shuf', '<?php
+$l = preg_split(''/\R/'', {T}); shuffle($l); echo implode("\n", $l);')
+    'Remove duplicate lines' = @('Console.WriteLine(string.Join("\n", {T}.Split(''\n'').Select(l => l.TrimEnd(''\r'')).Distinct()));   // keeps the first of each', '{T} -split ''\r?\n'' | Select-Object -Unique      # keeps the order', 'print("\n".join(dict.fromkeys({T}.splitlines())))   # keeps the order',
+                                 'console.log([...new Set({T}.split(/\r?\n/))].join("\n"));', 'System.out.println(String.join("\n", new java.util.LinkedHashSet<>(java.util.Arrays.asList({T}.split("\\r?\\n")))));', 'seen := map[string]bool{}; var out []string
+for _, l := range strings.Split({T}, "\n") { if !seen[l] { seen[l] = true; out = append(out, l) } }
+fmt.Println(strings.Join(out, "\n"))', 'printf ''%s\n'' {T} | awk ''!seen[$0]++''      # keeps the order (sort -u sorts too)', '<?php
+echo implode("\n", array_unique(preg_split(''/\R/'', {T})));')
+    'Remove empty lines' = @('Console.WriteLine(string.Join("\n", {T}.Split(''\n'').Select(l => l.TrimEnd(''\r'')).Where(l => l.Trim().Length > 0)));', '{T} -split ''\r?\n'' | Where-Object { $_.Trim() }', 'print("\n".join(l for l in {T}.splitlines() if l.strip()))',
+                             'console.log({T}.split(/\r?\n/).filter(l => l.trim()).join("\n"));', 'System.out.println(java.util.Arrays.stream({T}.split("\\r?\\n")).filter(l -> !l.isBlank()).collect(java.util.stream.Collectors.joining("\n")));', 'var out []string
+for _, l := range strings.Split({T}, "\n") { if strings.TrimSpace(l) != "" { out = append(out, l) } }
+fmt.Println(strings.Join(out, "\n"))', 'printf ''%s\n'' {T} | grep -v ''^[[:space:]]*$''', '<?php
+echo implode("\n", array_filter(preg_split(''/\R/'', {T}), fn($l) => trim($l) !== ''''));')
+    'Trim lines' = @('Console.WriteLine(string.Join("\n", {T}.Split(''\n'').Select(l => l.Trim())));', '({T} -split ''\r?\n'' | ForEach-Object { $_.Trim() }) -join "`n"', 'print("\n".join(l.strip() for l in {T}.splitlines()))',
+                     'console.log({T}.split(/\r?\n/).map(l => l.trim()).join("\n"));', 'System.out.println(java.util.Arrays.stream({T}.split("\\r?\\n")).map(String::strip).collect(java.util.stream.Collectors.joining("\n")));', 'lines := strings.Split({T}, "\n")
+for i := range lines { lines[i] = strings.TrimSpace(lines[i]) }
+fmt.Println(strings.Join(lines, "\n"))', 'printf ''%s\n'' {T} | sed ''s/^[[:space:]]*//; s/[[:space:]]*$//''', '<?php
+echo implode("\n", array_map(''trim'', preg_split(''/\R/'', {T})));')
+    'Number lines' = @('var lines = {T}.Split(''\n'').Select(l => l.TrimEnd(''\r'')).ToArray(); int w = lines.Length.ToString().Length;
+Console.WriteLine(string.Join("\n", lines.Select((l, i) => (i + 1).ToString().PadLeft(w) + "  " + l)));', '$l = @({T} -split ''\r?\n''); $w = "$($l.Count)".Length
+for ($i = 0; $i -lt $l.Count; $i++) { "$($i + 1)".PadLeft($w) + ''  '' + $l[$i] }', 'lines = {T}.splitlines(); w = len(str(len(lines)))
+print("\n".join(f"{i:>{w}}  {l}" for i, l in enumerate(lines, 1)))',
+                       'const lines = {T}.split(/\r?\n/), w = String(lines.length).length;
+console.log(lines.map((l, i) => String(i + 1).padStart(w) + "  " + l).join("\n"));', 'String[] lines = {T}.split("\\r?\\n"); int w = String.valueOf(lines.length).length();
+for (int i = 0; i < lines.length; i++) System.out.printf("%" + w + "d  %s%n", i + 1, lines[i]);', 'lines := strings.Split({T}, "\n"); w := len(strconv.Itoa(len(lines)))
+for i, l := range lines { fmt.Printf("%*d  %s\n", w, i+1, l) }', 't={T}; n=$(printf ''%s\n'' "$t" | wc -l | tr -d '' '')
+printf ''%s\n'' "$t" | awk -v w=${#n} ''{ printf "%" w "d  %s\n", NR, $0 }''', '<?php
+$l = preg_split(''/\R/'', {T}); $w = strlen(count($l));
+foreach ($l as $i => $x) echo str_pad($i + 1, $w, '' '', STR_PAD_LEFT) . "  $x\n";')
+    'Join lines with' = @('Console.WriteLine(string.Join({K}, {T}.Split(''\n'').Select(l => l.TrimEnd(''\r''))));', '({T} -split ''\r?\n'') -join {K}', 'print({K}.join({T}.splitlines()))',
+                          'console.log({T}.split(/\r?\n/).join({K}));', 'System.out.println(String.join({K}, {T}.split("\\r?\\n")));', 'fmt.Println(strings.Join(strings.Split({T}, "\n"), {K}))', 'printf ''%s\n'' {T} | awk -v sep={K} ''NR > 1 { printf "%s", sep } { printf "%s", $0 } END { print "" }''', '<?php
+echo implode({K}, preg_split(''/\R/'', {T}));')
+    'Split into lines at' = @('Console.WriteLine(string.Join("\n", {T}.Split({K})));', '({T} -split [regex]::Escape({K})) -join "`n"', 'print("\n".join({T}.split({K})))',
+                              'console.log({T}.split({K}).join("\n"));', 'System.out.println(String.join("\n", {T}.split(java.util.regex.Pattern.quote({K}))));', 'fmt.Println(strings.Join(strings.Split({T}, {K}), "\n"))', 'printf ''%s\n'' {T} | awk -v RS={K} ''{ print }''', '<?php
+echo implode("\n", explode({K}, {T}));')
+}
+foreach ($k in $LinesCode.Keys) {
+    $a = $LinesCode[$k]
+    Add-TransformCode $k @{ cs = $a[0]; ps = $a[1]; py = $a[2]; js = $a[3]; java = $a[4]; go = $a[5]; sh = $a[6]; php = $a[7] }
+}
+# ---- format
+Add-TransformCode 'JSON pretty print' @{
+    cs = 'using System.Text.Json;
+var doc = JsonDocument.Parse({T});
+Console.WriteLine(JsonSerializer.Serialize(doc, new JsonSerializerOptions { WriteIndented = true }));'
+    ps = '{T} | ConvertFrom-Json | ConvertTo-Json -Depth 100      # PowerShell 7 indents by 2; 5.1 lines values up wider'
+    py = 'import json
+
+print(json.dumps(json.loads({T}), indent=2, ensure_ascii=False))'
+    js = 'console.log(JSON.stringify(JSON.parse({T}), null, 2));'
+    java = '// Jackson
+var m = new com.fasterxml.jackson.databind.ObjectMapper();
+System.out.println(m.writerWithDefaultPrettyPrinter().writeValueAsString(m.readTree({T})));'
+    go = 'var out bytes.Buffer
+if err := json.Indent(&out, []byte({T}), "", "  "); err != nil { panic(err) }
+fmt.Println(out.String())'
+    sh = 'printf ''%s'' {T} | jq .      # or: python3 -m json.tool'
+    php = '<?php
+echo json_encode(json_decode({T}), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);'
+}
+Add-TransformCode 'JSON minify' @{
+    cs = 'using System.Text.Json;
+Console.WriteLine(JsonSerializer.Serialize(JsonDocument.Parse({T})));'
+    ps = '{T} | ConvertFrom-Json | ConvertTo-Json -Depth 100 -Compress'
+    py = 'import json
+
+print(json.dumps(json.loads({T}), separators=(",", ":"), ensure_ascii=False))'
+    js = 'console.log(JSON.stringify(JSON.parse({T})));'
+    java = 'var m = new com.fasterxml.jackson.databind.ObjectMapper();
+System.out.println(m.writeValueAsString(m.readTree({T})));'
+    go = 'var out bytes.Buffer
+if err := json.Compact(&out, []byte({T})); err != nil { panic(err) }
+fmt.Println(out.String())'
+    sh = 'printf ''%s'' {T} | jq -c .'
+    php = '<?php
+echo json_encode(json_decode({T}), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);'
+}
+Add-TransformCode 'JSON with sorted keys' @{
+    cs = 'using System.Text.Json.Nodes;
+JsonNode Sort(JsonNode n) => n switch {
+    JsonObject o => new JsonObject(o.OrderBy(p => p.Key, StringComparer.Ordinal).Select(p => KeyValuePair.Create(p.Key, p.Value == null ? null : Sort(p.Value.DeepClone())))),
+    JsonArray a => new JsonArray(a.Select(x => x == null ? null : Sort(x.DeepClone())).ToArray()),
+    _ => n.DeepClone() };
+Console.WriteLine(Sort(JsonNode.Parse({T})).ToJsonString(new() { WriteIndented = true }));'
+    ps = 'function Sort-Json($o) { if ($o -is [pscustomobject]) { $h = [ordered]@{}; foreach ($p in $o.PSObject.Properties | Sort-Object Name) { $h[$p.Name] = Sort-Json $p.Value }; [pscustomobject]$h } elseif ($o -is [array]) { , @($o | ForEach-Object { Sort-Json $_ }) } else { $o } }
+Sort-Json ({T} | ConvertFrom-Json) | ConvertTo-Json -Depth 100'
+    py = 'import json
+
+print(json.dumps(json.loads({T}), indent=2, sort_keys=True, ensure_ascii=False))'
+    js = 'const sort = v => Array.isArray(v) ? v.map(sort) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map(k => [k, sort(v[k])])) : v;
+console.log(JSON.stringify(sort(JSON.parse({T})), null, 2));'
+    java = 'var m = new com.fasterxml.jackson.databind.ObjectMapper().configure(com.fasterxml.jackson.databind.SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
+System.out.println(m.writerWithDefaultPrettyPrinter().writeValueAsString(m.readValue({T}, Object.class)));'
+    go = 'var v any
+if err := json.Unmarshal([]byte({T}), &v); err != nil { panic(err) }
+b, _ := json.MarshalIndent(v, "", "  ")   // Go writes map keys sorted
+fmt.Println(string(b))'
+    sh = 'printf ''%s'' {T} | jq -S .'
+    php = '<?php
+function ksort_deep(&$a) { if (is_array($a)) { ksort($a); foreach ($a as &$v) ksort_deep($v); } }
+$d = json_decode({T}, true); ksort_deep($d);
+echo json_encode($d, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);'
+}
+$FmtLib = @{
+    'SQL format' = @{ cs = '// NuGet: Microsoft.SqlServer.TransactSql.ScriptDom (T-SQL) - parse, then Sql160ScriptGenerator writes it formatted
+// (or keep using DevTools: Transform > SQL format)'; ps = '# PowerShell has no SQL formatter; DevTools'' Transform > SQL format, or the C# ScriptDom approach'
+                      py = 'import sqlparse          # pip install sqlparse
+
+print(sqlparse.format({T}, reindent=True, keyword_case="upper"))'; js = 'const { format } = require("sql-formatter");   // npm i sql-formatter
+console.log(format({T}, { keywordCase: "upper" }));'
+                      java = '// com.github.vertical-blank:sql-formatter
+System.out.println(com.github.vertical_blank.sqlformatter.SqlFormatter.format({T}));'; go = '// no standard SQL formatter; e.g. github.com/maxrichie5/go-sqlfmt or call sqlfluff / pg_format'
+                      sh = 'printf ''%s'' {T} | pg_format -      # or: sqlformat --reindent --keywords upper -'; php = '<?php
+// composer require doctrine/sql-formatter
+echo (new Doctrine\SqlFormatter\SqlFormatter(new Doctrine\SqlFormatter\NullHighlighter()))->format({T});' }
+    'SQL minify' = @{ cs = 'Console.WriteLine(System.Text.RegularExpressions.Regex.Replace(System.Text.RegularExpressions.Regex.Replace({T}, @"--[^\n]*|/\*[\s\S]*?\*/", " "), @"\s+", " ").Trim());   // ignores strings with -- or /* inside'
+                      ps = '([regex]::Replace({T}, ''--[^\n]*|/\*[\s\S]*?\*/'', '' '') -replace ''\s+'', '' '').Trim()'
+                      py = 'import re
+
+s = re.sub(r"--[^\n]*|/\*[\s\S]*?\*/", " ", {T})      # ignores strings with -- or /* inside
+print(" ".join(s.split()))'; js = 'console.log({T}.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, " ").replace(/\s+/g, " ").trim());'
+                      java = 'System.out.println({T}.replaceAll("--[^\\n]*|/\\*[\\s\\S]*?\\*/", " ").replaceAll("\\s+", " ").trim());'; go = 's := regexp.MustCompile(`--[^\n]*|/\*[\s\S]*?\*/`).ReplaceAllString({T}, " ")
+fmt.Println(strings.Join(strings.Fields(s), " "))'
+                      sh = 'printf ''%s'' {T} | perl -0pe ''s/--[^\n]*|\/\*.*?\*\// /gs; s/\s+/ /g; s/^ | $//g''; echo'; php = '<?php
+echo trim(preg_replace(''/\s+/'', '' '', preg_replace(''~--[^\n]*|/\*.*?\*/~s'', '' '', {T})));' }
+    'XML pretty print' = @{ cs = 'Console.WriteLine(System.Xml.Linq.XDocument.Parse({T}).ToString());'; ps = '$x = [xml]{T}; $sw = New-Object IO.StringWriter; $w = New-Object Xml.XmlTextWriter($sw); $w.Formatting = ''Indented''; $x.WriteTo($w); $sw.ToString()'
+                            py = 'import xml.dom.minidom
+
+print(xml.dom.minidom.parseString({T}).toprettyxml(indent="  "))'; js = 'const { XMLParser, XMLBuilder } = require("fast-xml-parser");   // npm i fast-xml-parser
+const o = new XMLParser({ ignoreAttributes: false }).parse({T});
+console.log(new XMLBuilder({ ignoreAttributes: false, format: true }).build(o));'
+                            java = 'var t = javax.xml.transform.TransformerFactory.newInstance().newTransformer();
+t.setOutputProperty(javax.xml.transform.OutputKeys.INDENT, "yes");
+t.setOutputProperty("{http://xml.apache.org/xslt}indent-amount", "2");
+var out = new java.io.StringWriter();
+t.transform(new javax.xml.transform.stream.StreamSource(new java.io.StringReader({T})), new javax.xml.transform.stream.StreamResult(out));
+System.out.println(out);'; go = '// decode and re-encode tokens with an indenting encoder
+d := xml.NewDecoder(strings.NewReader({T})); var b bytes.Buffer; e := xml.NewEncoder(&b); e.Indent("", "  ")
+for { t, err := d.Token(); if err != nil { break }; if c, ok := t.(xml.CharData); ok && len(bytes.TrimSpace(c)) == 0 { continue }; e.EncodeToken(t) }
+e.Flush(); fmt.Println(b.String())'
+                            sh = 'printf ''%s'' {T} | xmllint --format -'; php = '<?php
+$d = new DOMDocument(); $d->preserveWhiteSpace = false; $d->formatOutput = true; $d->loadXML({T});
+echo $d->saveXML();' }
+    'XML minify' = @{ cs = 'Console.WriteLine(System.Xml.Linq.XDocument.Parse({T}).ToString(System.Xml.Linq.SaveOptions.DisableFormatting));'; ps = '([xml]{T}).OuterXml'
+                      py = 'import xml.dom.minidom, re
+
+print(re.sub(r">\s+<", "><", {T}.strip()))'; js = 'console.log({T}.replace(/>\s+</g, "><").trim());'; java = 'System.out.println({T}.replaceAll(">\\s+<", "><").trim());'
+                      go = 'fmt.Println(regexp.MustCompile(`>\s+<`).ReplaceAllString(strings.TrimSpace({T}), "><"))'; sh = 'printf ''%s'' {T} | xmllint --noblanks - | grep -v ''^<?xml'''; php = '<?php
+echo preg_replace(''/>\s+</'', ''><'', trim({T}));' }
+    'HTML pretty print' = @{ cs = '// NuGet: AngleSharp - var doc = new HtmlParser().ParseDocument(html); doc.ToHtml(new PrettyMarkupFormatter())'; ps = '# no HTML formatter in PowerShell; use DevTools'' HTML pretty print, or npx prettier'
+                             py = 'from bs4 import BeautifulSoup     # pip install beautifulsoup4
+
+print(BeautifulSoup({T}, "html.parser").prettify())'; js = 'const prettier = require("prettier");     // npm i prettier
+prettier.format({T}, { parser: "html" }).then(console.log);'
+                             java = '// jsoup
+var doc = org.jsoup.Jsoup.parse({T}); doc.outputSettings().indentAmount(2).prettyPrint(true);
+System.out.println(doc.outerHtml());'; go = '// golang.org/x/net/html can parse; github.com/yosssi/gohtml formats: fmt.Println(gohtml.Format(html))'
+                             sh = 'printf ''%s'' {T} | tidy -i -q --show-warnings no'; php = '<?php
+$d = new DOMDocument(); $d->preserveWhiteSpace = false; $d->formatOutput = true; @$d->loadHTML({T});
+echo $d->saveHTML();' }
+    'XML pretty print, sorted attributes' = @{ cs = 'var doc = System.Xml.Linq.XDocument.Parse({T});
+foreach (var e in doc.Descendants()) e.ReplaceAttributes(e.Attributes().OrderBy(a => a.Name.ToString()).ToList());
+Console.WriteLine(doc.ToString());'; ps = '$x = [xml]{T}
+foreach ($e in $x.SelectNodes(''//*'')) { $atts = @($e.Attributes | Sort-Object Name); $e.Attributes.RemoveAll(); foreach ($a in $atts) { [void]$e.Attributes.Append($a) } }
+$sw = New-Object IO.StringWriter; $w = New-Object Xml.XmlTextWriter($sw); $w.Formatting = ''Indented''; $x.WriteTo($w); $sw.ToString()'
+                                              py = 'import xml.etree.ElementTree as ET   # Python 3.8+ keeps attributes in the order given
+
+root = ET.fromstring({T})
+for e in root.iter(): e.attrib = dict(sorted(e.attrib.items()))
+ET.indent(root); print(ET.tostring(root, encoding="unicode"))'; js = '// with fast-xml-parser: sort each object''s "@_" keys before building'; java = '// canonical XML (C14N) sorts attributes: org.apache.xml.security.c14n.Canonicalizer'
+                                              go = '// sort each xml.StartElement''s Attr slice while re-encoding the tokens (see "XML pretty print")'; sh = 'printf ''%s'' {T} | xmllint --c14n - | xmllint --format -      # C14N sorts attributes'; php = '<?php
+$d = new DOMDocument(); $d->loadXML({T});
+echo $d->C14N();   // canonical form: sorted attributes' }
+}
+foreach ($k in $FmtLib.Keys) { Add-TransformCode $k $FmtLib[$k] }
+Add-TransformCode 'Decode JWT' @{
+    cs = 'string Part(string p) { p = p.Replace(''-'', ''+'').Replace(''_'', ''/''); return System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(p.PadRight(p.Length + (4 - p.Length % 4) % 4, ''=''))); }
+var parts = {T}.Split(''.'');
+Console.WriteLine("header:  " + Part(parts[0]) + "\npayload: " + Part(parts[1]));   // not verified - use a JWT library to check the signature'
+    ps = 'function Part([string]$p) { $p = $p.Replace(''-'', ''+'').Replace(''_'', ''/''); $p += ''='' * ((4 - $p.Length % 4) % 4); [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($p)) }
+$parts = {T}.Split(''.'')
+"header:  $(Part $parts[0])"; "payload: $(Part $parts[1])"'
+    py = 'import base64, json
+
+def part(p): return json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))
+h, p, _ = {T}.split(".")
+print("header: ", part(h)); print("payload:", part(p))      # pip install pyjwt to verify'
+    js = 'const [h, p] = {T}.split(".");
+console.log("header: ", JSON.parse(Buffer.from(h, "base64url")));
+console.log("payload:", JSON.parse(Buffer.from(p, "base64url")));     // npm i jsonwebtoken to verify'
+    java = 'String[] parts = {T}.split("\\.");
+var d = java.util.Base64.getUrlDecoder();
+System.out.println("header:  " + new String(d.decode(parts[0])));
+System.out.println("payload: " + new String(d.decode(parts[1])));'
+    go = 'parts := strings.Split({T}, ".")
+h, _ := base64.RawURLEncoding.DecodeString(parts[0]); p, _ := base64.RawURLEncoding.DecodeString(parts[1])
+fmt.Println("header: ", string(h)); fmt.Println("payload:", string(p))'
+    sh = 'jwt={T}
+for i in 1 2; do s=$(printf ''%s'' "$jwt" | cut -d. -f$i | tr ''_-'' ''/+''); while [ $(( ${#s} % 4 )) -ne 0 ]; do s="$s="; done; printf ''%s'' "$s" | base64 -d; echo; done'
+    php = '<?php
+[$h, $p] = explode(''.'', {T});
+$dec = fn($s) => json_decode(base64_decode(strtr($s, ''-_'', ''+/'')), true);
+print_r([''header'' => $dec($h), ''payload'' => $dec($p)]);'
+}
+Add-TransformCode 'Strip HTML tags' @{
+    cs = 'string s = System.Text.RegularExpressions.Regex.Replace({T}, @"<(script|style)[^>]*>.*?</\1>", "", System.Text.RegularExpressions.RegexOptions.Singleline | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+s = System.Net.WebUtility.HtmlDecode(System.Text.RegularExpressions.Regex.Replace(s, "<[^>]+>", ""));
+Console.WriteLine(s.Trim());'
+    ps = '[System.Net.WebUtility]::HtmlDecode(({T} -replace ''(?is)<(script|style)[^>]*>.*?</\1>'', '''' -replace ''<[^>]+>'', '''')).Trim()'
+    py = 'import html, re
+
+s = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", "", {T})
+print(html.unescape(re.sub(r"<[^>]+>", "", s)).strip())      # robust: BeautifulSoup(s, "html.parser").get_text()'
+    js = 'const s = {T}.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, "").replace(/<[^>]+>/g, "");
+const entities = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&#39;": "''", "&nbsp;": " " };
+console.log(s.replace(/&(amp|lt|gt|quot|#39|nbsp);/g, e => entities[e]).trim());      // in a browser: new DOMParser().parseFromString(html, "text/html").body.textContent'
+    java = 'System.out.println(org.jsoup.Jsoup.parse({T}).text());     // jsoup'
+    go = 's := regexp.MustCompile(`(?is)<(script|style)[^>]*>.*?</(script|style)>`).ReplaceAllString({T}, "")
+fmt.Println(html.UnescapeString(strings.TrimSpace(regexp.MustCompile(`<[^>]+>`).ReplaceAllString(s, ""))))'
+    sh = 'printf ''%s'' {T} | sed -e ''s/<[^>]*>//g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g; s/&#39;/''\''''/g; s/&nbsp;/ /g; s/&amp;/\&/g''; echo      # or: html2text'
+    php = '<?php
+echo html_entity_decode(trim(strip_tags({T})));'
+}
+Add-TransformCode 'Collapse whitespace' @{
+    cs = 'Console.WriteLine(System.Text.RegularExpressions.Regex.Replace({T}, @"\s+", " ").Trim());'
+    ps = '({T} -replace ''\s+'', '' '').Trim()'
+    py = 'print(" ".join({T}.split()))'
+    js = 'console.log({T}.replace(/\s+/g, " ").trim());'
+    java = 'System.out.println({T}.replaceAll("\\s+", " ").trim());'
+    go = 'fmt.Println(strings.Join(strings.Fields({T}), " "))'
+    sh = 'printf ''%s'' {T} | tr -s ''[:space:]'' '' '' | sed ''s/^ //; s/ $//''; echo'
+    php = '<?php
+echo trim(preg_replace(''/\s+/u'', '' '', {T}));'
+}
+# ---- extract: every distinct match of a pattern, one per line
+$ExtractPatterns = @{
+    'Emails' = '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+    'URLs' = '\b(?:https?|ftp)://[^\s<>"'')\]]+|\bwww\.[^\s<>"'')\]]+'
+    'IP addresses' = '\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b|\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b'
+    'Numbers' = '-?\b\d+(?:[.,]\d+)?\b'
+}
+$ExtractCode = @{
+    cs = 'using System.Text.RegularExpressions;
+var found = Regex.Matches({T}, {P}).Select(m => m.Value).Distinct();
+Console.WriteLine(string.Join("\n", found));'
+    ps = '[regex]::Matches({T}, {P}) | ForEach-Object Value | Select-Object -Unique'
+    py = 'import re
+
+found = dict.fromkeys(m.group(0) for m in re.finditer({P}, {T}))   # distinct, in order
+print("\n".join(found))'
+    js = 'console.log([...new Set({T}.match(new RegExp({P}, "g")) || [])].join("\n"));'
+    java = 'var m = java.util.regex.Pattern.compile({P}).matcher({T});
+var found = new java.util.LinkedHashSet<String>();
+while (m.find()) found.add(m.group());
+System.out.println(String.join("\n", found));'
+    go = 'seen := map[string]bool{}
+for _, s := range regexp.MustCompile({P}).FindAllString({T}, -1) { if !seen[s] { seen[s] = true; fmt.Println(s) } }'
+    sh = 'printf ''%s'' {T} | LC_ALL=C.UTF-8 grep -oP -e {P} | awk ''!seen[$0]++''      # -P = Perl regex (GNU grep)'
+    php = '<?php
+preg_match_all({PPHP}, {T}, $m);
+echo implode("\n", array_unique($m[0]));'
+}
+foreach ($k in $ExtractPatterns.Keys) {
+    $code = @{}
+    foreach ($l in $ExtractCode.Keys) { $code[$l] = $ExtractCode[$l].Replace('{P}', ('{LIT:' + $ExtractPatterns[$k] + ':LIT}')).Replace('{PPHP}', ('{LIT:~' + $ExtractPatterns[$k] + '~:LIT}')) }
+    Add-TransformCode $k $code
+}
+$code = @{}
+foreach ($l in $ExtractCode.Keys) { $code[$l] = $ExtractCode[$l].Replace('{PPHP}', '{KPHP}').Replace('{P}', '{K}') }
+Add-TransformCode 'Matches of a regex' $code
+# ---- numbers, info, generate
+Add-TransformCode 'Binary to decimal' @{
+    cs = 'Console.WriteLine(Convert.ToUInt64({T}.Replace("0b", "").Replace(" ", ""), 2));'
+    ps = '[Convert]::ToUInt64(({T} -replace ''^0b|\s'', ''''), 2)'
+    py = 'print(int({T}.replace(" ", ""), 2))      # "0b..." works too'
+    js = 'console.log(BigInt("0b" + {T}.replace(/^0b|\s/g, "")).toString());'
+    java = 'System.out.println(Long.parseUnsignedLong({T}.replace("0b", "").replace(" ", ""), 2));'
+    go = 'n, _ := strconv.ParseUint(strings.ReplaceAll(strings.TrimPrefix({T}, "0b"), " ", ""), 2, 64)
+fmt.Println(n)'
+    sh = 'echo $((2#{RAW}))'
+    php = '<?php
+echo bindec({T});'
+}
+Add-TransformCode 'Count characters, words, lines' @{
+    cs = 'string t = {T};
+Console.WriteLine($"{t.Length} characters, {System.Text.RegularExpressions.Regex.Matches(t, @"[\p{L}\p{N}''_-]+").Count} words, {t.Split(''\n'').Length} lines, {System.Text.Encoding.UTF8.GetByteCount(t)} bytes (UTF-8)");'
+    ps = '$t = {T}
+"$($t.Length) characters, $([regex]::Matches($t, "[\p{L}\p{N}''_-]+").Count) words, $(($t -split "`n").Count) lines, $([Text.Encoding]::UTF8.GetByteCount($t)) bytes (UTF-8)"
+# or: $t | Measure-Object -Character -Word -Line'
+    py = 't = {T}
+print(f"{len(t)} characters, {len(t.split())} words, {len(t.splitlines())} lines, {len(t.encode())} bytes (UTF-8)")'
+    js = 'const t = {T};
+console.log(`${[...t].length} characters, ${(t.match(/\S+/g) || []).length} words, ${t.split(/\r?\n/).length} lines, ${Buffer.byteLength(t)} bytes (UTF-8)`);'
+    java = 'String t = {T};
+System.out.println(t.length() + " characters, " + (t.isBlank() ? 0 : t.trim().split("\\s+").length) + " words, " + t.split("\\r?\\n", -1).length + " lines");'
+    go = 't := {T}
+fmt.Printf("%d characters, %d words, %d lines, %d bytes\n", utf8.RuneCountInString(t), len(strings.Fields(t)), strings.Count(t, "\n")+1, len(t))'
+    sh = 'printf ''%s'' {T} | wc -m -w -l      # characters (-m), words, lines (newlines)'
+    php = '<?php
+$t = {T};
+echo mb_strlen($t) . " characters, " . str_word_count($t) . " words, " . (substr_count($t, "\n") + 1) . " lines, " . strlen($t) . " bytes";'
+}
+Add-TransformCode 'GUIDs' @{
+    cs = 'for (int i = 0; i < {KN}; i++) Console.WriteLine(Guid.NewGuid());      // .NET 9: Guid.CreateVersion7() (sortable)'
+    ps = '1..{KN} | ForEach-Object { [guid]::NewGuid() }      # or New-Guid'
+    py = 'import uuid
+
+for _ in range({KN}): print(uuid.uuid4())'
+    js = 'const crypto = require("crypto");
+for (let i = 0; i < {KN}; i++) console.log(crypto.randomUUID());'
+    java = 'for (int i = 0; i < {KN}; i++) System.out.println(java.util.UUID.randomUUID());'
+    go = '// github.com/google/uuid
+for i := 0; i < {KN}; i++ { fmt.Println(uuid.New()) }'
+    sh = 'for i in $(seq {KN}); do cat /proc/sys/kernel/random/uuid; done      # or: uuidgen'
+    php = '<?php
+for ($i = 0; $i < {KN}; $i++) echo vsprintf(''%s%s-%s-%s-%s-%s%s%s'', str_split(bin2hex(random_bytes(16) & hex2bin(''ffffffffffff0fff3fffffffffffffff'') | hex2bin(''00000000000040008000000000000000'')), 4)) . "\n";'
+}
+Add-TransformCode 'Password' @{
+    cs = 'using System.Security.Cryptography;
+const string chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*-_=+?";
+Console.WriteLine(RandomNumberGenerator.GetString(chars, {KN}));      // .NET 8+; a secure random generator'
+    ps = '$chars = ''ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*-_=+?''
+$rng = [Security.Cryptography.RandomNumberGenerator]::Create(); $b = New-Object byte[] 4
+-join (1..{KN} | ForEach-Object { $rng.GetBytes($b); $chars[[BitConverter]::ToUInt32($b, 0) % $chars.Length] })'
+    py = 'import secrets
+
+chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*-_=+?"
+print("".join(secrets.choice(chars) for _ in range({KN})))'
+    js = 'const crypto = require("crypto");
+const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*-_=+?";
+console.log(Array.from({ length: {KN} }, () => chars[crypto.randomInt(chars.length)]).join(""));'
+    java = 'var rnd = new java.security.SecureRandom();
+String chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*-_=+?";
+StringBuilder sb = new StringBuilder();
+for (int i = 0; i < {KN}; i++) sb.append(chars.charAt(rnd.nextInt(chars.length())));
+System.out.println(sb);'
+    go = 'const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*-_=+?"
+b := make([]byte, {KN})
+for i := range b { n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(chars)))); b[i] = chars[n.Int64()] }   // crypto/rand
+fmt.Println(string(b))'
+    sh = 'LC_ALL=C tr -dc ''A-HJ-NP-Za-km-z2-9!@#$%^&*_=+?-'' < /dev/urandom | head -c {KN}; echo      # or: openssl rand -base64 32'
+    php = '<?php
+$chars = ''ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*-_=+?''; $p = '''';
+for ($i = 0; $i < {KN}; $i++) $p .= $chars[random_int(0, strlen($chars) - 1)];
+echo $p;'
+}
+Add-TransformCode 'Random hex bytes' @{
+    cs = 'Console.WriteLine(Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes({KN})).ToLowerInvariant());'
+    ps = '$b = New-Object byte[] {KN}; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+-join ($b | ForEach-Object { $_.ToString(''x2'') })'
+    py = 'import secrets
+
+print(secrets.token_hex({KN}))'
+    js = 'console.log(require("crypto").randomBytes({KN}).toString("hex"));'
+    java = 'byte[] b = new byte[{KN}]; new java.security.SecureRandom().nextBytes(b);
+System.out.println(java.util.HexFormat.of().formatHex(b));'
+    go = 'b := make([]byte, {KN}); rand.Read(b)   // crypto/rand
+fmt.Println(hex.EncodeToString(b))'
+    sh = 'openssl rand -hex {KN}'
+    php = '<?php
+echo bin2hex(random_bytes({KN}));'
+}
+Add-TransformCode 'Lorem ipsum' @{
+    cs = '// NuGet: Bogus - new Bogus.Faker().Lorem.Paragraphs({KN})'
+    ps = '# no generator built in - DevTools'' Transform > Lorem ipsum, or Invoke-RestMethod "https://loripsum.net/api/{KN}/plaintext"'
+    py = 'import lorem            # pip install lorem
+
+print("\n\n".join(lorem.paragraph() for _ in range({KN})))'
+    js = 'const { LoremIpsum } = require("lorem-ipsum");   // npm i lorem-ipsum
+console.log(new LoremIpsum().generateParagraphs({KN}));'
+    java = '// com.thedeanda:lorem - LoremIpsum.getInstance().getParagraphs({KN}, {KN})'
+    go = '// github.com/drhodes/golorem - lorem.Paragraph(3, 6)'
+    sh = 'curl -s "https://loripsum.net/api/{KN}/plaintext"'
+    php = '<?php
+// composer require fakerphp/faker
+echo implode("\n\n", Faker\Factory::create()->paragraphs({KN}));'
+}
+}
+
+# The Morse table for the guides: each entry is a character followed by its code.
+$MorseCodeTable = 'A.- B-... C-.-. D-.. E. F..-. G--. H.... I.. J.--- K-.- L.-.. M-- N-. O--- P.--. Q--.- R.-. S... T- U..- V...- W.-- X-..- Y-.-- Z--.. ' +
+    '0----- 1.---- 2..--- 3...-- 4....- 5..... 6-.... 7--... 8---.. 9----. ..-.-.- ,--..-- ?..--.. ''.----. !-.-.-- /-..-. (-.--. )-.--.- &.-... :---... ' +
+    ';-.-.-. =-...- +.-.-. --....- _..--.- ".-..-. $...-..- @.--.-.'
+
 # A value written as a string literal of that language.
 function ConvertTo-CodeLiteral([string]$Value, [string]$Lang) {
     switch ($Lang) {
@@ -10520,10 +11321,24 @@ function Get-TransformCode([string]$Op, [string]$Lang, [string]$Text, [string]$K
     $sample = if ($Text.Length -gt 300) { 'your text' } elseif ($Text) { $Text } else { 'Hello, world!' }
     $isPw = $Op -like 'AES*'
     $k = if ($isPw) { 'your password' } elseif ($Key) { $Key } else { 'your key' }
-    $t = $tc[$Lang].Replace('{RAW}', ($sample -replace '[^\w.:+-]', '')).Replace('{T}', (ConvertTo-CodeLiteral $sample $Lang)).Replace('{K}', (ConvertTo-CodeLiteral $k $Lang))
+    $t = $tc[$Lang]
+    # a number key (Caesar shift, how many, length): the one typed in, else the op's own default
+    $def = ($TransformOps | Where-Object { $_.Name -eq $Op } | Select-Object -First 1).Default
+    $kn = if ($Key -match '^\s*-?\d+\s*$') { $Key.Trim() } elseif ($def -match '^\d+$') { $def } else { '3' }
+    $t = $t.Replace('{KN}', $kn).Replace('{KPHP}', (ConvertTo-CodeLiteral ('~' + $k.Replace('~', '\~') + '~') $Lang))
+    if ($t.Contains('{MORSE}')) { $t = $t.Replace('{MORSE}', (ConvertTo-CodeLiteral $MorseCodeTable $Lang)) }
+    if ($t.Contains('{NATO}')) { $t = $t.Replace('{NATO}', (ConvertTo-CodeLiteral 'Alfa Bravo Charlie Delta Echo Foxtrot Golf Hotel India Juliett Kilo Lima Mike November Oscar Papa Quebec Romeo Sierra Tango Uniform Victor Whiskey X-ray Yankee Zulu' $Lang)) }
+    if ($t.Contains('{FLIP')) {
+        # the upside-down letters come from DevTools itself (it reverses the text, so give it the list reversed)
+        $from = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,!?''"()[]{}<>_&;'
+        $rev = $from.ToCharArray(); [array]::Reverse($rev)
+        $t = $t.Replace('{FLIPFROM}', (ConvertTo-CodeLiteral $from $Lang)).Replace('{FLIPTO}', (ConvertTo-CodeLiteral ([PowerClipTransform]::Run('Upside-down text', (-join $rev), '')) $Lang))
+    }
+    $t = [regex]::Replace($t, '\{LIT:(.*?):LIT\}', { param($m) ConvertTo-CodeLiteral $m.Groups[1].Value $Lang })
+    $t = $t.Replace('{RAW}', ($sample -replace '[^\w.:+-]', '')).Replace('{T}', (ConvertTo-CodeLiteral $sample $Lang)).Replace('{K}', (ConvertTo-CodeLiteral $k $Lang))
     $cm = if ($Lang -in 'ps', 'py', 'sh') { '#' } else { '//' }
     # what DevTools gives for it (not where the code prints it another way: hex without spaces, ISO dates, JSON with quotes)
-    if ($Output -and $Output.Length -le 300 -and $Output -notmatch "`n" -and -not $isPw -and $Op -notin 'Windows protect (only you can open it)', 'Text to hex', 'XOR with key (to hex)', 'Unix time to date', 'JSON string escape', 'Date to Unix time') { $t += "`n`n$cm -> $Output" }
+    if ($Output -and $Output.Length -le 300 -and $Output -notmatch "`n" -and -not $isPw -and $Op -notin 'Windows protect (only you can open it)', 'Text to hex', 'XOR with key (to hex)', 'Unix time to date', 'JSON string escape', 'Date to Unix time', 'Password', 'Random hex bytes', 'Shuffle lines', 'Count characters, words, lines', 'SQL format', 'SQL minify', 'HTML pretty print', 'Decode JWT') { $t += "`n`n$cm -> $Output" }
     $t
 }
 
@@ -10532,7 +11347,7 @@ function Update-TransformCode($St) {
     if (-not $St.ShowCode -or -not $St.ShowCode.Checked -or -not $St.Op) { return }
     $lang = $TransformLangs[[string]$St.CodeLang.SelectedItem]
     $t = Get-TransformCode $St.Op.Name $lang $St.Input.Text $St.Key.Text $St.Output.Text
-    if (-not $t) { $t = "There's no code guide for ""$($St.Op.Name)"" yet.`n`nCode guides are there for every Encode, Hash and Encrypt operation (and number / time conversions):`npick one on the left." ; $lang = '' }
+    if (-not $t) { $t = "There's no code guide for ""$($St.Op.Name)"" in this language yet." ; $lang = '' }
     Set-RtbCode $St.Code ($t -replace "`r`n", "`n") $lang
 }
 
