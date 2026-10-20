@@ -81,6 +81,7 @@ Results that are copied land in the history like any other copy.
 
 ## Clipboard extras
 
+- **Links are kept**: when you copy a link that shows only its title (from a browser, Teams, Outlook...), the clip keeps the link. Every linked title gets its address after it in the text, like `Release notes (https://...)`, so it is searchable and pastes into plain-text apps; and pasting into apps that understand formatting (Teams, Outlook, Word, a browser editor) gives the real clickable links again.
 - **Clean up text** (right-click a text clip, or the Actions button): trim, join lines, remove empty or duplicate lines, collapse spaces, change case, sort or reverse lines, number them, join with commas or split at commas, quote lines for SQL `IN (...)`. The result is copied.
 - **Paste stack**: select several clips and choose **Paste one after another** (or start **Paste stack: collect what I copy next** from the palette or tray, then copy things). Each **Ctrl+Alt+Space** pastes the next one, in order; a small window shows what is left.
 - **Merge selected clips...**: joins several text clips with a separator you pick (new line, blank line, comma, space, tab or your own).

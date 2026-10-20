@@ -6880,7 +6880,7 @@ function New-ClipItem([string]$Kind = 'text', [string]$Text = '', [bool]$Pinned 
     [pscustomobject]@{
         Id = $Id; Kind = $Kind; Text = $Text; Pinned = $Pinned; Time = $dt
         Image = $null; Width = 0; Height = 0; Hash = $null; Files = @(); Bytes = [long]0
-        TextFile = $null; TextDirty = $false; Source = ''
+        TextFile = $null; TextDirty = $false; Source = ''; Html = ''; HtmlText = ''
     }
 }
 
@@ -6907,6 +6907,7 @@ function Save-History {
         $o = [ordered]@{ Id = $i.Id; Kind = $i.Kind; Text = $text; Pinned = [bool]$i.Pinned; Time = $i.Time.ToString('o') }
         if ($i.Source) { $o.Source = $i.Source }
         if ($i.TextFile) { $o.TextFile = $i.TextFile }
+        if ($i.Html -and $i.HtmlText -ceq $i.Text) { $o.Html = $i.Html }
         if ($i.Kind -eq 'image') { $o.Image = $i.Image; $o.Width = $i.Width; $o.Height = $i.Height; $o.Hash = $i.Hash; $o.Bytes = $i.Bytes }
         if ($i.Kind -eq 'files') { $o.Files = @($i.Files); $o.Bytes = $i.Bytes }
         $o
@@ -6984,6 +6985,7 @@ function Import-History {
                             $item.TextFile = [string]$x.TextFile
                         }
                         if (-not $item.Text) { continue }
+                        if ($x.Html) { $item.Html = [string]$x.Html; $item.HtmlText = $item.Text }
                     } elseif ($kind -eq 'image') {
                         if (-not $x.Image -or -not (Test-Path (Get-DataPath $x.Image))) { continue }
                         $item.Image = [string]$x.Image; $item.Width = [int]$x.Width; $item.Height = [int]$x.Height
@@ -7059,11 +7061,27 @@ function Find-Clip([string]$Kind, [scriptblock]$Match) {
     $null
 }
 
-function Add-ClipText([string]$Text) {
+function Add-ClipText([string]$Text, [string]$CfHtml = '') {
     if ([string]::IsNullOrWhiteSpace($Text)) { return }
     if ($Text.Length -gt $script:MaxTextMB * 1MB) { Write-Log "text skipped: $($Text.Length) chars"; return }
+    # a link copied as its title: keep the link (see Get-HtmlLinks)
+    $frag = ''
+    if ($CfHtml -and $CfHtml.Length -lt 2MB) {
+        try {
+            $frag = Get-HtmlFragment $CfHtml
+            $links = Get-HtmlLinks $frag
+            if ($links.Count) { $Text = Add-LinksToText $Text $links } else { $frag = '' }
+        } catch { Write-Log "html links: $_"; $frag = '' }
+    }
     $existing = Find-Clip 'text' { param($i) $i.Text -ceq $Text }
-    if ($existing) { Complete-Add $existing $false } else { Complete-Add (New-ClipItem 'text' $Text) $true }
+    if ($existing) {
+        if ($frag -and -not $existing.Html) { $existing.Html = $frag; $existing.HtmlText = $existing.Text }
+        Complete-Add $existing $false
+    } else {
+        $item = New-ClipItem 'text' $Text
+        if ($frag) { $item.Html = $frag; $item.HtmlText = $Text }
+        Complete-Add $item $true
+    }
 }
 
 function Add-ClipImage([System.Drawing.Image]$Image) {
@@ -7160,6 +7178,57 @@ function Add-IgnoredApp([string]$Name) {
 }
 
 # Reads the clipboard: files first, then text, then an image.
+# ---- Links in copied text: browsers, Teams, Outlook... put a link on the clipboard as HTML (<a href>) and only its
+#      title as plain text. The clip keeps that HTML (pasted back, so rich apps get the real link) and the
+#      addresses are added to the text after their titles: "Title (https://...)".
+# The fragment part of the clipboard's "HTML Format" (between StartFragment and EndFragment).
+function Get-HtmlFragment([string]$CfHtml) {
+    if (-not $CfHtml) { return '' }
+    $a = $CfHtml.IndexOf('<!--StartFragment-->'); $b = $CfHtml.LastIndexOf('<!--EndFragment-->')
+    if ($a -ge 0 -and $b -gt $a) { return $CfHtml.Substring($a + 20, $b - $a - 20) }
+    $i = $CfHtml.IndexOf('<'); if ($i -ge 0) { $CfHtml.Substring($i) } else { '' }
+}
+
+# The links of an HTML fragment: @{ Text; Url } (web and mail links only).
+function Get-HtmlLinks([string]$Html) {
+    $out = New-Object System.Collections.Generic.List[object]
+    $rx = '(?is)<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|''([^'']*)''|([^\s>]+))[^>]*>(.*?)</a\s*>'
+    foreach ($m in [regex]::Matches($Html, $rx)) {
+        $url = [System.Net.WebUtility]::HtmlDecode(($m.Groups[1].Value + $m.Groups[2].Value + $m.Groups[3].Value).Trim())
+        if ($url -notmatch '^(?i)(https?|ftp)://|^(?i)mailto:') { continue }
+        $t = [System.Net.WebUtility]::HtmlDecode(($m.Groups[4].Value -replace '<[^>]*>', '')) -replace '\s+', ' '
+        $out.Add(@{ Text = $t.Trim(); Url = $url })
+        if ($out.Count -ge 2000) { break }
+    }
+    , $out
+}
+
+# The text with the address after each linked title it doesn't already show.
+function Add-LinksToText([string]$Text, $Links) {
+    $todo = @($Links | Where-Object { $Text.IndexOf($_.Url, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and $Text.IndexOf(($_.Url -replace '^mailto:', ''), [StringComparison]::OrdinalIgnoreCase) -lt 0 })
+    if ($todo.Count -eq 0) { return $Text }
+    $pos = 0; $tail = New-Object System.Collections.Generic.List[string]
+    foreach ($l in $todo) {
+        $show = $l.Url -replace '^mailto:', ''
+        $i = if ($l.Text) { $Text.IndexOf($l.Text, $pos, [StringComparison]::Ordinal) } else { -1 }
+        if ($i -ge 0 -and $l.Text -ne $show) { $at = $i + $l.Text.Length; $ins = " ($show)"; $Text = $Text.Insert($at, $ins); $pos = $at + $ins.Length }
+        elseif ($i -lt 0) { $tail.Add($show) }
+    }
+    if ($tail.Count) { $Text = $Text.TrimEnd() + "`r`n" + ($tail -join "`r`n") }
+    $Text
+}
+
+# Clipboard "HTML Format" for a fragment (offsets are UTF-8 byte positions), as a stream so it goes on as-is.
+function New-CfHtml([string]$Fragment) {
+    $pre = '<html><body>' + "`r`n" + '<!--StartFragment-->'; $post = '<!--EndFragment-->' + "`r`n" + '</body></html>'
+    $head = "Version:0.9`r`nStartHTML:{0:D10}`r`nEndHTML:{1:D10}`r`nStartFragment:{2:D10}`r`nEndFragment:{3:D10}`r`n"
+    $u = New-Object System.Text.UTF8Encoding $false
+    $hl = $u.GetByteCount(($head -f 0, 0, 0, 0))
+    $sf = $hl + $u.GetByteCount($pre); $ef = $sf + $u.GetByteCount($Fragment); $eh = $ef + $u.GetByteCount($post)
+    $all = ($head -f $hl, $eh, $sf, $ef) + $pre + $Fragment + $post
+    New-Object System.IO.MemoryStream(, ($u.GetBytes($all + [char]0)))
+}
+
 function Read-Clipboard {
     for ($n = 0; $n -lt 5; $n++) {
         try {
@@ -7172,7 +7241,9 @@ function Read-Clipboard {
                 return @{ Kind = 'files'; Files = [string[]]$d.GetData([System.Windows.Forms.DataFormats]::FileDrop) }
             }
             if ($d.GetDataPresent([System.Windows.Forms.DataFormats]::UnicodeText)) {
-                return @{ Kind = 'text'; Text = [string]$d.GetData([System.Windows.Forms.DataFormats]::UnicodeText) }
+                $html = ''
+                if ($d.GetDataPresent([System.Windows.Forms.DataFormats]::Html)) { try { $html = [string]$d.GetData([System.Windows.Forms.DataFormats]::Html) } catch { } }
+                return @{ Kind = 'text'; Text = [string]$d.GetData([System.Windows.Forms.DataFormats]::UnicodeText); Html = $html }
             }
             if ($d.GetDataPresent([System.Windows.Forms.DataFormats]::Text)) {
                 return @{ Kind = 'text'; Text = [string]$d.GetData([System.Windows.Forms.DataFormats]::Text) }
@@ -8223,6 +8294,7 @@ function Invoke-Clip([bool]$Paste) {
             $data.SetFileDropList($drop)
         } else {
             $data.SetText($item.Text, [System.Windows.Forms.TextDataFormat]::UnicodeText)
+            if ($item.Html -and $item.HtmlText -ceq $item.Text) { $data.SetData([System.Windows.Forms.DataFormats]::Html, (New-CfHtml $item.Html)) }
         }
         $script:IgnoreUntil = (Get-Date).AddMilliseconds(800)
         [System.Windows.Forms.Clipboard]::SetDataObject($data, $true, 10, 50)
@@ -29125,7 +29197,7 @@ $clipHost.add_ClipboardChanged({
         $clip = Read-Clipboard
         if (-not $clip) { return }
         switch ($clip.Kind) {
-            'text'  { Add-ClipText $clip.Text }
+            'text'  { Add-ClipText $clip.Text $clip.Html }
             'files' { Add-ClipFiles $clip.Files }
             'image' { try { Add-ClipImage $clip.Image } finally { $clip.Image.Dispose() } }
         }
