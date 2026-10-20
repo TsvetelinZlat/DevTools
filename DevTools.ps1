@@ -7214,6 +7214,13 @@ $PlainFiles = @('settings.json', 'keys.dat', 'sync-deleted.json', 'deleted.json'
 function Test-ProtectPath([string]$Path) { $script:DataKey -and ($PlainFiles -notcontains (Split-Path -Leaf $Path)) }
 
 # Text of a data file, plain or encrypted.
+# The items of a JSON list (or the one object). PowerShell 5.1's ConvertFrom-Json returns an array as a single
+# object, so @(ConvertFrom-Json ...) would be one item holding all of them - always read lists through this.
+function ConvertFrom-JsonList([string]$Json) {
+    if (-not $Json -or -not $Json.Trim()) { return }
+    ConvertFrom-Json $Json | ForEach-Object { $_ }
+}
+
 function Read-DataText([string]$Path) {
     $bytes = [IO.File]::ReadAllBytes($Path)
     if ([PowerClipVault]::IsSealed($bytes)) {
@@ -16200,7 +16207,7 @@ function Import-Notes {
     }
     if (Test-Path $NoteFoldersFile) {
         try {
-            foreach ($x in @(ConvertFrom-Json (Read-DataText $NoteFoldersFile))) {
+            foreach ($x in @(ConvertFrom-JsonList (Read-DataText $NoteFoldersFile))) {
                 if ($x.Name) { (Add-NoteFolder ([string]$x.Name)).Collapsed = [bool]$x.Collapsed }
             }
         } catch { }
@@ -17436,7 +17443,7 @@ function Unlock-Vault {
             $VaultUI.Key = $key
             $VaultUI.Entries = New-Object System.Collections.Generic.List[object]
             if ($json.Trim() -and $json.Trim() -ne '[]') {
-                foreach ($x in @(ConvertFrom-Json $json)) {
+                foreach ($x in @(ConvertFrom-JsonList $json)) {
                     $VaultUI.Entries.Add([pscustomobject]@{ Id = [string]$x.Id; Name = [string]$x.Name; User = [string]$x.User; Secret = [string]$x.Secret
                                                             Url = [string]$x.Url; Notes = [string]$x.Notes; Modified = [string]$x.Modified })
                 }
@@ -17954,7 +17961,7 @@ function Import-Snippets {
         return
     }
     try {
-        foreach ($x in @(ConvertFrom-Json (Read-DataText $SnippetsFile))) {
+        foreach ($x in @(ConvertFrom-JsonList (Read-DataText $SnippetsFile))) {
             if ($x.Id) { $script:Snippets.Add([pscustomobject]@{ Id = [string]$x.Id; Name = [string]$x.Name; Text = [string]$x.Text }) }
         }
     } catch { Write-Log "snippets load failed: $_" }
@@ -23991,7 +23998,7 @@ Register-ToolboxPage 'color' 'Colour picker' $Glyph.Color 'colour color picker e
     param($panel, $st)
     foreach ($kv in (@{ Color = [System.Drawing.Color]::FromArgb(15, 108, 189); History = (New-Object System.Collections.Generic.List[string]) }).GetEnumerator()) { $st[$kv.Key] = $kv.Value }
     $st.Status = New-TbPage $panel
-    if (Test-Path $ColorsFile) { try { foreach ($x in @(ConvertFrom-Json (Read-DataText $ColorsFile))) { if ($x) { $st.History.Add([string]$x) } } } catch { } }
+    if (Test-Path $ColorsFile) { try { foreach ($x in @(ConvertFrom-JsonList (Read-DataText $ColorsFile))) { if ($x) { $st.History.Add([string]$x) } } } catch { } }
 
     $body = New-Object System.Windows.Forms.TableLayoutPanel
     $body.Dock = 'Fill'; $body.ColumnCount = 2; $body.BackColor = $C.Bg
@@ -24430,25 +24437,45 @@ function Update-CertCheck($St) {
 $HostsFile = Join-Path $DataDir 'hosts.json'
 $HostMon = New-Object DevHostMonitor
 $script:HostTargets = New-Object System.Collections.Generic.List[object]
+$script:HostSilence = @{}              # host id -> silenced until (DateTime.MaxValue = until turned back on)
 if ($null -eq $script:HostFolders) { $script:HostFolders = @() }
 if ($null -eq $script:HostCollapsed) { $script:HostCollapsed = @() }
 
+$script:HostsLoadFailed = $false
+
+# A host from saved / imported data ($null when it has no host name).
+function ConvertTo-HostTarget($X, [switch]$NewId) {
+    if (-not $X -or -not $X.Host) { return $null }
+    $t = New-Object DevHostTarget
+    $t.Id = if ($X.Id -and -not $NewId) { [string]$X.Id } else { [guid]::NewGuid().ToString('N') }
+    $t.Name = [string]$X.Name; $t.Host = ([string]$X.Host).Trim(); $t.Ports = [string]$X.Ports; $t.Folder = [string]$X.Folder
+    $p = 0; if ([int]::TryParse([string]$X.Port, [ref]$p)) { $t.Port = $p }
+    $t
+}
+
 function Import-MonitoredHosts {
     if (-not (Test-Path $HostsFile)) { return }
-    try {
-        foreach ($x in @(ConvertFrom-Json (Read-DataText $HostsFile))) {
-            if (-not $x.Host) { continue }
-            $t = New-Object DevHostTarget
-            $t.Id = if ($x.Id) { [string]$x.Id } else { [guid]::NewGuid().ToString('N') }
-            $t.Name = [string]$x.Name; $t.Host = [string]$x.Host; $t.Port = [int]$x.Port; $t.Ports = [string]$x.Ports; $t.Folder = [string]$x.Folder
+    try { $items = @(ConvertFrom-JsonList (Read-DataText $HostsFile)) }
+    catch {
+        # unreadable: leave the file alone (no saving over it) and keep a copy of it
+        $script:HostsLoadFailed = $true
+        Write-Log "hosts load failed: $_"
+        try { Copy-Item -LiteralPath $HostsFile -Destination ($HostsFile + '.unreadable-' + (Get-Date).ToString('yyyyMMdd-HHmmss')) -Force } catch { }
+        return
+    }
+    foreach ($x in $items) {
+        try {
+            $t = ConvertTo-HostTarget $x
+            if (-not $t) { continue }
             if ($x.SilencedUntil) { try { $script:HostSilence[$t.Id] = [datetime]::Parse([string]$x.SilencedUntil, $null, [Globalization.DateTimeStyles]::RoundtripKind) } catch { } }
             $script:HostTargets.Add($t)
-        }
-    } catch { Write-Log "hosts load failed: $_" }
+        } catch { Write-Log "host skipped: $_" }
+    }
+    # the last list that loaded, in case something goes wrong later
+    if ($script:HostTargets.Count) { try { Copy-Item -LiteralPath $HostsFile -Destination ($HostsFile + '.bak') -Force } catch { } }
 }
 
 # ---- Host alerts: a popup in the bottom-right corner for a few seconds; hosts can be silenced.
-$script:HostSilence = @{}              # host id -> silenced until (DateTime.MaxValue = until turned back on)
 $script:HostAlerts = New-Object System.Collections.Generic.List[object]
 
 function Test-HostSilenced($T) {
@@ -24560,11 +24587,77 @@ function Show-HostAlert($T, [bool]$Down) {
 }
 
 function Save-MonitoredHosts {
-    if ($script:NoSave) { return }
+    if ($script:NoSave -or $script:HostsLoadFailed) { return }
     $json = ConvertTo-Json -InputObject @($script:HostTargets | ForEach-Object {
         $u = $script:HostSilence[$_.Id]
         [ordered]@{ Id = $_.Id; Name = $_.Name; Host = $_.Host; Port = $_.Port; Ports = [string]$_.Ports; Folder = [string]$_.Folder; SilencedUntil = $(if ($u) { $u.ToString('o') } else { $null }) } }) -Depth 3
     try { Write-JsonFile $HostsFile $json } catch { Write-Log "hosts save failed: $_" }
+}
+
+# Export: the hosts and folders as a JSON file (not encrypted) to keep, share or load on another PC.
+# A message after export / import (or, with -Quiet, just the text back).
+function Show-HostsMessage([bool]$Quiet, [string]$Text, [string]$Title) { if ($Quiet) { $Text } else { [void][System.Windows.Forms.MessageBox]::Show($TbUI.Form, $Text, $Title) } }
+
+function Export-MonitoredHosts([string]$Path = '', [switch]$Quiet) {
+    if ($Path) { $path = $Path } else {
+    $d = New-Object System.Windows.Forms.SaveFileDialog
+    $d.Filter = 'DevTools hosts|*.json|All files|*.*'; $d.FileName = "devtools-hosts-$((Get-Date).ToString('yyyy-MM-dd')).json"
+    $script:Modal = $true
+    try { if ($d.ShowDialog($TbUI.Form) -ne 'OK') { return }; $path = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
+    }
+    $o = [ordered]@{
+        DevToolsHosts = 1
+        Folders = @(Get-HostFolderPaths)
+        Hosts = @($script:HostTargets | ForEach-Object { [ordered]@{ Name = [string]$_.Name; Host = [string]$_.Host; Port = $_.Port; Ports = [string]$_.Ports; Folder = [string]$_.Folder } })
+    }
+    try { [IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $o -Depth 4), (New-Object System.Text.UTF8Encoding $false)) }
+    catch { Show-HostsMessage $Quiet "Couldn't write the file: $($_.Exception.Message)" 'Export hosts'; return }
+    Show-HostsMessage $Quiet "Exported $($script:HostTargets.Count) host(s) to $(Split-Path -Leaf $path)." 'Export hosts'
+}
+
+# Import: adds the hosts of an exported file (also a plain list, or a text file with one host[:port] per line);
+# ones you already have (same host, port(s) and folder) are skipped.
+function Import-MonitoredHostsFile([string]$Path = '', [switch]$Quiet) {
+    if (-not $Path) {
+        $d = New-Object System.Windows.Forms.OpenFileDialog
+        $d.Filter = 'DevTools hosts or a list|*.json;*.txt;*.csv|All files|*.*'
+        $script:Modal = $true
+        try { if ($d.ShowDialog($TbUI.Form) -ne 'OK') { return }; $Path = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
+    }
+    try { $text = Read-DataText $Path } catch { Show-HostsMessage $Quiet "Couldn't read the file: $($_.Exception.Message)" 'Import hosts'; return }
+    $items = @(); $folders = @()
+    if ($text.TrimStart().StartsWith('{') -or $text.TrimStart().StartsWith('[')) {
+        try { $j = @(ConvertFrom-JsonList $text) } catch { Show-HostsMessage $Quiet "That isn't valid JSON: $($_.Exception.Message)" 'Import hosts'; return }
+        if ($j.Count -eq 1 -and $j[0].PSObject.Properties['Hosts']) { $items = @($j[0].Hosts | ForEach-Object { $_ }); $folders = @($j[0].Folders | Where-Object { $_ }) }
+        else { $items = $j }
+    } else {
+        # text: "host", "host:port", "name host:port" or "name,host,port" per line
+        foreach ($line in ($text -split '\r?\n')) {
+            $l = $line.Trim(); if (-not $l -or $l.StartsWith('#')) { continue }
+            $f = @($l -split '\s*[,;\t]\s*|\s+' | Where-Object { $_ })
+            $name = ''; $hp = $f[-1]; $port = ''
+            if ($f.Count -ge 3 -and $f[-1] -match '^\d+$') { $name = $f[0]; $hp = $f[1]; $port = $f[2] } elseif ($f.Count -ge 2) { $name = $f[0]; if ($f[-1] -match '^\d+$' -and $f.Count -eq 2) { $name = ''; $hp = $f[0]; $port = $f[1] } }
+            if ($hp -match '^(?:[a-z]+://)?\[?([^\]/\s]+?)\]?(?::(\d+))?(?:/.*)?$') { $hp = $Matches[1]; if ($Matches[2]) { $port = $Matches[2] } }
+            $items += [pscustomobject]@{ Name = $name; Host = $hp; Port = $port; Ports = ''; Folder = '' }
+        }
+    }
+    $have = @{}; foreach ($t in $script:HostTargets) { $have["$($t.Host)|$($t.Port)|$($t.Ports)|$($t.Folder)".ToLowerInvariant()] = $true }
+    $added = 0; $skipped = 0
+    foreach ($x in $items) {
+        $t = ConvertTo-HostTarget $x -NewId
+        if (-not $t) { continue }
+        $k = "$($t.Host)|$($t.Port)|$($t.Ports)|$($t.Folder)".ToLowerInvariant()
+        if ($have[$k]) { $skipped++; continue }
+        $have[$k] = $true; $script:HostTargets.Add($t); $added++
+    }
+    $known = @(Get-HostFolderPaths)
+    $script:HostFolders = @($known + @($folders | Where-Object { $known -notcontains [string]$_ } | ForEach-Object { [string]$_ }))
+    $script:HostsLoadFailed = $false
+    Save-MonitoredHosts; Save-Settings; Sync-HostMonitor
+    if ($TbUI.Pages['hosts'] -and $TbUI.Pages['hosts'].State) { Update-HostsPage }
+    $msg = "Added $added host(s)."; if ($skipped) { $msg += " $skipped you already had were skipped." }
+    if (-not $added -and -not $skipped) { $msg = 'There were no hosts in that file.' }
+    Show-HostsMessage $Quiet $msg 'Import hosts'
 }
 
 function Sync-HostMonitor {
@@ -24784,6 +24877,8 @@ Register-ToolboxPage 'hosts' 'Host monitor' $Glyph.Globe 'monitor uptime ping se
     [void](New-Button '' 'Move the selected host or folder down  (Alt+Down)' { Move-HostItem 1 } $bar ([string][char]0xE70D) 2)
     [void](New-Button 'New folder' 'A folder for hosts (inside the selected folder); right-click a host > Move to folder' { $rw = Get-HostSel; New-HostFolder $null $(if ($rw -and $rw.Header) { $rw.Folder } else { '' }) } $bar $Glyph.Folder 2)
     [void](New-Button 'Check now' 'Check every server right away' { $HostMon.CheckNow = $true } $bar $Glyph.Refresh 2)
+    [void](New-Button 'Export...' 'Save the hosts and folders to a file (to keep, share or load on another PC)' { Export-MonitoredHosts } $bar $Glyph.Save 2)
+    [void](New-Button 'Import...' 'Add the hosts from an exported file, or a text file with one host[:port] per line (ones you already have are skipped)' { Import-MonitoredHostsFile } $bar $Glyph.Open 2)
     New-TbLabel $bar 'Every' -Dim | Out-Null
     $st.Every = New-TbCombo $bar @('10 seconds', '30 seconds', '1 minute', '5 minutes') 120
     $st.Every.SelectedIndex = switch ($script:HostInterval) { 10 { 0 } 60 { 2 } 300 { 3 } default { 1 } }
@@ -28183,6 +28278,7 @@ function New-SettingsCard($Parent, [string]$Title) {
     $card.BackColor = $C.Card
     $card.Padding = New-Object System.Windows.Forms.Padding((Px 14), (Px 8), (Px 12), (Px 8))
     $card.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, (Px 6))
+    if ($SetUI.Cards -is [System.Collections.Generic.List[object]]) { $card.SuspendLayout(); $SetUI.Cards.Add($card) }
     $card.add_Paint({
         param($src, $e)
         $e.Graphics.SmoothingMode = 'AntiAlias'
@@ -28276,6 +28372,9 @@ function Show-Settings {
     $page.BackColor = $C.Bg
     $page.Padding = New-Object System.Windows.Forms.Padding((Px 18), (Px 6), (Px 10), (Px 18))
     $f.Controls.Add($page)
+    # laid out once at the end: adding rows to the auto-sizing cards one by one re-laid the whole page each time (seconds)
+    $page.SuspendLayout()
+    $SetUI.Cards = New-Object System.Collections.Generic.List[object]
     # Width the cards are laid out for (the page scrolls vertically only).
     $script:SetCardW = $f.ClientSize.Width - (Px 30) - [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth
 
@@ -28563,6 +28662,9 @@ function Show-Settings {
     $page.Controls.Add($about)
 
     $f.add_FormClosed({ $SetUI.Form = $null })
+    foreach ($cd in $SetUI.Cards) { $cd.ResumeLayout($false) }
+    $SetUI.Cards = $null
+    $page.ResumeLayout($true)
     Register-ThemedWindow $f
     Update-SettingsState
     $f.Show()
