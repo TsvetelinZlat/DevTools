@@ -21419,12 +21419,2891 @@ function Copy-TbText([string]$Text) {
 # ---- Tool groups: the one list of where every tool belongs. The Toolbox sidebar, the tray menu and the
 #      command palette are all built from it. An entry is a Toolbox page ('page:key') or a command-palette
 #      action by its title ('Short label=Palette title' shows a shorter name).
+# The diagram engine (model, text syntax, layout, drawing, canvas): compiled the first time the studio opens.
+$DgSource = @'
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+// ======================================================================================
+// Diagram studio: model, themes, colours, the text syntax (own + Mermaid flowcharts) and edits written back to the text.
+// ======================================================================================
+public class DgCategory { public string Id = "", Name = "", Light = "", Dark = ""; public bool Auto; }
+
+public class DgNode {
+    public string Id = "", Label = "", Badge = "", Cat = "", Shape = "", Fill = "", Stroke = "", TextColor = "", Icon = "", Status = "", Metric = "", Url = "", Desc = "", Group = "";
+    public List<string> Tags = new List<string>(), Lines = new List<string>(), Items = new List<string>();
+    public int Lane = -1, SrcLine = -1, Order, Rank = -1;
+    public float X, Y, W, H, FontSize, SetW, SetH;
+    public bool HasPos, Spark, Bold, Dashed, Declared, Hidden;
+    public List<System.Drawing.RectangleF> ItemBoxes = new List<System.Drawing.RectangleF>();   // absolute, after layout
+    public System.Drawing.RectangleF Box { get { return new System.Drawing.RectangleF(X, Y, W, H); } }
+    public System.Drawing.PointF Center { get { return new System.Drawing.PointF(X + W / 2, Y + H / 2); } }
+    public string Title { get { return string.IsNullOrEmpty(Label) ? Id : Label; } }
+    // the index of an item named like s ("Device A", "DeviceA", "devicea" or its number from 1)
+    public int ItemIndex(string s) {
+        if (string.IsNullOrEmpty(s)) return -1;
+        int n; if (int.TryParse(s, out n) && n >= 1 && n <= Items.Count) return n - 1;
+        string k = DgText.Squash(s);
+        for (int i = 0; i < Items.Count; i++) if (DgText.Squash(Items[i]) == k) return i;
+        return -1;
+    }
+}
+
+public class DgEdge {
+    public string Id = "", From = "", To = "", FromItem = "", ToItem = "", Label = "", Cat = "", Route = "", Color = "", FromSide = "", ToSide = "";
+    public List<System.Drawing.PointF> Via = new List<System.Drawing.PointF>();
+    public float Width, Density = 1f;
+    public int Dash;                       // 0 solid, 1 dashed, 2 dotted
+    public bool Animate, Both, ArrowStart, ArrowEnd = true, ArrowSet, ArrowAttr, Glow, GlowSet, Hidden;
+    public int SrcLine = -1;
+    public List<System.Drawing.PointF> Pts = new List<System.Drawing.PointF>();   // the route (after layout)
+    public string PathD = "";                                                     // the route as SVG path data
+    public bool Curved;
+    public float Detour = float.NaN;                                              // corridor around the shapes in between
+}
+
+public class DgGroup {
+    public string Id = "", Title = "", Cat = "", Fill = "", Stroke = "";
+    public bool Dashed = true;
+    public List<string> Members = new List<string>();
+    public System.Drawing.RectangleF Box;
+    public int SrcLine = -1;
+}
+
+public class DgDoc {
+    public string Title = "", Subtitle = "", Theme = "midnight", Mode = "dark", Direction = "LR", Font = "", Mono = "", Hint = "", Layout = "", Route = "";
+    public List<DgCategory> Cats = new List<DgCategory>();
+    public List<string> Lanes = new List<string>();
+    public List<DgNode> Nodes = new List<DgNode>();
+    public List<DgEdge> Edges = new List<DgEdge>();
+    public List<DgGroup> Groups = new List<DgGroup>();
+    public List<string> Warnings = new List<string>();
+    public HashSet<string> Off = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // features turned off: header legend panel flows ...
+    public float Spacing = 1f, Radius = 10f;
+    public bool LaneMode { get { return Lanes.Count > 0 || Nodes.Any(n => n.Lane >= 0); } }
+    public System.Drawing.RectangleF Bounds;                                                 // everything drawn (after layout)
+    public List<float> LaneX = new List<float>(), LaneW = new List<float>();                  // lane columns (after layout)
+
+    public DgNode Find(string id) {
+        if (id == null) return null;
+        foreach (var n in Nodes) if (string.Equals(n.Id, id, StringComparison.Ordinal)) return n;
+        return null;
+    }
+    public DgCategory FindCat(string id) {
+        if (string.IsNullOrEmpty(id)) return null;
+        foreach (var c in Cats) if (string.Equals(c.Id, id, StringComparison.OrdinalIgnoreCase)) return c;
+        return null;
+    }
+    public DgGroup FindGroup(string id) { foreach (var g in Groups) if (g.Id == id) return g; return null; }
+    public bool On(string feature) { return !Off.Contains(feature); }
+}
+
+// ---- Themes: a light and a dark palette each; categories get colours from the palette in order.
+public class DgTheme {
+    public string Name = "";
+    public Dictionary<string, string> Light = new Dictionary<string, string>(), Dark = new Dictionary<string, string>();
+    public string[] PaletteLight, PaletteDark;
+    public bool Glow;
+    public string Font = "", Mono = "";
+
+    static Dictionary<string, string> P(string s) {
+        var d = new Dictionary<string, string>();
+        foreach (var kv in s.Split(';')) { var i = kv.IndexOf('='); if (i > 0) d[kv.Substring(0, i).Trim()] = kv.Substring(i + 1).Trim(); }
+        return d;
+    }
+    static readonly string MidDark = "bg=#0a0f1d;grid=#1a2541;card=#0f172a;chip=#17223d;line=#243352;ink=#eef2ff;muted=#8693b8;panel=rgba(12,18,34,0.92);ok=#3ddc97;warn=#f5b94a;bad=#ff5d6c;btn=#151f38;btnLine=#26345a;btnHover=#1d2a4b;sel=#4ea8ff;pkt=#eef3ff;tint=9;chipTint=22;frameTint=5";
+    static readonly string MidLight = "bg=#e6eaf1;grid=#c4ccda;card=#ffffff;chip=#e1e6ef;line=#aeb8cb;ink=#0f1729;muted=#435069;panel=rgba(255,255,255,0.97);ok=#0a8f5a;warn=#a86f00;bad=#cc2638;btn=#ffffff;btnLine=#b4bdcf;btnHover=#e9edf4;sel=#0b5fc2;pkt=#1a2645;tint=0;chipTint=0;frameTint=0";
+    static readonly string[] MidPalD = { "#8b97ff", "#4ea8ff", "#3ddc97", "#ff8a95", "#f5b94a", "#b29dff", "#34d3b4", "#e879c6", "#ff5d6c", "#7dd3fc" };
+    static readonly string[] MidPalL = { "#3f4fc4", "#0b5fc2", "#06804f", "#c22f45", "#a86f00", "#6340d6", "#08806b", "#b02a86", "#cc2638", "#0369a1" };
+
+    public static readonly string[] Names = { "midnight", "daylight", "blueprint", "pastel", "mono", "neon", "corporate" };
+
+    public static DgTheme Get(string name) {
+        var t = new DgTheme { Name = (name ?? "").ToLowerInvariant() };
+        switch (t.Name) {
+            case "daylight":
+                t.Dark = P(MidDark); t.Light = P(MidLight.Replace("tint=0;chipTint=0;frameTint=0", "tint=6;chipTint=14;frameTint=4"));
+                t.PaletteDark = MidPalD; t.PaletteLight = MidPalL; break;
+            case "blueprint":
+                t.Dark = P("bg=#0b2a4a;grid=#1d4a75;card=#0f3358;chip=#154170;line=#3d6d9c;ink=#e8f1ff;muted=#9cb8d9;panel=rgba(11,42,74,0.94);ok=#5eead4;warn=#fcd34d;bad=#fb7185;btn=#123a63;btnLine=#2f5f8f;btnHover=#184775;sel=#7dd3fc;pkt=#ffffff;tint=10;chipTint=24;frameTint=6");
+                t.Light = P("bg=#eef5fc;grid=#c9dcef;card=#ffffff;chip=#e2edf8;line=#9fbcd9;ink=#0b2a4a;muted=#46627f;panel=rgba(255,255,255,0.97);ok=#0f766e;warn=#b45309;bad=#be123c;btn=#ffffff;btnLine=#a9c3dc;btnHover=#e6f0fa;sel=#0369a1;pkt=#0b2a4a;tint=5;chipTint=14;frameTint=3");
+                t.PaletteDark = new[] { "#7dd3fc", "#a5b4fc", "#5eead4", "#fcd34d", "#f9a8d4", "#c4b5fd", "#86efac", "#fda4af" };
+                t.PaletteLight = new[] { "#0369a1", "#4338ca", "#0f766e", "#b45309", "#be185d", "#6d28d9", "#15803d", "#be123c" }; break;
+            case "pastel":
+                t.Dark = P("bg=#1f1d1b;grid=#34302c;card=#282522;chip=#36322e;line=#4a453f;ink=#f4efe8;muted=#b3aa9e;panel=rgba(31,29,27,0.94);ok=#9fd8b5;warn=#f2cf8a;bad=#f2a0a0;btn=#2d2a27;btnLine=#4a453f;btnHover=#36322e;sel=#c9b6f2;pkt=#fff8ee;tint=14;chipTint=30;frameTint=7");
+                t.Light = P("bg=#fbf8f3;grid=#ece4d8;card=#ffffff;chip=#f3ede4;line=#d8cfc2;ink=#2d2a26;muted=#7a7268;panel=rgba(255,255,255,0.97);ok=#3f8f63;warn=#a8741a;bad=#c25454;btn=#ffffff;btnLine=#d8cfc2;btnHover=#f5efe6;sel=#7c5cc4;pkt=#2d2a26;tint=12;chipTint=26;frameTint=6");
+                t.PaletteDark = new[] { "#b8c4ff", "#a7d8f0", "#9fd8b5", "#f2b8c6", "#f2cf8a", "#c9b6f2", "#9ee0d6", "#f5b39b" };
+                t.PaletteLight = new[] { "#6f7fd6", "#4f9cc2", "#3f9a68", "#c96f88", "#b8862b", "#8e6fcf", "#2f9a8b", "#cf7a5c" }; break;
+            case "mono":
+                t.Dark = P("bg=#0d0d0e;grid=#232326;card=#161618;chip=#222225;line=#3a3a3f;ink=#f4f4f5;muted=#a1a1aa;panel=rgba(22,22,24,0.95);ok=#d4d4d8;warn=#a1a1aa;bad=#ff5d6c;btn=#1c1c1f;btnLine=#3a3a3f;btnHover=#27272a;sel=#ffffff;pkt=#ffffff;tint=0;chipTint=10;frameTint=3");
+                t.Light = P("bg=#fafafa;grid=#e4e4e7;card=#ffffff;chip=#f4f4f5;line=#d4d4d8;ink=#18181b;muted=#71717a;panel=rgba(255,255,255,0.97);ok=#3f3f46;warn=#71717a;bad=#dc2626;btn=#ffffff;btnLine=#d4d4d8;btnHover=#f4f4f5;sel=#18181b;pkt=#18181b;tint=0;chipTint=8;frameTint=2");
+                t.PaletteDark = new[] { "#e4e4e7", "#a1a1aa", "#d4d4d8", "#71717a", "#f4f4f5", "#52525b" };
+                t.PaletteLight = new[] { "#27272a", "#52525b", "#3f3f46", "#71717a", "#18181b", "#a1a1aa" }; break;
+            case "neon":
+                t.Dark = P("bg=#05010f;grid=#1c0f33;card=#0d0620;chip=#1a0d36;line=#3a1f66;ink=#f5f0ff;muted=#a693c9;panel=rgba(13,6,32,0.92);ok=#39ff14;warn=#ffe600;bad=#ff2b6d;btn=#140a2c;btnLine=#3a1f66;btnHover=#20103f;sel=#00e5ff;pkt=#ffffff;tint=12;chipTint=28;frameTint=6");
+                t.Light = P("bg=#f7f5ff;grid=#e1dcf5;card=#ffffff;chip=#efebfb;line=#cfc6ee;ink=#1a1033;muted=#5f5385;panel=rgba(255,255,255,0.97);ok=#0b8a3a;warn=#a17f00;bad=#d1124f;btn=#ffffff;btnLine=#cfc6ee;btnHover=#f1edfc;sel=#7c3aed;pkt=#1a1033;tint=6;chipTint=16;frameTint=3");
+                t.PaletteDark = new[] { "#00e5ff", "#ff2bd6", "#39ff14", "#ffe600", "#ff6b00", "#9d4dff", "#00ffa3", "#ff2b6d" };
+                t.PaletteLight = new[] { "#0891b2", "#c026d3", "#16a34a", "#ca8a04", "#ea580c", "#7c3aed", "#059669", "#e11d48" };
+                t.Glow = true; break;
+            case "corporate":
+                t.Dark = P("bg=#0f1720;grid=#1e2a36;card=#16212c;chip=#1f2d3b;line=#2f3f50;ink=#e8eef4;muted=#93a4b6;panel=rgba(15,23,32,0.95);ok=#3fb950;warn=#d29922;bad=#f85149;btn=#1a2632;btnLine=#30414f;btnHover=#223140;sel=#58a6ff;pkt=#e8eef4;tint=7;chipTint=18;frameTint=4");
+                t.Light = P("bg=#f4f6f8;grid=#dde3e9;card=#ffffff;chip=#eef1f4;line=#c5ced8;ink=#1b2733;muted=#5b6b7b;panel=rgba(255,255,255,0.98);ok=#1a7f37;warn=#9a6700;bad=#cf222e;btn=#ffffff;btnLine=#c5ced8;btnHover=#eef1f4;sel=#0969da;pkt=#1b2733;tint=4;chipTint=12;frameTint=3");
+                t.PaletteDark = new[] { "#58a6ff", "#3fb950", "#d29922", "#f85149", "#bc8cff", "#39c5cf", "#ff9bce", "#e3b341" };
+                t.PaletteLight = new[] { "#1f6feb", "#2da44e", "#bf8700", "#cf222e", "#8250df", "#0a7ea4", "#bf3989", "#9a6700" }; break;
+            default:
+                t.Name = "midnight"; t.Dark = P(MidDark); t.Light = P(MidLight); t.PaletteDark = MidPalD; t.PaletteLight = MidPalL; t.Glow = true; break;
+        }
+        return t;
+    }
+}
+
+// ---- Colours: in the window and in PNGs they are real colours; in SVG they can be CSS variables (light / dark switch).
+public class DgColors {
+    public DgTheme T;
+    public DgDoc Doc;
+    public bool Dark = true;
+    public bool Vars;                            // SVG with CSS variables
+    public Dictionary<string, string> CatL = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), CatD = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    public DgColors(DgDoc d, DgTheme t, bool dark, bool vars) {
+        Doc = d; T = t; Dark = dark; Vars = vars;
+        int i = 0;
+        foreach (var c in d.Cats) {
+            string l = !string.IsNullOrEmpty(c.Light) ? c.Light : t.PaletteLight[i % t.PaletteLight.Length];
+            string k = !string.IsNullOrEmpty(c.Dark) ? c.Dark : (!string.IsNullOrEmpty(c.Light) ? c.Light : t.PaletteDark[i % t.PaletteDark.Length]);
+            CatL[c.Id] = l; CatD[c.Id] = k; i++;
+        }
+    }
+    public Dictionary<string, string> Pal { get { return Dark ? T.Dark : T.Light; } }
+    public static string VarName(string key) { return "--" + key; }
+    public static string CatVar(string id) { return "--c-" + DgText.CssId(id); }
+
+    // a theme colour ("ink", "card") or a category ("c:prod") or a literal ("#123456")
+    public string Raw(string key) {
+        if (string.IsNullOrEmpty(key)) return "#000000";
+        if (key[0] == '#' || key.StartsWith("rgb")) return key;
+        if (key.StartsWith("c:")) { var id = key.Substring(2); var m = Dark ? CatD : CatL; string v; return m.TryGetValue(id, out v) ? v : Raw("ink"); }
+        string s; return Pal.TryGetValue(key, out s) ? s : "#888888";
+    }
+    public string Get(string key) {
+        if (!Vars || string.IsNullOrEmpty(key) || key[0] == '#' || key.StartsWith("rgb")) return Raw(key);
+        if (key.StartsWith("c:")) return "var(" + CatVar(key.Substring(2)) + ")";
+        return "var(--" + key + ")";
+    }
+    // pct% of a mixed into b; pct can be a number or a theme key holding one ("tint")
+    public string Mix(string a, string pct, string b) {
+        if (Vars) {
+            string p = char.IsDigit(pct[0]) ? pct + "%" : "var(--" + pct + ")";
+            return "color-mix(in oklch, " + Get(a) + " " + p + ", " + Get(b) + ")";
+        }
+        float f = char.IsDigit(pct[0]) ? float.Parse(pct, CultureInfo.InvariantCulture) : float.Parse(Raw(pct), CultureInfo.InvariantCulture);
+        return Hex(Blend(Parse(Raw(a)), Parse(Raw(b)), f / 100f));
+    }
+    public float Num(string key) { float f; return float.TryParse(Raw(key), NumberStyles.Float, CultureInfo.InvariantCulture, out f) ? f : 0; }
+
+    public static System.Drawing.Color Blend(System.Drawing.Color a, System.Drawing.Color b, float t) {
+        t = Math.Max(0, Math.Min(1, t));
+        return System.Drawing.Color.FromArgb((int)(a.A * t + b.A * (1 - t)), (int)(a.R * t + b.R * (1 - t)), (int)(a.G * t + b.G * (1 - t)), (int)(a.B * t + b.B * (1 - t)));
+    }
+    public static string Hex(System.Drawing.Color c) { return c.A < 255 ? string.Format("rgba({0},{1},{2},{3})", c.R, c.G, c.B, (c.A / 255f).ToString("0.##", CultureInfo.InvariantCulture)) : "#" + c.R.ToString("x2") + c.G.ToString("x2") + c.B.ToString("x2"); }
+    // #rgb, #rrggbb, #rrggbbaa, rgb(), rgba(), a few names
+    public static System.Drawing.Color Parse(string s) {
+        try {
+            s = (s ?? "").Trim();
+            if (s.StartsWith("#")) {
+                var h = s.Substring(1);
+                if (h.Length == 3) h = "" + h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+                int v = int.Parse(h.Substring(0, 6), NumberStyles.HexNumber);
+                int a = h.Length >= 8 ? int.Parse(h.Substring(6, 2), NumberStyles.HexNumber) : 255;
+                return System.Drawing.Color.FromArgb(a, (v >> 16) & 255, (v >> 8) & 255, v & 255);
+            }
+            var m = Regex.Match(s, @"rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)");
+            if (m.Success) {
+                float al = m.Groups[4].Success ? float.Parse(m.Groups[4].Value, CultureInfo.InvariantCulture) : 1f;
+                return System.Drawing.Color.FromArgb((int)(al * 255), (int)float.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture), (int)float.Parse(m.Groups[2].Value, CultureInfo.InvariantCulture), (int)float.Parse(m.Groups[3].Value, CultureInfo.InvariantCulture));
+            }
+            var c = System.Drawing.Color.FromName(s);
+            if (c.A > 0 || c.R > 0 || c.G > 0 || c.B > 0) return c;
+        } catch { }
+        return System.Drawing.Color.Gray;
+    }
+}
+
+// ---- The text syntax.
+public static class DgText {
+    public static string Squash(string s) { return Regex.Replace((s ?? "").ToLowerInvariant(), @"[^a-z0-9]", ""); }
+    public static string CssId(string s) { var r = Regex.Replace(s ?? "", @"[^A-Za-z0-9_-]", "_"); return r.Length == 0 ? "_" : r; }
+    static readonly string IdRx = @"[A-Za-z_\u00C0-\uFFFF][\w\-\u00C0-\uFFFF]*";
+
+    // ---- Parsing
+    public static DgDoc Parse(string text) {
+        var d = new DgDoc();
+        var lines = (text ?? "").Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+        DgNode last = null;
+        var groupStack = new Stack<DgGroup>();
+        int order = 0;
+        for (int li = 0; li < lines.Length; li++) {
+            string raw = lines[li];
+            string line = raw.Trim();
+            if (line.Length == 0 || line.StartsWith("%%") || line.StartsWith("//") || (line.StartsWith("#") && !Regex.IsMatch(line, "^#[0-9a-fA-F]{3,8}\\b"))) continue;
+            bool indented = raw.Length > 0 && (raw[0] == ' ' || raw[0] == '\t');
+            try {
+                string kw = Regex.Match(line, @"^[A-Za-z]+").Value.ToLowerInvariant();
+                string rest = kw.Length > 0 && line.Length > kw.Length ? line.Substring(kw.Length).Trim() : "";
+                bool restIsWord = kw.Length > 0 && (line.Length == kw.Length || line[kw.Length] == ' ' || line[kw.Length] == '\t');
+                // continuation lines of the last node
+                if (indented && last != null && restIsWord && IsNodeKey(kw) && !HasArrow(line)) { NodeKey(d, last, kw, rest); continue; }
+                if (restIsWord) {
+                    switch (kw) {
+                        case "title": d.Title = Unq(rest); continue;
+                        case "subtitle": d.Subtitle = Unq(rest); continue;
+                        case "hint": d.Hint = Unq(rest); continue;
+                        case "theme": { var p = rest.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries); foreach (var x in p) { var w = x.ToLowerInvariant(); if (w == "dark" || w == "light") d.Mode = w; else d.Theme = w; } continue; }
+                        case "mode": d.Mode = rest.ToLowerInvariant().Contains("light") ? "light" : "dark"; continue;
+                        case "direction": case "dir": d.Direction = Dir(rest); continue;
+                        case "graph": case "flowchart": d.Direction = Dir(rest); continue;
+                        case "layout": d.Layout = rest.ToLowerInvariant(); continue;
+                        case "routing": case "route": d.Route = rest.ToLowerInvariant(); continue;
+                        case "spacing": d.Spacing = Math.Max(0.4f, Math.Min(4f, F(rest, 1))); continue;
+                        case "radius": d.Radius = Math.Max(0, Math.Min(40, F(rest, 10))); continue;
+                        case "font": d.Font = Unq(rest); continue;
+                        case "mono": d.Mono = Unq(rest); continue;
+                        case "hide": foreach (var x in rest.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries)) d.Off.Add(x); continue;
+                        case "show": foreach (var x in rest.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries)) d.Off.Remove(x); continue;
+                        case "category": case "cat": case "flow": Category(d, rest); continue;
+                        case "lanes": case "columns": foreach (var x in SplitTop(rest, '|')) d.Lanes.Add(Unq(x.Trim())); continue;
+                        case "lane": { var m = Regex.Match(rest, @"^(\d+)\s+(.*)$"); if (m.Success) { int k = int.Parse(m.Groups[1].Value) - 1; while (d.Lanes.Count <= k) d.Lanes.Add(""); d.Lanes[k] = Unq(m.Groups[2].Value); } continue; }
+                        case "group": case "subgraph": {
+                            var g = GroupLine(d, kw, rest, li);
+                            if (line.EndsWith("{") || kw == "subgraph") groupStack.Push(g);
+                            continue;
+                        }
+                        case "end": if (rest.Length == 0) { if (groupStack.Count > 0) groupStack.Pop(); continue; } break;
+                        case "style": StyleLine(d, rest); continue;
+                        case "classdef": case "class": case "linkstyle": continue;
+                        case "click": { var m = Regex.Match(rest, "^(" + IdRx + ")\\s+(?:href\\s+)?\"([^\"]+)\""); if (m.Success) { var n = Node(d, m.Groups[1].Value, ref order); n.Url = m.Groups[2].Value; } continue; }
+                    }
+                }
+                if (line == "}") { if (groupStack.Count > 0) groupStack.Pop(); continue; }
+                var grp = groupStack.Count > 0 ? groupStack.Peek() : null;
+                if (HasArrow(line)) { EdgeLine(d, line, li, grp, ref order); last = null; continue; }
+                var decl = NodeLine(d, line, li, ref order);
+                if (decl != null) {
+                    last = decl;
+                    if (grp != null && !grp.Members.Contains(decl.Id)) { grp.Members.Add(decl.Id); decl.Group = grp.Id; }
+                    continue;
+                }
+                d.Warnings.Add("Line " + (li + 1) + ": not understood: " + line);
+            } catch (Exception ex) { d.Warnings.Add("Line " + (li + 1) + ": " + ex.Message); }
+        }
+        // group members named in { a, b } may be declared later: link them now
+        foreach (var g in d.Groups) foreach (var m in g.Members) { var n = d.Find(m); if (n == null) { n = Node(d, m, ref order); } if (string.IsNullOrEmpty(n.Group)) n.Group = g.Id; }
+        for (int i = 0; i < d.Edges.Count; i++) d.Edges[i].Id = "e" + i + "_" + CssId(d.Edges[i].From) + "_" + CssId(d.Edges[i].To);
+        return d;
+    }
+
+    static string Dir(string s) { s = (s ?? "").Trim().ToUpperInvariant(); if (s.StartsWith("TD") || s.StartsWith("TB")) return "TB"; if (s.StartsWith("BT")) return "BT"; if (s.StartsWith("RL")) return "RL"; return s.StartsWith("LR") || s.Length == 0 ? "LR" : "LR"; }
+    static float F(string s, float def) { float f; return float.TryParse((s ?? "").Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out f) ? f : def; }
+    public static string Unq(string s) {
+        s = (s ?? "").Trim();
+        if (s.Length >= 2 && ((s[0] == '"' && s[s.Length - 1] == '"') || (s[0] == '\'' && s[s.Length - 1] == '\''))) s = s.Substring(1, s.Length - 2);
+        s = Regex.Replace(s, @"\\u([0-9a-fA-F]{4})", m => ((char)Convert.ToInt32(m.Groups[1].Value, 16)).ToString());
+        return s.Replace("\\n", "\n").Replace("<br>", "\n").Replace("<br/>", "\n");
+    }
+    static bool IsNodeKey(string k) { return k == "desc" || k == "description" || k == "tags" || k == "lines" || k == "line" || k == "items" || k == "url" || k == "link" || k == "metric" || k == "badge" || k == "status" || k == "note"; }
+
+    static void NodeKey(DgDoc d, DgNode n, string k, string v) {
+        switch (k) {
+            case "desc": case "description": case "note": n.Desc = (n.Desc.Length > 0 ? n.Desc + " " : "") + Unq(v); break;
+            case "tags": foreach (var t in SplitTop(v, ',')) if (t.Trim().Length > 0) n.Tags.Add(Unq(t.Trim())); break;
+            case "lines": foreach (var t in Words(v)) n.Lines.Add(t); break;
+            case "line": n.Lines.Add(Unq(v)); break;
+            case "items": n.Items.Clear(); foreach (var t in Words(v)) n.Items.Add(t); break;
+            case "url": case "link": n.Url = Unq(v); break;
+            case "metric": n.Metric = Unq(v); break;
+            case "badge": n.Badge = Unq(v); break;
+            case "status": n.Status = Unq(v).ToLowerInvariant(); break;
+        }
+    }
+
+    // words separated by spaces, "quoted words" kept together
+    public static List<string> Words(string s) {
+        var r = new List<string>();
+        foreach (Match m in Regex.Matches(s ?? "", "\"([^\"]*)\"|'([^']*)'|(\\S+)")) r.Add(Unq(m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Success ? m.Groups[2].Value : m.Groups[3].Value));
+        return r;
+    }
+    // splits at sep outside quotes and brackets
+    public static List<string> SplitTop(string s, char sep) {
+        var r = new List<string>(); var sb = new StringBuilder(); char q = '\0'; int depth = 0;
+        foreach (char c in s ?? "") {
+            if (q != '\0') { sb.Append(c); if (c == q) q = '\0'; continue; }
+            if (c == '"' || c == '\'') { q = c; sb.Append(c); continue; }
+            if (c == '[' || c == '(' || c == '{') depth++;
+            if (c == ']' || c == ')' || c == '}') depth--;
+            if (c == sep && depth <= 0) { r.Add(sb.ToString()); sb.Clear(); continue; }
+            sb.Append(c);
+        }
+        r.Add(sb.ToString());
+        return r;
+    }
+
+    static void Category(DgDoc d, string rest) {
+        var w = Words(rest);
+        if (w.Count == 0) return;
+        var c = d.FindCat(w[0]);
+        if (c == null) { c = new DgCategory { Id = w[0] }; d.Cats.Add(c); }
+        c.Auto = false;
+        c.Name = c.Id;
+        var cols = new List<string>();
+        for (int i = 1; i < w.Count; i++) {
+            if (w[i] == "/") continue;
+            if (w[i].StartsWith("#") || w[i].StartsWith("rgb")) cols.Add(w[i]);
+            else if (i == 1) c.Name = w[i];
+        }
+        // "#light / #dark" may come as one word "#aaa/#bbb"
+        if (cols.Count == 1 && cols[0].Contains("/")) { var p = cols[0].Split('/'); cols = new List<string> { p[0], p[1] }; }
+        if (cols.Count > 0) c.Light = cols[0];
+        if (cols.Count > 1) c.Dark = cols[1];
+    }
+
+    static DgCategory AutoCat(DgDoc d, string id) {
+        var c = d.FindCat(id);
+        if (c != null) return c;
+        c = new DgCategory { Id = id, Name = char.ToUpperInvariant(id[0]) + id.Substring(1), Auto = true };
+        d.Cats.Add(c);
+        return c;
+    }
+
+    static DgNode Node(DgDoc d, string id, ref int order) {
+        var n = d.Find(id);
+        if (n == null) { n = new DgNode { Id = id, Order = order++ }; d.Nodes.Add(n); }
+        return n;
+    }
+
+    static DgGroup GroupLine(DgDoc d, string kw, string rest, int li) {
+        rest = rest.TrimEnd('{').Trim();
+        string members = "";
+        var mb = Regex.Match(rest, @"\{(.*)\}\s*$");
+        if (mb.Success) { members = mb.Groups[1].Value; rest = rest.Substring(0, mb.Index).Trim(); }
+        string attrs = "";
+        var ma = Regex.Match(rest, @"\s\[([^\]]*)\]\s*$");
+        if (ma.Success && kw == "group") { attrs = ma.Groups[1].Value; rest = rest.Substring(0, ma.Index).Trim(); }
+        var g = new DgGroup { SrcLine = li };
+        // group id "Title"  /  subgraph id [Title]  /  subgraph Title
+        var m = Regex.Match(rest, "^(" + IdRx + ")\\s*(?:\\[(.*)\\]|\"(.*)\"|'(.*)')?\\s*$");
+        if (m.Success) { g.Id = m.Groups[1].Value; g.Title = m.Groups[2].Success ? Unq(m.Groups[2].Value) : m.Groups[3].Success ? m.Groups[3].Value : m.Groups[4].Success ? m.Groups[4].Value : (kw == "subgraph" ? g.Id : ""); }
+        else { g.Title = Unq(rest); g.Id = "g" + Squash(rest); }
+        if (string.IsNullOrEmpty(g.Title)) g.Title = g.Id;
+        var old = d.FindGroup(g.Id); if (old != null) d.Groups.Remove(old);
+        d.Groups.Add(g);
+        foreach (var a in Attrs(attrs)) {
+            switch (a.Key) {
+                case "solid": g.Dashed = false; break;
+                case "dashed": g.Dashed = true; break;
+                case "fill": g.Fill = a.Value; break;
+                case "stroke": case "border": g.Stroke = a.Value; break;
+                case "cat": case "category": g.Cat = AutoCat(d, a.Value).Id; break;
+                case "": if (a.Value.Length > 0) g.Cat = AutoCat(d, a.Value).Id; break;
+            }
+        }
+        foreach (var x in members.Split(new[] { ',', ' ' }, StringSplitOptions.RemoveEmptyEntries)) if (!g.Members.Contains(x.Trim())) g.Members.Add(x.Trim());
+        return g;
+    }
+
+    static void StyleLine(DgDoc d, string rest) {
+        var m = Regex.Match(rest, "^(" + IdRx + ")\\s+(.*)$");
+        if (!m.Success) return;
+        int o = 0; var n = Node(d, m.Groups[1].Value, ref o); n.Order = d.Nodes.Count;
+        foreach (var p in m.Groups[2].Value.Split(',')) {
+            var kv = p.Split(new[] { ':' }, 2); if (kv.Length < 2) continue;
+            var k = kv[0].Trim().ToLowerInvariant(); var v = kv[1].Trim();
+            if (k == "fill") n.Fill = v; else if (k == "stroke") n.Stroke = v; else if (k == "color") n.TextColor = v;
+            else if (k == "stroke-dasharray") n.Dashed = true; else if (k == "font-weight" && v.StartsWith("b")) n.Bold = true;
+        }
+    }
+
+    // ---- attributes: [key value, flag, category, "quoted"]
+    public static List<KeyValuePair<string, string>> Attrs(string s) {
+        var r = new List<KeyValuePair<string, string>>();
+        foreach (var part in SplitTop(s ?? "", ',')) {
+            var p = part.Trim(); if (p.Length == 0) continue;
+            var m = Regex.Match(p, @"^([A-Za-z][\w-]*)(?:\s*[:=]\s*|\s+)(.+)$");
+            if (m.Success && KnownKey(m.Groups[1].Value.ToLowerInvariant())) r.Add(new KeyValuePair<string, string>(m.Groups[1].Value.ToLowerInvariant(), m.Groups[2].Value.Trim()));
+            else if (Regex.IsMatch(p, @"^[A-Za-z][\w-]*$")) r.Add(new KeyValuePair<string, string>(p.ToLowerInvariant(), ""));
+            else r.Add(new KeyValuePair<string, string>("", p));
+        }
+        return r;
+    }
+    static bool KnownKey(string k) {
+        switch (k) {
+            case "badge": case "lane": case "at": case "size": case "w": case "width": case "h": case "height": case "shape": case "fill": case "stroke": case "border": case "color": case "text":
+            case "icon": case "status": case "metric": case "url": case "link": case "font": case "lines": case "items": case "in": case "group": case "cat": case "category": case "flow":
+            case "desc": case "tags": case "label": case "via": case "density": case "arrow": case "from": case "to": case "route": return true;
+        }
+        return false;
+    }
+    static List<System.Drawing.PointF> Points(string s) {
+        var nums = Regex.Matches(s ?? "", @"-?\d+(?:\.\d+)?").Cast<Match>().Select(m => float.Parse(m.Value, CultureInfo.InvariantCulture)).ToList();
+        var r = new List<System.Drawing.PointF>();
+        for (int i = 0; i + 1 < nums.Count; i += 2) r.Add(new System.Drawing.PointF(nums[i], nums[i + 1]));
+        return r;
+    }
+
+    static void ApplyNodeAttrs(DgDoc d, DgNode n, string attrs) {
+        foreach (var a in Attrs(attrs)) {
+            string v = a.Value;
+            switch (a.Key) {
+                case "badge": n.Badge = Unq(v); break;
+                case "lane": n.Lane = (int)F(v, 1) - 1; break;
+                case "at": { var p = Points(v); if (p.Count > 0) { n.X = p[0].X; n.Y = p[0].Y; n.HasPos = true; } break; }
+                case "size": { var p = Regex.Matches(v, @"\d+(?:\.\d+)?").Cast<Match>().Select(m => F(m.Value, 0)).ToList(); if (p.Count > 0) n.SetW = p[0]; if (p.Count > 1) n.SetH = p[1]; break; }
+                case "w": case "width": n.SetW = F(v, 0); break;
+                case "h": case "height": n.SetH = F(v, 0); break;
+                case "shape": n.Shape = v.ToLowerInvariant(); break;
+                case "fill": n.Fill = v; break;
+                case "stroke": case "border": n.Stroke = v; break;
+                case "color": case "text": n.TextColor = v; break;
+                case "icon": n.Icon = Unq(v); break;
+                case "status": n.Status = v.ToLowerInvariant(); break;
+                case "metric": n.Metric = Unq(v); break;
+                case "url": case "link": n.Url = Unq(v); break;
+                case "font": n.FontSize = F(v, 0); break;
+                case "lines": n.Lines.Clear(); foreach (var t in Words(v)) n.Lines.Add(t); break;
+                case "items": n.Items.Clear(); foreach (var t in Words(v)) n.Items.Add(t); break;
+                case "desc": n.Desc = Unq(v); break;
+                case "tags": n.Tags.Clear(); foreach (var t in v.Split(new[] { ';', '|' }, StringSplitOptions.RemoveEmptyEntries)) n.Tags.Add(Unq(t.Trim())); break;
+                case "label": n.Label = Unq(v); break;
+                case "in": case "group": { var g = d.FindGroup(v.Trim()); if (g == null) { g = new DgGroup { Id = v.Trim(), Title = v.Trim() }; d.Groups.Add(g); } if (!g.Members.Contains(n.Id)) g.Members.Add(n.Id); n.Group = g.Id; break; }
+                case "cat": case "category": case "flow": n.Cat = AutoCat(d, v.Trim()).Id; break;
+                case "spark": case "sparkline": n.Spark = true; break;
+                case "bold": n.Bold = true; break;
+                case "dashed": n.Dashed = true; break;
+                case "hidden": n.Hidden = true; break;
+                case "ok": case "up": n.Status = "ok"; break;
+                case "warn": n.Status = "warn"; break;
+                case "down": n.Status = "down"; break;
+                case "card": case "rect": case "rounded": case "pill": case "diamond": case "circle": case "cylinder": case "db": case "doc": case "document":
+                case "hexagon": case "parallelogram": case "note": case "actor": case "table": n.Shape = a.Key == "db" ? "cylinder" : a.Key == "document" ? "doc" : a.Key; break;
+                case "": break;
+                default: n.Cat = AutoCat(d, a.Key).Id; break;       // a bare word is a category
+            }
+        }
+    }
+
+    // Mermaid-style shapes: id[..] id(..) id([..]) id[[..]] id[(..)] id((..)) id>..] id{..} id{{..}} id[/../] id[\..\]
+    static readonly string ShapeRx = @"(\(\(.*?\)\)|\(\[.*?\]\)|\[\[.*?\]\]|\[\(.*?\)\]|\{\{.*?\}\}|\[/.*?/\]|\[\\.*?\\\]|\[/.*?\\\]|\[\\.*?/\]|\[.*?\]|\(.*?\)|\{.*?\}|>.*?\])";
+    static void ApplyShape(DgNode n, string s) {
+        if (string.IsNullOrEmpty(s)) return;
+        string shape = "rounded", inner = s;
+        if (s.StartsWith("((")) { shape = "circle"; inner = s.Substring(2, s.Length - 4); }
+        else if (s.StartsWith("([")) { shape = "pill"; inner = s.Substring(2, s.Length - 4); }
+        else if (s.StartsWith("[[")) { shape = "rect"; inner = s.Substring(2, s.Length - 4); }
+        else if (s.StartsWith("[(")) { shape = "cylinder"; inner = s.Substring(2, s.Length - 4); }
+        else if (s.StartsWith("{{")) { shape = "hexagon"; inner = s.Substring(2, s.Length - 4); }
+        else if (s.StartsWith("[/") || s.StartsWith("[\\")) { shape = "parallelogram"; inner = s.Substring(2, s.Length - 4); }
+        else if (s.StartsWith("[")) { shape = "rect"; inner = s.Substring(1, s.Length - 2); }
+        else if (s.StartsWith("(")) { shape = "rounded"; inner = s.Substring(1, s.Length - 2); }
+        else if (s.StartsWith("{")) { shape = "diamond"; inner = s.Substring(1, s.Length - 2); }
+        else if (s.StartsWith(">")) { shape = "parallelogram"; inner = s.Substring(1, s.Length - 2); }
+        n.Label = Unq(inner);
+        if (string.IsNullOrEmpty(n.Shape)) n.Shape = shape;
+    }
+
+    // a node line: "id: Label [attrs]", "id[Label] [attrs]", "id [attrs]", "id"
+    static DgNode NodeLine(DgDoc d, string line, int li, ref int order) {
+        string attrs = null;
+        var ma = Regex.Match(line, @"\s\[([^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*)\]\s*$");
+        string head = line;
+        if (ma.Success) { attrs = ma.Groups[1].Value; head = line.Substring(0, ma.Index).TrimEnd(); }
+        var m = Regex.Match(head, "^(" + IdRx + ")\\s*:\\s*(.*)$");
+        DgNode n;
+        if (m.Success) { n = Node(d, m.Groups[1].Value, ref order); n.Label = Unq(m.Groups[2].Value); }
+        else {
+            m = Regex.Match(head, "^(" + IdRx + ")" + ShapeRx + "?\\s*$");
+            if (!m.Success) return null;
+            n = Node(d, m.Groups[1].Value, ref order);
+            if (m.Groups[2].Success) ApplyShape(n, m.Groups[2].Value);
+        }
+        if (n.SrcLine < 0 || !n.Declared) n.SrcLine = li;
+        n.Declared = true;
+        if (attrs != null) ApplyNodeAttrs(d, n, attrs);
+        return n;
+    }
+
+    // ---- edges: a -> b, a --> b, a -.-> b, a ==> b, a --- b, a <-> b, a -- text --> b, a -->|text| b, a -text-> b, a & b -> c, a -> b, c, chains
+    static readonly Regex ArrowRx = new Regex(@"(<?)(-\.+-?>?|={2,3}>|={3}|-{2,3}>|-{3}|->|--[ox])(?:\|([^|]*)\|)?");
+    public static bool HasArrow(string line) {
+        var s = Regex.Replace(line, "\"[^\"]*\"|'[^']*'|\\[[^\\]]*\\]|\\([^)]*\\)|\\{[^}]*\\}", "");
+        return ArrowRx.IsMatch(s);
+    }
+
+    static void EdgeLine(DgDoc d, string line, int li, DgGroup grp, ref int order) {
+        // trailing [attrs] (space before "[")
+        string attrs = null;
+        var ma = Regex.Match(line, @"\s\[([^\[\]]*)\]\s*$");
+        if (ma.Success) { var before = line.Substring(0, ma.Index).TrimEnd(); if (!before.EndsWith("]") || true) { attrs = ma.Groups[1].Value; line = before; } }
+        // labelled forms into |label|
+        line = Regex.Replace(line, @"--\s+([^\s>-][^>]*?)\s+-->", "-->|$1|");
+        line = Regex.Replace(line, @"==\s+([^\s>=][^>]*?)\s+==>", "==>|$1|");
+        line = Regex.Replace(line, @"-\.\s+([^>]*?)\s+\.->", "-.->|$1|");
+        line = Regex.Replace(line, @"(\s)-(?![-.>])([^\s>][^>]*?)(?<![-\s])->(\s)", "$1->|$2|$3");
+        // split into endpoint groups and arrows (outside quotes / shapes)
+        var parts = new List<string>(); var arrows = new List<Match>();
+        int pos = 0;
+        var masked = Regex.Replace(line, "\"[^\"]*\"|'[^']*'|\\[[^\\]]*\\]|\\([^)]*\\)|\\{[^}]*\\}", mm => new string('_', mm.Length));
+        foreach (Match am in ArrowRx.Matches(masked)) {
+            parts.Add(line.Substring(pos, am.Index - pos)); arrows.Add(ArrowRx.Match(line, am.Index)); pos = am.Index + am.Length;
+        }
+        parts.Add(line.Substring(pos));
+        if (arrows.Count == 0) return;
+        var ends = new List<List<string[]>>();
+        foreach (var p in parts) ends.Add(Endpoints(d, p, li, grp, ref order));
+        for (int i = 0; i < arrows.Count; i++) {
+            var am = arrows[i];
+            string tok = am.Groups[2].Value;
+            foreach (var a in ends[i]) foreach (var b in ends[i + 1]) {
+                var e = new DgEdge { From = a[0], FromItem = a[1], To = b[0], ToItem = b[1], SrcLine = li };
+                if (am.Groups[3].Success) e.Label = Unq(am.Groups[3].Value);
+                if (tok.Contains(".")) e.Dash = 1;
+                if (tok.StartsWith("=")) e.Width = 3f;
+                if (!tok.EndsWith(">") && !tok.EndsWith("o") && !tok.EndsWith("x")) { e.ArrowEnd = false; e.ArrowSet = true; }
+                if (am.Groups[1].Value == "<") { e.ArrowStart = true; e.Both = true; e.ArrowSet = true; }
+                if (attrs != null) ApplyEdgeAttrs(d, e, attrs);
+                d.Edges.Add(e);
+            }
+        }
+    }
+
+    // "a & b, c" -> each endpoint; "node.item" -> [node, item]; inline shapes declare the node
+    static List<string[]> Endpoints(DgDoc d, string s, int li, DgGroup grp, ref int order) {
+        var r = new List<string[]>();
+        foreach (var raw in SplitTop(s.Replace("&", ","), ',')) {
+            var p = raw.Trim(); if (p.Length == 0) continue;
+            var m = Regex.Match(p, "^(" + IdRx + ")(?:\\.(\"[^\"]+\"|'[^']+'|[\\w\\-]+))?" + ShapeRx + "?(?::::\\w+)?$");
+            if (!m.Success) { d.Warnings.Add("Line " + (li + 1) + ": not a node: " + p); continue; }
+            var n = Node(d, m.Groups[1].Value, ref order);
+            if (m.Groups[3].Success && m.Groups[3].Value.Length > 0) { ApplyShape(n, m.Groups[3].Value); if (!n.Declared) { n.SrcLine = li; } }
+            if (grp != null && string.IsNullOrEmpty(n.Group)) { if (!grp.Members.Contains(n.Id)) grp.Members.Add(n.Id); n.Group = grp.Id; }
+            r.Add(new[] { n.Id, m.Groups[2].Success ? Unq(m.Groups[2].Value) : "" });
+        }
+        return r;
+    }
+
+    static void ApplyEdgeAttrs(DgDoc d, DgEdge e, string attrs) {
+        foreach (var a in Attrs(attrs)) {
+            string v = a.Value;
+            switch (a.Key) {
+                case "label": e.Label = Unq(v); break;
+                case "dashed": e.Dash = 1; break;
+                case "dotted": e.Dash = 2; break;
+                case "solid": e.Dash = 0; break;
+                case "thick": e.Width = 3f; break;
+                case "width": e.Width = F(v, 1.6f); break;
+                case "color": case "stroke": e.Color = v; break;
+                case "curve": case "curved": e.Route = "curve"; break;
+                case "straight": e.Route = "straight"; break;
+                case "ortho": case "elbow": e.Route = "ortho"; break;
+                case "route": e.Route = v.ToLowerInvariant(); break;
+                case "via": e.Via = Points(v); break;
+                case "animate": case "animated": case "flowing": e.Animate = true; break;
+                case "density": e.Density = Math.Max(0.1f, Math.Min(5, F(v, 1))); e.Animate = true; break;
+                case "both": case "twoway": e.Both = true; break;
+                case "noarrow": e.ArrowEnd = false; e.ArrowStart = false; e.ArrowSet = true; e.ArrowAttr = true; break;
+                case "arrow": { var w = v.ToLowerInvariant(); e.ArrowSet = true; e.ArrowAttr = true; e.ArrowEnd = w == "end" || w == "both" || w == "yes"; e.ArrowStart = w == "start" || w == "both"; break; }
+                case "glow": e.Glow = true; e.GlowSet = true; break;
+                case "noglow": e.Glow = false; e.GlowSet = true; break;
+                case "hidden": e.Hidden = true; break;
+                case "from": e.FromSide = v.ToLowerInvariant(); break;
+                case "to": e.ToSide = v.ToLowerInvariant(); break;
+                case "cat": case "category": case "flow": e.Cat = AutoCat(d, v.Trim()).Id; break;
+                case "": if (v.Length > 0 && !v.Contains(" ")) e.Label = Unq(v); else if (v.Length > 0) e.Label = Unq(v); break;
+                default: e.Cat = AutoCat(d, a.Key).Id; break;
+            }
+        }
+    }
+
+    // ---- Edits written back to the text (the text is the saved diagram).
+    static string[] Lines(string text) { return (text ?? "").Replace("\r\n", "\n").Split('\n'); }
+    static string Join(string[] l) { return string.Join("\r\n", l); }
+
+    // the line where node id is declared on its own (not in an edge), or -1
+    static int DeclLine(string[] l, string id) {
+        var rx = new Regex("^\\s*" + Regex.Escape(id) + "(?:\\s*:|" + ShapeRx + "|\\s*\\[|\\s*$)");
+        for (int i = 0; i < l.Length; i++) if (rx.IsMatch(l[i]) && !HasArrow(l[i])) return i;
+        return -1;
+    }
+
+    // sets (or with value null removes) an attribute on a node's line, e.g. "at" "120 80"
+    public static string SetNodeAttr(string text, string id, string key, string value) {
+        var l = Lines(text);
+        int i = DeclLine(l, id);
+        if (i < 0) {
+            if (value == null) return text;
+            var list = l.ToList(); list.Add(id + " [" + Attr(key, value) + "]"); return Join(list.ToArray());
+        }
+        l[i] = SetAttrOnLine(l[i], key, value);
+        return Join(l);
+    }
+    public static string SetEdgeAttr(string text, int lineNo, string key, string value) {
+        var l = Lines(text);
+        if (lineNo < 0 || lineNo >= l.Length) return text;
+        l[lineNo] = SetAttrOnLine(l[lineNo], key, value);
+        return Join(l);
+    }
+    static string Attr(string key, string value) { return value == "" ? key : key + " " + value; }
+
+    static string SetAttrOnLine(string line, string key, string value) {
+        var ma = Regex.Match(line, @"\s\[([^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*)\]\s*$");
+        string head = ma.Success ? line.Substring(0, ma.Index) : line.TrimEnd();
+        var items = ma.Success ? SplitTop(ma.Groups[1].Value, ',').Select(x => x.Trim()).Where(x => x.Length > 0).ToList() : new List<string>();
+        int at = -1;
+        for (int k = 0; k < items.Count; k++) {
+            var w = Regex.Match(items[k], @"^[A-Za-z][\w-]*").Value.ToLowerInvariant();
+            if (w == key || (key == "shape" && IsShapeWord(w)) || (key == "status" && (w == "ok" || w == "up" || w == "warn" || w == "down"))) { at = k; break; }
+        }
+        if (value == null) { if (at >= 0) items.RemoveAt(at); }
+        else if (at >= 0) items[at] = Attr(key, value);
+        else items.Add(Attr(key, value));
+        return items.Count > 0 ? head + " [" + string.Join(", ", items) + "]" : head;
+    }
+    static bool IsShapeWord(string w) { return w == "card" || w == "rect" || w == "rounded" || w == "pill" || w == "diamond" || w == "circle" || w == "cylinder" || w == "db" || w == "doc" || w == "hexagon" || w == "parallelogram" || w == "note" || w == "actor" || w == "table"; }
+
+    // the label: "id: Label" lines get the new label; a Mermaid "id[Label]" keeps its brackets
+    public static string SetNodeLabel(string text, string id, string label) {
+        var l = Lines(text);
+        int i = DeclLine(l, id);
+        string safe = label.Replace("\r\n", "\\n").Replace("\n", "\\n");
+        if (i < 0) { var list = l.ToList(); list.Add(id + ": " + safe); return Join(list.ToArray()); }
+        var line = l[i];
+        var ma = Regex.Match(line, @"\s\[([^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*)\]\s*$");
+        string tail = ma.Success ? line.Substring(ma.Index) : "";
+        string indent = Regex.Match(line, @"^\s*").Value;
+        l[i] = indent + id + ": " + safe + tail;
+        return Join(l);
+    }
+
+    // a multi-line property (desc, lines, items, tags): drop its indented continuation lines, then set it as an attribute
+    public static string SetNodeKey(string text, string id, string key, string value) {
+        var l = Lines(text).ToList();
+        int i = DeclLine(l.ToArray(), id);
+        if (i >= 0) {
+            int j = i + 1;
+            while (j < l.Count && l[j].Length > 0 && (l[j][0] == ' ' || l[j][0] == '\t')) {
+                var k = Regex.Match(l[j].Trim(), @"^[A-Za-z]+").Value.ToLowerInvariant();
+                bool same = k == key || (key == "desc" && (k == "description" || k == "note")) || (key == "lines" && k == "line") || (key == "url" && k == "link");
+                if (same) l.RemoveAt(j); else j++;
+            }
+        }
+        return SetNodeAttr(Join(l.ToArray()), id, key, value);
+    }
+    // a directive line ("theme midnight dark", "layout lanes"): replaced, or added after the title
+    public static string SetDirective(string text, string key, string value) {
+        var l = Lines(text).ToList();
+        var rx = new Regex("^\\s*" + Regex.Escape(key) + "\\b", RegexOptions.IgnoreCase);
+        for (int i = 0; i < l.Count; i++) if (rx.IsMatch(l[i]) && !HasArrow(l[i])) { if (value == null) l.RemoveAt(i); else l[i] = key + (value.Length > 0 ? " " + value : ""); return Join(l.ToArray()); }
+        if (value == null) return text;
+        int at = 0;
+        for (int i = 0; i < l.Count; i++) if (Regex.IsMatch(l[i], @"^\s*(title|subtitle|theme|mode|font|mono|layout|direction|spacing|radius|hide|show|graph|flowchart)\b", RegexOptions.IgnoreCase)) at = i + 1;
+        l.Insert(at, key + (value.Length > 0 ? " " + value : ""));
+        return Join(l.ToArray());
+    }
+    // a category line: category id "Name" #light / #dark
+    public static string SetCategory(string text, string id, string name, string light, string dark) {
+        var l = Lines(text).ToList();
+        string line = "category " + id + " \"" + (name ?? id).Replace("\"", "'") + "\"" + (string.IsNullOrEmpty(light) ? "" : " " + light) + (string.IsNullOrEmpty(dark) ? "" : " / " + dark);
+        var rx = new Regex("^\\s*(category|cat|flow)\\s+" + Regex.Escape(id) + "\\b", RegexOptions.IgnoreCase);
+        for (int i = 0; i < l.Count; i++) if (rx.IsMatch(l[i])) { l[i] = line; return Join(l.ToArray()); }
+        int at = 0;
+        for (int i = 0; i < l.Count; i++) if (Regex.IsMatch(l[i], @"^\s*(title|subtitle|theme|mode|font|mono|layout|direction|spacing|radius|hide|show|category|cat|graph|flowchart)\b", RegexOptions.IgnoreCase)) at = i + 1;
+        l.Insert(at, line);
+        return Join(l.ToArray());
+    }
+
+    public static string AddLine(string text, string line) { var t = (text ?? "").TrimEnd(); return (t.Length > 0 ? t + "\r\n" : "") + line; }
+
+    // removes a node: its own line(s), its continuation lines and the edges that mention it
+    public static string RemoveNode(string text, string id) {
+        var l = Lines(text).ToList();
+        var rxEnd = new Regex("(^|[\\s,&>|-])" + Regex.Escape(id) + "(\\.[\\w\"' -]+)?(?=$|[\\s,&<\\[(\\-=.{>])");
+        for (int i = 0; i < l.Count; i++) {
+            if (HasArrow(l[i]) && rxEnd.IsMatch(l[i])) { l.RemoveAt(i); i--; continue; }
+            if (Regex.IsMatch(l[i], "^\\s*" + Regex.Escape(id) + "(?:\\s*:|\\s*\\[|\\s*\\(|\\s*\\{|\\s*$)") && !HasArrow(l[i])) {
+                l.RemoveAt(i);
+                while (i < l.Count && l[i].Length > 0 && (l[i][0] == ' ' || l[i][0] == '\t') && IsNodeKey(Regex.Match(l[i].Trim(), @"^[A-Za-z]+").Value.ToLowerInvariant())) l.RemoveAt(i);
+                i--;
+            }
+        }
+        return Join(l.ToArray());
+    }
+    public static string RemoveLine(string text, int lineNo) {
+        var l = Lines(text).ToList();
+        if (lineNo >= 0 && lineNo < l.Count) l.RemoveAt(lineNo);
+        return Join(l.ToArray());
+    }
+}
+
+// ---- Measuring text (the same numbers for the window, PNG and SVG).
+public static class DgMeasure {
+    static System.Drawing.Bitmap bmp = new System.Drawing.Bitmap(1, 1);
+    static System.Drawing.Graphics g = System.Drawing.Graphics.FromImage(bmp);
+    static Dictionary<string, System.Drawing.Font> fonts = new Dictionary<string, System.Drawing.Font>();
+    public static string UiFamily = "Segoe UI", MonoFamily = "Consolas";
+    public static System.Drawing.Font Font(float px, int weight, bool mono) {
+        string k = px.ToString(CultureInfo.InvariantCulture) + "|" + weight + "|" + mono;
+        System.Drawing.Font f;
+        if (!fonts.TryGetValue(k, out f)) {
+            var style = weight >= 600 ? System.Drawing.FontStyle.Bold : System.Drawing.FontStyle.Regular;
+            string fam = mono ? MonoFamily : (weight >= 600 ? "Segoe UI Semibold" : (weight == 500 ? "Segoe UI" : "Segoe UI"));
+            if (fam == "Segoe UI Semibold") style = System.Drawing.FontStyle.Regular;
+            try { f = new System.Drawing.Font(fam, Math.Max(1, px), style, System.Drawing.GraphicsUnit.Pixel); } catch { f = new System.Drawing.Font(System.Drawing.FontFamily.GenericSansSerif, Math.Max(1, px), style, System.Drawing.GraphicsUnit.Pixel); }
+            fonts[k] = f;
+        }
+        return f;
+    }
+    public static float Width(string s, float px, int weight, bool mono) {
+        if (string.IsNullOrEmpty(s)) return 0;
+        lock (g) return g.MeasureString(s, Font(px, weight, mono), 100000, System.Drawing.StringFormat.GenericTypographic).Width * (mono ? 1.0f : 1.06f);
+    }
+}
+
+// ---- Layout: sizes, positions (lanes / layered / grid / circle / force), group frames and edge routes.
+public static class DgLayout {
+    const float Pad = 14f;
+    public static bool IsCard(DgNode n) {
+        if (!string.IsNullOrEmpty(n.Shape)) return n.Shape == "card";
+        return n.Badge.Length > 0 || n.Lines.Count > 0 || n.Items.Count > 0 || n.Spark || n.Metric.Length > 0;
+    }
+    public static float TitleSize(DgNode n, bool card) { return n.FontSize > 0 ? n.FontSize : (card ? 15f : 13.5f); }
+    public static List<string> Wrap(string s, float px, int weight, float maxW) {
+        var r = new List<string>();
+        foreach (var para in (s ?? "").Split('\n')) {
+            var words = para.Split(' '); var cur = "";
+            foreach (var w in words) {
+                var t = cur.Length == 0 ? w : cur + " " + w;
+                if (cur.Length > 0 && DgMeasure.Width(t, px, weight, false) > maxW) { r.Add(cur); cur = w; } else cur = t;
+            }
+            r.Add(cur);
+        }
+        return r;
+    }
+
+    public static void Measure(DgDoc d, DgNode n) {
+        bool card = IsCard(n);
+        string shape = card ? "card" : (string.IsNullOrEmpty(n.Shape) ? "rounded" : n.Shape);
+        float ts = TitleSize(n, card);
+        float w, h;
+        if (shape == "card") {
+            float tw = DgMeasure.Width(n.Title, ts, 600, false);
+            float lw = n.Lines.Count == 0 ? 0 : n.Lines.Max(x => DgMeasure.Width(x, 11.5f, 400, false));
+            float bw = n.Badge.Length > 0 ? DgMeasure.Width(n.Badge, 10.5f, 600, true) + 14 + 22 + (n.Metric.Length > 0 ? DgMeasure.Width(n.Metric, 10f, 400, true) + 16 : 0) : 0;
+            float iw = n.Items.Sum(x => Math.Max(32, DgMeasure.Width(x, 10.5f, 400, false) + 18)) + Math.Max(0, n.Items.Count - 1) * 40;
+            w = Math.Max(220, Math.Max(Math.Max(tw, lw), Math.Max(bw, iw)) + Pad * 2 + 8);
+            h = Pad + (n.Badge.Length > 0 || n.Metric.Length > 0 ? 28 : 0) + ts + 8 + n.Lines.Count * 16 + (n.Items.Count > 0 ? 42 : 0) + (n.Spark ? 38 : 0) + Pad - 2;
+        } else if (shape == "table") {
+            float tw = DgMeasure.Width(n.Title, 13.5f, 600, false);
+            float lw = n.Lines.Count == 0 ? 0 : n.Lines.Max(x => DgMeasure.Width(x, 11.5f, 400, true) + 44);
+            w = Math.Max(170, Math.Max(tw, lw) + 32); h = 34 + n.Lines.Count * 22 + 8;
+        } else {
+            var lines = Wrap(n.Title, ts, n.Bold ? 600 : 500, 220);
+            float tw = lines.Max(x => DgMeasure.Width(x, ts, n.Bold ? 600 : 500, false));
+            w = Math.Max(110, tw + 34); h = Math.Max(46, lines.Count * (ts + 5) + 24);
+            if (n.Badge.Length > 0) h += 18;
+            if (shape == "diamond") { w = w * 1.45f; h = h * 1.5f; }
+            else if (shape == "circle") { var m = Math.Max(w, h) * 1.05f; w = m; h = m; }
+            else if (shape == "hexagon" || shape == "parallelogram") w += 28;
+            else if (shape == "cylinder") h += 14;
+            else if (shape == "actor") { w = Math.Max(80, tw + 16); h = 86; }
+        }
+        n.W = n.SetW > 0 ? n.SetW : (float)Math.Ceiling(w);
+        n.H = n.SetH > 0 ? n.SetH : (float)Math.Ceiling(h);
+    }
+
+    // where a card's items sit (absolute)
+    public static void ItemBoxes(DgNode n) {
+        n.ItemBoxes.Clear();
+        if (n.Items.Count == 0) return;
+        float y = n.Y + n.H - Pad - (n.Spark ? 38 : 0) - 28;
+        var widths = n.Items.Select(x => Math.Max(32, DgMeasure.Width(x, 10.5f, 400, false) + 18)).ToList();
+        float inner = n.W - Pad * 2, sum = widths.Sum();
+        float gap = n.Items.Count > 1 ? (inner - sum) / (n.Items.Count - 1) : 0;
+        float x0 = n.X + Pad;
+        if (n.Items.Count == 1) x0 = n.X + (n.W - widths[0]) / 2;
+        for (int i = 0; i < n.Items.Count; i++) { float hh = widths[i] < 50 ? 20 : 28; n.ItemBoxes.Add(new System.Drawing.RectangleF(x0, y + (28 - hh) / 2, widths[i], hh)); x0 += widths[i] + gap; }
+    }
+
+    public static void Apply(DgDoc d) {
+        foreach (var n in d.Nodes) { Measure(d, n); n.Rank = -1; }
+        var vis = d.Nodes.Where(n => !n.Hidden).ToList();
+        string mode = string.IsNullOrEmpty(d.Layout) ? (d.LaneMode ? "lanes" : "layered") : d.Layout;
+        if (mode == "lanes" && !d.LaneMode) mode = "layered";
+        var auto = vis.Where(n => !n.HasPos).ToList();
+        if (auto.Count > 0) {
+            if (mode == "lanes") Lanes(d, vis);
+            else if (mode == "grid") Grid(d, auto);
+            else if (mode == "circle" || mode == "radial") Circle(d, auto);
+            else if (mode == "force") { Layered(d, vis); Force(d, auto); }
+            else Layered(d, vis);
+        }
+        foreach (var n in d.Nodes) ItemBoxes(n);
+        Frames(d);
+        DgRoute.All(d);
+        Bounds(d);
+    }
+
+    // ranks from the links (longest path; cycles are broken in declaration order)
+    static Dictionary<string, int> Ranks(DgDoc d, List<DgNode> nodes) {
+        var ids = new HashSet<string>(nodes.Select(n => n.Id));
+        var outs = nodes.ToDictionary(n => n.Id, n => new List<string>());
+        var state = nodes.ToDictionary(n => n.Id, n => 0);
+        var dag = new List<KeyValuePair<string, string>>();
+        foreach (var e in d.Edges) if (e.From != e.To && ids.Contains(e.From) && ids.Contains(e.To)) outs[e.From].Add(e.To);
+        // DFS to drop back edges
+        Action<string> dfs = null;
+        dfs = id => {
+            state[id] = 1;
+            foreach (var t in outs[id]) { if (state[t] == 0) { dag.Add(new KeyValuePair<string, string>(id, t)); dfs(t); } else if (state[t] == 2) dag.Add(new KeyValuePair<string, string>(id, t)); }
+            state[id] = 2;
+        };
+        foreach (var n in nodes.OrderBy(x => x.Order)) if (state[n.Id] == 0) dfs(n.Id);
+        var rank = nodes.ToDictionary(n => n.Id, n => 0);
+        for (int it = 0; it < nodes.Count + 1; it++) {
+            bool ch = false;
+            foreach (var kv in dag) if (rank[kv.Value] < rank[kv.Key] + 1) { rank[kv.Value] = rank[kv.Key] + 1; ch = true; }
+            if (!ch) break;
+        }
+        // pull sources right next to their first child
+        foreach (var n in nodes) {
+            var kids = dag.Where(kv => kv.Key == n.Id).Select(kv => rank[kv.Value]).ToList();
+            bool hasIn = dag.Any(kv => kv.Value == n.Id);
+            if (!hasIn && kids.Count > 0) rank[n.Id] = Math.Max(rank[n.Id], kids.Min() - 1);
+        }
+        return rank;
+    }
+
+    static void Layered(DgDoc d, List<DgNode> nodes) {
+        bool horiz = d.Direction == "LR" || d.Direction == "RL";
+        float gapMain = 90f * d.Spacing, gapCross = 34f * d.Spacing;
+        var rank = Ranks(d, nodes);
+        foreach (var n in nodes) n.Rank = rank[n.Id];
+        int maxR = rank.Count == 0 ? 0 : rank.Values.Max();
+        var layers = new List<List<DgNode>>();
+        for (int r = 0; r <= maxR; r++) layers.Add(nodes.Where(n => rank[n.Id] == r).OrderBy(n => n.Order).ToList());
+        // keep group members together, then cut crossings by barycentres
+        var nb = nodes.ToDictionary(n => n.Id, n => new List<string>());
+        foreach (var e in d.Edges) if (nb.ContainsKey(e.From) && nb.ContainsKey(e.To) && e.From != e.To) { nb[e.From].Add(e.To); nb[e.To].Add(e.From); }
+        var pos = new Dictionary<string, float>();
+        Action fill = () => { foreach (var l in layers) for (int i = 0; i < l.Count; i++) pos[l[i].Id] = i; };
+        fill();
+        for (int sweep = 0; sweep < 8; sweep++) {
+            var seq = sweep % 2 == 0 ? Enumerable.Range(1, layers.Count - 1) : Enumerable.Range(0, Math.Max(0, layers.Count - 1)).Reverse();
+            foreach (int r in seq) {
+                int other = sweep % 2 == 0 ? r - 1 : r + 1;
+                if (other < 0 || other >= layers.Count) continue;
+                var oset = new HashSet<string>(layers[other].Select(n => n.Id));
+                var bary = new Dictionary<string, float>();
+                foreach (var n in layers[r]) {
+                    var ps = nb[n.Id].Where(oset.Contains).Select(x => pos[x]).ToList();
+                    bary[n.Id] = ps.Count > 0 ? ps.Average() : pos[n.Id];
+                }
+                layers[r] = layers[r].OrderBy(n => bary[n.Id]).ThenBy(n => string.IsNullOrEmpty(n.Group) ? "" : n.Group).ThenBy(n => n.Order).ToList();
+                fill();
+            }
+        }
+        // coordinates
+        float main = 0;
+        var crossSizes = layers.Select(l => l.Sum(n => horiz ? n.H : n.W) + Math.Max(0, l.Count - 1) * gapCross).ToList();
+        float maxCross = crossSizes.Count == 0 ? 0 : crossSizes.Max();
+        for (int r = 0; r < layers.Count; r++) {
+            var l = layers[r];
+            float thick = l.Count == 0 ? 0 : l.Max(n => horiz ? n.W : n.H);
+            float c = (maxCross - crossSizes[r]) / 2;
+            foreach (var n in l) {
+                if (!n.HasPos) {
+                    if (horiz) { n.X = main + (thick - n.W) / 2; n.Y = c; } else { n.X = c; n.Y = main + (thick - n.H) / 2; }
+                    // a little more room around group frames
+                }
+                c += (horiz ? n.H : n.W) + gapCross + (string.IsNullOrEmpty(n.Group) ? 0 : 8);
+            }
+            main += thick + gapMain;
+        }
+        if (d.Direction == "RL" || d.Direction == "BT") {
+            float m = nodes.Max(n => horiz ? n.X + n.W : n.Y + n.H);
+            foreach (var n in nodes) if (!n.HasPos) { if (horiz) n.X = m - n.X - n.W; else n.Y = m - n.Y - n.H; }
+        }
+        Offset(nodes, 40, 40);
+    }
+
+    static void Lanes(DgDoc d, List<DgNode> nodes) {
+        d.LaneX.Clear(); d.LaneW.Clear();
+        var rank = Ranks(d, nodes);
+        int lanes = Math.Max(d.Lanes.Count, nodes.Count == 0 ? 0 : nodes.Max(n => n.Lane >= 0 ? n.Lane + 1 : (rank[n.Id] + 1)));
+        var cols = new List<List<DgNode>>();
+        for (int i = 0; i < lanes; i++) cols.Add(new List<DgNode>());
+        foreach (var n in nodes.OrderBy(q => q.Order)) { int li = n.Lane >= 0 ? Math.Min(n.Lane, lanes - 1) : Math.Min(rank[n.Id], lanes - 1); n.Rank = li; cols[li].Add(n); }
+        float gapX = 110f * d.Spacing, gapY = 24f * d.Spacing, top = d.Lanes.Count > 0 ? 70f : 40f;
+        // stacked heights (group frames need room for their title)
+        Func<List<DgNode>, float> height = col => {
+            float h = 0; string g = null;
+            for (int i = 0; i < col.Count; i++) {
+                var n = col[i];
+                if (!string.IsNullOrEmpty(n.Group) && n.Group != g) h += 30;
+                if (!string.IsNullOrEmpty(n.Group) && (i == col.Count - 1 || col[i + 1].Group != n.Group)) h += 14;
+                g = n.Group;
+                h += n.H + (i > 0 ? gapY : 0);
+            }
+            return h;
+        };
+        float tallest = cols.Count == 0 ? 0 : cols.Max(c => height(c));
+        float x = 40;
+        for (int ci = 0; ci < cols.Count; ci++) {
+            var col = cols[ci];
+            float w = col.Count == 0 ? 200 : col.Max(n => n.W);
+            float h = height(col);
+            int k = col.Count;
+            float extra = k > 0 ? (tallest - h) / (k + 1) : 0;
+            float y = top + extra; string g = null;
+            for (int i = 0; i < col.Count; i++) {
+                var n = col[i];
+                if (!string.IsNullOrEmpty(n.Group) && n.Group != g) y += 30;
+                g = n.Group;
+                if (!n.HasPos) { n.X = x + (w - n.W) / 2; n.Y = y; }
+                y += n.H + gapY + extra;
+                if (!string.IsNullOrEmpty(n.Group) && (i == col.Count - 1 || col[i + 1].Group != n.Group)) y += 14;
+            }
+            d.LaneX.Add(x); d.LaneW.Add(w);
+            x += w + gapX;
+        }
+    }
+
+    static void Grid(DgDoc d, List<DgNode> nodes) {
+        int cols = Math.Max(1, (int)Math.Ceiling(Math.Sqrt(nodes.Count)));
+        float cw = nodes.Max(n => n.W) + 50 * d.Spacing, ch = nodes.Max(n => n.H) + 50 * d.Spacing;
+        for (int i = 0; i < nodes.Count; i++) { nodes[i].X = 40 + (i % cols) * cw; nodes[i].Y = 40 + (i / cols) * ch; }
+    }
+    static void Circle(DgDoc d, List<DgNode> nodes) {
+        float big = nodes.Max(n => Math.Max(n.W, n.H));
+        float r = Math.Max(160, nodes.Count * (big + 30 * d.Spacing) / (float)(2 * Math.PI));
+        for (int i = 0; i < nodes.Count; i++) {
+            double a = -Math.PI / 2 + 2 * Math.PI * i / nodes.Count;
+            nodes[i].X = 40 + r + (float)(r * Math.Cos(a)) - nodes[i].W / 2 + big / 2; nodes[i].Y = 40 + r + (float)(r * Math.Sin(a)) - nodes[i].H / 2 + big / 2;
+        }
+    }
+    static void Force(DgDoc d, List<DgNode> nodes) {
+        var idx = nodes.Select((n, i) => new { n, i }).ToDictionary(x => x.n.Id, x => x.i);
+        float k = 180f * d.Spacing;
+        for (int it = 0; it < 250; it++) {
+            var disp = new System.Drawing.PointF[nodes.Count];
+            for (int i = 0; i < nodes.Count; i++) for (int j = i + 1; j < nodes.Count; j++) {
+                var a = nodes[i].Center; var b = nodes[j].Center;
+                float dx = a.X - b.X, dy = a.Y - b.Y, dist = Math.Max(1f, (float)Math.Sqrt(dx * dx + dy * dy));
+                float f = k * k / dist; dx = dx / dist * f; dy = dy / dist * f;
+                disp[i] = new System.Drawing.PointF(disp[i].X + dx, disp[i].Y + dy); disp[j] = new System.Drawing.PointF(disp[j].X - dx, disp[j].Y - dy);
+            }
+            foreach (var e in d.Edges) {
+                int i, j; if (!idx.TryGetValue(e.From, out i) || !idx.TryGetValue(e.To, out j) || i == j) continue;
+                var a = nodes[i].Center; var b = nodes[j].Center;
+                float dx = a.X - b.X, dy = a.Y - b.Y, dist = Math.Max(1f, (float)Math.Sqrt(dx * dx + dy * dy));
+                float f = dist * dist / k; dx = dx / dist * f; dy = dy / dist * f;
+                disp[i] = new System.Drawing.PointF(disp[i].X - dx, disp[i].Y - dy); disp[j] = new System.Drawing.PointF(disp[j].X + dx, disp[j].Y + dy);
+            }
+            float temp = 30f * (1 - it / 250f) + 1;
+            for (int i = 0; i < nodes.Count; i++) {
+                float len = Math.Max(0.01f, (float)Math.Sqrt(disp[i].X * disp[i].X + disp[i].Y * disp[i].Y));
+                nodes[i].X += disp[i].X / len * Math.Min(len, temp); nodes[i].Y += disp[i].Y / len * Math.Min(len, temp);
+            }
+        }
+        Offset(nodes, 40, 40);
+    }
+    static void Offset(List<DgNode> nodes, float x, float y) {
+        var auto = nodes.Where(n => !n.HasPos).ToList();
+        if (auto.Count == 0) return;
+        float mx = auto.Min(n => n.X), my = auto.Min(n => n.Y);
+        foreach (var n in auto) { n.X += x - mx; n.Y += y - my; }
+    }
+
+    static void Frames(DgDoc d) {
+        foreach (var g in d.Groups) {
+            var ms = g.Members.Select(m => d.Find(m)).Where(n => n != null && !n.Hidden).ToList();
+            if (ms.Count == 0) { g.Box = System.Drawing.RectangleF.Empty; continue; }
+            float x0 = ms.Min(n => n.X) - 16, y0 = ms.Min(n => n.Y) - 30, x1 = ms.Max(n => n.X + n.W) + 16, y1 = ms.Max(n => n.Y + n.H) + 14;
+            float tw = DgMeasure.Width(g.Title, 14, 600, false) + 32;
+            if (x1 - x0 < tw) { float c = (x0 + x1) / 2; x0 = c - tw / 2; x1 = c + tw / 2; }
+            g.Box = new System.Drawing.RectangleF(x0, y0, x1 - x0, y1 - y0);
+        }
+    }
+
+    static void Bounds(DgDoc d) {
+        var rs = new List<System.Drawing.RectangleF>();
+        foreach (var n in d.Nodes) if (!n.Hidden) rs.Add(n.Box);
+        foreach (var g in d.Groups) if (!g.Box.IsEmpty) rs.Add(g.Box);
+        foreach (var e in d.Edges) foreach (var p in e.Pts) rs.Add(new System.Drawing.RectangleF(p.X - 2, p.Y - 2, 4, 4));
+        if (rs.Count == 0) { d.Bounds = new System.Drawing.RectangleF(0, 0, 400, 300); return; }
+        float x0 = rs.Min(r => r.X), y0 = rs.Min(r => r.Y), x1 = rs.Max(r => r.Right), y1 = rs.Max(r => r.Bottom);
+        if (d.Lanes.Count > 0 && d.LaneX.Count > 0) { y0 = Math.Min(y0, 34); x1 = Math.Max(x1, d.LaneX[d.LaneX.Count - 1] + d.LaneW[d.LaneW.Count - 1]); }
+        d.Bounds = System.Drawing.RectangleF.FromLTRB(x0 - 24, y0 - 20, x1 + 24, y1 + 24);
+    }
+}
+
+// ---- Routes between nodes (ports spread along each side, right-angled corridors, curves or straight lines).
+public static class DgRoute {
+    class End { public DgEdge E; public bool Src; public System.Drawing.RectangleF Box; public string Side; public float Other; public System.Drawing.PointF P; }
+
+    static System.Drawing.RectangleF BoxOf(DgDoc d, string id, string item) {
+        var n = d.Find(id);
+        if (n == null) return System.Drawing.RectangleF.Empty;
+        int i = n.ItemIndex(item);
+        return i >= 0 && i < n.ItemBoxes.Count ? n.ItemBoxes[i] : n.Box;
+    }
+    static System.Drawing.PointF C(System.Drawing.RectangleF r) { return new System.Drawing.PointF(r.X + r.Width / 2, r.Y + r.Height / 2); }
+
+    public static void All(DgDoc d) {
+        var ends = new List<End>();
+        foreach (var e in d.Edges) {
+            e.Pts.Clear(); e.PathD = "";
+            var a = BoxOf(d, e.From, e.FromItem); var b = BoxOf(d, e.To, e.ToItem);
+            if (a.IsEmpty || b.IsEmpty) continue;
+            var na = d.Find(e.From); var nbn = d.Find(e.To);
+            if (na.Hidden || nbn.Hidden || e.Hidden) continue;
+            string sa = e.FromSide, sb = e.ToSide;
+            var ca = C(a); var cb = C(b);
+            bool horiz = d.LaneMode || d.Direction == "LR" || d.Direction == "RL";
+            if (string.IsNullOrEmpty(sa) || string.IsNullOrEmpty(sb)) {
+                float dx = cb.X - ca.X, dy = cb.Y - ca.Y;
+                bool useH;
+                if (e.From == e.To && e.FromItem != e.ToItem) useH = Math.Abs(dx) >= Math.Abs(dy);
+                else if (horiz) useH = Math.Abs(dx) > Math.Min(a.Width, b.Width) * 0.5f || Math.Abs(dx) > Math.Abs(dy);
+                else useH = Math.Abs(dy) < Math.Min(a.Height, b.Height) * 0.5f && Math.Abs(dx) > Math.Abs(dy);
+                if (string.IsNullOrEmpty(sa)) sa = useH ? (dx >= 0 ? "right" : "left") : (dy >= 0 ? "bottom" : "top");
+                if (string.IsNullOrEmpty(sb)) sb = useH ? (dx >= 0 ? "left" : "right") : (dy >= 0 ? "top" : "bottom");
+            }
+            e.Detour = float.NaN;
+            bool autoSides = string.IsNullOrEmpty(e.FromSide) && string.IsNullOrEmpty(e.ToSide) && e.Via.Count == 0 && e.From != e.To && e.Route != "straight" && !(string.IsNullOrEmpty(e.Route) && d.Route == "straight");
+            if (autoSides && na.Rank >= 0 && nbn.Rank >= 0 && !d.LaneMode) {
+                int dr = nbn.Rank - na.Rank;
+                bool flip = d.Direction == "RL" || d.Direction == "BT";
+                if (flip) dr = -dr;
+                if (dr > 1 || dr <= 0) {
+                    int lo = Math.Min(na.Rank, nbn.Rank), hi = Math.Max(na.Rank, nbn.Rank);
+                    var between = d.Nodes.Where(q => !q.Hidden && q.Rank >= lo && q.Rank <= hi).ToList();
+                    if (horiz) {
+                        bool above = cb.Y < ca.Y - 4 || (dr <= 0 && false);
+                        sa = above ? "top" : "bottom"; sb = sa;
+                        e.Detour = above ? between.Min(q => q.Y) - 22 : between.Max(q => q.Y + q.H) + 22;
+                    } else {
+                        bool left = cb.X < ca.X - 4;
+                        if (dr <= 0) left = false;
+                        sa = left ? "left" : "right"; sb = sa;
+                        e.Detour = left ? between.Min(q => q.X) - 22 : between.Max(q => q.X + q.W) + 22;
+                    }
+                }
+            }
+            ends.Add(new End { E = e, Src = true, Box = a, Side = sa, Other = sa == "left" || sa == "right" ? cb.Y : cb.X });
+            ends.Add(new End { E = e, Src = false, Box = b, Side = sb, Other = sb == "left" || sb == "right" ? ca.Y : ca.X });
+        }
+        // spread the ports along each side, in the order of where the other ends are
+        foreach (var grp in ends.GroupBy(x => x.Box.ToString() + "|" + x.Side)) {
+            var l = grp.OrderBy(x => x.Other).ToList();
+            var r = l[0].Box; string side = l[0].Side;
+            bool vert = side == "left" || side == "right";
+            float len = vert ? r.Height : r.Width;
+            float margin = Math.Min(len * 0.2f, 16f);
+            // the same edge pair going out and back (a <-> b drawn twice) shares nothing special; items are small: use the middle
+            var owner = l[0].Src ? d.Find(l[0].E.From) : d.Find(l[0].E.To);
+            bool tip = owner != null && !DgLayout.IsCard(owner) && (owner.Shape == "diamond" || owner.Shape == "circle" || owner.Shape == "actor");
+            bool isItem = l[0].Src ? !string.IsNullOrEmpty(l[0].E.FromItem) : !string.IsNullOrEmpty(l[0].E.ToItem);
+            for (int i = 0; i < l.Count; i++) {
+                float t = l.Count == 1 || len < 40 || isItem ? len / 2 : tip ? len / 2 + (i - (l.Count - 1) / 2f) * 9 : margin + (len - 2 * margin) * (i + 0.5f) / l.Count;
+                l[i].P = side == "left" ? new System.Drawing.PointF(r.X, r.Y + t) : side == "right" ? new System.Drawing.PointF(r.Right, r.Y + t)
+                       : side == "top" ? new System.Drawing.PointF(r.X + t, r.Y) : new System.Drawing.PointF(r.X + t, r.Bottom);
+            }
+        }
+        var byEdge = ends.GroupBy(x => x.E).ToDictionary(g => g.Key, g => g.ToList());
+        // a few pixels apart: one straight line instead of a tiny step
+        foreach (var kv in byEdge) {
+            if (kv.Value.Count < 2 || !float.IsNaN(kv.Key.Detour)) continue;
+            var s0 = kv.Value[0]; var t0 = kv.Value[1];
+            bool hs = IsH(s0.Side) && IsH(t0.Side) && s0.Side != t0.Side, vs = !IsH(s0.Side) && !IsH(t0.Side) && s0.Side != t0.Side;
+            if (hs && Math.Abs(s0.P.Y - t0.P.Y) < 14) {
+                float y = (s0.P.Y + t0.P.Y) / 2;
+                float lo = Math.Max(s0.Box.Y, t0.Box.Y) + 6, hi = Math.Min(s0.Box.Bottom, t0.Box.Bottom) - 6;
+                if (lo <= hi) { y = Math.Max(lo, Math.Min(hi, y)); s0.P = new System.Drawing.PointF(s0.P.X, y); t0.P = new System.Drawing.PointF(t0.P.X, y); }
+            } else if (vs && Math.Abs(s0.P.X - t0.P.X) < 14) {
+                float x = (s0.P.X + t0.P.X) / 2;
+                float lo = Math.Max(s0.Box.X, t0.Box.X) + 6, hi = Math.Min(s0.Box.Right, t0.Box.Right) - 6;
+                if (lo <= hi) { x = Math.Max(lo, Math.Min(hi, x)); s0.P = new System.Drawing.PointF(x, s0.P.Y); t0.P = new System.Drawing.PointF(x, t0.P.Y); }
+            }
+        }
+        // detours that share a side are spread apart
+        foreach (var grp in byEdge.Keys.Where(k => !float.IsNaN(k.Detour)).GroupBy(k => byEdge[k][0].Side)) {
+            int k = 0;
+            foreach (var e in grp.OrderBy(x => Math.Abs(x.Detour))) { string side = grp.Key; float off = k * 12; e.Detour += side == "left" || side == "top" ? -off : off; k++; }
+        }
+        // corridors: links from the same node side share one trunk; different nodes get their own lane in the gap
+        var trunk = new Dictionary<DgEdge, float>();
+        var hEdges = byEdge.Where(kv => IsH(kv.Value[0].Side) && IsH(kv.Value[1].Side) && kv.Key.Via.Count == 0).ToList();
+        foreach (var gap in hEdges.GroupBy(kv => GapKey(kv.Value[0].P.X, kv.Value[1].P.X))) {
+            var srcs = gap.Select(kv => kv.Key.From + "|" + kv.Value[0].Side).Distinct().ToList();
+            foreach (var kv in gap) {
+                float x0 = kv.Value[0].P.X, x1 = kv.Value[1].P.X;
+                int k = srcs.IndexOf(kv.Key.From + "|" + kv.Value[0].Side);
+                float lo = Math.Min(x0, x1), hi = Math.Max(x0, x1);
+                float span = hi - lo;
+                float mid = srcs.Count <= 1 ? lo + Math.Min(span / 2, Math.Max(24, span * 0.5f)) : lo + span * (k + 1) / (srcs.Count + 1);
+                if (span < 24) mid = (x0 + x1) / 2;
+                trunk[kv.Key] = mid;
+            }
+        }
+        var vEdges = byEdge.Where(kv => !IsH(kv.Value[0].Side) && !IsH(kv.Value[1].Side) && kv.Key.Via.Count == 0).ToList();
+        foreach (var gap in vEdges.GroupBy(kv => GapKey(kv.Value[0].P.Y, kv.Value[1].P.Y))) {
+            var srcs = gap.Select(kv => kv.Key.From + "|" + kv.Value[0].Side).Distinct().ToList();
+            foreach (var kv in gap) {
+                float y0 = kv.Value[0].P.Y, y1 = kv.Value[1].P.Y;
+                int k = srcs.IndexOf(kv.Key.From + "|" + kv.Value[0].Side);
+                float lo = Math.Min(y0, y1), hi = Math.Max(y0, y1), span = hi - lo;
+                trunk[kv.Key] = srcs.Count <= 1 ? (y0 + y1) / 2 : lo + span * (k + 1) / (srcs.Count + 1);
+            }
+        }
+        foreach (var kv in byEdge) {
+            var e = kv.Key; var s = kv.Value[0]; var t = kv.Value[1];
+            string route = !string.IsNullOrEmpty(e.Route) ? e.Route : (!string.IsNullOrEmpty(d.Route) ? d.Route : "ortho");
+            var pts = new List<System.Drawing.PointF>();
+            pts.Add(s.P);
+            if (route == "curve") {
+                e.Curved = true;
+                float dist = (float)Math.Sqrt(Sq(t.P.X - s.P.X) + Sq(t.P.Y - s.P.Y)) * 0.45f;
+                if (!float.IsNaN(e.Detour)) dist = (IsH(s.Side) ? Math.Abs(e.Detour - s.P.X) : Math.Abs(e.Detour - s.P.Y)) * 1.34f;
+                var c1 = Out(s.P, s.Side, dist); var c2 = Out(t.P, t.Side, dist);
+                e.PathD = "M" + P(s.P) + " C" + P(c1) + " " + P(c2) + " " + P(t.P);
+                for (int i = 1; i <= 24; i++) pts.Add(Bez(s.P, c1, c2, t.P, i / 24f));
+                e.Pts = pts; continue;
+            }
+            e.Curved = false;
+            if (!float.IsNaN(e.Detour) && route != "straight") {
+                if (IsH(s.Side)) { pts.Add(new System.Drawing.PointF(e.Detour, s.P.Y)); pts.Add(new System.Drawing.PointF(e.Detour, t.P.Y)); }
+                else { pts.Add(new System.Drawing.PointF(s.P.X, e.Detour)); pts.Add(new System.Drawing.PointF(t.P.X, e.Detour)); }
+                pts.Add(t.P);
+                e.Pts = Clean(pts); e.PathD = RoundedPath(e.Pts, 10);
+                continue;
+            }
+            if (route == "straight") { pts.Add(t.P); }
+            else if (e.Via.Count > 0) {
+                var cur = s.P; bool h = IsH(s.Side);
+                foreach (var v in e.Via) { if (h) pts.Add(new System.Drawing.PointF(v.X, cur.Y)); else pts.Add(new System.Drawing.PointF(cur.X, v.Y)); pts.Add(v); cur = v; }
+                if (IsH(t.Side)) pts.Add(new System.Drawing.PointF(cur.X, t.P.Y)); else pts.Add(new System.Drawing.PointF(t.P.X, cur.Y));
+                pts.Add(t.P);
+            } else if (IsH(s.Side) && IsH(t.Side)) {
+                float mx; if (!trunk.TryGetValue(e, out mx)) mx = (s.P.X + t.P.X) / 2;
+                bool back = (s.Side == "right" && t.P.X < s.P.X + 8) || (s.Side == "left" && t.P.X > s.P.X - 8);
+                if (back && Math.Abs(t.P.Y - s.P.Y) > 1) {
+                    float o1 = s.Side == "right" ? s.P.X + 20 : s.P.X - 20, o2 = t.Side == "left" ? t.P.X - 20 : t.P.X + 20;
+                    float my = Math.Max(s.Box.Bottom, t.Box.Bottom) + 22;
+                    pts.Add(new System.Drawing.PointF(o1, s.P.Y)); pts.Add(new System.Drawing.PointF(o1, my)); pts.Add(new System.Drawing.PointF(o2, my)); pts.Add(new System.Drawing.PointF(o2, t.P.Y));
+                } else if (Math.Abs(s.P.Y - t.P.Y) > 0.5f) { pts.Add(new System.Drawing.PointF(mx, s.P.Y)); pts.Add(new System.Drawing.PointF(mx, t.P.Y)); }
+                pts.Add(t.P);
+            } else if (!IsH(s.Side) && !IsH(t.Side)) {
+                float my; if (!trunk.TryGetValue(e, out my)) my = (s.P.Y + t.P.Y) / 2;
+                if (Math.Abs(s.P.X - t.P.X) > 0.5f) { pts.Add(new System.Drawing.PointF(s.P.X, my)); pts.Add(new System.Drawing.PointF(t.P.X, my)); }
+                pts.Add(t.P);
+            } else if (IsH(s.Side)) { pts.Add(new System.Drawing.PointF(t.P.X, s.P.Y)); pts.Add(t.P); }
+            else { pts.Add(new System.Drawing.PointF(s.P.X, t.P.Y)); pts.Add(t.P); }
+            e.Pts = Clean(pts);
+            e.PathD = RoundedPath(e.Pts, 8);
+        }
+    }
+    static bool IsH(string side) { return side == "left" || side == "right"; }
+    static string GapKey(float a, float b) { return ((int)Math.Round(Math.Min(a, b) / 6)).ToString() + ":" + ((int)Math.Round(Math.Max(a, b) / 6)).ToString(); }
+    static float Sq(float v) { return v * v; }
+    static System.Drawing.PointF Out(System.Drawing.PointF p, string side, float d) {
+        switch (side) { case "left": return new System.Drawing.PointF(p.X - d, p.Y); case "right": return new System.Drawing.PointF(p.X + d, p.Y); case "top": return new System.Drawing.PointF(p.X, p.Y - d); default: return new System.Drawing.PointF(p.X, p.Y + d); }
+    }
+    static System.Drawing.PointF Bez(System.Drawing.PointF a, System.Drawing.PointF b, System.Drawing.PointF c, System.Drawing.PointF d, float t) {
+        float u = 1 - t;
+        return new System.Drawing.PointF(u * u * u * a.X + 3 * u * u * t * b.X + 3 * u * t * t * c.X + t * t * t * d.X, u * u * u * a.Y + 3 * u * u * t * b.Y + 3 * u * t * t * c.Y + t * t * t * d.Y);
+    }
+    static List<System.Drawing.PointF> Clean(List<System.Drawing.PointF> p) {
+        var r = new List<System.Drawing.PointF>();
+        foreach (var q in p) { if (r.Count > 0 && Math.Abs(r[r.Count - 1].X - q.X) < 0.5f && Math.Abs(r[r.Count - 1].Y - q.Y) < 0.5f) continue; r.Add(q); }
+        // drop middle points on a straight line
+        for (int i = r.Count - 2; i >= 1; i--) {
+            var a = r[i - 1]; var b = r[i]; var c = r[i + 1];
+            if ((Math.Abs(a.X - b.X) < 0.5f && Math.Abs(b.X - c.X) < 0.5f) || (Math.Abs(a.Y - b.Y) < 0.5f && Math.Abs(b.Y - c.Y) < 0.5f)) r.RemoveAt(i);
+        }
+        return r;
+    }
+    public static string P(System.Drawing.PointF p) { return N(p.X) + "," + N(p.Y); }
+    public static string N(float v) { return Math.Round(v, 1).ToString(CultureInfo.InvariantCulture); }
+    // a polyline with rounded corners as path data (M L Q)
+    public static string RoundedPath(List<System.Drawing.PointF> p, float r) {
+        if (p.Count == 0) return "";
+        var sb = new StringBuilder("M" + P(p[0]));
+        for (int i = 1; i < p.Count; i++) {
+            if (i == p.Count - 1) { sb.Append(" L" + P(p[i])); break; }
+            var a = p[i - 1]; var b = p[i]; var c = p[i + 1];
+            float l1 = (float)Math.Sqrt(Sq(b.X - a.X) + Sq(b.Y - a.Y)), l2 = (float)Math.Sqrt(Sq(c.X - b.X) + Sq(c.Y - b.Y));
+            float rr = Math.Min(r, Math.Min(l1, l2) / 2);
+            if (rr < 0.5f) { sb.Append(" L" + P(b)); continue; }
+            var p1 = new System.Drawing.PointF(b.X - (b.X - a.X) / l1 * rr, b.Y - (b.Y - a.Y) / l1 * rr);
+            var p2 = new System.Drawing.PointF(b.X + (c.X - b.X) / l2 * rr, b.Y + (c.Y - b.Y) / l2 * rr);
+            sb.Append(" L" + P(p1) + " Q" + P(b) + " " + P(p2));
+        }
+        return sb.ToString();
+    }
+    // a point d along a polyline, and its direction
+    public static System.Drawing.PointF At(List<System.Drawing.PointF> p, float d, out float angle) {
+        angle = 0;
+        if (p.Count == 0) return System.Drawing.PointF.Empty;
+        if (p.Count == 1) return p[0];
+        for (int i = 1; i < p.Count; i++) {
+            float l = (float)Math.Sqrt(Sq(p[i].X - p[i - 1].X) + Sq(p[i].Y - p[i - 1].Y));
+            angle = (float)Math.Atan2(p[i].Y - p[i - 1].Y, p[i].X - p[i - 1].X);
+            if (d <= l || i == p.Count - 1) { float f = l > 0 ? Math.Max(0, Math.Min(1, d / l)) : 0; return new System.Drawing.PointF(p[i - 1].X + (p[i].X - p[i - 1].X) * f, p[i - 1].Y + (p[i].Y - p[i - 1].Y) * f); }
+            d -= l;
+        }
+        return p[p.Count - 1];
+    }
+    public static float Length(List<System.Drawing.PointF> p) { float s = 0; for (int i = 1; i < p.Count; i++) s += (float)Math.Sqrt(Sq(p[i].X - p[i - 1].X) + Sq(p[i].Y - p[i - 1].Y)); return s; }
+}
+
+// ---- Painters: the same drawing goes to GDI+ (window, PNG) or to SVG text.
+public interface IDgPainter {
+    void Begin(string cls, string id, string data);
+    void End();
+    void Rect(float x, float y, float w, float h, float r, string fill, string stroke, float sw, int dash, float opacity);
+    void Ellipse(float cx, float cy, float rx, float ry, string fill, string stroke, float sw, float opacity);
+    void Path(string d, string fill, string stroke, float sw, int dash, float opacity, string cls);
+    void Text(float x, float y, string text, float px, int weight, string color, string anchor, bool mono, float opacity, float spacing, string cls);
+}
+
+public class DgSvgPainter : IDgPainter {
+    public StringBuilder Sb = new StringBuilder();
+    int depth = 2;
+    public bool Pretty = true;
+    public string FontVar = "var(--font)", MonoVar = "var(--mono)";
+    static string N(float v) { return DgRoute.N(v); }
+    public static string Esc(string s) { return (s ?? "").Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;"); }
+    void Line(string s) { if (Pretty) Sb.Append(' ', depth * 2); Sb.Append(s); if (Pretty) Sb.Append('\n'); }
+    static string Dash(int dash, float sw) { return dash == 1 ? ";stroke-dasharray:" + N(Math.Max(4, sw * 3)) + " " + N(Math.Max(3, sw * 2.4f)) : dash == 2 ? ";stroke-dasharray:1 " + N(Math.Max(3, sw * 2.2f)) + ";stroke-linecap:round" : ""; }
+    static string Op(float o) { return o < 0.999f ? ";opacity:" + N(o) : ""; }
+    public void Begin(string cls, string id, string data) {
+        var a = new StringBuilder("<g");
+        if (!string.IsNullOrEmpty(id)) a.Append(" id=\"" + Esc(id) + "\"");
+        if (!string.IsNullOrEmpty(cls)) a.Append(" class=\"" + Esc(cls) + "\"");
+        if (!string.IsNullOrEmpty(data)) a.Append(" " + data);
+        a.Append(">");
+        Line(a.ToString()); depth++;
+    }
+    public void End() { depth--; Line("</g>"); }
+    public void Rect(float x, float y, float w, float h, float r, string fill, string stroke, float sw, int dash, float opacity) {
+        Line("<rect x=\"" + N(x) + "\" y=\"" + N(y) + "\" width=\"" + N(w) + "\" height=\"" + N(h) + "\"" + (r > 0 ? " rx=\"" + N(r) + "\"" : "") +
+             " style=\"fill:" + (fill ?? "none") + (stroke != null ? ";stroke:" + stroke + ";stroke-width:" + N(sw) : "") + Dash(dash, sw) + Op(opacity) + "\"/>");
+    }
+    public void Ellipse(float cx, float cy, float rx, float ry, string fill, string stroke, float sw, float opacity) {
+        Line((Math.Abs(rx - ry) < 0.01f ? "<circle cx=\"" + N(cx) + "\" cy=\"" + N(cy) + "\" r=\"" + N(rx) + "\"" : "<ellipse cx=\"" + N(cx) + "\" cy=\"" + N(cy) + "\" rx=\"" + N(rx) + "\" ry=\"" + N(ry) + "\"") +
+             " style=\"fill:" + (fill ?? "none") + (stroke != null ? ";stroke:" + stroke + ";stroke-width:" + N(sw) : "") + Op(opacity) + "\"/>");
+    }
+    public void Path(string d, string fill, string stroke, float sw, int dash, float opacity, string cls) {
+        Line("<path" + (string.IsNullOrEmpty(cls) ? "" : " class=\"" + cls + "\"") + " d=\"" + d + "\" style=\"fill:" + (fill ?? "none") + (stroke != null ? ";stroke:" + stroke + ";stroke-width:" + N(sw) + ";stroke-linejoin:round;stroke-linecap:round" : "") + Dash(dash, sw) + Op(opacity) + "\"/>");
+    }
+    public void Text(float x, float y, string text, float px, int weight, string color, string anchor, bool mono, float opacity, float spacing, string cls) {
+        Line("<text" + (string.IsNullOrEmpty(cls) ? "" : " class=\"" + cls + "\"") + " x=\"" + N(x) + "\" y=\"" + N(y) + "\" style=\"" + (anchor != "start" ? "text-anchor:" + anchor + ";" : "") +
+             (mono ? "font-family:" + MonoVar + ";" : "") + "font-size:" + N(px) + "px;" + (weight != 400 ? "font-weight:" + weight + ";" : "") + (spacing > 0 ? "letter-spacing:" + N(spacing) + "em;" : "") + "fill:" + color + Op(opacity) + "\">" + Esc(text) + "</text>");
+    }
+}
+
+public class DgGdiPainter : IDgPainter {
+    public System.Drawing.Graphics G;
+    Stack<float> alpha = new Stack<float>();
+    public float GroupAlpha = 1f;
+    public DgGdiPainter(System.Drawing.Graphics g) { G = g; }
+    System.Drawing.Color Col(string s, float o) {
+        var c = DgColors.Parse(s);
+        return System.Drawing.Color.FromArgb((int)Math.Max(0, Math.Min(255, c.A * o * GroupAlpha)), c.R, c.G, c.B);
+    }
+    public void Begin(string cls, string id, string data) { alpha.Push(GroupAlpha); }
+    public void End() { if (alpha.Count > 0) GroupAlpha = alpha.Pop(); }
+    System.Drawing.Pen Pen(string stroke, float sw, int dash, float o) {
+        var p = new System.Drawing.Pen(Col(stroke, o), sw);
+        p.LineJoin = System.Drawing.Drawing2D.LineJoin.Round;
+        if (dash == 1) p.DashPattern = new float[] { Math.Max(4, sw * 3) / sw, Math.Max(3, sw * 2.4f) / sw };
+        else if (dash == 2) { p.DashCap = System.Drawing.Drawing2D.DashCap.Round; p.DashPattern = new float[] { 0.1f, Math.Max(3, sw * 2.2f) / sw }; }
+        else { p.StartCap = System.Drawing.Drawing2D.LineCap.Round; p.EndCap = System.Drawing.Drawing2D.LineCap.Round; }
+        return p;
+    }
+    public static System.Drawing.Drawing2D.GraphicsPath RoundRect(float x, float y, float w, float h, float r) {
+        var gp = new System.Drawing.Drawing2D.GraphicsPath();
+        r = Math.Min(r, Math.Min(w, h) / 2);
+        if (r <= 0.1f) { gp.AddRectangle(new System.Drawing.RectangleF(x, y, w, h)); return gp; }
+        float dd = r * 2;
+        gp.AddArc(x, y, dd, dd, 180, 90); gp.AddArc(x + w - dd, y, dd, dd, 270, 90); gp.AddArc(x + w - dd, y + h - dd, dd, dd, 0, 90); gp.AddArc(x, y + h - dd, dd, dd, 90, 90);
+        gp.CloseFigure();
+        return gp;
+    }
+    public void Rect(float x, float y, float w, float h, float r, string fill, string stroke, float sw, int dash, float opacity) {
+        using (var gp = RoundRect(x, y, w, h, r)) {
+            if (fill != null && fill != "none") using (var b = new System.Drawing.SolidBrush(Col(fill, opacity))) G.FillPath(b, gp);
+            if (stroke != null) using (var p = Pen(stroke, sw, dash, opacity)) G.DrawPath(p, gp);
+        }
+    }
+    public void Ellipse(float cx, float cy, float rx, float ry, string fill, string stroke, float sw, float opacity) {
+        if (fill != null && fill != "none") using (var b = new System.Drawing.SolidBrush(Col(fill, opacity))) G.FillEllipse(b, cx - rx, cy - ry, rx * 2, ry * 2);
+        if (stroke != null) using (var p = Pen(stroke, sw, 0, opacity)) G.DrawEllipse(p, cx - rx, cy - ry, rx * 2, ry * 2);
+    }
+    // path data with M L Q C Z (what DgRender writes)
+    public static System.Drawing.Drawing2D.GraphicsPath ToPath(string d) {
+        var gp = new System.Drawing.Drawing2D.GraphicsPath();
+        var tok = Regex.Matches(d ?? "", @"[MLQCZmlqcz]|-?\d+(?:\.\d+)?").Cast<Match>().Select(m => m.Value).ToList();
+        var cur = new System.Drawing.PointF(0, 0); var start = cur; int i = 0; char cmd = 'M';
+        Func<float> num = () => float.Parse(tok[i++], CultureInfo.InvariantCulture);
+        while (i < tok.Count) {
+            if (char.IsLetter(tok[i][0])) cmd = tok[i++][0];
+            if (cmd == 'Z' || cmd == 'z') { gp.CloseFigure(); cur = start; continue; }
+            if (i >= tok.Count) break;
+            if (cmd == 'M') { cur = new System.Drawing.PointF(num(), num()); start = cur; gp.StartFigure(); cmd = 'L'; continue; }
+            if (cmd == 'L') { var p = new System.Drawing.PointF(num(), num()); gp.AddLine(cur, p); cur = p; continue; }
+            if (cmd == 'Q') { var c = new System.Drawing.PointF(num(), num()); var p = new System.Drawing.PointF(num(), num());
+                var c1 = new System.Drawing.PointF(cur.X + 2f / 3 * (c.X - cur.X), cur.Y + 2f / 3 * (c.Y - cur.Y)); var c2 = new System.Drawing.PointF(p.X + 2f / 3 * (c.X - p.X), p.Y + 2f / 3 * (c.Y - p.Y));
+                gp.AddBezier(cur, c1, c2, p); cur = p; continue; }
+            if (cmd == 'C') { var c1 = new System.Drawing.PointF(num(), num()); var c2 = new System.Drawing.PointF(num(), num()); var p = new System.Drawing.PointF(num(), num()); gp.AddBezier(cur, c1, c2, p); cur = p; continue; }
+            i++;
+        }
+        return gp;
+    }
+    public void Path(string d, string fill, string stroke, float sw, int dash, float opacity, string cls) {
+        using (var gp = ToPath(d)) {
+            if (fill != null && fill != "none") using (var b = new System.Drawing.SolidBrush(Col(fill, opacity))) G.FillPath(b, gp);
+            if (stroke != null) using (var p = Pen(stroke, sw, dash, opacity)) G.DrawPath(p, gp);
+        }
+    }
+    public void Text(float x, float y, string text, float px, int weight, string color, string anchor, bool mono, float opacity, float spacing, string cls) {
+        if (string.IsNullOrEmpty(text)) return;
+        var f = DgMeasure.Font(px, weight, mono);
+        float asc = f.FontFamily.GetCellAscent(f.Style) * f.Size / f.FontFamily.GetEmHeight(f.Style);
+        float w = DgMeasure.Width(text, px, weight, mono) / (mono ? 1f : 1.06f);
+        float x0 = anchor == "middle" ? x - w / 2 : anchor == "end" ? x - w : x;
+        using (var b = new System.Drawing.SolidBrush(Col(color, opacity))) G.DrawString(text, f, b, x0, y - asc, System.Drawing.StringFormat.GenericTypographic);
+    }
+}
+
+// ---- What the view adds to the drawing: hover, selection, outages, hidden flows.
+public class DgView {
+    public string Hover = "";
+    public HashSet<string> Selected = new HashSet<string>(), Down = new HashSet<string>(StringComparer.Ordinal), HiddenCats = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    public string SelectedEdge = "";
+    public bool Editing;            // selection outlines, connect handles
+    public Dictionary<string, List<float>> Spark = new Dictionary<string, List<float>>();
+    public Dictionary<string, string> Rate = new Dictionary<string, string>();
+}
+
+// ---- The drawing itself.
+public static class DgRender {
+    public static string FontStack(DgDoc d) { return (d.Font.Length > 0 ? "'" + d.Font + "', " : "") + "'Segoe UI', system-ui, -apple-system, sans-serif"; }
+    public static string MonoStack(DgDoc d) { return (d.Mono.Length > 0 ? "'" + d.Mono + "', " : "") + "'Cascadia Mono', Consolas, ui-monospace, monospace"; }
+
+    static string CatKey(DgDoc d, string cat) { return string.IsNullOrEmpty(cat) || d.FindCat(cat) == null ? null : "c:" + cat; }
+
+    public static HashSet<string> Related(DgDoc d, string id) {
+        var r = new HashSet<string> { id };
+        foreach (var e in d.Edges) { if (e.From == id) r.Add(e.To); if (e.To == id) r.Add(e.From); }
+        return r;
+    }
+
+    public static void Draw(DgDoc d, DgColors c, IDgPainter p, DgView v) {
+        if (v == null) v = new DgView();
+        var rel = string.IsNullOrEmpty(v.Hover) ? null : Related(d, v.Hover);
+        // lane headings
+        if (d.Lanes.Count > 0 && d.LaneX.Count > 0) {
+            p.Begin("dg-lanes", null, null);
+            for (int i = 0; i < d.Lanes.Count && i < d.LaneX.Count; i++)
+                if (d.Lanes[i].Length > 0) p.Text(d.LaneX[i], d.Bounds.Y + 36, d.Lanes[i].ToUpperInvariant(), 11, 600, c.Get("muted"), "start", false, 1, 0.12f, "dg-lane");
+            p.End();
+        }
+        // group frames
+        foreach (var g in d.Groups) {
+            if (g.Box.IsEmpty) continue;
+            string ck = CatKey(d, g.Cat);
+            float o = rel == null || g.Members.Any(m => rel.Contains(m)) ? 1f : 0.35f;
+            p.Begin("dg-group", "group-" + DgText.CssId(g.Id), "data-group=\"" + DgSvgPainter.Esc(g.Id) + "\"");
+            string fill = g.Fill.Length > 0 ? g.Fill : (ck != null ? c.Mix(ck, "frameTint", "bg") : c.Mix("ink", "3", "bg"));
+            string stroke = g.Stroke.Length > 0 ? g.Stroke : (ck != null ? c.Mix(ck, "60", "card") : c.Get("line"));
+            p.Rect(g.Box.X, g.Box.Y, g.Box.Width, g.Box.Height, d.Radius + 2, fill, stroke, 1.2f, g.Dashed ? 1 : 0, o);
+            p.Text(g.Box.X + g.Box.Width / 2, g.Box.Y + 21, g.Title, 13.5f, 600, c.Get("ink"), "middle", false, o, 0, null);
+            p.End();
+        }
+        // links between nodes, then the nodes, then links inside a node (between its items) on top
+        foreach (var e in d.Edges) if (e.From != e.To) DrawEdge(d, c, p, v, e, rel);
+        foreach (var n in d.Nodes) {
+            if (n.Hidden) continue;
+            float o = rel == null || rel.Contains(n.Id) ? 1f : 0.22f;
+            DrawNode(d, c, p, v, n, o);
+        }
+        foreach (var e in d.Edges) if (e.From == e.To) DrawEdge(d, c, p, v, e, rel);
+    }
+
+    static void DrawEdge(DgDoc d, DgColors c, IDgPainter p, DgView v, DgEdge e, HashSet<string> rel) {
+        {
+            if (e.Pts.Count < 2) return;
+            string ck = CatKey(d, e.Cat);
+            bool hid = !string.IsNullOrEmpty(e.Cat) && v.HiddenCats.Contains(e.Cat);
+            float o = hid ? 0.12f : (rel == null || e.From == v.Hover || e.To == v.Hover ? 1f : 0.15f);
+            if (v.Down.Contains(e.From) || v.Down.Contains(e.To)) o *= 0.55f;
+            string col = e.Color.Length > 0 ? e.Color : (ck != null ? c.Get(ck) : c.Mix("muted", "70", "card"));
+            float sw = e.Width > 0 ? e.Width : 1.6f;
+            bool glow = e.GlowSet ? e.Glow : c.T.Glow || e.Animate;
+            p.Begin("dg-link", "link-" + DgText.CssId(e.Id), "data-link=\"" + DgSvgPainter.Esc(e.Id) + "\" data-from=\"" + DgSvgPainter.Esc(e.From) + "\" data-to=\"" + DgSvgPainter.Esc(e.To) + "\"" + (e.Cat.Length > 0 ? " data-cat=\"" + DgSvgPainter.Esc(e.Cat) + "\"" : ""));
+            if (glow) p.Path(e.PathD, null, col, sw + 6.5f, 0, 0.08f * o, "dg-glow");
+            if (v.SelectedEdge == e.Id && v.Editing) p.Path(e.PathD, null, c.Get("sel"), sw + 4, 0, 0.45f, null);
+            p.Path(e.PathD, null, col, sw, e.Dash, o, "dg-line");
+            bool arrowEnd = e.ArrowAttr || (e.ArrowSet && !e.Animate) ? e.ArrowEnd : !e.Animate;
+            bool arrowStart = e.ArrowAttr || (e.ArrowSet && !e.Animate) ? e.ArrowStart : false;
+            if (arrowEnd) Arrow(p, e.Pts[e.Pts.Count - 2], e.Pts[e.Pts.Count - 1], col, sw, o, e.Curved ? e.Pts : null, false);
+            if (arrowStart) Arrow(p, e.Pts[1], e.Pts[0], col, sw, o, e.Curved ? e.Pts : null, true);
+            if (e.Label.Length > 0) {
+                float a; var m = DgRoute.At(e.Pts, DgRoute.Length(e.Pts) / 2, out a);
+                float tw = DgMeasure.Width(e.Label, 10.5f, 500, false) + 12;
+                p.Rect(m.X - tw / 2, m.Y - 9, tw, 18, 9, c.Get("bg"), c.Mix("line", "80", "bg"), 1, 0, o);
+                p.Text(m.X, m.Y + 3.8f, e.Label, 10.5f, 500, c.Get("muted"), "middle", false, o, 0, null);
+            }
+            p.End();
+        }
+    }
+
+    static void Arrow(IDgPainter p, System.Drawing.PointF from, System.Drawing.PointF to, string col, float sw, float o, List<System.Drawing.PointF> curve, bool start) {
+        if (curve != null && curve.Count > 2) { from = start ? curve[2] : curve[curve.Count - 3]; }
+        float a = (float)Math.Atan2(to.Y - from.Y, to.X - from.X);
+        float l = 8 + sw * 1.6f, w = 4 + sw;
+        var b = new System.Drawing.PointF(to.X - (float)Math.Cos(a) * l, to.Y - (float)Math.Sin(a) * l);
+        var l1 = new System.Drawing.PointF(b.X + (float)Math.Sin(a) * w, b.Y - (float)Math.Cos(a) * w);
+        var l2 = new System.Drawing.PointF(b.X - (float)Math.Sin(a) * w, b.Y + (float)Math.Cos(a) * w);
+        p.Path("M" + DgRoute.P(to) + " L" + DgRoute.P(l1) + " L" + DgRoute.P(l2) + " Z", col, null, 0, 0, o, "dg-arrow");
+    }
+
+    static string StatusCol(DgColors c, string s) { return s == "down" || s == "bad" || s == "error" ? c.Get("bad") : s == "warn" || s == "warning" ? c.Get("warn") : c.Get("ok"); }
+
+    public static void DrawNode(DgDoc d, DgColors c, IDgPainter p, DgView v, DgNode n, float o) {
+        string ck = CatKey(d, n.Cat);
+        bool card = DgLayout.IsCard(n);
+        string shape = card ? "card" : (string.IsNullOrEmpty(n.Shape) ? "rounded" : n.Shape);
+        bool down = v.Down.Contains(n.Id) || n.Status == "down";
+        string status = down ? "down" : n.Status;
+        string ink = n.TextColor.Length > 0 ? n.TextColor : c.Get("ink");
+        string fill = n.Fill.Length > 0 ? n.Fill : (ck != null ? c.Mix(ck, card ? "tint" : "14", "card") : c.Get("card"));
+        string stroke = n.Stroke.Length > 0 ? n.Stroke : (ck != null ? c.Mix(ck, "60", "card") : c.Get("line"));
+        if (down) stroke = c.Get("bad");
+        float sw = card ? 1.4f : 1.3f;
+        string data = "data-node=\"" + DgSvgPainter.Esc(n.Id) + "\"" + (n.Cat.Length > 0 ? " data-cat=\"" + DgSvgPainter.Esc(n.Cat) + "\"" : "");
+        p.Begin("dg-node" + (n.Url.Length > 0 ? " dg-link-node" : ""), "node-" + DgText.CssId(n.Id), data);
+        float x = n.X, y = n.Y, w = n.W, h = n.H;
+        if (v.Editing && v.Selected.Contains(n.Id)) p.Rect(x - 4, y - 4, w + 8, h + 8, d.Radius + 4, null, c.Get("sel"), 2, 0, 0.9f);
+        if (shape == "card") {
+            p.Rect(x, y, w, h, d.Radius, fill, stroke, sw, n.Dashed ? 1 : 0, o);
+            float ty = y + 14;
+            float bx = x + 14;
+            if (n.Badge.Length > 0) {
+                float bw = DgMeasure.Width(n.Badge, 10.5f, 600, true) + 14;
+                p.Rect(bx, ty, bw, 19, 4, ck != null ? c.Mix(ck, "chipTint", "chip") : c.Get("chip"), null, 0, 0, o);
+                p.Text(bx + bw / 2, ty + 13.2f, n.Badge, 10.5f, 600, ck != null ? c.Get(ck) : ink, "middle", true, o, 0, null);
+                bx += bw + 12;
+            }
+            if (n.Badge.Length > 0 || status.Length > 0 || n.Metric.Length > 0) {
+                if (status.Length > 0 || n.Badge.Length > 0) p.Ellipse(bx, ty + 9.5f, 4, 4, StatusCol(c, status), null, 0, o);
+                string rate = n.Metric; string r2; if (v.Rate.TryGetValue(n.Id, out r2)) rate = r2;
+                if (rate.Length > 0) p.Text(x + w - 14, ty + 13, rate, 10, 400, c.Get("muted"), "end", true, o, 0, "dg-rate");
+                ty += 28;
+            }
+            float ts = DgLayout.TitleSize(n, true);
+            p.Text(x + 14, ty + ts - 1, n.Title, ts, 600, ink, "start", false, o, 0, "dg-title");
+            ty += ts + 8;
+            foreach (var ln in n.Lines) { p.Text(x + 14, ty + 11, ln, 11.5f, 400, c.Get("muted"), "start", false, o, 0, null); ty += 16; }
+            for (int i = 0; i < n.ItemBoxes.Count; i++) {
+                var r = n.ItemBoxes[i]; bool small = r.Height < 24;
+                p.Begin("dg-item", null, "data-item=\"" + DgSvgPainter.Esc(n.Id + "." + n.Items[i]) + "\"");
+                p.Rect(r.X, r.Y, r.Width, r.Height, small ? 4 : 6, ck != null ? c.Mix(ck, "chipTint", "chip") : c.Get("chip"), ck != null ? c.Mix(ck, "45", "card") : c.Get("line"), small ? 1.3f : 1, 0, o);
+                p.Text(r.X + r.Width / 2, r.Y + r.Height / 2 + (small ? 3.2f : 3.8f), n.Items[i], small ? 8.5f : 10.5f, small ? 600 : 400, ink, "middle", small, o, 0, null);
+                p.End();
+            }
+            if (n.Spark) {
+                float sx = x + 14, sy = y + h - 14 - 28, sww = w - 28;
+                List<float> s; if (!v.Spark.TryGetValue(n.Id, out s)) s = DemoSpark(n.Id);
+                p.Path(SparkPath(s, sx, sy, sww, 26), null, ck != null ? c.Get(ck) : c.Get("muted"), 1.5f, 0, o, "dg-spark");
+            }
+        } else if (shape == "table") {
+            p.Rect(x, y, w, h, 8, c.Get("card"), stroke, 1.3f, 0, o);
+            p.Path(TopRound(x, y, w, 30, 8), ck != null ? c.Mix(ck, "28", "card") : c.Get("chip"), null, 0, 0, o, null);
+            p.Text(x + 12, y + 20, n.Title, 13.5f, 600, ink, "start", false, o, 0, "dg-title");
+            float ry = y + 34;
+            foreach (var ln in n.Lines) {
+                var parts = ln.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                string name = parts.Length > 0 ? parts[0] : "", type = "", flags = "";
+                foreach (var pp in parts.Skip(1)) { var u = pp.ToUpperInvariant(); if (u == "PK" || u == "FK" || u == "UQ" || u == "NN") flags += (flags.Length > 0 ? " " : "") + u; else type += (type.Length > 0 ? " " : "") + pp; }
+                if (flags.Length > 0) { p.Rect(x + 8, ry + 4, 24, 14, 3, flags.Contains("PK") ? c.Mix("warn", "30", "card") : c.Mix("sel", "25", "card"), null, 0, 0, o); p.Text(x + 20, ry + 14.2f, flags.Contains("PK") ? "PK" : "FK", 8.5f, 700, flags.Contains("PK") ? c.Get("warn") : c.Get("sel"), "middle", true, o, 0, null); }
+                p.Text(x + 38, ry + 15, name, 11.5f, flags.Contains("PK") ? 600 : 400, ink, "start", true, o, 0, null);
+                p.Text(x + w - 10, ry + 15, type, 10.5f, 400, c.Get("muted"), "end", true, o, 0, null);
+                ry += 22;
+            }
+        } else {
+            switch (shape) {
+                case "circle": p.Ellipse(x + w / 2, y + h / 2, w / 2, h / 2, fill, stroke, sw, o); break;
+                case "pill": p.Rect(x, y, w, h, h / 2, fill, stroke, sw, n.Dashed ? 1 : 0, o); break;
+                case "rect": p.Rect(x, y, w, h, 2, fill, stroke, sw, n.Dashed ? 1 : 0, o); break;
+                case "diamond": p.Path("M" + DgRoute.N(x + w / 2) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h / 2) + " L" + DgRoute.N(x + w / 2) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x) + "," + DgRoute.N(y + h / 2) + " Z", fill, stroke, sw, 0, o, null); break;
+                case "hexagon": { float k = 16; p.Path("M" + DgRoute.N(x + k) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w - k) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h / 2) + " L" + DgRoute.N(x + w - k) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x + k) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x) + "," + DgRoute.N(y + h / 2) + " Z", fill, stroke, sw, 0, o, null); break; }
+                case "parallelogram": { float k = 16; p.Path("M" + DgRoute.N(x + k) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w - k) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x) + "," + DgRoute.N(y + h) + " Z", fill, stroke, sw, 0, o, null); break; }
+                case "cylinder": { float e = 9; p.Path("M" + DgRoute.N(x) + "," + DgRoute.N(y + e) + " Q" + DgRoute.N(x + w / 2) + "," + DgRoute.N(y - e) + " " + DgRoute.N(x + w) + "," + DgRoute.N(y + e) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h - e) + " Q" + DgRoute.N(x + w / 2) + "," + DgRoute.N(y + h + e) + " " + DgRoute.N(x) + "," + DgRoute.N(y + h - e) + " Z", fill, stroke, sw, 0, o, null);
+                                     p.Path("M" + DgRoute.N(x) + "," + DgRoute.N(y + e) + " Q" + DgRoute.N(x + w / 2) + "," + DgRoute.N(y + e * 3) + " " + DgRoute.N(x + w) + "," + DgRoute.N(y + e), null, stroke, sw, 0, o, null); break; }
+                case "doc": { p.Path("M" + DgRoute.N(x) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h - 8) + " Q" + DgRoute.N(x + w * 0.75f) + "," + DgRoute.N(y + h - 18) + " " + DgRoute.N(x + w / 2) + "," + DgRoute.N(y + h - 8) + " Q" + DgRoute.N(x + w * 0.25f) + "," + DgRoute.N(y + h + 2) + " " + DgRoute.N(x) + "," + DgRoute.N(y + h - 8) + " Z", fill, stroke, sw, 0, o, null); break; }
+                case "note": { float k = 12; p.Path("M" + DgRoute.N(x) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w - k) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + k) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x) + "," + DgRoute.N(y + h) + " Z", ck == null && n.Fill.Length == 0 ? c.Mix("warn", "16", "card") : fill, stroke, sw, 0, o, null); break; }
+                case "actor": { float cx = x + w / 2; p.Ellipse(cx, y + 11, 9, 9, fill, stroke, 1.6f, o); p.Path("M" + DgRoute.N(cx) + "," + DgRoute.N(y + 20) + " L" + DgRoute.N(cx) + "," + DgRoute.N(y + 46) + " M" + DgRoute.N(cx - 15) + "," + DgRoute.N(y + 29) + " L" + DgRoute.N(cx + 15) + "," + DgRoute.N(y + 29) + " M" + DgRoute.N(cx) + "," + DgRoute.N(y + 46) + " L" + DgRoute.N(cx - 12) + "," + DgRoute.N(y + 62) + " M" + DgRoute.N(cx) + "," + DgRoute.N(y + 46) + " L" + DgRoute.N(cx + 12) + "," + DgRoute.N(y + 62), null, stroke, 1.6f, 0, o, null); break; }
+                default: p.Rect(x, y, w, h, d.Radius, fill, stroke, sw, n.Dashed ? 1 : 0, o); break;
+            }
+            float ts = DgLayout.TitleSize(n, false);
+            var lines = DgLayout.Wrap(n.Title, ts, n.Bold ? 600 : 500, shape == "diamond" ? w / 1.45f - 30 : w - 30);
+            float lh = ts + 5;
+            float top = shape == "actor" ? y + h - 8 : y + h / 2 - lines.Count * lh / 2 + ts * 0.82f + (n.Badge.Length > 0 ? 9 : 0) + (shape == "cylinder" ? 5 : 0);
+            if (n.Badge.Length > 0 && shape != "actor") {
+                float bw = DgMeasure.Width(n.Badge, 9.5f, 600, true) + 10;
+                p.Rect(x + w / 2 - bw / 2, top - ts - 15, bw, 15, 3, ck != null ? c.Mix(ck, "chipTint", "chip") : c.Get("chip"), null, 0, 0, o);
+                p.Text(x + w / 2, top - ts - 4, n.Badge, 9.5f, 600, ck != null ? c.Get(ck) : ink, "middle", true, o, 0, null);
+            }
+            foreach (var ln in lines) { p.Text(x + w / 2, top, ln, ts, n.Bold ? 600 : 500, ink, "middle", false, o, 0, "dg-title"); top += lh; }
+            if (status.Length > 0) p.Ellipse(x + w - 9, y + 9, 3.5f, 3.5f, StatusCol(c, status), null, 0, o);
+        }
+        p.End();
+    }
+
+    static string TopRound(float x, float y, float w, float h, float r) {
+        return "M" + DgRoute.N(x) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x) + "," + DgRoute.N(y + r) + " Q" + DgRoute.N(x) + "," + DgRoute.N(y) + " " + DgRoute.N(x + r) + "," + DgRoute.N(y) +
+               " L" + DgRoute.N(x + w - r) + "," + DgRoute.N(y) + " Q" + DgRoute.N(x + w) + "," + DgRoute.N(y) + " " + DgRoute.N(x + w) + "," + DgRoute.N(y + r) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h) + " Z";
+    }
+    public static List<float> DemoSpark(string id) {
+        var r = new List<float>(); var rnd = new Random(id.GetHashCode());
+        float v = 0.5f;
+        for (int i = 0; i < 40; i++) { v = Math.Max(0.1f, Math.Min(0.95f, v + (float)(rnd.NextDouble() - 0.5) * 0.25f)); r.Add(v); }
+        return r;
+    }
+    public static string SparkPath(List<float> s, float x, float y, float w, float h) {
+        if (s.Count < 2) return "M" + DgRoute.N(x) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h);
+        float max = Math.Max(0.0001f, s.Max());
+        var sb = new StringBuilder();
+        for (int i = 0; i < s.Count; i++) sb.Append((i == 0 ? "M" : " L") + DgRoute.N(x + w * i / (s.Count - 1)) + "," + DgRoute.N(y + h - s[i] / max * h));
+        return sb.ToString();
+    }
+}
+
+// ---- SVG documents: CSS variables for both themes, the drawing, optional hover / draw-in animation.
+public class DgSvgOptions {
+    public bool Vars = true, Background = true, Responsive = true, Accessible = true, Hover = true, DrawIn, Pretty = true, Interactive;
+    public string Mode = "auto";           // auto (follows the system), dark, light
+    public string Scope = "";               // CSS selector the variables belong to (default: the svg's own class)
+    public string Prefix = "dg";            // put before every class and id, so several diagrams can share one page
+}
+
+public static class DgSvg {
+    static string Block(DgDoc d, DgColors c, bool dark) {
+        var pal = dark ? c.T.Dark : c.T.Light;
+        var sb = new StringBuilder();
+        foreach (var kv in pal) {
+            string v = kv.Value;
+            if (kv.Key == "tint" || kv.Key == "chipTint" || kv.Key == "frameTint") v = v + "%";
+            sb.Append("--" + kv.Key + ":" + v + ";");
+        }
+        var m = dark ? c.CatD : c.CatL;
+        foreach (var kv in m) sb.Append(DgColors.CatVar(kv.Key) + ":" + kv.Value + ";");
+        return sb.ToString();
+    }
+    public static string Css(DgDoc d, DgTheme t, string scope, string mode, bool hover, bool drawIn) {
+        var cd = new DgColors(d, t, true, true); var cl = new DgColors(d, t, false, true);
+        var sb = new StringBuilder();
+        string fonts = "--font:" + DgRender.FontStack(d) + ";--mono:" + DgRender.MonoStack(d) + ";";
+        string first = mode == "light" ? Block(d, cl, false) : Block(d, cd, true);
+        sb.Append(scope + "{" + fonts + first + "font-family:var(--font)}\n");
+        if (mode == "auto") sb.Append("@media (prefers-color-scheme: light){" + scope + ":not([data-theme=dark]){" + Block(d, cl, false) + "}}\n");
+        sb.Append(scope + "[data-theme=light]{" + Block(d, cl, false) + "}\n");
+        sb.Append(scope + "[data-theme=dark]{" + Block(d, cd, true) + "}\n");
+        sb.Append(scope + " text{font-family:var(--font)}\n");
+        if (hover) {
+            sb.Append(scope + " .dg-node,"+ scope + " .dg-link{transition:opacity .25s}\n");
+            sb.Append(scope + ":has(.dg-node:hover) .dg-node:not(:hover){opacity:.35}\n");
+            sb.Append(scope + " .dg-link-node{cursor:pointer}\n");
+        }
+        if (drawIn) sb.Append(scope + " .dg-draw{stroke-dasharray:1;stroke-dashoffset:1;animation:dgdraw 1.4s ease forwards}@keyframes dgdraw{to{stroke-dashoffset:0}}\n");
+        return sb.ToString();
+    }
+
+    public static string Document(DgDoc d, DgTheme t, DgSvgOptions o) {
+        var c = new DgColors(d, t, o.Mode != "light", o.Vars);
+        var p = new DgSvgPainter { Pretty = o.Pretty };
+        if (!o.Vars) { p.FontVar = DgRender.FontStack(d).Replace("'", ""); p.MonoVar = DgRender.MonoStack(d).Replace("'", ""); }
+        var b = d.Bounds;
+        string cls = "dg dg-" + DgText.CssId(string.IsNullOrEmpty(d.Title) ? "diagram" : d.Title.ToLowerInvariant());
+        string scope = string.IsNullOrEmpty(o.Scope) ? "svg.dg" : o.Scope;
+        var sb = new StringBuilder();
+        string vb = DgRoute.N(b.X) + " " + DgRoute.N(b.Y) + " " + DgRoute.N(b.Width) + " " + DgRoute.N(b.Height);
+        sb.Append("<svg xmlns=\"http://www.w3.org/2000/svg\" class=\"" + cls + "\" viewBox=\"" + vb + "\"" +
+                  (o.Responsive ? " width=\"100%\" style=\"max-width:" + DgRoute.N(b.Width) + "px;height:auto\"" : " width=\"" + DgRoute.N(b.Width) + "\" height=\"" + DgRoute.N(b.Height) + "\"") +
+                  (o.Mode == "dark" || o.Mode == "light" ? " data-theme=\"" + o.Mode + "\"" : "") +
+                  (o.Accessible ? " role=\"img\" aria-labelledby=\"dg-title dg-desc\"" : "") + ">\n");
+        if (o.Accessible) {
+            sb.Append("  <title id=\"dg-title\">" + DgSvgPainter.Esc(string.IsNullOrEmpty(d.Title) ? "Diagram" : d.Title) + "</title>\n");
+            sb.Append("  <desc id=\"dg-desc\">" + DgSvgPainter.Esc(Describe(d)) + "</desc>\n");
+        }
+        if (o.Vars) sb.Append("  <style>\n" + Css(d, t, scope, o.Mode, o.Hover, o.DrawIn) + "  </style>\n");
+        if (o.Background) {
+            sb.Append("  <defs><pattern id=\"dg-dots\" width=\"24\" height=\"24\" patternUnits=\"userSpaceOnUse\"><circle cx=\"12\" cy=\"12\" r=\"1\" style=\"fill:" + c.Get("grid") + "\"/></pattern></defs>\n");
+            sb.Append("  <rect x=\"" + DgRoute.N(b.X) + "\" y=\"" + DgRoute.N(b.Y) + "\" width=\"" + DgRoute.N(b.Width) + "\" height=\"" + DgRoute.N(b.Height) + "\" style=\"fill:" + c.Get("bg") + "\"/>\n");
+            sb.Append("  <rect x=\"" + DgRoute.N(b.X) + "\" y=\"" + DgRoute.N(b.Y) + "\" width=\"" + DgRoute.N(b.Width) + "\" height=\"" + DgRoute.N(b.Height) + "\" style=\"fill:url(#dg-dots)\"/>\n");
+        }
+        sb.Append("  <g class=\"dg-vp\">\n");
+        DgRender.Draw(d, c, p, new DgView());
+        sb.Append(p.Sb.ToString());
+        sb.Append("  </g>\n</svg>\n");
+        var s = sb.ToString();
+        s = ApplyPrefix(s, o.Prefix);
+        if (o.DrawIn) s = s.Replace("class=\"" + P(o.Prefix) + "-line\" d=", "class=\"" + P(o.Prefix) + "-line " + P(o.Prefix) + "-draw\" pathLength=\"1\" d=");
+        if (!o.Pretty) s = Regex.Replace(s, @">\s+<", "><").Trim();
+        return s;
+    }
+    public static string P(string prefix) {
+        var p = Regex.Replace((prefix ?? "").Trim().ToLowerInvariant(), @"[^a-z0-9_-]", "-").Trim('-');
+        if (p.Length == 0) p = "dg";
+        if (!char.IsLetter(p[0])) p = "d" + p;
+        return p;
+    }
+    // a prefix from the title: "Network visibility architecture" -> "network-visibility"
+    public static string SuggestPrefix(DgDoc d) {
+        var w = Regex.Matches((d.Title ?? "").ToLowerInvariant(), @"[a-z0-9]+").Cast<Match>().Select(m => m.Value).Take(2).ToList();
+        return w.Count == 0 ? "dg" : P(string.Join("-", w));
+    }
+    // every "dg-" class / id / reference, the root class "dg" and the keyframes get the prefix
+    public static string ApplyPrefix(string s, string prefix) {
+        var p = P(prefix);
+        if (p == "dg") return s;
+        s = Regex.Replace(s, @"(?<![\w-])dg-", p + "-");
+        s = s.Replace("class=\"dg ", "class=\"" + p + " ").Replace("svg.dg", "svg." + p).Replace("dgdraw", p + "draw");
+        return s;
+    }
+    public static string Describe(DgDoc d) {
+        var parts = new List<string>();
+        foreach (var n in d.Nodes) if (!n.Hidden) {
+            var outs = d.Edges.Where(e => e.From == n.Id).Select(e => d.Find(e.To)).Where(x => x != null).Select(x => x.Title).Distinct().ToList();
+            parts.Add(n.Title + (outs.Count > 0 ? " -> " + string.Join(", ", outs) : ""));
+        }
+        return string.Join("; ", parts);
+    }
+}
+
+// ---- The canvas in the Diagram studio: zoom / pan, hover, select, drag, connect, flowing packets, legend.
+public class DgCanvas : System.Windows.Forms.Panel {
+    public DgDoc Doc = new DgDoc();
+    public DgTheme Theme = DgTheme.Get("midnight");
+    public bool Dark = true, Animate = true, Editable = true, Paused, HoverDim = true;
+    public float Speed = 1f, UiScale = 1f;
+    public DgView View = new DgView();
+    public float Zoom = 1f;
+    public System.Drawing.PointF Pan = new System.Drawing.PointF(0, 0);       // canvas units at the top-left
+    public System.Drawing.Color UiBack = System.Drawing.Color.FromArgb(30, 30, 30), UiFore = System.Drawing.Color.White, UiLine = System.Drawing.Color.Gray, UiAccent = System.Drawing.Color.DodgerBlue;
+    public event EventHandler SelectionChanged, NodeOpened, Moved, EdgeAdded, DeleteRequested, LegendChanged;
+    public string NewEdgeFrom = "", NewEdgeTo = "";
+    public List<string> MovedIds = new List<string>();
+
+    class Packet { public DgEdge E; public float D, Len; public bool Back; }
+    List<Packet> packets = new List<Packet>();
+    Dictionary<string, float> spawnAcc = new Dictionary<string, float>();
+    Dictionary<string, float> flowCount = new Dictionary<string, float>();
+    System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
+    DateTime last = DateTime.Now, lastSample = DateTime.Now;
+    Random rnd = new Random(7);
+
+    enum Mode { None, Pan, Drag, Box, Link }
+    Mode mode = Mode.None;
+    System.Drawing.Point down;
+    System.Drawing.PointF dragAnchor;
+    Dictionary<string, System.Drawing.PointF> dragFrom = new Dictionary<string, System.Drawing.PointF>();
+    System.Drawing.PointF panFrom, mouseW;
+    System.Drawing.RectangleF box;
+    bool moved;
+    string linkFrom = "";
+    List<KeyValuePair<System.Drawing.RectangleF, string>> legendHits = new List<KeyValuePair<System.Drawing.RectangleF, string>>();
+
+    public DgCanvas() {
+        SetStyle(System.Windows.Forms.ControlStyles.AllPaintingInWmPaint | System.Windows.Forms.ControlStyles.OptimizedDoubleBuffer | System.Windows.Forms.ControlStyles.UserPaint |
+                 System.Windows.Forms.ControlStyles.ResizeRedraw | System.Windows.Forms.ControlStyles.Selectable, true);
+        TabStop = true;
+        timer.Interval = 33;
+        timer.Tick += delegate { Step(); };
+        timer.Start();
+    }
+    protected override void Dispose(bool disposing) { if (disposing) { timer.Stop(); timer.Dispose(); } base.Dispose(disposing); }
+
+    public void SetDoc(DgDoc d, bool keepView) {
+        var old = Doc; Doc = d;
+        packets.Clear();
+        var keep = new HashSet<string>(View.Selected.Where(id => d.Find(id) != null));
+        View.Selected = keep;
+        if (!keepView) ZoomToFit();
+        Invalidate();
+    }
+
+    System.Drawing.PointF W(System.Drawing.Point p) { return new System.Drawing.PointF(p.X / Zoom + Pan.X, p.Y / Zoom + Pan.Y); }
+    public bool UserView;                     // the user zoomed or panned: no more automatic fitting
+    protected override void OnResize(EventArgs e) { base.OnResize(e); if (!UserView) ZoomToFit(); }
+    public void SetZoom(float z) { SetZoom(z, new System.Drawing.Point(Width / 2, Height / 2)); }
+    public void SetZoom(float z, System.Drawing.Point at) {
+        z = Math.Max(0.15f, Math.Min(4f, z));
+        UserView = true;
+        var w = W(at);
+        Zoom = z;
+        Pan = new System.Drawing.PointF(w.X - at.X / Zoom, w.Y - at.Y / Zoom);
+        Invalidate();
+    }
+    public void ZoomToFit() {
+        var b = Doc.Bounds;
+        if (b.Width <= 0 || Width <= 0) return;
+        float top = Doc.On("header") ? 64 * UiScale : 10, bottom = 54 * UiScale;
+        float z = Math.Min((Width - 24) / b.Width, (Height - top - bottom) / b.Height);
+        Zoom = Math.Max(0.15f, Math.Min(1.6f, z));
+        Pan = new System.Drawing.PointF(b.X - ((Width / Zoom) - b.Width) / 2, b.Y - top / Zoom - ((Height - top - bottom) / Zoom - b.Height) / 2);
+        Invalidate();
+    }
+    public System.Drawing.Bitmap RenderBitmap(float scale, bool background, bool dark) {
+        var b = Doc.Bounds;
+        var bmp = new System.Drawing.Bitmap(Math.Max(1, (int)Math.Ceiling(b.Width * scale)), Math.Max(1, (int)Math.Ceiling(b.Height * scale)));
+        bmp.SetResolution(96 * scale, 96 * scale);
+        using (var g = System.Drawing.Graphics.FromImage(bmp)) {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+            var c = new DgColors(Doc, Theme, dark, false);
+            if (background) { g.Clear(DgColors.Parse(c.Raw("bg"))); }
+            g.ScaleTransform(scale, scale);
+            g.TranslateTransform(-b.X, -b.Y);
+            if (background) Dots(g, c, b);
+            DgRender.Draw(Doc, c, new DgGdiPainter(g), new DgView { Down = View.Down, HiddenCats = View.HiddenCats });
+        }
+        return bmp;
+    }
+    void Dots(System.Drawing.Graphics g, DgColors c, System.Drawing.RectangleF r) {
+        using (var b = new System.Drawing.SolidBrush(DgColors.Parse(c.Raw("grid")))) {
+            float x0 = (float)Math.Floor(r.X / 24) * 24 + 12, y0 = (float)Math.Floor(r.Y / 24) * 24 + 12;
+            for (float x = x0; x < r.Right; x += 24) for (float y = y0; y < r.Bottom; y += 24) g.FillEllipse(b, x - 1, y - 1, 2, 2);
+        }
+    }
+
+    // ---- hit tests (canvas units)
+    public DgNode NodeAt(System.Drawing.PointF w) {
+        DgNode hit = null;
+        foreach (var n in Doc.Nodes) if (!n.Hidden && n.Box.Contains(w)) hit = n;          // the last drawn wins
+        return hit;
+    }
+    public DgEdge EdgeAt(System.Drawing.PointF w) {
+        float best = 6 / Zoom; DgEdge hit = null;
+        foreach (var e in Doc.Edges) for (int i = 1; i < e.Pts.Count; i++) { float dd = Dist(w, e.Pts[i - 1], e.Pts[i]); if (dd < best) { best = dd; hit = e; } }
+        return hit;
+    }
+    static float Dist(System.Drawing.PointF p, System.Drawing.PointF a, System.Drawing.PointF b) {
+        float dx = b.X - a.X, dy = b.Y - a.Y, l = dx * dx + dy * dy;
+        float t = l == 0 ? 0 : Math.Max(0, Math.Min(1, ((p.X - a.X) * dx + (p.Y - a.Y) * dy) / l));
+        float x = a.X + t * dx - p.X, y = a.Y + t * dy - p.Y;
+        return (float)Math.Sqrt(x * x + y * y);
+    }
+    System.Drawing.PointF LinkHandle(DgNode n) { return new System.Drawing.PointF(n.X + n.W, n.Y + n.H / 2); }
+    bool OnHandle(DgNode n, System.Drawing.PointF w) { var h = LinkHandle(n); float r = 8 / Zoom; return Editable && Math.Abs(w.X - h.X) <= r && Math.Abs(w.Y - h.Y) <= r; }
+
+    public void Select(IEnumerable<string> ids) { View.Selected = new HashSet<string>(ids); View.SelectedEdge = ""; Invalidate(); if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); }
+    public string SelectedId { get { return View.Selected.Count == 1 ? View.Selected.First() : ""; } }
+
+    // ---- mouse
+    protected override void OnMouseDown(System.Windows.Forms.MouseEventArgs e) {
+        base.OnMouseDown(e); Focus();
+        down = e.Location; moved = false;
+        var w = W(e.Location);
+        if (e.Button == System.Windows.Forms.MouseButtons.Middle) { mode = Mode.Pan; panFrom = Pan; return; }
+        if (e.Button != System.Windows.Forms.MouseButtons.Left) return;
+        foreach (var kv in legendHits) if (kv.Key.Contains(e.Location)) {
+            if (View.HiddenCats.Contains(kv.Value)) View.HiddenCats.Remove(kv.Value); else View.HiddenCats.Add(kv.Value);
+            Invalidate(); if (LegendChanged != null) LegendChanged(this, EventArgs.Empty); return;
+        }
+        if (ZoomClick(e.Location)) return;
+        var n = NodeAt(w);
+        if (n != null && OnHandle(n, w)) { mode = Mode.Link; linkFrom = n.Id; mouseW = w; return; }
+        if (n != null) {
+            bool ctrl = (System.Windows.Forms.Control.ModifierKeys & System.Windows.Forms.Keys.Control) != 0;
+            if (ctrl) { if (!View.Selected.Remove(n.Id)) View.Selected.Add(n.Id); }
+            else if (!View.Selected.Contains(n.Id)) View.Selected = new HashSet<string> { n.Id };
+            View.SelectedEdge = "";
+            if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty);
+            if (Editable) {
+                mode = Mode.Drag; dragAnchor = w; dragFrom.Clear();
+                foreach (var id in View.Selected) { var m = Doc.Find(id); if (m != null) dragFrom[id] = new System.Drawing.PointF(m.X, m.Y); }
+            }
+            Invalidate(); return;
+        }
+        var ed = EdgeAt(w);
+        if (ed != null) { View.Selected.Clear(); View.SelectedEdge = ed.Id; Invalidate(); if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); return; }
+        bool shift = (System.Windows.Forms.Control.ModifierKeys & System.Windows.Forms.Keys.Shift) != 0;
+        if (shift && Editable) { mode = Mode.Box; box = new System.Drawing.RectangleF(w, System.Drawing.SizeF.Empty); return; }
+        mode = Mode.Pan; panFrom = Pan;
+    }
+    protected override void OnMouseMove(System.Windows.Forms.MouseEventArgs e) {
+        base.OnMouseMove(e);
+        var w = W(e.Location);
+        if (Math.Abs(e.X - down.X) + Math.Abs(e.Y - down.Y) > 3) moved = true;
+        switch (mode) {
+            case Mode.Pan: if (moved) { UserView = true; Pan = new System.Drawing.PointF(panFrom.X - (e.X - down.X) / Zoom, panFrom.Y - (e.Y - down.Y) / Zoom); Invalidate(); } return;
+            case Mode.Drag:
+                if (!moved) return;
+                float dx = w.X - dragAnchor.X, dy = w.Y - dragAnchor.Y;
+                foreach (var kv in dragFrom) { var m = Doc.Find(kv.Key); if (m == null) continue; m.X = (float)Math.Round((kv.Value.X + dx) / 4) * 4; m.Y = (float)Math.Round((kv.Value.Y + dy) / 4) * 4; m.HasPos = true; DgLayout.ItemBoxes(m); }
+                DgRoute.All(Doc); packets.Clear(); Invalidate(); return;
+            case Mode.Box: box = System.Drawing.RectangleF.FromLTRB(Math.Min(box.X, w.X), Math.Min(box.Y, w.Y), Math.Max(box.X, w.X), Math.Max(box.Y, w.Y)); mouseW = w; Invalidate(); return;
+            case Mode.Link: mouseW = w; Invalidate(); return;
+        }
+        var n = NodeAt(w);
+        string h = n == null ? "" : n.Id;
+        Cursor = n != null ? (OnHandle(n, w) ? System.Windows.Forms.Cursors.Cross : System.Windows.Forms.Cursors.Hand) : (EdgeAt(w) != null ? System.Windows.Forms.Cursors.Hand : System.Windows.Forms.Cursors.Default);
+        if (h != View.Hover) { View.Hover = HoverDim ? h : ""; hoverId = h; Invalidate(); }
+    }
+    string hoverId = "";
+    protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); if (View.Hover.Length > 0 || hoverId.Length > 0) { View.Hover = ""; hoverId = ""; Invalidate(); } }
+    protected override void OnMouseUp(System.Windows.Forms.MouseEventArgs e) {
+        base.OnMouseUp(e);
+        var w = W(e.Location);
+        var m = mode; mode = Mode.None;
+        if (m == Mode.Drag && moved) { MovedIds = dragFrom.Keys.ToList(); if (Moved != null) Moved(this, EventArgs.Empty); }
+        else if (m == Mode.Box) {
+            var ids = Doc.Nodes.Where(n => !n.Hidden && box.IntersectsWith(n.Box)).Select(n => n.Id).ToList();
+            Select(ids); box = System.Drawing.RectangleF.Empty;
+        } else if (m == Mode.Link) {
+            var t = NodeAt(w);
+            if (t != null && t.Id != linkFrom) { NewEdgeFrom = linkFrom; NewEdgeTo = t.Id; if (EdgeAdded != null) EdgeAdded(this, EventArgs.Empty); }
+            linkFrom = ""; Invalidate();
+        } else if (m == Mode.Pan && !moved) {
+            if (View.Selected.Count > 0 || View.SelectedEdge.Length > 0) { View.Selected.Clear(); View.SelectedEdge = ""; Invalidate(); if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); }
+        }
+    }
+    protected override void OnMouseDoubleClick(System.Windows.Forms.MouseEventArgs e) {
+        base.OnMouseDoubleClick(e);
+        var n = NodeAt(W(e.Location));
+        if (n != null) { View.Selected = new HashSet<string> { n.Id }; if (NodeOpened != null) NodeOpened(this, EventArgs.Empty); }
+    }
+    protected override void OnMouseWheel(System.Windows.Forms.MouseEventArgs e) {
+        base.OnMouseWheel(e);
+        var k = System.Windows.Forms.Control.ModifierKeys;
+        if ((k & System.Windows.Forms.Keys.Control) != 0) SetZoom(Zoom * (float)Math.Pow(1.0018, e.Delta), e.Location);
+        else if ((k & System.Windows.Forms.Keys.Shift) != 0) { UserView = true; Pan = new System.Drawing.PointF(Pan.X - e.Delta / Zoom, Pan.Y); Invalidate(); }
+        else { UserView = true; Pan = new System.Drawing.PointF(Pan.X, Pan.Y - e.Delta / Zoom); Invalidate(); }
+    }
+    protected override bool IsInputKey(System.Windows.Forms.Keys k) { var b = k & System.Windows.Forms.Keys.KeyCode; return b == System.Windows.Forms.Keys.Left || b == System.Windows.Forms.Keys.Right || b == System.Windows.Forms.Keys.Up || b == System.Windows.Forms.Keys.Down || base.IsInputKey(k); }
+    protected override void OnKeyDown(System.Windows.Forms.KeyEventArgs e) {
+        base.OnKeyDown(e);
+        if (e.Control && (e.KeyCode == System.Windows.Forms.Keys.Oemplus || e.KeyCode == System.Windows.Forms.Keys.Add)) { SetZoom(Zoom * 1.2f); e.Handled = true; }
+        else if (e.Control && (e.KeyCode == System.Windows.Forms.Keys.OemMinus || e.KeyCode == System.Windows.Forms.Keys.Subtract)) { SetZoom(Zoom / 1.2f); e.Handled = true; }
+        else if (e.Control && e.KeyCode == System.Windows.Forms.Keys.D0) { ZoomToFit(); UserView = false; e.Handled = true; }
+        else if (e.Control && e.KeyCode == System.Windows.Forms.Keys.A) { Select(Doc.Nodes.Where(n => !n.Hidden).Select(n => n.Id)); e.Handled = true; }
+        else if (e.KeyCode == System.Windows.Forms.Keys.Delete && Editable) { if (DeleteRequested != null) DeleteRequested(this, EventArgs.Empty); e.Handled = true; }
+        else if (Editable && View.Selected.Count > 0 && (e.KeyCode == System.Windows.Forms.Keys.Left || e.KeyCode == System.Windows.Forms.Keys.Right || e.KeyCode == System.Windows.Forms.Keys.Up || e.KeyCode == System.Windows.Forms.Keys.Down)) {
+            float step = e.Shift ? 24 : 4;
+            float dx = e.KeyCode == System.Windows.Forms.Keys.Left ? -step : e.KeyCode == System.Windows.Forms.Keys.Right ? step : 0, dy = e.KeyCode == System.Windows.Forms.Keys.Up ? -step : e.KeyCode == System.Windows.Forms.Keys.Down ? step : 0;
+            foreach (var id in View.Selected) { var n = Doc.Find(id); if (n == null) continue; n.X += dx; n.Y += dy; n.HasPos = true; DgLayout.ItemBoxes(n); }
+            DgRoute.All(Doc); packets.Clear(); Invalidate();
+            MovedIds = View.Selected.ToList(); if (Moved != null) Moved(this, EventArgs.Empty);
+            e.Handled = true;
+        }
+    }
+
+    // ---- zoom buttons (bottom right, pixels): -, %, +, fit
+    System.Drawing.RectangleF[] ZoomButtons() {
+        float s = UiScale, h = 28 * s, y = Height - h - 12 * s, x = Width - 12 * s;
+        float[] w = { 40 * s, 30 * s, 56 * s, 30 * s };
+        var r = new System.Drawing.RectangleF[4];
+        for (int i = 0; i < 4; i++) { x -= w[i]; r[3 - i] = new System.Drawing.RectangleF(x, y, w[i], h); x -= 2 * s; }
+        return r;
+    }
+    bool ZoomClick(System.Drawing.Point p) {
+        var b = ZoomButtons();
+        if (b[0].Contains(p)) SetZoom(Zoom / 1.2f); else if (b[1].Contains(p)) SetZoom(1f); else if (b[2].Contains(p)) SetZoom(Zoom * 1.2f); else if (b[3].Contains(p)) { ZoomToFit(); UserView = false; } else return false;
+        return true;
+    }
+
+    // ---- animation: packets along animated links; rates and sparklines from what flows
+    void Step() {
+        var now = DateTime.Now; float dt = (float)Math.Min(0.1, (now - last).TotalSeconds); last = now;
+        if (!Visible || !Animate || Paused) return;
+        bool any = false;
+        foreach (var e in Doc.Edges) {
+            if (!e.Animate || e.Pts.Count < 2) continue;
+            any = true;
+            if (View.Down.Contains(e.From) || (!string.IsNullOrEmpty(e.Cat) && View.HiddenCats.Contains(e.Cat))) continue;
+            float acc; spawnAcc.TryGetValue(e.Id, out acc);
+            acc += dt * Speed * 1.6f * e.Density;
+            while (acc >= 1) {
+                acc -= 1;
+                float len = DgRoute.Length(e.Pts);
+                packets.Add(new Packet { E = e, D = 0, Len = len, Back = false });
+                if (e.Both && rnd.NextDouble() < 0.9) packets.Add(new Packet { E = e, D = -(float)rnd.NextDouble() * 40, Len = len, Back = true });
+            }
+            spawnAcc[e.Id] = acc;
+        }
+        if (!any) return;
+        float v = 120f * Speed;
+        for (int i = packets.Count - 1; i >= 0; i--) {
+            var p = packets[i];
+            p.D += v * dt;
+            string target = p.Back ? p.E.From : p.E.To;
+            if (p.D >= p.Len) {
+                packets.RemoveAt(i);
+                if (!View.Down.Contains(target)) { float c; flowCount.TryGetValue(target, out c); flowCount[target] = c + 1; }
+            }
+        }
+        if (packets.Count > 2500) packets.RemoveRange(0, packets.Count - 2500);
+        if ((now - lastSample).TotalSeconds >= 1) {
+            float secs = (float)(now - lastSample).TotalSeconds; lastSample = now;
+            foreach (var n in Doc.Nodes) {
+                float c; flowCount.TryGetValue(n.Id, out c);
+                float rate = c / secs * 1180f;
+                List<float> s; if (!View.Spark.TryGetValue(n.Id, out s)) { s = new List<float>(); View.Spark[n.Id] = s; }
+                s.Add(rate); if (s.Count > 40) s.RemoveAt(0);
+                if (n.Metric.Length == 0 && Doc.Edges.Any(e => e.Animate && (e.To == n.Id || e.From == n.Id))) View.Rate[n.Id] = Fmt(rate) + " pps";
+            }
+            flowCount.Clear();
+        }
+        Invalidate();
+    }
+    public static string Fmt(float v) { return v >= 1e6 ? (v / 1e6).ToString("0.0", CultureInfo.InvariantCulture) + "M" : v >= 1e3 ? (v / 1e3).ToString("0.0", CultureInfo.InvariantCulture) + "k" : v.ToString("0", CultureInfo.InvariantCulture); }
+    public void ResetFlows() { packets.Clear(); spawnAcc.Clear(); View.Spark.Clear(); View.Rate.Clear(); Invalidate(); }
+
+    // ---- paint
+    protected override void OnPaint(System.Windows.Forms.PaintEventArgs pe) {
+        var g = pe.Graphics;
+        var c = new DgColors(Doc, Theme, Dark, false);
+        g.Clear(DgColors.Parse(c.Raw("bg")));
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+        g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+        var st = g.Save();
+        g.ScaleTransform(Zoom, Zoom);
+        g.TranslateTransform(-Pan.X, -Pan.Y);
+        if (Doc.On("grid")) Dots(g, c, new System.Drawing.RectangleF(Pan.X, Pan.Y, Width / Zoom, Height / Zoom));
+        View.Editing = Editable;
+        DgRender.Draw(Doc, c, new DgGdiPainter(g), View);
+        // packets
+        if (Animate) {
+            var rel = string.IsNullOrEmpty(View.Hover) ? null : DgRender.Related(Doc, View.Hover);
+            foreach (var p in packets) {
+                if (p.D < 0) continue;
+                float a; var pt = DgRoute.At(p.E.Pts, p.Back ? p.Len - p.D : p.D, out a);
+                string ck = !string.IsNullOrEmpty(p.E.Cat) && Doc.FindCat(p.E.Cat) != null ? "c:" + p.E.Cat : "pkt";
+                var col = DgColors.Parse(p.E.Color.Length > 0 ? p.E.Color : c.Raw(ck));
+                float o = rel == null || p.E.From == View.Hover || p.E.To == View.Hover ? 1f : 0.15f;
+                using (var b = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb((int)(60 * o), col))) g.FillEllipse(b, pt.X - 5, pt.Y - 5, 10, 10);
+                using (var b = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb((int)(255 * o), col))) g.FillEllipse(b, pt.X - 2.6f, pt.Y - 2.6f, 5.2f, 5.2f);
+            }
+        }
+        // connect handle on the hovered node, the link being drawn, the selection box
+        if (Editable) {
+            var hn = Doc.Find(hoverId);
+            if (hn != null && mode == Mode.None) {
+                var h = LinkHandle(hn);
+                using (var b = new System.Drawing.SolidBrush(DgColors.Parse(c.Raw("sel")))) g.FillEllipse(b, h.X - 5, h.Y - 5, 10, 10);
+                using (var pen = new System.Drawing.Pen(DgColors.Parse(c.Raw("bg")), 1.5f)) g.DrawEllipse(pen, h.X - 5, h.Y - 5, 10, 10);
+            }
+            if (mode == Mode.Link) {
+                var f = Doc.Find(linkFrom);
+                if (f != null) using (var pen = new System.Drawing.Pen(DgColors.Parse(c.Raw("sel")), 2 / Zoom) { DashPattern = new float[] { 4, 3 } }) g.DrawLine(pen, LinkHandle(f), mouseW);
+            }
+            if (mode == Mode.Box) {
+                using (var b = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(40, DgColors.Parse(c.Raw("sel"))))) g.FillRectangle(b, box);
+                using (var pen = new System.Drawing.Pen(DgColors.Parse(c.Raw("sel")), 1 / Zoom)) g.DrawRectangle(pen, box.X, box.Y, box.Width, box.Height);
+            }
+        }
+        g.Restore(st);
+        PaintOverlay(g, c);
+    }
+
+    // header, legend and zoom buttons (pixels, on top)
+    void PaintOverlay(System.Drawing.Graphics g, DgColors c) {
+        float s = UiScale;
+        var panel = DgColors.Parse(c.Raw("panel")); var line = DgColors.Parse(c.Raw("btnLine")); var ink = DgColors.Parse(c.Raw("ink")); var muted = DgColors.Parse(c.Raw("muted"));
+        var fUi = DgMeasure.Font(12.5f * s, 400, false); var fBold = DgMeasure.Font(14.5f * s, 600, false); var fMono = DgMeasure.Font(12f * s, 400, true); var fSmall = DgMeasure.Font(10.5f * s, 400, false);
+        // header: title and totals
+        if (Doc.On("header") && (Doc.Title.Length > 0)) {
+            int down = Doc.Nodes.Count(n => View.Down.Contains(n.Id) || n.Status == "down");
+            float total = View.Rate.Count == 0 ? 0 : Doc.Nodes.Where(n => Doc.Edges.Any(e => e.Animate && e.To == n.Id) && !Doc.Edges.Any(e => e.Animate && e.From == n.Id)).Sum(n => View.Spark.ContainsKey(n.Id) && View.Spark[n.Id].Count > 0 ? View.Spark[n.Id].Last() : 0);
+            string stats = Doc.Nodes.Count(n => !n.Hidden) + " components   " + (down > 0 ? down + " down" : "all up") + (total > 0 ? "   " + Fmt(total) + " pps delivered" : "");
+            float tw = g.MeasureString(Doc.Title, fBold).Width, sw2 = g.MeasureString(stats, fSmall).Width;
+            var r = new System.Drawing.RectangleF(14 * s, 14 * s, Math.Max(tw, sw2) + 46 * s, 50 * s);
+            using (var gp = DgGdiPainter.RoundRect(r.X, r.Y, r.Width, r.Height, 10 * s)) { using (var b = new System.Drawing.SolidBrush(panel)) g.FillPath(b, gp); using (var p = new System.Drawing.Pen(line)) g.DrawPath(p, gp); }
+            var dot = DgColors.Parse(c.Raw(down > 0 ? "bad" : "ok"));
+            using (var b = new System.Drawing.SolidBrush(dot)) g.FillEllipse(b, r.X + 14 * s, r.Y + 15 * s, 8 * s, 8 * s);
+            using (var b = new System.Drawing.SolidBrush(ink)) g.DrawString(Doc.Title, fBold, b, r.X + 28 * s, r.Y + 8 * s);
+            using (var b = new System.Drawing.SolidBrush(muted)) g.DrawString(stats, fSmall, b, r.X + 28 * s, r.Y + 29 * s);
+        }
+        // legend: one chip per flow / category used by links (click to hide)
+        legendHits.Clear();
+        if (Doc.On("legend")) {
+            var cats = Doc.Cats.Where(k => Doc.Edges.Any(e => e.Cat == k.Id) || Doc.Nodes.Any(n => n.Cat == k.Id)).ToList();
+            float maxX = ZoomButtons()[0].X - 12 * s;
+            // rows from the bottom: measure first, then lay out so the last row sits at the bottom
+            var widths = cats.Select(k => g.MeasureString(k.Name, fUi).Width + 38 * s).ToList();
+            int rows = 1; { float xx = 14 * s; foreach (var w0 in widths) { if (xx + w0 > maxX && xx > 14 * s) { rows++; xx = 14 * s; } xx += w0 + 8 * s; } }
+            float x = 14 * s, y = Height - 44 * s - (rows - 1) * 36 * s;
+            int ki = 0;
+            foreach (var k in cats) {
+                var w = widths[ki++];
+                if (x + w > maxX && x > 14 * s) { x = 14 * s; y += 36 * s; }
+                var r = new System.Drawing.RectangleF(x, y, w, 30 * s);
+                bool off = View.HiddenCats.Contains(k.Id);
+                using (var gp = DgGdiPainter.RoundRect(r.X, r.Y, r.Width, r.Height, 15 * s)) { using (var b = new System.Drawing.SolidBrush(panel)) g.FillPath(b, gp); using (var p = new System.Drawing.Pen(line)) g.DrawPath(p, gp); }
+                var col = DgColors.Parse(c.Raw("c:" + k.Id));
+                using (var b = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(off ? 90 : 255, col))) g.FillEllipse(b, r.X + 13 * s, r.Y + 10.5f * s, 9 * s, 9 * s);
+                using (var b = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(off ? 110 : 255, ink))) {
+                    var f2 = off ? new System.Drawing.Font(fUi, System.Drawing.FontStyle.Strikeout) : fUi;
+                    g.DrawString(k.Name, f2, b, r.X + 27 * s, r.Y + 6.5f * s);
+                    if (off) f2.Dispose();
+                }
+                legendHits.Add(new KeyValuePair<System.Drawing.RectangleF, string>(r, k.Id));
+                x += w + 8 * s;
+            }
+        }
+        // zoom buttons
+        var zb = ZoomButtons();
+        string[] t = { "-", ((int)Math.Round(Zoom * 100)) + "%", "+", "Fit" };
+        for (int i = 0; i < 4; i++) {
+            var r = zb[i];
+            using (var gp = DgGdiPainter.RoundRect(r.X, r.Y, r.Width, r.Height, 6 * s)) { using (var b = new System.Drawing.SolidBrush(panel)) g.FillPath(b, gp); using (var p = new System.Drawing.Pen(line)) g.DrawPath(p, gp); }
+            var sz = g.MeasureString(t[i], fMono);
+            using (var b = new System.Drawing.SolidBrush(ink)) g.DrawString(t[i], fMono, b, r.X + (r.Width - sz.Width) / 2, r.Y + (r.Height - sz.Height) / 2);
+        }
+    }
+}
+
+'@
+
+function Initialize-Diagrams {
+    if ('DgDoc' -as [type]) { return $true }
+    $old = [System.Windows.Forms.Cursor]::Current; [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::WaitCursor
+    try { Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing, System.Core -TypeDefinition $DgSource -ErrorAction Stop; $true }
+    catch { Write-Log "diagram engine: $_"; [void][System.Windows.Forms.MessageBox]::Show("The diagram engine couldn't start:`n$($_.Exception.Message)", 'Diagram studio'); $false }
+    finally { [System.Windows.Forms.Cursor]::Current = $old }
+}
+
+# ======================================================================================
+# Diagram studio: diagrams from text (own syntax or Mermaid), drawn live on a canvas you can drag, style and
+# animate; saved as text; exported as a picture, SVG code or an interactive web page.
+# ======================================================================================
+$DgDir = Join-Path $DataDir 'diagrams'
+$DgUI = @{ Form = $null; Text = ''; Undo = (New-Object System.Collections.Generic.List[string]); Redo = (New-Object System.Collections.Generic.List[string]); File = ''; Quiet = $false; Doc = $null }
+
+function Get-DiagramExamples {
+    $ex = [ordered]@{}
+    $ex['Network visibility map'] = @'
+title Network visibility architecture
+theme midnight dark
+font IBM Plex Sans
+mono IBM Plex Mono
+
+category prod "Production" #3f4fc4 / #8b97ff
+category tap "Capture" #b02a86 / #e879c6
+category ixia "IXIA" #0b5fc2 / #4ea8ff
+category gigamon "Gigamon" #06804f / #3ddc97
+category ns "Netscout" #c22f45 / #ff8a95
+category alg "Allegro" #a86f00 / #f5b94a
+category end "Endace" #6340d6 / #b29dff
+category vec "Vectra" #08806b / #34d3b4
+category mgmt "Management" #cc2638 / #ff5d6c
+
+lanes "Production network" | "Network TAPs" | "Packet brokers" | "Monitoring tools" | "Management"
+
+core: Core Network [badge CORE, prod, lane 1, items "Device A" "TAP" "Device B"]
+  desc Production segment. Devices exchange live traffic in both directions; the TAP on their link copies it to the packet brokers.
+fw: Firewalls [badge FW, prod, lane 1, items "Device A" "TAP" "Device B"]
+  desc Production segment. The TAP on the firewall link copies its traffic to the packet brokers.
+dc: Data Centers [badge DC, prod, lane 1, items "Device A" "TAP" "Device B"]
+  desc Production segment in the data centers.
+dmz: Cloud / DMZ [badge DMZ, prod, lane 1, items "Device A" "TAP" "Device B"]
+  desc Production segment for cloud and DMZ traffic.
+app: Applications [badge APP, prod, lane 1, items "Device A" "TAP" "Device B"]
+  desc Production segment for application traffic.
+
+taps: Network TAPs [badge TAP, tap, lane 2, spark, lines "Passive optical copies" "of every production link"]
+  desc Sits between two network devices and passively copies traffic. Copies go to both packet brokers.
+  tags Passive, Optical splitter, No packet loss
+
+ixia: IXIA Packet Broker [badge IXIA, ixia, lane 3, spark, lines "Filtering \u00b7 Load balancing" "Aggregation \u00b7 Packet processing"]
+  desc Receives copied production traffic and distributes it to the monitoring tools.
+  tags Filtering, Load balancing, Aggregation, Packet processing
+gigamon: Gigamon Packet Broker [badge GIG, gigamon, lane 3, spark, lines "Filtering \u00b7 Load balancing" "Aggregation \u00b7 Packet processing"]
+  desc Receives copied production traffic and distributes it to the monitoring tools.
+  tags Filtering, Load balancing, Aggregation, Packet processing
+
+netscout: Netscout Probes [badge NS, ns, lane 4, spark, lines "Traffic analysis and network" "performance monitoring"]
+  desc Traffic analysis and network performance monitoring. Reports to the Netscout Global Servers.
+allegro: Allegro [badge ALG, alg, lane 4, spark, lines "Packet analysis and troubleshooting"]
+  desc Packet analysis and troubleshooting.
+endace: Endace [badge END, end, lane 4, spark, lines "Packet recording and" "long term storage"]
+  desc Packet recording and long term storage.
+vectra: Vectra AI [badge AI, vec, lane 4, spark, lines "Network detection, response" "and security analytics"]
+  desc Network detection, response and security analytics.
+
+group global "Netscout Global Servers" [mgmt, dashed] {
+  gs1: Global Server #1 [badge GS1, mgmt, lane 5, lines "Active"]
+  gs2: Global Server #2 [badge GS2, mgmt, lane 5, lines "Active"]
+}
+
+core.1 <-> core.2 [prod, animate]
+core.2 <-> core.3 [prod, animate]
+fw.1 <-> fw.2 [prod, animate]
+fw.2 <-> fw.3 [prod, animate]
+dc.1 <-> dc.2 [prod, animate]
+dc.2 <-> dc.3 [prod, animate]
+dmz.1 <-> dmz.2 [prod, animate]
+dmz.2 <-> dmz.3 [prod, animate]
+app.1 <-> app.2 [prod, animate]
+app.2 <-> app.3 [prod, animate]
+
+core, fw, dc, dmz, app -> taps [tap, dashed, animate]
+taps -> ixia [ixia, animate]
+taps -> gigamon [gigamon, animate]
+ixia -> netscout, allegro, endace, vectra [ixia, animate]
+gigamon -> netscout, allegro, endace, vectra [gigamon, animate]
+netscout -> gs1 [mgmt, dashed, animate, density 0.5]
+gs1 <-> gs2 [mgmt, dashed, label "sync"]
+'@
+    $ex['Flowchart (Mermaid)'] = @'
+%% Mermaid flowcharts work as they are: paste one from your docs
+graph TD
+    A([Request comes in]) --> B{Logged in?}
+    B -- yes --> C[Load the dashboard]
+    B -- no --> D[Show the sign-in page]
+    D --> E[(Users DB)]
+    E --> F{Password OK?}
+    F -->|yes| C
+    F -->|no| G[/Show an error/]
+    G --> D
+    C --> H((Done))
+'@
+    $ex['Microservices'] = @'
+title Shop platform
+theme corporate light
+direction LR
+
+category edge "Edge"
+category svc "Services"
+category data "Data"
+category async "Events"
+
+web: Web app [badge WEB, edge, shape pill]
+mobile: Mobile app [badge IOS, edge, shape pill]
+gw: API gateway [badge GW, edge, lines "Auth \u00b7 rate limits"]
+group core "Core services" [svc] {
+  orders: Orders [badge ORD, svc, spark]
+  catalog: Catalog [badge CAT, svc, spark]
+  pay: Payments [badge PAY, svc, spark, status warn]
+}
+pg: Orders DB [data, shape cylinder]
+redis: Cache [data, shape cylinder]
+bus: Event bus [badge KAFKA, async]
+mail: E-mails [async, shape doc]
+
+web, mobile -> gw [edge, animate]
+gw -> orders, catalog, pay [svc, animate]
+orders -> pg [data]
+catalog -> redis [data]
+orders -> bus [async, dashed, animate]
+bus -> mail [async, dashed, animate]
+pay -> bus [async, dashed, animate]
+'@
+    $ex['Org chart'] = @'
+title Engineering
+theme pastel light
+direction TB
+route ortho
+
+cto: Ada Lovelace [badge CTO, lines "Chief technology officer"]
+vpe: Grace Hopper [badge VP, lines "Engineering"]
+vpp: Alan Turing [badge VP, lines "Platform"]
+web: Web team [shape rounded]
+apps: Apps team [shape rounded]
+infra: Infrastructure [shape rounded]
+sec: Security [shape rounded]
+
+cto -> vpe, vpp
+vpe -> web, apps
+vpp -> infra, sec
+'@
+    $ex['Simple flow'] = @'
+title Deploy pipeline
+theme neon dark
+direction LR
+
+commit: Commit [shape circle]
+build: Build [badge CI]
+test: Tests [badge CI, status ok]
+review: Review [shape diamond]
+deploy: Deploy [badge CD, status warn]
+users((Users))
+
+commit -> build -> test -> review [animate]
+review -approved-> deploy [animate]
+review -changes-> commit [dashed, curve]
+deploy -> users [animate, density 2]
+'@
+    $ex
+}
+
+function Get-DiagramFiles {
+    if (-not (Test-Path -LiteralPath $DgDir)) { return @() }
+    @(Get-ChildItem -LiteralPath $DgDir -Filter '*.dgm' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+}
+
+# The text changed (typed, or an edit on the canvas): parse, lay out, draw.
+function Update-Diagram([switch]$Fit) {
+    $t = $DgUI.Text
+    $d = [DgText]::Parse($t)
+    [DgLayout]::Apply($d)
+    $DgUI.Doc = $d
+    $cv = $DgUI.Canvas
+    $cv.Theme = [DgTheme]::Get($d.Theme)
+    if (-not $DgUI.ModeSet) { $cv.Dark = $d.Mode -ne 'light' }
+    $cv.SetDoc($d, (-not $Fit))
+    if ($Fit) { $cv.UserView = $false; $cv.ZoomToFit() }
+    $w = @($d.Warnings)
+    $DgUI.Warn.Text = if ($w.Count) { ($w | Select-Object -First 3) -join "`n" } else { "$(@($d.Nodes).Count) shapes, $(@($d.Edges).Count) links" }
+    $DgUI.Warn.ForeColor = if ($w.Count) { $C.Yellow } else { $C.Dim }
+    Update-DiagramProps
+    Update-DiagramTitle
+    if ($DgUI.File) { $DgUI.SaveTimer.Stop(); $DgUI.SaveTimer.Start() }
+}
+
+function Update-DiagramTitle {
+    if (-not $DgUI.Form) { return }
+    $n = if ($DgUI.File) { [IO.Path]::GetFileNameWithoutExtension($DgUI.File) } else { 'not saved' }
+    $DgUI.Form.Text = "Diagram studio  -  $n"
+}
+
+# Replaces the text (from an edit), with undo.
+function Set-DiagramText([string]$Text, [switch]$Fit, [switch]$NoUndo) {
+    if ($Text -ceq $DgUI.Text) { return }
+    if (-not $NoUndo) { $DgUI.Undo.Add($DgUI.Text); if ($DgUI.Undo.Count -gt 200) { $DgUI.Undo.RemoveAt(0) }; $DgUI.Redo.Clear() }
+    $DgUI.Text = $Text
+    $DgUI.Quiet = $true
+    try {
+        $ed = $DgUI.Editor
+        $top = $ed.GetCharIndexFromPosition((New-Object System.Drawing.Point(2, 2)))     # keep what was in view
+        $sel = $ed.SelectionStart
+        [PowerClipTheme]::Redraw($ed.Handle, $false)
+        try {
+            $ed.Text = $Text
+            Set-DiagramColors
+            $ed.Select([Math]::Min($top, $ed.TextLength), 0); $ed.ScrollToCaret()
+            $ed.Select([Math]::Min($sel, $ed.TextLength), 0)
+        } finally { [PowerClipTheme]::Redraw($ed.Handle, $true); $ed.Invalidate() }
+    } finally { $DgUI.Quiet = $false }
+    Update-Diagram -Fit:$Fit
+}
+
+function Undo-Diagram {
+    if ($DgUI.Undo.Count -eq 0) { return }
+    $DgUI.Redo.Add($DgUI.Text)
+    $t = $DgUI.Undo[$DgUI.Undo.Count - 1]; $DgUI.Undo.RemoveAt($DgUI.Undo.Count - 1)
+    Set-DiagramText $t -NoUndo
+}
+function Redo-Diagram {
+    if ($DgUI.Redo.Count -eq 0) { return }
+    $DgUI.Undo.Add($DgUI.Text)
+    $t = $DgUI.Redo[$DgUI.Redo.Count - 1]; $DgUI.Redo.RemoveAt($DgUI.Redo.Count - 1)
+    Set-DiagramText $t -NoUndo
+}
+
+# Colours in the text: comments, keywords, ids, [attributes], "strings", arrows, #colours.
+function Set-DiagramColors {
+    $ed = $DgUI.Editor
+    $t = $ed.Text
+    [PowerClipTheme]::Redraw($ed.Handle, $false)
+    $ss = $ed.SelectionStart; $sl = $ed.SelectionLength
+    try {
+        $ed.SelectAll(); $ed.SelectionColor = $C.Fore
+        $paint = { param($rx, $col, $grp) foreach ($m in [regex]::Matches($t, $rx, 'Multiline')) { $g = $m.Groups[$grp]; if ($g.Length) { $ed.Select($g.Index, $g.Length); $ed.SelectionColor = $col } } }
+        & $paint '^\s*(title|subtitle|theme|mode|font|mono|layout|direction|dir|graph|flowchart|route|routing|spacing|radius|hide|show|category|cat|flow|lanes|lane|group|subgraph|end|style|hint|click)\b' $C.Accent 1
+        & $paint '^\s*([A-Za-z_][\w\-]*)\s*:' $C.Purple 1
+        & $paint '^\s+(desc|description|tags|lines|line|items|url|link|metric|badge|status|note)\b' $C.Green 1
+        & $paint '(\s\[[^\]\r\n]*\])\s*$' $C.Dim 1
+        & $paint '(<?(-\.+-?>?|={2,3}>|-{2,3}>|-{3}|->)(\|[^|\r\n]*\|)?)' $C.Green 1
+        & $paint '("[^"\r\n]*")' $C.Orange 1
+        & $paint '(#[0-9a-fA-F]{3,8})\b' $C.Orange 1
+        & $paint '^\s*((%%|//|#(?![0-9a-fA-F]{3,8}\b)).*)$' $C.Dim 1
+    } finally { $ed.Select($ss, $sl); [PowerClipTheme]::Redraw($ed.Handle, $true); $ed.Invalidate() }
+}
+
+# ---- saving
+function Save-DiagramFile {
+    if (-not $DgUI.File) { return }
+    try {
+        if (-not (Test-Path -LiteralPath $DgDir)) { [void](New-Item -ItemType Directory -Path $DgDir -Force) }
+        Write-JsonFile $DgUI.File $DgUI.Text
+    } catch { Write-Log "diagram save failed: $_" }
+}
+function New-DiagramName([string]$Base) {
+    $Base = (($Base -replace '[\\/:*?"<>|]', ' ') -replace '\s+', ' ').Trim()
+    if (-not $Base) { $Base = 'Diagram' }
+    $n = $Base; $i = 2
+    while (Test-Path -LiteralPath (Join-Path $DgDir "$n.dgm")) { $n = "$Base $i"; $i++ }
+    $n
+}
+function Open-DiagramFile([string]$Path) {
+    Save-DiagramFile
+    try { $t = Read-DataText $Path } catch { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, "Couldn't open it: $($_.Exception.Message)", 'Diagram studio'); return }
+    $DgUI.File = $Path
+    $DgUI.Undo.Clear(); $DgUI.Redo.Clear()
+    Set-DiagramText $t -Fit -NoUndo
+    Update-DiagramList
+}
+function New-DiagramFromText([string]$Name, [string]$Text) {
+    Save-DiagramFile
+    if (-not (Test-Path -LiteralPath $DgDir)) { [void](New-Item -ItemType Directory -Path $DgDir -Force) }
+    $DgUI.File = Join-Path $DgDir ((New-DiagramName $Name) + '.dgm')
+    $DgUI.Undo.Clear(); $DgUI.Redo.Clear()
+    Set-DiagramText $Text -Fit -NoUndo
+    Save-DiagramFile
+    Update-DiagramList
+}
+function Update-DiagramList {
+    $l = $DgUI.List
+    if (-not $l) { return }
+    $l.BeginUpdate(); $l.Items.Clear()
+    foreach ($f in Get-DiagramFiles) { [void]$l.Items.Add($f.BaseName); if ($f.FullName -eq $DgUI.File) { $l.SelectedIndex = $l.Items.Count - 1 } }
+    $l.EndUpdate()
+}
+
+# ---- edits from the canvas and the properties panel (all go through the text)
+function Set-DiagramNodeAttr([string]$Id, [string]$Key, $Value) { Set-DiagramText ([DgText]::SetNodeAttr($DgUI.Text, $Id, $Key, $Value)) }
+function Format-DiagramWords($Lines) { (@($Lines | Where-Object { $_ -ne '' } | ForEach-Object { '"' + ($_ -replace '"', "'") + '"' }) -join ' ') }
+
+function Add-DiagramNode([float]$X, [float]$Y) {
+    $i = 1; while ($DgUI.Doc.Find("n$i")) { $i++ }
+    $id = "n$i"
+    $line = "${id}: New shape [at $([int]$X) $([int]$Y)]"
+    Set-DiagramText ([DgText]::AddLine($DgUI.Text, $line))
+    $DgUI.Canvas.Select([string[]]@($id))
+}
+
+function Remove-DiagramSelection {
+    $cv = $DgUI.Canvas
+    $t = $DgUI.Text
+    if ($cv.View.Selected.Count) { foreach ($id in @($cv.View.Selected)) { $t = [DgText]::RemoveNode($t, $id) } }
+    elseif ($cv.View.SelectedEdge) {
+        $e = $DgUI.Doc.Edges | Where-Object { $_.Id -eq $cv.View.SelectedEdge } | Select-Object -First 1
+        if ($e -and $e.SrcLine -ge 0) { $t = [DgText]::RemoveLine($t, $e.SrcLine) }
+    } else { return }
+    Set-DiagramText $t
+}
+
+function Edit-DiagramLabel {
+    $cv = $DgUI.Canvas
+    $n = $DgUI.Doc.Find($cv.SelectedId)
+    if (-not $n) { return }
+    $tb = New-Object System.Windows.Forms.TextBox
+    $tb.BorderStyle = 'FixedSingle'; $tb.BackColor = $C.Bg; $tb.ForeColor = $C.Fore; $tb.Font = $FontMain
+    $tb.Text = $n.Title -replace "`n", ' '
+    $x = ($n.X - $cv.Pan.X) * $cv.Zoom; $y = ($n.Y + $n.H / 2 - $cv.Pan.Y) * $cv.Zoom
+    $tb.Width = [Math]::Max((Px 160), [int]($n.W * $cv.Zoom)); $tb.Location = New-Object System.Drawing.Point([int]$x, [int]($y - $tb.Height / 2))
+    $tb.Tag = $n.Id
+    $done = {
+        param($src, $commit)
+        if ($src.Tag -eq '') { return }
+        $id = $src.Tag; $src.Tag = ''
+        $v = $src.Text.Trim()
+        $DgUI.Canvas.Controls.Remove($src); $src.Dispose()
+        if ($commit -and $v) { Set-DiagramText ([DgText]::SetNodeLabel($DgUI.Text, $id, $v)) }
+        $DgUI.Canvas.Focus()
+    }
+    $tb.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Enter') { $e.SuppressKeyPress = $true; & $done $src $true } elseif ($e.KeyCode -eq 'Escape') { $e.SuppressKeyPress = $true; & $done $src $false } }.GetNewClosure())
+    $tb.add_LostFocus({ param($src, $e) & $done $src $true }.GetNewClosure())
+    $cv.Controls.Add($tb); $tb.Focus(); $tb.SelectAll()
+}
+
+# ---- properties (right): the selected shape or link, or the whole diagram; in Preview: the details of a shape
+function Add-DgProp($Panel, [string]$Label, $Control, [int]$Width = 250) {
+    if ($Label) { $l = New-TbLabel $Panel $Label -Dim; $l.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, (Px 2)) }
+    if ($Control) { if ($Control.Width -lt (Px 40) -or $Width -gt 0) { $Control.Width = Px ($Width * $TextZoom) }; $Panel.Controls.Add($Control) }
+    $Control
+}
+function New-DgBox([string]$Text, [scriptblock]$OnChange, [switch]$Multi, [int]$Height = 0) {
+    $b = New-TbBox -Multi:$Multi
+    if ($Multi) { $b.ScrollBars = 'Vertical'; $b.AcceptsReturn = $true; $b.Height = Px $(if ($Height) { $Height } else { 70 }) }
+    $b.Text = $Text
+    $b.Tag = @{ On = $OnChange; Old = $Text }
+    $b.add_Leave({ param($src, $e) if ($src.Text -cne $src.Tag.Old) { $src.Tag.Old = $src.Text; & $src.Tag.On $src.Text } })
+    if (-not $Multi) { $b.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Enter') { $e.SuppressKeyPress = $true; if ($src.Text -cne $src.Tag.Old) { $src.Tag.Old = $src.Text; & $src.Tag.On $src.Text } } }) }
+    $b
+}
+function New-DgCombo($Items, [string]$Value, [scriptblock]$OnChange, [switch]$Editable) {
+    $cx = New-Object System.Windows.Forms.ComboBox
+    $cx.DropDownStyle = if ($Editable) { 'DropDown' } else { 'DropDownList' }; $cx.FlatStyle = 'Flat'; $cx.BackColor = $C.Bg; $cx.ForeColor = $C.Fore
+    foreach ($i in $Items) { [void]$cx.Items.Add($i) }
+    $cx.Text = $Value; if (-not $Editable) { $k = $cx.Items.IndexOf($Value); if ($k -ge 0) { $cx.SelectedIndex = $k } }
+    $cx.Tag = @{ On = $OnChange; Ready = $true }
+    $cx.add_SelectionChangeCommitted({ param($src, $e) & $src.Tag.On ([string]$src.SelectedItem) })
+    if ($Editable) { $cx.add_Leave({ param($src, $e) if ($src.Text -and -not $src.Items.Contains($src.Text)) { & $src.Tag.On $src.Text } }) }
+    $cx
+}
+function New-DgColorButton($Parent, [string]$Label, [string]$Value, [scriptblock]$OnChange) {
+    $b = New-Button $(if ($Value) { "$Label  $Value" } else { "$Label  (auto)" }) 'Pick a colour (right-click: back to automatic)' {
+        param($src, $e)
+        $dlg = New-Object System.Windows.Forms.ColorDialog; $dlg.FullOpen = $true
+        if ($src.Tag.Value) { $dlg.Color = [DgColors]::Parse($src.Tag.Value) }
+        $script:Modal = $true
+        try { if ($dlg.ShowDialog($DgUI.Form) -eq 'OK') { $hex = '#' + $dlg.Color.R.ToString('x2') + $dlg.Color.G.ToString('x2') + $dlg.Color.B.ToString('x2'); & $src.Tag.On $hex } } finally { $script:Modal = $false; $dlg.Dispose() }
+    } $Parent $Glyph.Color 2
+    $b.Tag = @{ Value = $Value; On = $OnChange }
+    $b.add_MouseUp({ param($src, $e) if ($e.Button -eq 'Right') { & $src.Tag.On $null } })
+    $b
+}
+
+function Update-DiagramProps {
+    $p = $DgUI.Props
+    if (-not $p -or $DgUI.PropsBusy) { return }
+    $cv = $DgUI.Canvas; $d = $DgUI.Doc
+    $p.SuspendLayout()
+    foreach ($ctl in @($p.Controls)) { $p.Controls.Remove($ctl); $ctl.Dispose() }
+    $cats = @($d.Cats | ForEach-Object { $_.Id })
+    $node = if ($cv.View.Selected.Count -eq 1) { $d.Find(@($cv.View.Selected)[0]) } else { $null }
+    $edge = if ($cv.View.SelectedEdge) { $d.Edges | Where-Object { $_.Id -eq $cv.View.SelectedEdge } | Select-Object -First 1 } else { $null }
+    if (-not $cv.Editable -and $node) { Show-DiagramDetails $p $node }
+    elseif ($node) {
+        $id = $node.Id
+        New-TbLabel $p "Shape  $id" -Title | Out-Null
+        Add-DgProp $p 'Title' (New-DgBox $node.Label { param($v) Set-DiagramText ([DgText]::SetNodeLabel($DgUI.Text, $DgUI.PropId, $v)) }) | Out-Null
+        Add-DgProp $p 'Badge (short code on the card)' (New-DgBox $node.Badge { param($v) Set-DiagramNodeAttr $DgUI.PropId 'badge' $(if ($v) { $v } else { $null }) }) 140 | Out-Null
+        Add-DgProp $p 'Category (colour; type a new name to add one)' (New-DgCombo (@('(none)') + $cats) $(if ($node.Cat) { $node.Cat } else { '(none)' }) { param($v) Set-DiagramNodeAttr $DgUI.PropId 'cat' $(if ($v -and $v -ne '(none)') { $v -replace '\W', '' } else { $null }) } -Editable) | Out-Null
+        $shapes = @('auto', 'card', 'rounded', 'rect', 'pill', 'circle', 'diamond', 'hexagon', 'parallelogram', 'cylinder', 'doc', 'note', 'actor', 'table')
+        Add-DgProp $p 'Shape' (New-DgCombo $shapes $(if ($node.Shape) { $node.Shape } else { 'auto' }) { param($v) Set-DiagramNodeAttr $DgUI.PropId 'shape' $(if ($v -ne 'auto') { $v } else { $null }) }) 160 | Out-Null
+        if ($d.LaneMode) {
+            $lanes = @('auto') + @(for ($i = 0; $i -lt [Math]::Max($d.Lanes.Count, 1); $i++) { "$($i + 1)  $(if ($i -lt $d.Lanes.Count) { $d.Lanes[$i] })" })
+            Add-DgProp $p 'Lane (column)' (New-DgCombo $lanes $(if ($node.Lane -ge 0) { $lanes[$node.Lane + 1] } else { 'auto' }) { param($v) Set-DiagramNodeAttr $DgUI.PropId 'lane' $(if ($v -ne 'auto') { ($v -split ' ')[0] } else { $null }) }) 200 | Out-Null
+        }
+        Add-DgProp $p 'Status dot' (New-DgCombo @('none', 'ok', 'warn', 'down') $(if ($node.Status) { $node.Status } else { 'none' }) { param($v) Set-DiagramNodeAttr $DgUI.PropId 'status' $(if ($v -ne 'none') { $v } else { $null }) }) 120 | Out-Null
+        $sp = New-CheckBox $p 'Sparkline (live traffic graph)' $node.Spark; $sp.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0)
+        $sp.add_CheckedChanged({ param($src, $e) Set-DiagramNodeAttr $DgUI.PropId 'spark' $(if ($src.Checked) { '' } else { $null }) })
+        Add-DgProp $p 'Text lines under the title (one per line)' (New-DgBox (@($node.Lines) -join "`r`n") { param($v) $w = Format-DiagramWords ($v -split "`r?`n"); Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'lines', $(if ($w) { $w } else { $null }))) } -Multi -Height 54) | Out-Null
+        Add-DgProp $p 'Items inside (one per line; link to them as id.1, id.2 ...)' (New-DgBox (@($node.Items) -join "`r`n") { param($v) $w = Format-DiagramWords ($v -split "`r?`n"); Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'items', $(if ($w) { $w } else { $null }))) } -Multi -Height 54) | Out-Null
+        Add-DgProp $p 'Description (shown when the shape is clicked)' (New-DgBox $node.Desc { param($v) Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'desc', $(if ($v.Trim()) { '"' + (($v -replace '"', "'") -replace "`r?`n", ' ') + '"' } else { $null }))) } -Multi -Height 64) | Out-Null
+        Add-DgProp $p 'Tags (comma separated)' (New-DgBox (@($node.Tags) -join ', ') { param($v) $w = (@($v -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join '; '); Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'tags', $(if ($w) { $w } else { $null }))) }) | Out-Null
+        Add-DgProp $p 'Link (opens when clicked in the web page)' (New-DgBox $node.Url { param($v) Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'url', $(if ($v) { '"' + $v + '"' } else { $null }))) }) | Out-Null
+        $row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.AutoSize = $true; $row.WrapContents = $true; $row.MaximumSize = New-Object System.Drawing.Size((Px (260 * $TextZoom)), 0); $row.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0)
+        [void](New-DgColorButton $row 'Fill' $node.Fill { param($v) Set-DiagramNodeAttr $DgUI.PropId 'fill' $v })
+        [void](New-DgColorButton $row 'Border' $node.Stroke { param($v) Set-DiagramNodeAttr $DgUI.PropId 'stroke' $v })
+        [void](New-DgColorButton $row 'Text' $node.TextColor { param($v) Set-DiagramNodeAttr $DgUI.PropId 'color' $v })
+        $p.Controls.Add($row)
+        $b2 = New-Object System.Windows.Forms.FlowLayoutPanel; $b2.AutoSize = $true; $b2.WrapContents = $true; $b2.MaximumSize = New-Object System.Drawing.Size((Px (260 * $TextZoom)), 0); $b2.Margin = New-Object System.Windows.Forms.Padding(0, (Px 10), 0, 0)
+        [void](New-Button 'Auto position' 'Let the layout place it again' { Set-DiagramNodeAttr $DgUI.PropId 'at' $null } $b2 $Glyph.Refresh 2)
+        [void](New-Button 'Delete' 'Delete this shape and its links (Del)' { Remove-DiagramSelection } $b2 $Glyph.Delete 2)
+        $p.Controls.Add($b2)
+        $DgUI.PropId = $id
+    } elseif ($edge) {
+        $DgUI.PropLine = $edge.SrcLine
+        New-TbLabel $p 'Link' -Title | Out-Null
+        $fromN = $d.Find($edge.From); $toN = $d.Find($edge.To)
+        New-TbLabel $p "$($fromN.Title)$(if ($edge.FromItem) { " ($($edge.FromItem))" })  ->  $($toN.Title)$(if ($edge.ToItem) { " ($($edge.ToItem))" })" -Dim | Out-Null
+        $setE = { param($k, $v) Set-DiagramText ([DgText]::SetEdgeAttr($DgUI.Text, $DgUI.PropLine, $k, $v)) }
+        $DgUI.SetEdge = $setE
+        Add-DgProp $p 'Label' (New-DgBox $edge.Label { param($v) & $DgUI.SetEdge 'label' $(if ($v) { '"' + ($v -replace '"', "'") + '"' } else { $null }) }) | Out-Null
+        Add-DgProp $p 'Category / flow (colour)' (New-DgCombo (@('(none)') + $cats) $(if ($edge.Cat) { $edge.Cat } else { '(none)' }) { param($v) & $DgUI.SetEdge 'cat' $(if ($v -and $v -ne '(none)') { $v -replace '\W', '' } else { $null }) } -Editable) | Out-Null
+        Add-DgProp $p 'Line' (New-DgCombo @('solid', 'dashed', 'dotted') @('solid', 'dashed', 'dotted')[$edge.Dash] { param($v) $t = $DgUI.Text; foreach ($k in 'dashed', 'dotted', 'solid') { $t = [DgText]::SetEdgeAttr($t, $DgUI.PropLine, $k, $null) }; if ($v -ne 'solid') { $t = [DgText]::SetEdgeAttr($t, $DgUI.PropLine, $v, '') }; Set-DiagramText $t }) 120 | Out-Null
+        Add-DgProp $p 'Route' (New-DgCombo @('auto', 'ortho', 'curve', 'straight') $(if ($edge.Route) { $edge.Route } else { 'auto' }) { param($v) & $DgUI.SetEdge 'route' $(if ($v -ne 'auto') { $v } else { $null }) }) 120 | Out-Null
+        Add-DgProp $p 'Arrows' (New-DgCombo @('auto', 'end', 'both', 'start', 'none') $(if ($edge.ArrowAttr) { if ($edge.ArrowStart -and $edge.ArrowEnd) { 'both' } elseif ($edge.ArrowStart) { 'start' } elseif ($edge.ArrowEnd) { 'end' } else { 'none' } } else { 'auto' }) { param($v) $t = [DgText]::SetEdgeAttr($DgUI.Text, $DgUI.PropLine, 'noarrow', $null); $t = [DgText]::SetEdgeAttr($t, $DgUI.PropLine, 'arrow', $(if ($v -ne 'auto') { $v } else { $null })); Set-DiagramText $t }) 120 | Out-Null
+        $an = New-CheckBox $p 'Animated: packets flow along it' $edge.Animate; $an.Margin = New-Object System.Windows.Forms.Padding(0, (Px 10), 0, 0)
+        $an.add_CheckedChanged({ param($src, $e) & $DgUI.SetEdge 'animate' $(if ($src.Checked) { '' } else { $null }) })
+        $bo = New-CheckBox $p 'Both ways' $edge.Both; $bo.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), 0, 0)
+        $bo.add_CheckedChanged({ param($src, $e) & $DgUI.SetEdge 'both' $(if ($src.Checked) { '' } else { $null }) })
+        $row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.AutoSize = $true; $row.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0)
+        [void](New-DgColorButton $row 'Colour' $edge.Color { param($v) & $DgUI.SetEdge 'color' $v })
+        [void](New-Button 'Delete' 'Delete this link (its whole line in the text)' { Remove-DiagramSelection } $row $Glyph.Delete 2)
+        $p.Controls.Add($row)
+        New-TbLabel $p 'A line like  a -> b, c  makes several links: changes here apply to all of them.' -Dim | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0) }
+    } else {
+        New-TbLabel $p 'Diagram' -Title | Out-Null
+        Add-DgProp $p 'Title' (New-DgBox $d.Title { param($v) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'title', $(if ($v) { $v } else { $null }))) }) | Out-Null
+        Add-DgProp $p 'Theme' (New-DgCombo ([DgTheme]::Names) $d.Theme { param($v) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'theme', "$v $(if ($DgUI.Canvas.Dark) { 'dark' } else { 'light' })")) }) 160 | Out-Null
+        $layouts = @('auto', 'lanes', 'layered', 'grid', 'circle', 'force')
+        Add-DgProp $p 'Layout' (New-DgCombo $layouts $(if ($d.Layout) { $d.Layout } else { 'auto' }) { param($v) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'layout', $(if ($v -ne 'auto') { $v } else { $null }))) -Fit }) 160 | Out-Null
+        Add-DgProp $p 'Direction' (New-DgCombo @('LR  left to right', 'TB  top to bottom', 'RL  right to left', 'BT  bottom to top') $(switch ($d.Direction) { 'TB' { 'TB  top to bottom' } 'RL' { 'RL  right to left' } 'BT' { 'BT  bottom to top' } default { 'LR  left to right' } }) { param($v) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'direction', ($v -split ' ')[0])) -Fit }) 160 | Out-Null
+        Add-DgProp $p 'Links' (New-DgCombo @('ortho', 'curve', 'straight') $(if ($d.Route) { $d.Route } else { 'ortho' }) { param($v) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'route', $(if ($v -ne 'ortho') { $v } else { $null }))) }) 120 | Out-Null
+        $sn = New-TbNumber $p ([int]($d.Spacing * 100)) 40 400; Add-DgProp $p 'Spacing %' $null | Out-Null; $p.Controls.SetChildIndex($sn, $p.Controls.Count - 1)
+        $sn.add_ValueChanged({ param($src, $e) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'spacing', $(if ($src.Value -ne 100) { ([double]$src.Value / 100).ToString([Globalization.CultureInfo]::InvariantCulture) } else { $null }))) })
+        $rn = New-TbNumber $p ([int]$d.Radius) 0 40; Add-DgProp $p 'Corner radius' $null | Out-Null; $p.Controls.SetChildIndex($rn, $p.Controls.Count - 1)
+        $rn.add_ValueChanged({ param($src, $e) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'radius', $(if ($src.Value -ne 10) { [string]$src.Value } else { $null }))) })
+        foreach ($feat in @(@('header', 'Title and totals at the top'), @('legend', 'Legend (click a flow to hide it)'), @('grid', 'Dotted background'))) {
+            $cb = New-CheckBox $p $feat[1] (-not $d.Off.Contains($feat[0])); $cb.Tag = $feat[0]; $cb.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, 0)
+            $cb.add_CheckedChanged({ param($src, $e) $off = @($DgUI.Doc.Off | Where-Object { $_ -ne $src.Tag }); if (-not $src.Checked) { $off += $src.Tag }; Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'hide', $(if ($off) { $off -join ' ' } else { $null }))) })
+        }
+        if (@($d.Cats).Count) {
+            New-TbLabel $p 'Categories: light / dark colour' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding(0, (Px 12), 0, (Px 2)) }
+            $cl = New-Object DgColors($d, $DgUI.Canvas.Theme, $false, $false); $cdk = New-Object DgColors($d, $DgUI.Canvas.Theme, $true, $false)
+            foreach ($k in $d.Cats) {
+                $row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.AutoSize = $true; $row.WrapContents = $false; $row.Margin = New-Object System.Windows.Forms.Padding(0, (Px 2), 0, 0)
+                $nm = New-TbLabel $row $k.Name; $nm.Width = Px 90; $nm.AutoSize = $false; $nm.Height = $FontMain.Height + (Px 8)
+                foreach ($dark in $false, $true) {
+                    $hex = if ($dark) { $cdk.Raw("c:$($k.Id)") } else { $cl.Raw("c:$($k.Id)") }
+                    $sw = New-Object System.Windows.Forms.Panel; $sw.Size = New-Object System.Drawing.Size((Px 26), (Px 20)); $sw.BackColor = [DgColors]::Parse($hex); $sw.Cursor = 'Hand'; $sw.Margin = New-Object System.Windows.Forms.Padding((Px 4), (Px 2), 0, 0)
+                    $sw.Tag = @{ Id = $k.Id; Name = $k.Name; Dark = $dark; L = $cl.Raw("c:$($k.Id)"); D = $cdk.Raw("c:$($k.Id)") }
+                    $tooltip.SetToolTip($sw, $(if ($dark) { 'Colour in the dark theme' } else { 'Colour in the light theme' }))
+                    $sw.add_Click({
+                        param($src, $e)
+                        $dlg = New-Object System.Windows.Forms.ColorDialog; $dlg.FullOpen = $true; $dlg.Color = $src.BackColor
+                        $script:Modal = $true
+                        try {
+                            if ($dlg.ShowDialog($DgUI.Form) -eq 'OK') {
+                                $hx = '#' + $dlg.Color.R.ToString('x2') + $dlg.Color.G.ToString('x2') + $dlg.Color.B.ToString('x2')
+                                $tg = $src.Tag; $l = if ($tg.Dark) { $tg.L } else { $hx }; $dk = if ($tg.Dark) { $hx } else { $tg.D }
+                                Set-DiagramText ([DgText]::SetCategory($DgUI.Text, $tg.Id, $tg.Name, $l, $dk))
+                            }
+                        } finally { $script:Modal = $false; $dlg.Dispose() }
+                    })
+                    $row.Controls.Add($sw)
+                }
+                $p.Controls.Add($row)
+            }
+        }
+        New-TbLabel $p "Tips: drag shapes to move them; drag from a shape's dot to another shape to link them; double-click a shape to rename it; right-click for more. Shift+drag selects several." -Dim | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0); $_.Margin = New-Object System.Windows.Forms.Padding(0, (Px 14), 0, 0) }
+    }
+    Set-ControlTheme $p $null $script:IsDark
+    $p.ResumeLayout()
+}
+
+# Preview mode: what the web page shows when a shape is clicked.
+function Show-DiagramDetails($P, $Node) {
+    $d = $DgUI.Doc; $cv = $DgUI.Canvas
+    $DgUI.PropId = $Node.Id
+    $cat = $d.FindCat($Node.Cat)
+    $cn = if ($cat -and $cat.Name -ne $Node.Badge) { $cat.Name.ToUpper() } else { '' }
+    $hd = New-TbLabel $P (@($Node.Badge, $cn) -join '   ').Trim() -Dim
+    New-TbLabel $P $Node.Title -Title | Out-Null
+    if ($Node.Desc) { New-TbLabel $P $Node.Desc | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0); $_.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, (Px 4)) } }
+    if (@($Node.Tags).Count) { New-TbLabel $P ((@($Node.Tags) | ForEach-Object { "[$_]" }) -join '  ') -Dim | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0) } }
+    $ins = @($d.Edges | Where-Object { $_.To -eq $Node.Id -and $_.From -ne $Node.Id } | ForEach-Object { $d.Find($_.From).Title } | Select-Object -Unique)
+    $outs = @($d.Edges | Where-Object { $_.From -eq $Node.Id -and $_.To -ne $Node.Id } | ForEach-Object { $d.Find($_.To).Title } | Select-Object -Unique)
+    New-TbLabel $P 'Receives from' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding(0, (Px 10), 0, 0) }
+    New-TbLabel $P $(if ($ins) { $ins -join ', ' } else { '-' }) | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0) }
+    New-TbLabel $P 'Sends to' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0) }
+    New-TbLabel $P $(if ($outs) { $outs -join ', ' } else { '-' }) | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0) }
+    $isDown = $cv.View.Down.Contains($Node.Id)
+    $st = New-TbLabel $P $(if ($isDown) { 'DOWN (simulated outage)' } else { 'Operational' })
+    $st.ForeColor = if ($isDown) { $C.Red } else { $C.Green }; $st.Margin = New-Object System.Windows.Forms.Padding(0, (Px 12), 0, (Px 4))
+    [void](New-Button $(if ($isDown) { 'End outage' } else { 'Simulate outage' }) 'Stop the traffic from this shape (only in the preview)' {
+        $id = $DgUI.PropId; $v = $DgUI.Canvas.View
+        if ($v.Down.Contains($id)) { [void]$v.Down.Remove($id) } else { [void]$v.Down.Add($id) }
+        $DgUI.Canvas.Invalidate(); Update-DiagramProps
+    } $P $Glyph.Pause 2)
+}
+
+# ---- export: picture, PNG, SVG code
+function Save-DiagramPng([float]$Scale) {
+    $d = New-Object System.Windows.Forms.SaveFileDialog
+    $d.Filter = 'PNG picture|*.png'; $d.FileName = "$(if ($DgUI.Doc.Title) { $DgUI.Doc.Title } else { 'diagram' }).png" -replace '[\\/:*?"<>|]', '_'
+    $script:Modal = $true
+    try { if ($d.ShowDialog($DgUI.Form) -ne 'OK') { return }; $path = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
+    $bmp = $DgUI.Canvas.RenderBitmap($Scale, (-not $DgUI.Transparent), $DgUI.Canvas.Dark)
+    try { $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png) } finally { $bmp.Dispose() }
+}
+
+function Show-DiagramCode {
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'SVG code'; $f.Icon = $IconActive; $f.StartPosition = 'CenterParent'
+    $f.Size = New-Object System.Drawing.Size((Px 1000), (Px 720)); $f.BackColor = $C.Panel; $f.ForeColor = $C.Fore; $f.Font = $FontMain; $f.KeyPreview = $true
+    $f.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Escape') { $src.Close() } })
+    $st = @{ Form = $f }
+    $opt = New-Object System.Windows.Forms.FlowLayoutPanel
+    $opt.Dock = 'Top'; $opt.AutoSize = $true; $opt.WrapContents = $true; $opt.BackColor = $C.Panel; $opt.Padding = New-Object System.Windows.Forms.Padding((Px 10), (Px 8), (Px 10), (Px 6))
+    $st.Kind = New-TbCombo $opt @('Plain SVG') 170
+    $st.Kind.SelectedIndex = 0
+    $st.Mode = New-TbCombo $opt @('Follows the system theme', 'Dark', 'Light') 190
+    $st.Mode.SelectedIndex = if ($DgUI.Canvas.Dark) { 1 } else { 2 }
+    $st.Vars = New-CheckBox $opt 'Colours as CSS variables' $true
+    $st.Bg = New-CheckBox $opt 'Background' $true
+    $st.Resp = New-CheckBox $opt 'Scales to its container' $true
+    $st.Acc = New-CheckBox $opt 'Title and description (accessibility)' $true
+    $st.Hover = New-CheckBox $opt 'Hover highlight' $true
+    $st.Draw = New-CheckBox $opt 'Draw-in animation' $false
+    $st.Min = New-CheckBox $opt 'Minified' $false
+    New-TbLabel $opt 'Prefix for classes and ids' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding((Px 12), (Px 9), (Px 4), 0) }
+    $st.Prefix = New-TbBox -Mono; $st.Prefix.Width = Px 150; $st.Prefix.Text = [DgSvg]::SuggestPrefix($DgUI.Doc); $st.Prefix.Margin = New-Object System.Windows.Forms.Padding(0, (Px 5), 0, 0)
+    $tooltip.SetToolTip($st.Prefix, 'Every class and id starts with this, so several diagrams can sit on the same page without clashing')
+    $opt.Controls.Add($st.Prefix)
+    $bar = New-Object System.Windows.Forms.FlowLayoutPanel
+    $bar.Dock = 'Bottom'; $bar.AutoSize = $true; $bar.BackColor = $C.Panel; $bar.Padding = New-Object System.Windows.Forms.Padding((Px 10), (Px 6), (Px 10), (Px 8))
+    $code = New-TbRtb -ReadOnly; $code.Dock = 'Fill'; $code.WordWrap = $false
+    $st.Code = $code
+    $st.Info = $null
+    $f.Controls.Add($code); $f.Controls.Add($opt); $f.Controls.Add($bar)
+    $f.Tag = $st
+    $make = {
+        param($s)
+        $o = New-Object DgSvgOptions
+        $o.Vars = $s.Vars.Checked; $o.Background = $s.Bg.Checked; $o.Responsive = $s.Resp.Checked; $o.Accessible = $s.Acc.Checked
+        $o.Hover = $s.Hover.Checked; $o.DrawIn = $s.Draw.Checked; $o.Pretty = -not $s.Min.Checked
+        $o.Mode = @('auto', 'dark', 'light')[$s.Mode.SelectedIndex]
+        $o.Prefix = $s.Prefix.Text
+        if (-not $o.Vars -and $o.Mode -eq 'auto') { $o.Mode = if ($DgUI.Canvas.Dark) { 'dark' } else { 'light' } }
+        [DgSvg]::Document($DgUI.Doc, $DgUI.Canvas.Theme, $o)
+    }
+    $st.Make = $make
+    $refresh = { param($s) $t = & $s.Make $s; $s.Text = $t; Set-RtbCode $s.Code $(if ($t.Length -gt 200000) { $t.Substring(0, 200000) + "`n... (copy or save to get all of it)" } else { $t }) 'svg'; $s.Info.Text = "$([Math]::Round($t.Length / 1KB, 1)) KB" }
+    $st.Refresh = $refresh
+    [void](New-Button 'Copy' 'Copy the code' { $s = $this.FindForm().Tag; [System.Windows.Forms.Clipboard]::SetText($s.Text); $s.Info.Text = 'Copied.' } $bar $Glyph.Copy 1)
+    [void](New-Button 'Save...' 'Save as a file' {
+        $s = $this.FindForm().Tag
+        $dd = New-Object System.Windows.Forms.SaveFileDialog; $dd.Filter = 'SVG picture|*.svg'; $dd.FileName = "$(if ($DgUI.Doc.Title) { $DgUI.Doc.Title } else { 'diagram' }).svg" -replace '[\\/:*?"<>|]', '_'
+        $script:Modal = $true
+        try { if ($dd.ShowDialog($s.Form) -eq 'OK') { [IO.File]::WriteAllText($dd.FileName, $s.Text, (New-Object System.Text.UTF8Encoding $false)); $s.Info.Text = "Saved $(Split-Path -Leaf $dd.FileName)." } } finally { $script:Modal = $false; $dd.Dispose() }
+    } $bar $Glyph.Save 2)
+    [void](New-Button 'Open in browser' 'See it in your web browser (a temporary file on this PC)' {
+        $s = $this.FindForm().Tag
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('devtools-diagram-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.html')
+        $page = "<!doctype html><html><head><meta charset=""utf-8""><title>Diagram</title><style>html,body{margin:0;background:#888}body{padding:16px}</style></head><body>`n" + $s.Text + "`n</body></html>"
+        [IO.File]::WriteAllText($tmp, $page, (New-Object System.Text.UTF8Encoding $false))
+        Start-Process $tmp
+    } $bar $Glyph.Open 2)
+    $st.Info = New-TbLabel $bar '' -Dim
+    $st.Info.Margin = New-Object System.Windows.Forms.Padding((Px 10), (Px 8), 0, 0)
+    $st.Prefix.add_TextChanged({ param($src, $e) $s = $src.FindForm().Tag; if ($s.Refresh) { & $s.Refresh $s } })
+    foreach ($ctl in @($st.Mode)) { $ctl.add_SelectedIndexChanged({ param($src, $e) $s = $src.FindForm().Tag; if ($s.Refresh) { & $s.Refresh $s } }) }
+    foreach ($ctl in @($st.Vars, $st.Bg, $st.Resp, $st.Acc, $st.Hover, $st.Draw, $st.Min)) { $ctl.add_CheckedChanged({ param($src, $e) $s = $src.FindForm().Tag; & $s.Refresh $s }) }
+    Register-ThemedWindow $f
+    & $refresh $st
+    $script:Modal = $true
+    try { [void]$f.ShowDialog($DgUI.Form) } finally { $script:Modal = $false; $f.Dispose() }
+}
+
+function Show-DiagramExportMenu($Anchor) {
+    $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    [void](Add-MenuItem $m 'Copy as picture' { $b = $DgUI.Canvas.RenderBitmap(2, $true, $DgUI.Canvas.Dark); try { Set-ClipboardImage $b } finally { $b.Dispose() } } $Glyph.Copy)
+    [void](Add-MenuItem $m 'Save PNG (1x)...' { Save-DiagramPng 1 } $Glyph.Photo)
+    [void](Add-MenuItem $m 'Save PNG (2x, sharp)...' { Save-DiagramPng 2 } $Glyph.Photo)
+    [void](Add-MenuItem $m 'Save PNG (3x, print)...' { Save-DiagramPng 3 } $Glyph.Photo)
+    $tp = Add-MenuItem $m 'Transparent PNG background' { $DgUI.Transparent = -not $DgUI.Transparent }
+    $tp.Checked = [bool]$DgUI.Transparent
+    [void]$m.Items.Add('-')
+    [void](Add-MenuItem $m 'SVG code...' { Show-DiagramCode } $Glyph.Code)
+    $m.Show($Anchor, (New-Object System.Drawing.Point(0, $Anchor.Height)))
+}
+
+function Show-DiagramExamplesMenu($Anchor) {
+    $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    foreach ($k in (Get-DiagramExamples).Keys) {
+        $it = Add-MenuItem $m $k { param($src, $e) New-DiagramFromText $src.Tag ((Get-DiagramExamples)[$src.Tag]) } $Glyph.Apps
+        $it.Tag = $k
+    }
+    $m.Show($Anchor, (New-Object System.Drawing.Point(0, $Anchor.Height)))
+}
+
+function Show-DiagramStudio([string]$Text = '') {
+    Hide-Picker
+    if (-not (Initialize-Diagrams)) { return }
+    if ($DgUI.Form) {
+        if ($DgUI.Form.WindowState -eq 'Minimized') { $DgUI.Form.WindowState = 'Normal' }
+        $DgUI.Form.Activate()
+        if ($Text) { New-DiagramFromText 'Diagram' $Text }
+        return
+    }
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'Diagram studio'; $f.Icon = $IconActive
+    $f.Size = New-Object System.Drawing.Size((Px 1500), (Px 900)); $f.MinimumSize = New-Object System.Drawing.Size((Px 1000), (Px 600))
+    $f.StartPosition = 'CenterScreen'; $f.BackColor = $C.Panel; $f.ForeColor = $C.Fore; $f.Font = $FontMain; $f.KeyPreview = $true
+    $DgUI.Form = $f
+
+    # right: properties
+    $right = New-Object System.Windows.Forms.FlowLayoutPanel
+    $right.Dock = 'Right'; $right.Width = Px (290 * $TextZoom); $right.FlowDirection = 'TopDown'; $right.WrapContents = $false; $right.AutoScroll = $true
+    $right.BackColor = $C.Bg; $right.Padding = New-Object System.Windows.Forms.Padding((Px 14), (Px 10), (Px 8), (Px 10))
+    $DgUI.Props = $right
+
+    # left: text editor and saved diagrams
+    $left = New-Object System.Windows.Forms.Panel
+    $left.Dock = 'Left'; $left.Width = Px 430; $left.BackColor = $C.Bg
+    $tabs = New-TabSet $left
+    $pText = Add-ApiTab $tabs 'Text'
+    $pSaved = Add-ApiTab $tabs 'Saved'
+    $ed = New-TbRtb; $ed.Dock = 'Fill'; $ed.AcceptsTab = $true; $ed.WordWrap = $false
+    $DgUI.Editor = $ed
+    $warn = New-Object System.Windows.Forms.Label
+    $warn.Dock = 'Bottom'; $warn.AutoSize = $false; $warn.Height = Px 46; $warn.ForeColor = $C.Dim; $warn.BackColor = $C.Bg; $warn.Font = $FontSmall; $warn.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 4), (Px 6), 0)
+    $DgUI.Warn = $warn
+    $help = New-Object System.Windows.Forms.LinkLabel
+    $help.Dock = 'Bottom'; $help.Text = 'Syntax help'; $help.LinkColor = $C.Accent; $help.BackColor = $C.Bg; $help.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 2), 0, (Px 4)); $help.AutoSize = $false; $help.Height = $FontMain.Height + (Px 8)
+    $help.add_LinkClicked({ Show-DiagramHelp })
+    $pText.Controls.Add($ed); $pText.Controls.Add($warn); $pText.Controls.Add($help)
+    $list = New-Object System.Windows.Forms.ListBox
+    $list.Dock = 'Fill'; $list.BorderStyle = 'None'; $list.BackColor = $C.Bg; $list.ForeColor = $C.Fore; $list.IntegralHeight = $false; $list.ItemHeight = $FontMain.Height + (Px 10)
+    $list.add_DoubleClick({ param($src, $e) if ($src.SelectedItem) { Open-DiagramFile (Join-Path $DgDir "$($src.SelectedItem).dgm"); Select-ApiTab $DgUI.Tabs 'Text' } })
+    $lm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    [void](Add-MenuItem $lm 'Open' { $s = $DgUI.List.SelectedItem; if ($s) { Open-DiagramFile (Join-Path $DgDir "$s.dgm"); Select-ApiTab $DgUI.Tabs 'Text' } } $Glyph.Open)
+    [void](Add-MenuItem $lm 'Rename...' {
+        $s = $DgUI.List.SelectedItem; if (-not $s) { return }
+        $n = Read-TextDialog 'Rename diagram' 'New name' $s $DgUI.Form
+        if (-not $n -or $n -eq $s) { return }
+        $new = Join-Path $DgDir ((New-DiagramName $n) + '.dgm')
+        Move-Item -LiteralPath (Join-Path $DgDir "$s.dgm") -Destination $new
+        if ($DgUI.File -eq (Join-Path $DgDir "$s.dgm")) { $DgUI.File = $new; Update-DiagramTitle }
+        Update-DiagramList
+    } $Glyph.Edit)
+    [void](Add-MenuItem $lm 'Delete' {
+        $s = $DgUI.List.SelectedItem; if (-not $s) { return }
+        if ([System.Windows.Forms.MessageBox]::Show($DgUI.Form, "Delete the diagram ""$s""?", 'Diagram studio', 'YesNo', 'Question') -ne 'Yes') { return }
+        $p = Join-Path $DgDir "$s.dgm"
+        if ($DgUI.File -eq $p) { $DgUI.File = ''; Update-DiagramTitle }
+        Remove-Item -LiteralPath $p -Force
+        Update-DiagramList
+    } $Glyph.Delete)
+    $list.ContextMenuStrip = $lm
+    $pSaved.Controls.Add($list)
+    $DgUI.List = $list; $DgUI.Tabs = $tabs
+    Select-ApiTab $tabs 'Text'
+
+    # top: commands
+    $top = New-Object System.Windows.Forms.FlowLayoutPanel
+    $top.Dock = 'Top'; $top.AutoSize = $true; $top.WrapContents = $true; $top.BackColor = $C.Panel; $top.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 6))
+    [void](New-Button 'New' 'A new, empty diagram' { New-DiagramFromText 'Diagram' "title My diagram`r`ntheme midnight dark`r`n`r`na: Start`r`nb: Next step`r`na -> b" } $top $Glyph.Add 2)
+    $exb = New-Button 'Examples' 'Start from an example' { Show-DiagramExamplesMenu $this } $top $Glyph.Apps 2
+    [void](New-Button '' 'Undo (Ctrl+Z)' { Undo-Diagram } $top ([string][char]0xE7A7) 2)
+    [void](New-Button '' 'Redo (Ctrl+Y)' { Redo-Diagram } $top ([string][char]0xE7A6) 2)
+    $DgUI.ModeBtn = New-Button 'Edit' 'Edit: drag, link and style shapes.  Preview: click shapes for details and try outages, as in the web page.' {
+        $cv = $DgUI.Canvas; $cv.Editable = -not $cv.Editable
+        $this.Text = if ($cv.Editable) { 'Edit' } else { 'Preview' }
+        $cv.View.Selected.Clear(); $cv.View.SelectedEdge = ''; $cv.Invalidate(); Update-DiagramProps
+    } $top $Glyph.Edit 2
+    $DgUI.DarkBtn = New-Button 'Dark' 'Switch between the dark and the light colours' {
+        $cv = $DgUI.Canvas; $cv.Dark = -not $cv.Dark; $DgUI.ModeSet = $true
+        $this.Text = if ($cv.Dark) { 'Dark' } else { 'Light' }
+        $cv.Invalidate()
+    } $top ([string][char]0xE793) 2
+    $DgUI.PauseBtn = New-Button 'Pause' 'Pause / play the flowing packets' { $cv = $DgUI.Canvas; $cv.Paused = -not $cv.Paused; $this.Text = if ($cv.Paused) { 'Play' } else { 'Pause' } } $top $Glyph.Pause 2
+    $sp = New-TbCombo $top @('0.5x', '1x', '2x', '4x') 70; $sp.SelectedIndex = 1
+    $sp.add_SelectedIndexChanged({ param($src, $e) $DgUI.Canvas.Speed = @(0.5, 1, 2, 4)[$src.SelectedIndex] })
+    [void](New-Button 'Re-layout' 'Forget moved positions and lay everything out again' {
+        $t = $DgUI.Text
+        foreach ($n in $DgUI.Doc.Nodes) { if ($n.HasPos) { $t = [DgText]::SetNodeAttr($t, $n.Id, 'at', $null) } }
+        Set-DiagramText $t -Fit
+    } $top $Glyph.Refresh 2)
+    $exp = New-Button 'Export' 'Picture, PNG, SVG code' { Show-DiagramExportMenu $this } $top $Glyph.Save 1
+
+    # middle: canvas
+    $cv = New-Object DgCanvas
+    $cv.Dock = 'Fill'; $cv.UiScale = $Scale * $TextZoom; $cv.Font = $FontMain
+    $DgUI.Canvas = $cv
+    $cv.add_SelectionChanged({ Update-DiagramProps })
+    $cv.add_Moved({
+        param($src, $e)
+        $t = $DgUI.Text
+        foreach ($id in $src.MovedIds) { $n = $DgUI.Doc.Find($id); if ($n) { $t = [DgText]::SetNodeAttr($t, $id, 'at', "$([int]$n.X) $([int]$n.Y)") } }
+        Set-DiagramText $t
+    })
+    $cv.add_EdgeAdded({ param($src, $e) Set-DiagramText ([DgText]::AddLine($DgUI.Text, "$($src.NewEdgeFrom) -> $($src.NewEdgeTo)")) })
+    $cv.add_DeleteRequested({ Remove-DiagramSelection })
+    $cv.add_NodeOpened({ if ($DgUI.Canvas.Editable) { Edit-DiagramLabel } })
+    $cm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $cm.add_Opening({
+        param($src, $e)
+        $src.Items.Clear()
+        $cv = $DgUI.Canvas
+        $pt = $cv.PointToClient([System.Windows.Forms.Cursor]::Position)
+        $w = New-Object System.Drawing.PointF(($pt.X / $cv.Zoom + $cv.Pan.X), ($pt.Y / $cv.Zoom + $cv.Pan.Y))
+        $DgUI.MenuAt = $w
+        $n = $cv.NodeAt($w)
+        if ($n -and -not $cv.View.Selected.Contains($n.Id)) { $cv.Select([string[]]@($n.Id)) }
+        [void](Add-MenuItem $src 'Add a shape here' { Add-DiagramNode $DgUI.MenuAt.X $DgUI.MenuAt.Y } $Glyph.Add)
+        if ($n) {
+            [void](Add-MenuItem $src 'Rename' { Edit-DiagramLabel } $Glyph.Edit 'Double-click')
+            [void](Add-MenuItem $src 'Auto position' { $t = $DgUI.Text; foreach ($id in @($DgUI.Canvas.View.Selected)) { $t = [DgText]::SetNodeAttr($t, $id, 'at', $null) }; Set-DiagramText $t } $Glyph.Refresh)
+            [void](Add-MenuItem $src 'Delete' { Remove-DiagramSelection } $Glyph.Delete 'Del')
+        }
+        [void]$src.Items.Add('-')
+        [void](Add-MenuItem $src 'Fit to window' { $DgUI.Canvas.ZoomToFit() } $Glyph.View 'Ctrl+0')
+    })
+    $cv.ContextMenuStrip = $cm
+
+    $f.Controls.Add($cv); $f.Controls.Add($right); $f.Controls.Add($left); $f.Controls.Add($top)
+    $cv.BringToFront()
+
+    $DgUI.ColorTimer = New-TbDebounce 500 { if ($DgUI.Form) { Set-DiagramColors } }
+    $DgUI.TypeTimer = New-TbDebounce 380 {
+        if (-not $DgUI.Form) { return }
+        $t = $DgUI.Editor.Text
+        if ($t -cne $DgUI.Text) { $DgUI.Undo.Add($DgUI.Text); $DgUI.Redo.Clear(); $DgUI.Text = $t; Update-Diagram }
+    }
+    $DgUI.SaveTimer = New-TbDebounce 1500 { Save-DiagramFile }
+    $ed.add_TextChanged({ if ($DgUI.Quiet) { return }; $DgUI.TypeTimer.Stop(); $DgUI.TypeTimer.Start(); $DgUI.ColorTimer.Stop(); $DgUI.ColorTimer.Start() })
+    $f.add_KeyDown({
+        param($src, $e)
+        if ($e.Control -and $e.KeyCode -eq 'Z') { $e.SuppressKeyPress = $true; Undo-Diagram }
+        elseif ($e.Control -and $e.KeyCode -eq 'Y') { $e.SuppressKeyPress = $true; Redo-Diagram }
+        elseif ($e.Control -and $e.KeyCode -eq 'S') { $e.SuppressKeyPress = $true; Save-DiagramFile }
+    })
+    $f.add_FormClosing({ $DgUI.TypeTimer.Stop(); $t = $DgUI.Editor.Text; if ($t -cne $DgUI.Text) { $DgUI.Text = $t }; Save-DiagramFile })
+    $f.add_FormClosed({ foreach ($k in 'TypeTimer', 'ColorTimer', 'SaveTimer') { if ($DgUI[$k]) { $DgUI[$k].Dispose(); $DgUI[$k] = $null } }; $DgUI.Form = $null; $DgUI.Canvas = $null; $DgUI.Props = $null; $DgUI.List = $null; $DgUI.ModeSet = $false })
+    Register-ThemedWindow $f
+    $f.Show()
+    [PowerClipHost]::EnsureShown($f.Handle)
+    # the last diagram, or the example
+    $files = Get-DiagramFiles
+    if ($Text) { New-DiagramFromText 'Diagram' $Text }
+    elseif ($files.Count) { Open-DiagramFile $files[0].FullName }
+    else { New-DiagramFromText 'Network visibility map' ((Get-DiagramExamples)['Network visibility map']) }
+    Update-DiagramList
+}
+
+function Show-DiagramHelp {
+    $t = @'
+DIAGRAM TEXT  -  a line each; indent to add details to the shape above
+
+title My diagram                  theme midnight dark   (daylight blueprint pastel mono neon corporate; dark / light)
+direction LR                      LR TB RL BT  (auto layout)       layout lanes | layered | grid | circle | force
+route ortho                       ortho | curve | straight         spacing 1.2     radius 10     font IBM Plex Sans
+hide header legend grid           turn parts off
+category prod "Production" #3f4fc4 / #8b97ff      a colour for light / dark (bare words in [ ] become categories too)
+lanes "Clients" | "Servers" | "Storage"           columns; put shapes in them with  lane 2
+
+SHAPES
+web: Web app [badge WEB, prod, lane 1, status ok, spark]
+  desc Shown when the shape is clicked.
+  tags Fast, Cached
+  lines "First line under the title" "Second line"
+  items "Device A" "TAP" "Device B"              small boxes inside; link them as web.1 or web.TAP
+db[(Orders DB)]   a([Pill])   b{Decision?}   c((Circle))   d{{Hex}}   e[/Lean/]    (Mermaid shapes)
+[shape card|rounded|rect|pill|circle|diamond|hexagon|parallelogram|cylinder|doc|note|actor|table]
+[fill #123456, stroke #..., color #..., font 16, bold, dashed, size 240 90, at 120 80, url "https://..."]
+
+LINKS
+a -> b            a --> b        a -.-> b (dashed)     a ==> b (thick)      a --- b (no arrow)     a <-> b (both)
+a -yes-> b        a -- yes --> b     a -->|yes| b      a -> b, c, d     a & b -> c     a -> b -> c
+a -> b [prod, animate, density 2, dashed, dotted, curve, straight, both, noarrow, arrow both, label "x", via 300 120]
+
+GROUPS
+group core "Core services" [svc, dashed] { a, b, c }      or      subgraph core [Core services] ... end
+
+Graph TD / flowchart LR Mermaid text works as it is.
+'@
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'Diagram text'; $f.Icon = $IconActive; $f.StartPosition = 'CenterParent'; $f.Size = New-Object System.Drawing.Size((Px 1000), (Px 640))
+    $f.BackColor = $C.Bg; $f.KeyPreview = $true; $f.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Escape') { $src.Close() } })
+    $r = New-TbRtb -ReadOnly; $r.Dock = 'Fill'; $r.Text = $t
+    $f.Controls.Add($r)
+    Register-ThemedWindow $f
+    $f.Show($DgUI.Form)
+}
+
+
+Register-PaletteCommand 'Diagram studio' '' $Glyph.Apps { Show-DiagramStudio } 'diagram flowchart mermaid svg architecture network map draw chart graph org'
+
 $ToolGroups = [ordered]@{
     'Clipboard & notes'     = @('Clipboard history', 'Notes', 'Snippets', 'Secrets', 'Paste stack=Paste stack: collect what I copy next')
     'Text & data'           = @('Transform=Transform text', 'page:json', 'page:regex', 'page:jwt', 'page:markdown', 'page:numbers', 'page:units', 'page:cron', 'page:time', 'page:gen')
     'Encode & share'        = @('page:qr', 'page:stego', 'page:codeimg')
     'Files'                 = @('Compare', 'Find in files', 'page:hash', 'page:log')
     'Web & API'             = @('API tester', 'API chains', 'Test API=Test API: start / stop')
+    'Data'                  = @('Diagram studio')
     'Network'               = @('Network tools', 'page:dns', 'page:subnet', 'page:hosts', 'page:ports', 'page:cert', 'page:certmake')
     'System'                = @('page:env', 'page:procs', 'Git')
     'Screen & productivity' = @('Screenshot=Take a screenshot', 'Text from a picture (OCR)=Copy text from the clipboard picture (OCR)', 'Edit clipboard picture=Edit the picture on the clipboard', 'page:color', 'page:record', 'page:timer', 'Reminder=New reminder...', 'page:mouse')

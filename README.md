@@ -130,6 +130,7 @@ An encrypted vault for passwords, API keys and tokens: the lock icon, **Ctrl+Shi
 | Encode & share | QR code, Hide secret messages, Code to image |
 | Files | Compare, Find in files, File hash, Log viewer |
 | Web & API | API tester, API chains, Test API |
+| Data | Diagram studio |
 | Network | Network tools, DNS lookup & whois, Subnet calculator, Host monitor, Ports, Certificates, Certificate maker |
 | System | Environment & PATH, Processes & services, Git |
 | Screen & productivity | Screenshot, Text from a picture (OCR), Edit clipboard picture, Colour picker, Screen recorder (GIF), Timer & Pomodoro, Reminder, Mouse mover & clicker |
@@ -403,6 +404,53 @@ The menu also opens the full list in the browser, shows the **requests it receiv
 - **History** keeps the last 100 requests sent, with their status and time. Click one to load it again.
 - **Environments** (the **...** button next to the Environment list) hold variables. Write `{{name}}` anywhere (URL, params, headers, auth, body) and it's replaced with the value from the selected environment, e.g. `{{baseUrl}}/users` with `baseUrl = https://api.example.com`. Unknown variables are reported in the status bar.
 - Everything is kept in `data\api\` (collections, history, environments, and the last request, which reopens next time).
+
+## Diagram studio
+
+Diagrams from a few lines of text: architecture maps, flowcharts, org charts and service maps. They are drawn live, you can drag and style them, they animate, and they export as a picture or as **SVG code** for a web page. Open it from the Toolbox (**Data** group) or the command palette.
+
+- **Write it** on the left; the drawing updates as you type. **Mermaid flowcharts** (`graph TD`, `A --> B`, `B{Decision?}`, `subgraph ... end`) work as they are, so you can paste them from your docs. The own syntax adds more:
+  - **Cards**: a badge, a status dot, lines of text, small items inside (Device A / TAP / Device B) and a live sparkline.
+  - **Categories**: one colour each for light and dark, used by the cards, the links and the legend.
+  - **Lanes**: columns with headings.
+  - **Groups**: dashed frames.
+  - **Links**: right-angled, curved or straight; dashed, thick, two-way, labelled; **animated**, so packets flow along them.
+
+  **Syntax help** (bottom left) lists it all, and **Examples** has a network visibility map, a Mermaid flowchart, microservices, an org chart and a deploy flow.
+  ```
+  title Shop platform
+  theme corporate light
+  category svc "Services" #1f6feb / #58a6ff
+  gw: API gateway [badge GW, lines "Auth \u00b7 rate limits"]
+  orders: Orders [badge ORD, svc, spark, status ok]
+  gw -> orders [svc, animate]
+  ```
+- **Or draw it** on the canvas:
+  - Drag shapes to move them.
+  - Drag from a shape's dot to another shape to link them.
+  - Double-click a shape to rename it; right-click for **Add a shape here**.
+  - Shift+drag selects several; the arrow keys nudge the selection; Del deletes.
+  - Everything you do is written back into the text, so the text is always the whole diagram.
+  - **Undo / Redo** with Ctrl+Z / Ctrl+Y.
+- **Properties** (right):
+  - **A shape**: title, badge, category, shape (card, rounded, pill, circle, diamond, hexagon, parallelogram, cylinder, document, note, actor, table), lane, status, sparkline, lines, items, description, tags, link, and fill / border / text colours.
+  - **A link**: label, category, solid / dashed / dotted, route, arrows, animated, both ways, colour.
+  - **Nothing selected**: the whole diagram. Theme (midnight, daylight, blueprint, pastel, mono, neon, corporate), layout (lanes, layered, grid, circle, force), direction, spacing, corner radius, header / legend / dots, and each category's light and dark colour.
+- **Layout** is automatic. Lanes put cards into columns; layered layouts order shapes to cut crossings, and links that skip a level go around the shapes in between. Moved shapes keep their place (`at x y` in the text); **Re-layout** forgets that.
+- **Edit / Preview**: in Preview, the canvas behaves like the web page will.
+  - Hovering a shape dims everything unrelated.
+  - Clicking a shape shows its details: description, tags, what it receives from and sends to.
+  - **Simulate outage** stops its traffic.
+  - The legend chips hide or show each flow. **Pause** and the speed stop or change the packets; **Dark / Light** switches the colours.
+- **Export**:
+  - **Copy as picture**, or **PNG** at 1x / 2x / 3x (with a transparent option).
+  - **SVG code**, with a live preview of the code and options:
+    - colours as **CSS variables** that follow the system's light / dark theme, or fixed dark or light
+    - background, scaling to its container, accessibility title and description
+    - hover highlight, draw-in animation, minified
+    - a **prefix for every class and id**, so several diagrams can sit on the same page without clashing
+  - **Copy**, **Save** or **Open in browser** to see the result.
+- Diagrams are saved as you go under `data\diagrams\` (one `.dgm` text file each; **Saved** lists them, right-click to rename or delete).
 
 ## Git
 
