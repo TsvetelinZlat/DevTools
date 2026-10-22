@@ -500,6 +500,11 @@ A SQL Server client with nothing to install (it uses the SQL Server support buil
 - **Objects**: databases > tables, views, procedures and functions > columns, with their types and PK / FK keys.
   - Double-click a name to insert it.
   - Right-click a table: **SELECT TOP 100**, its definition, or an **ER diagram from here** (with the tables linked to it). Right-click a database: **ER diagram of all tables**.
+- **Live diagram** (beside the editor, the **Live diagram** button shows / hides it): the query under the cursor drawn as you write it, before anything runs.
+  - Every table of the FROM / JOINs (CTEs and subqueries too) with its real columns, alias and PK / FK keys.
+  - Joins as links from key column to key column, coloured by type (INNER, LEFT, RIGHT, FULL, CROSS / APPLY) and labelled with the ON condition.
+  - Selected columns highlighted; columns used in joins (J), WHERE (W) and GROUP / ORDER BY (S) marked; unused ones dimmed; the WHERE conditions under their table. `INSERT INTO ... SELECT` shows where the rows go.
+  - Click a table to find it in the SQL; **Open in Diagram studio** to style or export it.
 - **Editor** with SQL colours. **F5** or **Ctrl+Enter** runs the selection, or everything; `GO` lines separate batches (as in SSMS). **Cancel** (or Esc) stops a long query. **Max rows** caps what is shown per result.
 - **Results**: a tab per result set, plus **Messages** (rows affected, PRINT output, errors).
   - An error selects the line it happened on.

@@ -22045,6 +22045,7 @@ public static class DgText {
                 case "from": case "to": {
                     var w = v.ToLowerInvariant().Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries);
                     string side = w.Length > 0 ? w[0] : ""; float t = w.Length > 1 ? F(w[1], float.NaN) : float.NaN;
+                    if (side == "auto") side = "";
                     if (a.Key == "from") { e.FromSide = side; e.FromT = t; } else { e.ToSide = side; e.ToT = t; }
                     break;
                 }
@@ -22254,7 +22255,8 @@ public static class DgLayout {
             w = tl.Max(x => DgMeasure.Width(x, tsz, n.Bold ? 600 : 400, false)) + 10; h = tl.Length * (tsz + 5) + 6;
         } else if (shape == "table") {
             float tw = DgMeasure.Width(n.Title, 13.5f, 600, false);
-            float lw = n.Lines.Count == 0 ? 0 : n.Lines.Max(x => DgMeasure.Width(x, 11.5f, 400, true) + 44);
+            float lw = n.Lines.Count == 0 ? 0 : n.Lines.Max(x => DgMeasure.Width(Regex.Replace(x, @"\s@\w+", ""), 11.5f, 400, true) + 44 + Regex.Matches(x, @"@(on|where|sort)").Count * 16 + (x.StartsWith("? ") ? 40 : 0));
+            if (n.Badge.Length > 0) tw += DgMeasure.Width(n.Badge, 10.5f, 600, true) + 24;
             w = Math.Max(170, Math.Max(tw, lw) + 32); h = 34 + n.Lines.Count * 22 + 8;
         } else {
             var lines = Wrap(n.Title, ts, n.Bold ? 600 : 500, 220);
@@ -23010,14 +23012,36 @@ public static class DgRender {
             p.Rect(x, y, w, h, 8, c.Get("card"), stroke, 1.3f, 0, o, "dg-box");
             p.Path(TopRound(x, y, w, 30, 8), ck != null ? c.Mix(ck, "28", "card") : c.Get("chip"), null, 0, 0, o, null);
             p.Text(x + 12, y + 20, n.Title, 13.5f, 600, ink, "start", false, o, 0, "dg-title");
+            if (n.Badge.Length > 0) {
+                float bw = DgMeasure.Width(n.Badge, 10.5f, 600, true) + 12;
+                p.Rect(x + w - bw - 8, y + 7, bw, 17, 4, ck != null ? c.Mix(ck, "40", "card") : c.Get("chip"), null, 0, 0, o);
+                p.Text(x + w - bw / 2 - 8, y + 19.5f, n.Badge, 10.5f, 600, ink, "middle", true, o, 0, null);
+            }
             float ry = y + 34;
             foreach (var ln in n.Lines) {
+                if (ln.StartsWith("? ")) {      // a WHERE condition
+                    p.Rect(x + 6, ry + 3, w - 12, 16, 3, c.Mix("warn", "14", "card"), null, 0, 0, o);
+                    p.Text(x + 12, ry + 14.5f, "WHERE " + ln.Substring(2), 10.5f, 500, c.Get("warn"), "start", true, o, 0, null);
+                    ry += 22; continue;
+                }
                 var parts = ln.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
                 string name = parts.Length > 0 ? parts[0] : "", type = "", flags = "";
-                foreach (var pp in parts.Skip(1)) { var u = pp.ToUpperInvariant(); if (u == "PK" || u == "FK" || u == "UQ" || u == "NN") flags += (flags.Length > 0 ? " " : "") + u; else type += (type.Length > 0 ? " " : "") + pp; }
+                var marks = new HashSet<string>();
+                foreach (var pp in parts.Skip(1)) { var u = pp.ToUpperInvariant(); if (u == "PK" || u == "FK" || u == "UQ" || u == "NN") flags += (flags.Length > 0 ? " " : "") + u; else if (pp.StartsWith("@")) marks.Add(pp.Substring(1).ToLowerInvariant()); else type += (type.Length > 0 ? " " : "") + pp; }
+                float ro = marks.Contains("dim") ? o * 0.42f : o;
+                if (marks.Contains("sel")) p.Rect(x + 1, ry + 1, w - 2, 20, 0, c.Mix("sel", "13", "card"), null, 0, 0, o);
+                float mx = x + w - 10 - DgMeasure.Width(type, 10.5f, 400, true) - 8;
+                foreach (var mk in new[] { "sort", "where", "on" }) {
+                    if (!marks.Contains(mk)) continue;
+                    string mc = mk == "on" ? c.Get("sel") : mk == "where" ? c.Get("warn") : c.Get("muted");
+                    string lt = mk == "on" ? "J" : mk == "where" ? "W" : "S";
+                    p.Ellipse(mx - 6, ry + 11, 6.5f, 6.5f, mc, null, 0, ro, null);
+                    p.Text(mx - 6, ry + 14.2f, lt, 8.5f, 700, c.Get("card"), "middle", true, ro, 0, null);
+                    mx -= 16;
+                }
                 if (flags.Length > 0) { p.Rect(x + 8, ry + 4, 24, 14, 3, flags.Contains("PK") ? c.Mix("warn", "30", "card") : c.Mix("sel", "25", "card"), null, 0, 0, o); p.Text(x + 20, ry + 14.2f, flags.Contains("PK") ? "PK" : "FK", 8.5f, 700, flags.Contains("PK") ? c.Get("warn") : c.Get("sel"), "middle", true, o, 0, null); }
-                p.Text(x + 38, ry + 15, name, 11.5f, flags.Contains("PK") ? 600 : 400, ink, "start", true, o, 0, null);
-                p.Text(x + w - 10, ry + 15, type, 10.5f, 400, c.Get("muted"), "end", true, o, 0, null);
+                p.Text(x + 38, ry + 15, name, 11.5f, flags.Contains("PK") || marks.Contains("sel") ? 600 : 400, marks.Contains("sel") ? c.Get("sel") : ink, "start", true, ro, 0, null);
+                p.Text(x + w - 10, ry + 15, type, 10.5f, 400, c.Get("muted"), "end", true, ro, 0, null);
                 ry += 22;
             }
         } else {
@@ -24631,6 +24655,392 @@ JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id JOIN sys.schemas rs
             sb.Append(id(b) + " -> " + id(a) + " [label \"1 : n\"]\r\n");
         }
         return sb.ToString();
+    }
+}
+
+// ---- Live query diagram: reads a SELECT (CTEs, subqueries, joins, WHERE / GROUP / ORDER) and makes diagram text:
+//      the tables with their columns (from the database), links for the joins from key column to key column.
+public class DgSqlSchema {
+    // "schema.table" (lower case) -> columns: name, type, "PK"/"", "FK"/""
+    public Dictionary<string, List<string[]>> Tables = new Dictionary<string, List<string[]>>(StringComparer.OrdinalIgnoreCase);
+    public static DgSqlSchema Load(string conn) {
+        var s = new DgSqlSchema();
+        var t = DgSql.Query(conn, @"SELECT s.name AS sch, o.name AS tbl, c.name AS col, TYPE_NAME(c.user_type_id) AS typ,
+  CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id WHERE i.is_primary_key = 1 AND ic.object_id = c.object_id AND ic.column_id = c.column_id) THEN 'PK' ELSE '' END AS pk,
+  CASE WHEN EXISTS (SELECT 1 FROM sys.foreign_key_columns f WHERE f.parent_object_id = c.object_id AND f.parent_column_id = c.column_id) THEN 'FK' ELSE '' END AS fk
+FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id JOIN sys.columns c ON c.object_id = o.object_id
+WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 ORDER BY s.name, o.name, c.column_id", 30);
+        foreach (System.Data.DataRow r in t.Rows) {
+            string k = r["sch"] + "." + r["tbl"];
+            List<string[]> l; if (!s.Tables.TryGetValue(k, out l)) { l = new List<string[]>(); s.Tables[k] = l; }
+            l.Add(new[] { r["col"].ToString(), r["typ"].ToString(), r["pk"].ToString(), r["fk"].ToString() });
+        }
+        return s;
+    }
+    public string Resolve(string name) {
+        var parts = name.Split('.').Where(p => p.Length > 0).ToList();
+        if (parts.Count >= 2) { var k = parts[parts.Count - 2] + "." + parts[parts.Count - 1]; if (Tables.ContainsKey(k)) return k; }
+        var last = parts.Count > 0 ? parts[parts.Count - 1] : name;
+        if (Tables.ContainsKey("dbo." + last)) return "dbo." + last;
+        return Tables.Keys.FirstOrDefault(k => k.EndsWith("." + last, StringComparison.OrdinalIgnoreCase));
+    }
+}
+
+public static class DgSqlViz {
+    class Tok { public string T = ""; public int Pos, Len, Kind; public string U { get { return Kind == 0 ? T.ToUpperInvariant() : T; } } }   // 0 word, 1 number, 2 string, 3 symbol, 4 quoted name
+    class Src {
+        public string Alias = "", Name = "", Key = "", Join = "", On = "", Id = "";
+        public int Pos, Len;
+        public bool Derived;
+        public List<string> OutCols = new List<string>();
+        public Dictionary<string, HashSet<string>> Marks = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        public List<string> Filters = new List<string>();
+        public string JoinFrom = "", FromCol = "", ToCol = "";
+        public bool All;
+        public object Tag;
+        public int OnStart, OnEnd;
+    }
+    public static Dictionary<string, int[]> Map = new Dictionary<string, int[]>();    // node id -> where it is in the text (pos, length)
+    public static string Info = "";
+
+    static List<Tok> Lex(string s) {
+        var r = new List<Tok>(); int i = 0, n = s.Length;
+        while (i < n) {
+            char c = s[i];
+            if (char.IsWhiteSpace(c)) { i++; continue; }
+            if (c == '-' && i + 1 < n && s[i + 1] == '-') { while (i < n && s[i] != '\n') i++; continue; }
+            if (c == '/' && i + 1 < n && s[i + 1] == '*') { int e = s.IndexOf("*/", i + 2); i = e < 0 ? n : e + 2; continue; }
+            int st = i;
+            if (c == '\'' || ((c == 'N' || c == 'n') && i + 1 < n && s[i + 1] == '\'')) {
+                if (c != '\'') i++;
+                i++; while (i < n) { if (s[i] == '\'') { if (i + 1 < n && s[i + 1] == '\'') { i += 2; continue; } i++; break; } i++; }
+                r.Add(new Tok { T = s.Substring(st, i - st), Pos = st, Len = i - st, Kind = 2 }); continue;
+            }
+            if (c == '[') { int e = s.IndexOf(']', i); i = e < 0 ? n : e + 1; r.Add(new Tok { T = s.Substring(st + 1, Math.Max(0, i - st - 2)), Pos = st, Len = i - st, Kind = 4 }); continue; }
+            if (c == '"') { int e = s.IndexOf('"', i + 1); i = e < 0 ? n : e + 1; r.Add(new Tok { T = s.Substring(st + 1, Math.Max(0, i - st - 2)), Pos = st, Len = i - st, Kind = 4 }); continue; }
+            if (char.IsLetter(c) || c == '_' || c == '@' || c == '#') { while (i < n && (char.IsLetterOrDigit(s[i]) || s[i] == '_' || s[i] == '@' || s[i] == '#' || s[i] == '$')) i++; r.Add(new Tok { T = s.Substring(st, i - st), Pos = st, Len = i - st, Kind = 0 }); continue; }
+            if (char.IsDigit(c)) { while (i < n && (char.IsLetterOrDigit(s[i]) || s[i] == '.')) i++; r.Add(new Tok { T = s.Substring(st, i - st), Pos = st, Len = i - st, Kind = 1 }); continue; }
+            if (i + 1 < n && "<>!=".IndexOf(c) >= 0 && "=>".IndexOf(s[i + 1]) >= 0) { i += 2; r.Add(new Tok { T = s.Substring(st, 2), Pos = st, Len = 2, Kind = 3 }); continue; }
+            i++; r.Add(new Tok { T = c.ToString(), Pos = st, Len = 1, Kind = 3 });
+        }
+        return r;
+    }
+    static bool IsName(Tok t) { return t.Kind == 4 || (t.Kind == 0 && !Reserved.Contains(t.U)); }
+    static readonly HashSet<string> Reserved = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+        "SELECT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "APPLY", "ON", "AND", "OR", "NOT", "GROUP", "BY", "ORDER", "HAVING", "UNION", "ALL",
+        "EXCEPT", "INTERSECT", "AS", "WITH", "TOP", "DISTINCT", "INTO", "VALUES", "INSERT", "UPDATE", "DELETE", "SET", "MERGE", "USING", "WHEN", "THEN", "ELSE", "END", "CASE",
+        "IN", "IS", "NULL", "LIKE", "BETWEEN", "EXISTS", "OPTION", "FOR", "OFFSET", "FETCH", "NEXT", "ROWS", "ROW", "ONLY", "PIVOT", "UNPIVOT", "OVER", "PARTITION", "GO", "ASC", "DESC", "NOLOCK", "WINDOW" };
+    static readonly HashSet<string> ClauseEnd = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "WHERE", "GROUP", "ORDER", "HAVING", "UNION", "EXCEPT", "INTERSECT", "OPTION", "FOR", "OFFSET", "WINDOW" };
+
+    // a dotted name starting at i: returns the end (exclusive)
+    static int NameAt(List<Tok> t, int i, int end, out string name) {
+        name = ""; if (i >= end || !(IsName(t[i]) || t[i].Kind == 0)) return i;
+        var sb = new StringBuilder(t[i].T); int j = i + 1;
+        while (j + 1 < end && t[j].T == "." && (t[j + 1].Kind == 0 || t[j + 1].Kind == 4)) { sb.Append('.').Append(t[j + 1].T); j += 2; }
+        name = sb.ToString(); return j;
+    }
+    static int Close(List<Tok> t, int open, int end) { int d = 0; for (int i = open; i < end; i++) { if (t[i].T == "(") d++; else if (t[i].T == ")") { d--; if (d == 0) return i; } } return end - 1; }
+    static string Text(string src, List<Tok> t, int a, int b) { if (a >= b || b > t.Count) return ""; int s = t[a].Pos, e = t[b - 1].Pos + t[b - 1].Len; return Regex.Replace(src.Substring(s, e - s), @"\s+", " ").Trim(); }
+
+    class Query { public List<Src> Sources = new List<Src>(); public List<string> SelectCols = new List<string>(); public bool Star; public int ClauseStart, ClauseEnd, SelStart = -1, SelEnd; }
+    static int idn;
+
+    // the SELECT (or the FROM part of UPDATE / DELETE) in t[a..b)
+    static Query Parse(string src, List<Tok> t, int a, int b, List<Src> all, DgSqlSchema schema, Dictionary<string, Src> ctes) {
+        var q = new Query();
+        int sel = -1, from = -1, depth = 0;
+        for (int i = a; i < b; i++) {
+            if (t[i].T == "(") depth++; else if (t[i].T == ")") depth--;
+            else if (depth == 0 && t[i].Kind == 0) {
+                if (t[i].U == "SELECT" && sel < 0) sel = i;
+                else if (t[i].U == "FROM" && from < 0 && (sel >= 0 || i == a || t[a].U == "DELETE" || t[a].U == "UPDATE")) { from = i; break; }
+            }
+        }
+        if (from < 0) return q;
+        // select list: output names and column references
+        if (sel >= 0) {
+            int s0 = sel + 1;
+            while (s0 < from && (t[s0].U == "DISTINCT" || t[s0].U == "ALL" || t[s0].U == "TOP")) { if (t[s0].U == "TOP") { s0++; if (s0 < from && t[s0].T == "(") s0 = Close(t, s0, from); } s0++; }
+            int d = 0, st = s0;
+            for (int i = s0; i <= from; i++) {
+                if (i < from && t[i].T == "(") d++; else if (i < from && t[i].T == ")") d--;
+                if (i == from || (d == 0 && t[i].T == ",")) {
+                    if (i > st) {
+                        string outName = "";
+                        if (i - st >= 2 && IsName(t[i - 1]) && (t[i - 2].U == "AS" || t[i - 2].Kind == 0 || t[i - 2].T == ")" || t[i - 2].Kind == 4 || t[i - 2].Kind == 1 || t[i - 2].Kind == 2)) outName = t[i - 1].T;
+                        else if (i - st == 1) outName = t[st].T;
+                        else if (i - st == 3 && t[st + 1].T == ".") outName = t[st + 2].T;
+                        else if (i - st >= 3 && t[st + 1].T == "=" && IsName(t[st])) outName = t[st].T;
+                        if (t[i - 1].T == "*") { q.Star = true; outName = ""; }
+                        q.SelectCols.Add(outName.Length > 0 ? outName : Text(src, t, st, i));
+                    }
+                    st = i + 1;
+                }
+            }
+        }
+        // sources and joins
+        int j = from + 1; string join = ""; int clauseEnd = b;
+        for (int i = from + 1, d = 0; i < b; i++) { if (t[i].T == "(") d++; else if (t[i].T == ")") d--; else if (d == 0 && t[i].Kind == 0 && ClauseEnd.Contains(t[i].U)) { clauseEnd = i; break; } }
+        Src prev = null;
+        while (j < clauseEnd) {
+            var s = new Src();
+            int start = j;
+            if (t[j].T == "(") {
+                int c = Close(t, j, clauseEnd);
+                var inner = Parse(src, t, j + 1, c, all, schema, ctes);
+                s.Derived = true; s.Name = "(subquery)"; s.OutCols = inner.SelectCols;
+                foreach (var x in inner.Sources) x.JoinFrom = "feeds:" + x.Id;
+                s.Pos = t[j].Pos; s.Len = t[c].Pos + 1 - t[j].Pos;
+                j = c + 1;
+                s.Tag = inner;
+            } else {
+                string nm; int e = NameAt(t, j, clauseEnd, out nm);
+                if (e == j) { j++; continue; }
+                s.Name = nm; s.Pos = t[j].Pos; s.Len = t[e - 1].Pos + t[e - 1].Len - t[j].Pos;
+                if (e < clauseEnd && t[e].T == "(") e = Close(t, e, clauseEnd) + 1;      // table-valued function
+                j = e;
+            }
+            if (j < clauseEnd && t[j].U == "AS") j++;
+            if (j < clauseEnd && IsName(t[j]) && t[j].U != "WITH") { s.Alias = t[j].T; j++; }
+            if (j < clauseEnd && t[j].U == "WITH" && j + 1 < clauseEnd && t[j + 1].T == "(") j = Close(t, j + 1, clauseEnd) + 1;   // table hints
+            if (s.Alias.Length == 0) s.Alias = s.Name.Split('.').Last();
+            s.Join = join.Length > 0 ? join : (prev == null ? "FROM" : "CROSS");
+            Src cte;
+            if (!s.Derived && ctes.TryGetValue(s.Name, out cte)) { s.Key = "cte:" + cte.Name; s.Derived = true; s.OutCols = cte.OutCols; s.Tag = cte; }
+            else if (!s.Derived && schema != null) s.Key = schema.Resolve(s.Name) ?? "";
+            s.Id = "t" + (idn++) + "_" + Regex.Replace(s.Alias, @"[^\w]", "_");
+            // ON condition
+            if (j < clauseEnd && t[j].U == "ON") {
+                int k = j + 1, d2 = 0;
+                for (; k < clauseEnd; k++) {
+                    if (t[k].T == "(") d2++; else if (t[k].T == ")") d2--;
+                    else if (d2 == 0 && t[k].Kind == 0 && (t[k].U == "JOIN" || t[k].U == "INNER" || t[k].U == "LEFT" || t[k].U == "RIGHT" || t[k].U == "FULL" || t[k].U == "CROSS" || t[k].U == "OUTER")) break;
+                    else if (d2 == 0 && t[k].T == ",") break;
+                }
+                s.On = Text(src, t, j + 1, k); s.OnStart = j + 1; s.OnEnd = k;
+                j = k;
+            }
+            q.Sources.Add(s); all.Add(s); prev = s;
+            // next join
+            join = "";
+            if (j < clauseEnd && t[j].T == ",") { join = "CROSS"; j++; continue; }
+            var jw = new List<string>();
+            while (j < clauseEnd && t[j].Kind == 0 && (t[j].U == "INNER" || t[j].U == "LEFT" || t[j].U == "RIGHT" || t[j].U == "FULL" || t[j].U == "CROSS" || t[j].U == "OUTER" || t[j].U == "JOIN" || t[j].U == "APPLY")) { jw.Add(t[j].U); j++; if (jw[jw.Count - 1] == "JOIN" || jw[jw.Count - 1] == "APPLY") break; }
+            if (jw.Count == 0) break;
+            join = jw.Contains("LEFT") ? "LEFT" : jw.Contains("RIGHT") ? "RIGHT" : jw.Contains("FULL") ? "FULL" : jw.Contains("APPLY") ? (jw.Contains("OUTER") ? "OUTER APPLY" : "CROSS APPLY") : jw.Contains("CROSS") ? "CROSS" : "INNER";
+        }
+        // where / group / order / having
+        q.ClauseStart = clauseEnd; q.ClauseEnd = b;
+        q.SelStart = sel >= 0 ? sel + 1 : -1; q.SelEnd = from;
+        return q;
+    }
+
+    // alias.column references in t[a..b) -> mark
+    static void MarkRefs(List<Tok> t, int a, int b, List<Src> srcs, DgSqlSchema schema, string mark) {
+        for (int i = a; i < b; i++) {
+            if (!(t[i].Kind == 0 || t[i].Kind == 4)) continue;
+            if (i + 2 < b && t[i + 1].T == "." && (t[i + 2].Kind == 0 || t[i + 2].Kind == 4 || t[i + 2].T == "*")) {
+                var s = srcs.FirstOrDefault(x => string.Equals(x.Alias, t[i].T, StringComparison.OrdinalIgnoreCase));
+                if (s != null) { if (t[i + 2].T == "*") s.All = true; else Mark(s, t[i + 2].T, mark); }
+                i += 2; continue;
+            }
+            if (t[i].Kind == 0 && Reserved.Contains(t[i].U)) continue;
+            if (i + 1 < b && t[i + 1].T == "(") continue;                                   // a function
+            if (i > a && t[i - 1].T == ".") continue;
+            // unqualified: the table that has it
+            var owners = srcs.Where(x => Has(x, t[i].T, schema)).ToList();
+            if (owners.Count == 1) Mark(owners[0], t[i].T, mark);
+            else if (owners.Count == 0 && srcs.Count == 1 && mark != "on") Mark(srcs[0], t[i].T, mark);
+        }
+    }
+    static bool Has(Src s, string col, DgSqlSchema schema) {
+        if (s.Derived) return s.OutCols.Any(c => string.Equals(c, col, StringComparison.OrdinalIgnoreCase));
+        List<string[]> cols;
+        return schema != null && s.Key.Length > 0 && schema.Tables.TryGetValue(s.Key, out cols) && cols.Any(c => string.Equals(c[0], col, StringComparison.OrdinalIgnoreCase));
+    }
+    static void Mark(Src s, string col, string mark) {
+        HashSet<string> m; if (!s.Marks.TryGetValue(col, out m)) { m = new HashSet<string>(); s.Marks[col] = m; }
+        m.Add(mark);
+    }
+
+    static string Q(string s) { return "\"" + (s ?? "").Replace("\"", "'") + "\""; }
+    static string Cut(string s, int n) { return s.Length <= n ? s : s.Substring(0, n - 1) + "\u2026"; }
+
+    // the statement under the caret (split at ; and GO)
+    static void Statement(List<Tok> t, int caret, out int a, out int b) {
+        var cuts = new List<int> { 0 };
+        for (int i = 0; i < t.Count; i++) if (t[i].T == ";" || (t[i].Kind == 0 && t[i].U == "GO")) cuts.Add(i + 1);
+        cuts.Add(t.Count + 1);
+        a = 0; b = t.Count;
+        for (int k = 0; k + 1 < cuts.Count; k++) {
+            int s = cuts[k], e = Math.Min(t.Count, cuts[k + 1] - 1);
+            if (e <= s) continue;
+            int sp = t[s].Pos, ep = t[e - 1].Pos + t[e - 1].Len;
+            a = s; b = e;
+            if (caret <= ep + 1 && (k == 0 || caret >= sp - 1 || caret > t[Math.Max(0, s - 1)].Pos)) {
+                if (caret >= (k == 0 ? 0 : t[s - 1].Pos)) return;
+            }
+        }
+    }
+
+    public static string Build(string sql, int caret, DgSqlSchema schema, bool dark) {
+        Map = new Dictionary<string, int[]>(); Info = ""; idn = 0;
+        var t = Lex(sql ?? "");
+        if (t.Count == 0) { Info = "Write a SELECT with FROM / JOIN to see it here."; return ""; }
+        int a, b; Statement(t, caret, out a, out b);
+        // CTEs
+        var ctes = new Dictionary<string, Src>(StringComparer.OrdinalIgnoreCase);
+        var all = new List<Src>();
+        var cteList = new List<KeyValuePair<Src, Query>>();
+        int i0 = a;
+        if (i0 < b && t[i0].U == "WITH") {
+            int i = i0 + 1;
+            while (i < b) {
+                string nm; int e = NameAt(t, i, b, out nm);
+                if (e == i) break;
+                var cols = new List<string>();
+                if (e < b && t[e].T == "(") { int c = Close(t, e, b); for (int k = e + 1; k < c; k++) if (IsName(t[k])) cols.Add(t[k].T); e = c + 1; }
+                if (e < b && t[e].U == "AS") e++;
+                if (e >= b || t[e].T != "(") break;
+                int close = Close(t, e, b);
+                var cs = new Src { Name = nm, Alias = nm, Derived = true, Join = "CTE", Pos = t[i].Pos, Len = t[i].Len, Id = "cte" + (idn++) + "_" + Regex.Replace(nm, @"[^\w]", "_") };
+                var inner = Parse(sql, t, e + 1, close, all, schema, ctes);
+                cs.OutCols = cols.Count > 0 ? cols : inner.SelectCols;
+                cs.Tag = inner;
+                ctes[nm] = cs;
+                cteList.Add(new KeyValuePair<Src, Query>(cs, inner));
+                i = close + 1;
+                if (i < b && t[i].T == ",") { i++; continue; }
+                break;
+            }
+            i0 = i;
+        }
+        // INSERT INTO x ... / UPDATE x ... / the main SELECT
+        string target = "";
+        if (i0 < b && t[i0].U == "INSERT") { int k = i0 + 1; if (k < b && t[k].U == "INTO") k++; NameAt(t, k, b, out target); }
+        var main = Parse(sql, t, i0, b, all, schema, ctes);
+        var allQ = new List<Query> { main };
+        foreach (var kv in cteList) allQ.Add(kv.Value);
+        foreach (var s in all) if (s.Tag is Query) allQ.Add((Query)s.Tag);
+        foreach (var q in allQ.Distinct()) {
+            if (q.SelStart >= 0) MarkRefs(t, q.SelStart, q.SelEnd, q.Sources, schema, "sel");
+            if (q.Star) foreach (var s in q.Sources) s.All = true;
+            foreach (var s in q.Sources) if (s.OnEnd > s.OnStart) MarkRefs(t, s.OnStart, s.OnEnd, q.Sources, schema, "on");
+            // WHERE / GROUP BY / ORDER BY / HAVING
+            string clause = ""; int st = -1, depth = 0;
+            for (int i = q.ClauseStart; i <= q.ClauseEnd; i++) {
+                bool kw = i < q.ClauseEnd && depth == 0 && t[i].Kind == 0 && (t[i].U == "WHERE" || t[i].U == "GROUP" || t[i].U == "ORDER" || t[i].U == "HAVING" || t[i].U == "UNION" || t[i].U == "OPTION" || t[i].U == "EXCEPT" || t[i].U == "INTERSECT");
+                if (i == q.ClauseEnd || kw) {
+                    if (st >= 0 && clause.Length > 0) {
+                        string m = clause == "WHERE" || clause == "HAVING" ? "where" : "sort";
+                        MarkRefs(t, st, i, q.Sources, schema, m);
+                        if (clause == "WHERE") Filters(sql, t, st, i, q.Sources, schema);
+                    }
+                    if (i < q.ClauseEnd) { clause = t[i].U; st = i + 1; if (clause == "GROUP" || clause == "ORDER") st++; if (clause == "UNION" || clause == "EXCEPT" || clause == "INTERSECT") clause = ""; }
+                }
+                if (i < q.ClauseEnd) { if (t[i].T == "(") depth++; else if (t[i].T == ")") depth--; }
+            }
+            // which source each join comes from, and the key columns
+            for (int k = 1; k < q.Sources.Count; k++) {
+                var s = q.Sources[k];
+                var refs = new List<string[]>();
+                for (int i = s.OnStart; i + 2 < s.OnEnd; i++) if ((t[i].Kind == 0 || t[i].Kind == 4) && t[i + 1].T == "." && (t[i + 2].Kind == 0 || t[i + 2].Kind == 4)) { refs.Add(new[] { t[i].T, t[i + 2].T }); i += 2; }
+                var mine = refs.FirstOrDefault(r => string.Equals(r[0], s.Alias, StringComparison.OrdinalIgnoreCase));
+                var other = refs.FirstOrDefault(r => !string.Equals(r[0], s.Alias, StringComparison.OrdinalIgnoreCase) && q.Sources.Take(k).Any(x => string.Equals(x.Alias, r[0], StringComparison.OrdinalIgnoreCase)));
+                var from = other != null ? q.Sources.Take(k).First(x => string.Equals(x.Alias, other[0], StringComparison.OrdinalIgnoreCase)) : q.Sources[k - 1];
+                s.JoinFrom = from.Id;
+                if (other != null) s.FromCol = other[1];
+                if (mine != null) s.ToCol = mine[1];
+            }
+        }
+        if (all.Count == 0 && ctes.Count == 0) { Info = "No FROM / JOIN in this statement yet."; return ""; }
+        // ---- diagram text
+        var sb = new StringBuilder();
+        sb.Append("title Query\r\ntheme " + (dark ? "midnight dark" : "daylight light") + "\r\ndirection LR\r\nroute ortho\r\nhide header\r\nspacing 1.7\r\n");
+        sb.Append("category inner \"INNER JOIN\" #0b5fc2 / #4ea8ff\r\ncategory left \"LEFT JOIN\" #06804f / #3ddc97\r\ncategory right \"RIGHT JOIN\" #a86f00 / #f5b94a\r\ncategory full \"FULL JOIN\" #6340d6 / #b29dff\r\n");
+        sb.Append("category cross \"CROSS / APPLY\" #c22f45 / #ff8a95\r\ncategory derived \"CTE / subquery\" #08806b / #34d3b4\r\ncategory write \"INSERT INTO\" #cc2638 / #ff5d6c\r\n\r\n");
+        var rowsOf = new Dictionary<string, List<string>>();
+        var nodes = ctes.Values.Concat(all).ToList();
+        foreach (var s in nodes) {
+            var lines = new List<string>();
+            List<string[]> cols = null;
+            if (!s.Derived && schema != null && s.Key.Length > 0) schema.Tables.TryGetValue(s.Key, out cols);
+            if (s.Derived) foreach (var c in s.OutCols.Take(30)) lines.Add(Col(c, "", s, "", ""));
+            else if (cols != null) {
+                bool any = s.Marks.Count > 0;
+                var show = cols.Where(c => cols.Count <= 14 || s.All || s.Marks.ContainsKey(c[0]) || c[2] == "PK" || c[3] == "FK").Take(30).ToList();
+                foreach (var c in show) lines.Add(Col(c[0], c[1], s, c[2], c[3]));
+                if (show.Count < cols.Count) lines.Add("\"... " + (cols.Count - show.Count) + " more\"");
+            } else foreach (var m in s.Marks.Keys) lines.Add(Col(m, "", s, "", ""));
+            foreach (var f in s.Filters.Take(4)) lines.Add(Q("? " + Cut(f, 46)));
+            rowsOf[s.Id] = lines.Select(l => Regex.Match(l, "^\"([^ \"]*)").Groups[1].Value).ToList();
+            string title = s.Derived ? s.Name + (s.Join == "CTE" ? "  (CTE)" : "") : (s.Key.Length > 0 ? s.Key : s.Name + "  (not found)");
+            string badge = s.Alias.Length > 0 && !string.Equals(s.Alias, s.Name.Split('.').Last(), StringComparison.OrdinalIgnoreCase) ? s.Alias : "";
+            sb.Append(s.Id + ": " + title.Replace("\n", " ") + " [shape table" + (badge.Length > 0 ? ", badge " + badge : "") + (s.Derived ? ", cat derived" : "") + ", lines " + string.Join(" ", lines) + "]\r\n");
+            Map[s.Id] = new[] { s.Pos, s.Len };
+        }
+        if (target.Length > 0) { sb.Append("target: " + target + " [shape table, cat write]\r\n"); }
+        sb.Append("\r\n");
+        foreach (var s in nodes) {
+            if (s.JoinFrom.StartsWith("feeds:")) continue;
+            if (s.JoinFrom.Length == 0) continue;
+            string cat = s.Join == "LEFT" ? "left" : s.Join == "RIGHT" ? "right" : s.Join == "FULL" ? "full" : s.Join.Contains("APPLY") || s.Join == "CROSS" ? "cross" : "inner";
+            var attrs = new List<string> { "cat " + cat };
+            string lbl = s.On.Length > 0 ? s.On : s.Join;
+            attrs.Add("label " + Q(Cut(lbl, 44)));
+            float ft = RowT(rowsOf, s.JoinFrom, s.FromCol), tt = RowT(rowsOf, s.Id, s.ToCol);
+            if (!float.IsNaN(ft)) attrs.Add("from auto " + ft.ToString("0.###", CultureInfo.InvariantCulture));
+            if (!float.IsNaN(tt)) attrs.Add("to auto " + tt.ToString("0.###", CultureInfo.InvariantCulture));
+            if (s.Join == "LEFT" || s.Join == "RIGHT" || s.Join == "FULL") attrs.Add("dashed");
+            sb.Append(s.JoinFrom + " -> " + s.Id + " [" + string.Join(", ", attrs) + "]\r\n");
+        }
+        // subqueries and CTEs: the tables inside feed them
+        foreach (var s in nodes) {
+            var inner = s.Tag as Query;
+            if (inner == null) continue;
+            foreach (var x in inner.Sources) sb.Append(x.Id + " -> " + s.Id + " [cat derived, dotted]\r\n");
+        }
+        // a CTE used in the main query: from the CTE node to its use
+        foreach (var s in all) { var c = s.Tag as Src; if (c != null) sb.Append(c.Id + " -> " + s.Id + " [cat derived, dotted, label \"uses\"]\r\n"); }
+        if (target.Length > 0 && main.Sources.Count > 0) sb.Append(main.Sources[0].Id + " -> target [cat write, label \"INSERT\"]\r\n");
+        int tables = nodes.Count(s => !s.Derived), joins = nodes.Count(s => s.JoinFrom.Length > 0 && !s.JoinFrom.StartsWith("feeds:"));
+        Info = tables + " table" + (tables == 1 ? "" : "s") + ", " + joins + " join" + (joins == 1 ? "" : "s") + (ctes.Count > 0 ? ", " + ctes.Count + " CTE" + (ctes.Count == 1 ? "" : "s") : "");
+        return sb.ToString();
+    }
+
+    static string Col(string name, string type, Src s, string pk, string fk) {
+        var marks = new List<string>();
+        HashSet<string> m;
+        if (s.Marks.TryGetValue(name, out m)) foreach (var x in m) marks.Add("@" + x);
+        else if (s.All) marks.Add("@sel");
+        if (s.Marks.Count > 0 && !s.All && marks.Count == 0) marks.Add("@dim");
+        return "\"" + name.Replace(" ", "_").Replace("\"", "'") + (type.Length > 0 ? " " + type : "") + (pk.Length > 0 ? " PK" : "") + (fk.Length > 0 ? " FK" : "") + (marks.Count > 0 ? " " + string.Join(" ", marks) : "") + "\"";
+    }
+    // where a column's row sits along the table's height (to attach a join link to it)
+    static float RowT(Dictionary<string, List<string>> rows, string id, string col) {
+        List<string> r; if (string.IsNullOrEmpty(col) || !rows.TryGetValue(id, out r)) return float.NaN;
+        int i = r.FindIndex(x => string.Equals(x, col.Replace(" ", "_"), StringComparison.OrdinalIgnoreCase));
+        if (i < 0) return float.NaN;
+        float h = 34 + r.Count * 22 + 8;
+        return (34 + i * 22 + 11) / h;
+    }
+    // WHERE conditions (split at AND at the top level) under the table they name
+    static void Filters(string sql, List<Tok> t, int a, int b, List<Src> srcs, DgSqlSchema schema) {
+        int st = a, d = 0;
+        for (int i = a; i <= b; i++) {
+            if (i < b && t[i].T == "(") d++; else if (i < b && t[i].T == ")") d--;
+            if (i == b || (d == 0 && t[i].Kind == 0 && t[i].U == "AND" && !(i > a + 1 && t.Skip(a).Take(i - a).Any(x => x.U == "BETWEEN") && false))) {
+                if (i > st) {
+                    string cond = Text(sql, t, st, i);
+                    Src owner = null;
+                    for (int k = st; k + 2 < i; k++) if ((t[k].Kind == 0 || t[k].Kind == 4) && t[k + 1].T == ".") { owner = srcs.FirstOrDefault(x => string.Equals(x.Alias, t[k].T, StringComparison.OrdinalIgnoreCase)); if (owner != null) break; }
+                    if (owner == null) for (int k = st; k < i; k++) { if (t[k].Kind != 0 && t[k].Kind != 4) continue; var o = srcs.Where(x => Has(x, t[k].T, schema)).ToList(); if (o.Count == 1) { owner = o[0]; break; } }
+                    if (owner == null && srcs.Count == 1) owner = srcs[0];
+                    if (owner != null) owner.Filters.Add(cond);
+                }
+                st = i + 1;
+            }
+        }
     }
 }
 
@@ -26826,6 +27236,30 @@ function Update-SqlSideLists {
     if ($q) { $q.BeginUpdate(); $q.Items.Clear(); foreach ($x in $SqlUI.Queries) { [void]$q.Items.Add($x.Name) }; $q.EndUpdate() }
 }
 
+# ---- live query diagram (beside the editor): the statement under the cursor, redrawn as you type
+function Update-SqlLive {
+    if (-not $SqlUI.Form -or $SqlUI.LiveSplit.Panel2Collapsed) { return }
+    $c0 = Get-SqlConn
+    $key = if ($c0) { "$($c0.Name)|$($SqlUI.DbBox.Text)" } else { '' }
+    if ($key -ne $SqlUI.SchemaKey) {
+        $SqlUI.SchemaKey = $key; $SqlUI.Schema = $null
+        if ($c0) { try { $SqlUI.Schema = [DgSqlSchema]::Load((Get-SqlConnString $c0 $SqlUI.DbBox.Text)) } catch { $SqlUI.LiveInfo.Text = "Columns not loaded: $($_.Exception.InnerException.Message)" } }
+    }
+    $ed = $SqlUI.Editor
+    $text = [DgSqlViz]::Build($ed.Text, $ed.SelectionStart, $SqlUI.Schema, $script:IsDark)
+    $SqlUI.LiveText = $text
+    $SqlUI.LiveInfo.Text = [DgSqlViz]::Info
+    $cv = $SqlUI.LiveCanvas
+    if (-not $text) { $cv.SetDoc((New-Object DgDoc), $true); return }
+    $d = [DgText]::Parse($text); [DgLayout]::Apply($d)
+    $cv.Theme = [DgTheme]::Get($d.Theme); $cv.Dark = $script:IsDark
+    $sig = (@($d.Nodes | ForEach-Object { $_.Label }) -join '|')
+    $refit = $sig -ne $SqlUI.LiveSig
+    $SqlUI.LiveSig = $sig
+    $cv.SetDoc($d, $true)
+    if ($refit) { $cv.UserView = $false; $cv.ZoomToFit() }
+}
+
 function Show-SqlClient {
     Hide-Picker
     if (-not (Initialize-Diagrams)) { return }
@@ -26907,6 +27341,7 @@ function Show-SqlClient {
     $SqlUI.DbBox.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 10), 0)
     $SqlUI.DbBox.add_DropDown({ param($src, $e) $src.Items.Clear(); $c0 = Get-SqlConn; if ($c0) { try { foreach ($r in ([DgSql]::Query((Get-SqlConnString $c0 'master'), 'SELECT name FROM sys.databases WHERE HAS_DBACCESS(name) = 1 ORDER BY name', 10)).Rows) { [void]$src.Items.Add([string]$r[0]) } } catch { } } })
     $top.Controls.Add($SqlUI.DbBox)
+    $SqlUI.DbBox.add_TextChanged({ if ($SqlUI.LiveTimer) { $SqlUI.LiveTimer.Stop(); $SqlUI.LiveTimer.Start() } })
     $SqlUI.RunBtn = New-Button 'Run' 'Run the selection, or everything (F5 / Ctrl+Enter)' { Start-SqlRun } $top $Glyph.Play 1
     $SqlUI.CancelBtn = New-Button 'Cancel' 'Stop the running query' { if ($SqlUI.Run) { $SqlUI.Run.Cancel() } } $top $Glyph.Pause 2
     $SqlUI.CancelBtn.Enabled = $false
@@ -26919,13 +27354,35 @@ function Show-SqlClient {
         $SqlUI.Queries.Insert(0, [pscustomobject]@{ Name = $n; Sql = $t }); Save-SqlData 'queries'; Update-SqlSideLists
     } $top $Glyph.Save 2)
     [void](New-Button 'ER diagram' 'A diagram of the tables of this database, their columns and keys' { New-SqlErDiagram } $top $Glyph.Apps 2)
+    $SqlUI.LiveBtn = New-Button 'Live diagram' 'Show / hide the diagram of the query as you write it' {
+        $SqlUI.LiveSplit.Panel2Collapsed = -not $SqlUI.LiveSplit.Panel2Collapsed
+        $this.Selected = -not $SqlUI.LiveSplit.Panel2Collapsed; $this.Invalidate()
+        Update-SqlLive
+    } $top $Glyph.View 2
+    $SqlUI.LiveBtn.Selected = $true
 
     # middle: editor over results
     $split = New-Object System.Windows.Forms.SplitContainer
     $split.Dock = 'Fill'; $split.Orientation = 'Horizontal'; $split.SplitterWidth = 5; $split.BackColor = $C.Line; $split.Panel1.BackColor = $C.Bg; $split.Panel2.BackColor = $C.Bg
+    $live = New-Object System.Windows.Forms.SplitContainer
+    $live.Dock = 'Fill'; $live.Orientation = 'Vertical'; $live.SplitterWidth = 5; $live.BackColor = $C.Line; $live.Panel1.BackColor = $C.Bg; $live.Panel2.BackColor = $C.Bg
+    $split.Panel1.Controls.Add($live); $SqlUI.LiveSplit = $live
     $ed = New-TbRtb; $ed.Dock = 'Fill'; $ed.AcceptsTab = $true; $ed.WordWrap = $false
-    $ed.Text = "-- F5 or Ctrl+Enter runs the selection, or everything. GO separates batches.`r`nSELECT TOP 100 name, create_date FROM sys.tables ORDER BY create_date DESC;"
-    $split.Panel1.Controls.Add($ed); $SqlUI.Editor = $ed
+    $ed.Text = "-- F5 or Ctrl+Enter runs the selection, or everything. GO separates batches.`r`n-- The diagram on the right follows the statement under the cursor as you write it.`r`nSELECT TOP 100 name, create_date FROM sys.tables ORDER BY create_date DESC;"
+    $live.Panel1.Controls.Add($ed); $SqlUI.Editor = $ed
+    $lcv = New-Object DgCanvas
+    $lcv.Dock = 'Fill'; $lcv.UiScale = $Scale * $TextZoom; $lcv.Font = $FontMain; $lcv.Editable = $false; $lcv.Animate = $false
+    $lcv.add_SelectionChanged({
+        param($src, $e)
+        $id = $src.SelectedId; if (-not $id) { return }
+        $m = $null; if ([DgSqlViz]::Map.TryGetValue($id, [ref]$m)) { $SqlUI.LiveQuiet = $true; $SqlUI.Editor.Select($m[0], $m[1]); $SqlUI.Editor.ScrollToCaret(); $SqlUI.LiveQuiet = $false }
+    })
+    $lbar = New-Object System.Windows.Forms.FlowLayoutPanel; $lbar.Dock = 'Top'; $lbar.AutoSize = $true; $lbar.WrapContents = $true; $lbar.BackColor = $C.Panel; $lbar.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 3), (Px 6), (Px 3))
+    [void](New-Button 'Open in Diagram studio' 'Edit, style or export this diagram' { if ($SqlUI.LiveText) { Show-DiagramStudio; New-DiagramFromText 'Query' $SqlUI.LiveText } } $lbar $Glyph.Apps 2)
+    [void](New-Button 'Refresh columns' 'Read the tables and columns of the database again' { $SqlUI.SchemaKey = '-'; Update-SqlLive } $lbar $Glyph.Refresh 2)
+    $SqlUI.LiveInfo = New-TbLabel $lbar '' -Dim; $SqlUI.LiveInfo.Margin = New-Object System.Windows.Forms.Padding((Px 8), (Px 8), 0, 0)
+    $live.Panel2.Controls.Add($lcv); $live.Panel2.Controls.Add($lbar)
+    $SqlUI.LiveCanvas = $lcv
     $rb = New-Object System.Windows.Forms.FlowLayoutPanel; $rb.Dock = 'Bottom'; $rb.AutoSize = $true; $rb.BackColor = $C.Panel; $rb.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 4), (Px 6), (Px 4))
     [void](New-Button 'Copy' 'Copy the result with headers (tab-separated, pastes into Excel)' { Export-SqlResult 'copy' } $rb $Glyph.Copy 2)
     [void](New-Button 'CSV...' 'Save the result as CSV' { Export-SqlResult 'csv' } $rb $Glyph.Save 2)
@@ -26941,7 +27398,9 @@ function Show-SqlClient {
     $split.BringToFront()
 
     $SqlUI.ColorTimer = New-TbDebounce 450 { if ($SqlUI.Form -and $SqlUI.Editor.TextLength -lt 60000) { $ss = $SqlUI.Editor.SelectionStart; $sl = $SqlUI.Editor.SelectionLength; Set-RtbCode $SqlUI.Editor $SqlUI.Editor.Text 'sql'; $SqlUI.Editor.Select($ss, $sl) } }
-    $ed.add_TextChanged({ $SqlUI.ColorTimer.Stop(); $SqlUI.ColorTimer.Start() })
+    $ed.add_TextChanged({ $SqlUI.ColorTimer.Stop(); $SqlUI.ColorTimer.Start(); $SqlUI.LiveTimer.Stop(); $SqlUI.LiveTimer.Start() })
+    $SqlUI.LiveTimer = New-TbDebounce 450 { if ($SqlUI.Form) { try { Update-SqlLive } catch { Write-Log "live diagram: $_" } } }
+    $ed.add_SelectionChanged({ if (-not $SqlUI.LiveQuiet -and $SqlUI.LiveTimer) { $SqlUI.LiveTimer.Stop(); $SqlUI.LiveTimer.Start() } })
     $SqlUI.Timer = New-Object System.Windows.Forms.Timer; $SqlUI.Timer.Interval = 120
     $SqlUI.Timer.add_Tick({ if (-not $SqlUI.Run) { $SqlUI.Timer.Stop(); return }; if ($SqlUI.Run.Done) { $SqlUI.Timer.Stop(); Complete-SqlRun } else { Set-SqlStatus "Running...  $([Math]::Round(((Get-Date) - $SqlUI.Started).TotalSeconds, 1)) s" $C.Accent } })
     $f.add_KeyDown({
@@ -26949,16 +27408,18 @@ function Show-SqlClient {
         if ($e.KeyCode -eq 'F5' -or ($e.Control -and $e.KeyCode -eq 'Return')) { $e.SuppressKeyPress = $true; Start-SqlRun }
         elseif ($e.KeyCode -eq 'Escape' -and $SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }
     })
-    $f.add_FormClosed({ if ($SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }; foreach ($k in 'Timer', 'ColorTimer') { if ($SqlUI[$k]) { $SqlUI[$k].Dispose(); $SqlUI[$k] = $null } }; $SqlUI.Form = $null })
+    $f.add_FormClosed({ if ($SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }; foreach ($k in 'Timer', 'ColorTimer', 'LiveTimer') { if ($SqlUI[$k]) { $SqlUI[$k].Dispose(); $SqlUI[$k] = $null } }; $SqlUI.Form = $null; $SqlUI.SchemaKey = '' })
     Register-ThemedWindow $f
     $f.Show()
     [PowerClipHost]::EnsureShown($f.Handle)
-    $split.SplitterDistance = [int]($split.Height * 0.42)
+    $split.SplitterDistance = [int]($split.Height * 0.5)
+    $live.SplitterDistance = [int]($live.Width * 0.45)
     Update-SqlConnList
     $c0 = Get-SqlConn; if ($c0) { $SqlUI.DbBox.Text = $c0.Database }
     Update-SqlSideLists
     Set-RtbCode $ed $ed.Text 'sql'
     Update-SqlTree
+    Update-SqlLive
     if (-not $SqlUI.Conns.Count) { Set-SqlStatus 'Pick "New connection..." in the list at the top left to start.' $C.Accent }
 }
 
