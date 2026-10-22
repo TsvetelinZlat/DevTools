@@ -21807,6 +21807,7 @@ public static class DgText {
                 case "stroke": case "border": g.Stroke = a.Value; break;
                 case "cat": case "category": g.Cat = AutoCat(d, a.Value).Id; break;
                 case "": if (a.Value.Length > 0) g.Cat = AutoCat(d, a.Value).Id; break;
+                default: g.Cat = AutoCat(d, a.Key).Id; break;
             }
         }
         foreach (var x in members.Split(new[] { ',', ' ' }, StringSplitOptions.RemoveEmptyEntries)) if (!g.Members.Contains(x.Trim())) g.Members.Add(x.Trim());
@@ -21876,7 +21877,7 @@ public static class DgText {
                 case "desc": n.Desc = Unq(v); break;
                 case "tags": n.Tags.Clear(); foreach (var t in v.Split(new[] { ';', '|' }, StringSplitOptions.RemoveEmptyEntries)) n.Tags.Add(Unq(t.Trim())); break;
                 case "label": n.Label = Unq(v); break;
-                case "in": case "group": { var g = d.FindGroup(v.Trim()); if (g == null) { g = new DgGroup { Id = v.Trim(), Title = v.Trim() }; d.Groups.Add(g); } if (!g.Members.Contains(n.Id)) g.Members.Add(n.Id); n.Group = g.Id; break; }
+                case "in": case "group": { if (v.Trim().Length == 0) { n.Cat = AutoCat(d, a.Key).Id; break; } var g = d.FindGroup(v.Trim()); if (g == null) { g = new DgGroup { Id = v.Trim(), Title = v.Trim() }; d.Groups.Add(g); } if (!g.Members.Contains(n.Id)) g.Members.Add(n.Id); n.Group = g.Id; break; }
                 case "cat": case "category": case "flow": n.Cat = AutoCat(d, v.Trim()).Id; break;
                 case "spark": case "sparkline": n.Spark = true; break;
                 case "bold": n.Bold = true; break;
@@ -22384,6 +22385,21 @@ public static class DgLayout {
         for (int i = 0; i < nodes.Count; i++) { nodes[i].X = 40 + (i % cols) * cw; nodes[i].Y = 40 + (i / cols) * ch; }
     }
     static void Circle(DgDoc d, List<DgNode> nodes) {
+        // a hub linked to (nearly) everything goes in the middle: a mind map
+        var deg = nodes.ToDictionary(n => n.Id, n => d.Edges.Count(e => e.From != e.To && (e.From == n.Id || e.To == n.Id)));
+        var hub = nodes.Count > 3 ? nodes.OrderByDescending(n => deg[n.Id]).First() : null;
+        if (hub != null && deg[hub.Id] >= (nodes.Count - 1) * 0.6) {
+            var ring = nodes.Where(n => n != hub).ToList();
+            float bg = ring.Max(n => Math.Max(n.W, n.H));
+            float rr = Math.Max(Math.Max(hub.W, hub.H) / 2 + bg + 40 * d.Spacing, ring.Count * (bg + 24 * d.Spacing) / (float)(2 * Math.PI));
+            float cx = 40 + rr + bg / 2, cy = 40 + rr + bg / 2;
+            hub.X = cx - hub.W / 2; hub.Y = cy - hub.H / 2;
+            for (int i = 0; i < ring.Count; i++) {
+                double a = -Math.PI / 2 + 2 * Math.PI * i / ring.Count;
+                ring[i].X = cx + (float)(rr * Math.Cos(a)) - ring[i].W / 2; ring[i].Y = cy + (float)(rr * Math.Sin(a)) * 0.75f - ring[i].H / 2;
+            }
+            return;
+        }
         float big = nodes.Max(n => Math.Max(n.W, n.H));
         float r = Math.Max(160, nodes.Count * (big + 30 * d.Spacing) / (float)(2 * Math.PI));
         for (int i = 0; i < nodes.Count; i++) {
@@ -22671,8 +22687,8 @@ public static class DgRoute {
 public interface IDgPainter {
     void Begin(string cls, string id, string data);
     void End();
-    void Rect(float x, float y, float w, float h, float r, string fill, string stroke, float sw, int dash, float opacity);
-    void Ellipse(float cx, float cy, float rx, float ry, string fill, string stroke, float sw, float opacity);
+    void Rect(float x, float y, float w, float h, float r, string fill, string stroke, float sw, int dash, float opacity, string cls = null);
+    void Ellipse(float cx, float cy, float rx, float ry, string fill, string stroke, float sw, float opacity, string cls = null);
     void Path(string d, string fill, string stroke, float sw, int dash, float opacity, string cls);
     void Text(float x, float y, string text, float px, int weight, string color, string anchor, bool mono, float opacity, float spacing, string cls);
 }
@@ -22696,12 +22712,13 @@ public class DgSvgPainter : IDgPainter {
         Line(a.ToString()); depth++;
     }
     public void End() { depth--; Line("</g>"); }
-    public void Rect(float x, float y, float w, float h, float r, string fill, string stroke, float sw, int dash, float opacity) {
-        Line("<rect x=\"" + N(x) + "\" y=\"" + N(y) + "\" width=\"" + N(w) + "\" height=\"" + N(h) + "\"" + (r > 0 ? " rx=\"" + N(r) + "\"" : "") +
+    public void Rect(float x, float y, float w, float h, float r, string fill, string stroke, float sw, int dash, float opacity, string cls = null) {
+        Line("<rect" + (string.IsNullOrEmpty(cls) ? "" : " class=\"" + cls + "\"") + " x=\"" + N(x) + "\" y=\"" + N(y) + "\" width=\"" + N(w) + "\" height=\"" + N(h) + "\"" + (r > 0 ? " rx=\"" + N(r) + "\"" : "") +
              " style=\"fill:" + (fill ?? "none") + (stroke != null ? ";stroke:" + stroke + ";stroke-width:" + N(sw) : "") + Dash(dash, sw) + Op(opacity) + "\"/>");
     }
-    public void Ellipse(float cx, float cy, float rx, float ry, string fill, string stroke, float sw, float opacity) {
-        Line((Math.Abs(rx - ry) < 0.01f ? "<circle cx=\"" + N(cx) + "\" cy=\"" + N(cy) + "\" r=\"" + N(rx) + "\"" : "<ellipse cx=\"" + N(cx) + "\" cy=\"" + N(cy) + "\" rx=\"" + N(rx) + "\" ry=\"" + N(ry) + "\"") +
+    public void Ellipse(float cx, float cy, float rx, float ry, string fill, string stroke, float sw, float opacity, string cls = null) {
+        string ca = string.IsNullOrEmpty(cls) ? "" : " class=\"" + cls + "\"";
+        Line((Math.Abs(rx - ry) < 0.01f ? "<circle" + ca + " cx=\"" + N(cx) + "\" cy=\"" + N(cy) + "\" r=\"" + N(rx) + "\"" : "<ellipse" + ca + " cx=\"" + N(cx) + "\" cy=\"" + N(cy) + "\" rx=\"" + N(rx) + "\" ry=\"" + N(ry) + "\"") +
              " style=\"fill:" + (fill ?? "none") + (stroke != null ? ";stroke:" + stroke + ";stroke-width:" + N(sw) : "") + Op(opacity) + "\"/>");
     }
     public void Path(string d, string fill, string stroke, float sw, int dash, float opacity, string cls) {
@@ -22741,13 +22758,13 @@ public class DgGdiPainter : IDgPainter {
         gp.CloseFigure();
         return gp;
     }
-    public void Rect(float x, float y, float w, float h, float r, string fill, string stroke, float sw, int dash, float opacity) {
+    public void Rect(float x, float y, float w, float h, float r, string fill, string stroke, float sw, int dash, float opacity, string cls = null) {
         using (var gp = RoundRect(x, y, w, h, r)) {
             if (fill != null && fill != "none") using (var b = new System.Drawing.SolidBrush(Col(fill, opacity))) G.FillPath(b, gp);
             if (stroke != null) using (var p = Pen(stroke, sw, dash, opacity)) G.DrawPath(p, gp);
         }
     }
-    public void Ellipse(float cx, float cy, float rx, float ry, string fill, string stroke, float sw, float opacity) {
+    public void Ellipse(float cx, float cy, float rx, float ry, string fill, string stroke, float sw, float opacity, string cls = null) {
         if (fill != null && fill != "none") using (var b = new System.Drawing.SolidBrush(Col(fill, opacity))) G.FillEllipse(b, cx - rx, cy - ry, rx * 2, ry * 2);
         if (stroke != null) using (var p = Pen(stroke, sw, 0, opacity)) G.DrawEllipse(p, cx - rx, cy - ry, rx * 2, ry * 2);
     }
@@ -22825,7 +22842,7 @@ public static class DgRender {
             if (g.Box.IsEmpty) continue;
             string ck = CatKey(d, g.Cat);
             float o = rel == null || g.Members.Any(m => rel.Contains(m)) ? 1f : 0.35f;
-            p.Begin("dg-group", "group-" + DgText.CssId(g.Id), "data-group=\"" + DgSvgPainter.Esc(g.Id) + "\"");
+            p.Begin("dg-group", "dg-group-" + DgText.CssId(g.Id), "data-group=\"" + DgSvgPainter.Esc(g.Id) + "\"");
             string fill = g.Fill.Length > 0 ? g.Fill : (ck != null ? c.Mix(ck, "frameTint", "bg") : c.Mix("ink", "3", "bg"));
             string stroke = g.Stroke.Length > 0 ? g.Stroke : (ck != null ? c.Mix(ck, "60", "card") : c.Get("line"));
             p.Rect(g.Box.X, g.Box.Y, g.Box.Width, g.Box.Height, d.Radius + 2, fill, stroke, 1.2f, g.Dashed ? 1 : 0, o);
@@ -22852,7 +22869,7 @@ public static class DgRender {
             string col = e.Color.Length > 0 ? e.Color : (ck != null ? c.Get(ck) : c.Mix("muted", "70", "card"));
             float sw = e.Width > 0 ? e.Width : 1.6f;
             bool glow = e.GlowSet ? e.Glow : c.T.Glow || e.Animate;
-            p.Begin("dg-link", "link-" + DgText.CssId(e.Id), "data-link=\"" + DgSvgPainter.Esc(e.Id) + "\" data-from=\"" + DgSvgPainter.Esc(e.From) + "\" data-to=\"" + DgSvgPainter.Esc(e.To) + "\"" + (e.Cat.Length > 0 ? " data-cat=\"" + DgSvgPainter.Esc(e.Cat) + "\"" : ""));
+            p.Begin("dg-link", "dg-link-" + DgText.CssId(e.Id), "data-link=\"" + DgSvgPainter.Esc(e.Id) + "\" data-from=\"" + DgSvgPainter.Esc(e.From) + "\" data-to=\"" + DgSvgPainter.Esc(e.To) + "\"" + (e.Cat.Length > 0 ? " data-cat=\"" + DgSvgPainter.Esc(e.Cat) + "\"" : ""));
             if (glow) p.Path(e.PathD, null, col, sw + 6.5f, 0, 0.08f * o, "dg-glow");
             if (v.SelectedEdge == e.Id && v.Editing) p.Path(e.PathD, null, c.Get("sel"), sw + 4, 0, 0.45f, null);
             p.Path(e.PathD, null, col, sw, e.Dash, o, "dg-line");
@@ -22894,11 +22911,11 @@ public static class DgRender {
         if (down) stroke = c.Get("bad");
         float sw = card ? 1.4f : 1.3f;
         string data = "data-node=\"" + DgSvgPainter.Esc(n.Id) + "\"" + (n.Cat.Length > 0 ? " data-cat=\"" + DgSvgPainter.Esc(n.Cat) + "\"" : "");
-        p.Begin("dg-node" + (n.Url.Length > 0 ? " dg-link-node" : ""), "node-" + DgText.CssId(n.Id), data);
+        p.Begin("dg-node" + (n.Url.Length > 0 ? " dg-link-node" : ""), "dg-node-" + DgText.CssId(n.Id), data);
         float x = n.X, y = n.Y, w = n.W, h = n.H;
         if (v.Editing && v.Selected.Contains(n.Id)) p.Rect(x - 4, y - 4, w + 8, h + 8, d.Radius + 4, null, c.Get("sel"), 2, 0, 0.9f);
         if (shape == "card") {
-            p.Rect(x, y, w, h, d.Radius, fill, stroke, sw, n.Dashed ? 1 : 0, o);
+            p.Rect(x, y, w, h, d.Radius, fill, stroke, sw, n.Dashed ? 1 : 0, o, "dg-box");
             float ty = y + 14;
             float bx = x + 14;
             if (n.Badge.Length > 0) {
@@ -22908,7 +22925,7 @@ public static class DgRender {
                 bx += bw + 12;
             }
             if (n.Badge.Length > 0 || status.Length > 0 || n.Metric.Length > 0) {
-                if (status.Length > 0 || n.Badge.Length > 0) p.Ellipse(bx, ty + 9.5f, 4, 4, StatusCol(c, status), null, 0, o);
+                if (status.Length > 0 || n.Badge.Length > 0) p.Ellipse(bx, ty + 9.5f, 4, 4, StatusCol(c, status), null, 0, o, "dg-status");
                 string rate = n.Metric; string r2; if (v.Rate.TryGetValue(n.Id, out r2)) rate = r2;
                 if (rate.Length > 0) p.Text(x + w - 14, ty + 13, rate, 10, 400, c.Get("muted"), "end", true, o, 0, "dg-rate");
                 ty += 28;
@@ -22930,7 +22947,7 @@ public static class DgRender {
                 p.Path(SparkPath(s, sx, sy, sww, 26), null, ck != null ? c.Get(ck) : c.Get("muted"), 1.5f, 0, o, "dg-spark");
             }
         } else if (shape == "table") {
-            p.Rect(x, y, w, h, 8, c.Get("card"), stroke, 1.3f, 0, o);
+            p.Rect(x, y, w, h, 8, c.Get("card"), stroke, 1.3f, 0, o, "dg-box");
             p.Path(TopRound(x, y, w, 30, 8), ck != null ? c.Mix(ck, "28", "card") : c.Get("chip"), null, 0, 0, o, null);
             p.Text(x + 12, y + 20, n.Title, 13.5f, 600, ink, "start", false, o, 0, "dg-title");
             float ry = y + 34;
@@ -22945,18 +22962,18 @@ public static class DgRender {
             }
         } else {
             switch (shape) {
-                case "circle": p.Ellipse(x + w / 2, y + h / 2, w / 2, h / 2, fill, stroke, sw, o); break;
-                case "pill": p.Rect(x, y, w, h, h / 2, fill, stroke, sw, n.Dashed ? 1 : 0, o); break;
-                case "rect": p.Rect(x, y, w, h, 2, fill, stroke, sw, n.Dashed ? 1 : 0, o); break;
-                case "diamond": p.Path("M" + DgRoute.N(x + w / 2) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h / 2) + " L" + DgRoute.N(x + w / 2) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x) + "," + DgRoute.N(y + h / 2) + " Z", fill, stroke, sw, 0, o, null); break;
-                case "hexagon": { float k = 16; p.Path("M" + DgRoute.N(x + k) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w - k) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h / 2) + " L" + DgRoute.N(x + w - k) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x + k) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x) + "," + DgRoute.N(y + h / 2) + " Z", fill, stroke, sw, 0, o, null); break; }
-                case "parallelogram": { float k = 16; p.Path("M" + DgRoute.N(x + k) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w - k) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x) + "," + DgRoute.N(y + h) + " Z", fill, stroke, sw, 0, o, null); break; }
-                case "cylinder": { float e = 9; p.Path("M" + DgRoute.N(x) + "," + DgRoute.N(y + e) + " Q" + DgRoute.N(x + w / 2) + "," + DgRoute.N(y - e) + " " + DgRoute.N(x + w) + "," + DgRoute.N(y + e) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h - e) + " Q" + DgRoute.N(x + w / 2) + "," + DgRoute.N(y + h + e) + " " + DgRoute.N(x) + "," + DgRoute.N(y + h - e) + " Z", fill, stroke, sw, 0, o, null);
+                case "circle": p.Ellipse(x + w / 2, y + h / 2, w / 2, h / 2, fill, stroke, sw, o, "dg-box"); break;
+                case "pill": p.Rect(x, y, w, h, h / 2, fill, stroke, sw, n.Dashed ? 1 : 0, o, "dg-box"); break;
+                case "rect": p.Rect(x, y, w, h, 2, fill, stroke, sw, n.Dashed ? 1 : 0, o, "dg-box"); break;
+                case "diamond": p.Path("M" + DgRoute.N(x + w / 2) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h / 2) + " L" + DgRoute.N(x + w / 2) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x) + "," + DgRoute.N(y + h / 2) + " Z", fill, stroke, sw, 0, o, "dg-box"); break;
+                case "hexagon": { float k = 16; p.Path("M" + DgRoute.N(x + k) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w - k) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h / 2) + " L" + DgRoute.N(x + w - k) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x + k) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x) + "," + DgRoute.N(y + h / 2) + " Z", fill, stroke, sw, 0, o, "dg-box"); break; }
+                case "parallelogram": { float k = 16; p.Path("M" + DgRoute.N(x + k) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w - k) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x) + "," + DgRoute.N(y + h) + " Z", fill, stroke, sw, 0, o, "dg-box"); break; }
+                case "cylinder": { float e = 9; p.Path("M" + DgRoute.N(x) + "," + DgRoute.N(y + e) + " Q" + DgRoute.N(x + w / 2) + "," + DgRoute.N(y - e) + " " + DgRoute.N(x + w) + "," + DgRoute.N(y + e) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h - e) + " Q" + DgRoute.N(x + w / 2) + "," + DgRoute.N(y + h + e) + " " + DgRoute.N(x) + "," + DgRoute.N(y + h - e) + " Z", fill, stroke, sw, 0, o, "dg-box");
                                      p.Path("M" + DgRoute.N(x) + "," + DgRoute.N(y + e) + " Q" + DgRoute.N(x + w / 2) + "," + DgRoute.N(y + e * 3) + " " + DgRoute.N(x + w) + "," + DgRoute.N(y + e), null, stroke, sw, 0, o, null); break; }
-                case "doc": { p.Path("M" + DgRoute.N(x) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h - 8) + " Q" + DgRoute.N(x + w * 0.75f) + "," + DgRoute.N(y + h - 18) + " " + DgRoute.N(x + w / 2) + "," + DgRoute.N(y + h - 8) + " Q" + DgRoute.N(x + w * 0.25f) + "," + DgRoute.N(y + h + 2) + " " + DgRoute.N(x) + "," + DgRoute.N(y + h - 8) + " Z", fill, stroke, sw, 0, o, null); break; }
-                case "note": { float k = 12; p.Path("M" + DgRoute.N(x) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w - k) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + k) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x) + "," + DgRoute.N(y + h) + " Z", ck == null && n.Fill.Length == 0 ? c.Mix("warn", "16", "card") : fill, stroke, sw, 0, o, null); break; }
+                case "doc": { p.Path("M" + DgRoute.N(x) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h - 8) + " Q" + DgRoute.N(x + w * 0.75f) + "," + DgRoute.N(y + h - 18) + " " + DgRoute.N(x + w / 2) + "," + DgRoute.N(y + h - 8) + " Q" + DgRoute.N(x + w * 0.25f) + "," + DgRoute.N(y + h + 2) + " " + DgRoute.N(x) + "," + DgRoute.N(y + h - 8) + " Z", fill, stroke, sw, 0, o, "dg-box"); break; }
+                case "note": { float k = 12; p.Path("M" + DgRoute.N(x) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w - k) + "," + DgRoute.N(y) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + k) + " L" + DgRoute.N(x + w) + "," + DgRoute.N(y + h) + " L" + DgRoute.N(x) + "," + DgRoute.N(y + h) + " Z", ck == null && n.Fill.Length == 0 ? c.Mix("warn", "16", "card") : fill, stroke, sw, 0, o, "dg-box"); break; }
                 case "actor": { float cx = x + w / 2; p.Ellipse(cx, y + 11, 9, 9, fill, stroke, 1.6f, o); p.Path("M" + DgRoute.N(cx) + "," + DgRoute.N(y + 20) + " L" + DgRoute.N(cx) + "," + DgRoute.N(y + 46) + " M" + DgRoute.N(cx - 15) + "," + DgRoute.N(y + 29) + " L" + DgRoute.N(cx + 15) + "," + DgRoute.N(y + 29) + " M" + DgRoute.N(cx) + "," + DgRoute.N(y + 46) + " L" + DgRoute.N(cx - 12) + "," + DgRoute.N(y + 62) + " M" + DgRoute.N(cx) + "," + DgRoute.N(y + 46) + " L" + DgRoute.N(cx + 12) + "," + DgRoute.N(y + 62), null, stroke, 1.6f, 0, o, null); break; }
-                default: p.Rect(x, y, w, h, d.Radius, fill, stroke, sw, n.Dashed ? 1 : 0, o); break;
+                default: p.Rect(x, y, w, h, d.Radius, fill, stroke, sw, n.Dashed ? 1 : 0, o, "dg-box"); break;
             }
             float ts = DgLayout.TitleSize(n, false);
             var lines = DgLayout.Wrap(n.Title, ts, n.Bold ? 600 : 500, shape == "diamond" ? w / 1.45f - 30 : w - 30);
@@ -22968,7 +22985,7 @@ public static class DgRender {
                 p.Text(x + w / 2, top - ts - 4, n.Badge, 9.5f, 600, ck != null ? c.Get(ck) : ink, "middle", true, o, 0, null);
             }
             foreach (var ln in lines) { p.Text(x + w / 2, top, ln, ts, n.Bold ? 600 : 500, ink, "middle", false, o, 0, "dg-title"); top += lh; }
-            if (status.Length > 0) p.Ellipse(x + w - 9, y + 9, 3.5f, 3.5f, StatusCol(c, status), null, 0, o);
+            if (status.Length > 0) p.Ellipse(x + w - 9, y + 9, 3.5f, 3.5f, StatusCol(c, status), null, 0, o, "dg-status");
         }
         p.End();
     }
@@ -23104,7 +23121,9 @@ public class DgCanvas : System.Windows.Forms.Panel {
     public float Zoom = 1f;
     public System.Drawing.PointF Pan = new System.Drawing.PointF(0, 0);       // canvas units at the top-left
     public System.Drawing.Color UiBack = System.Drawing.Color.FromArgb(30, 30, 30), UiFore = System.Drawing.Color.White, UiLine = System.Drawing.Color.Gray, UiAccent = System.Drawing.Color.DodgerBlue;
-    public event EventHandler SelectionChanged, NodeOpened, Moved, EdgeAdded, DeleteRequested, LegendChanged;
+    public event EventHandler SelectionChanged, NodeOpened, Moved, EdgeAdded, DeleteRequested, LegendChanged, CopyRequested, PasteRequested, DuplicateRequested;
+    public System.Drawing.PointF MouseCanvas;       // where the mouse is (canvas units)
+    public bool MouseInside;
     public string NewEdgeFrom = "", NewEdgeTo = "";
     public List<string> MovedIds = new List<string>();
 
@@ -23197,6 +23216,11 @@ public class DgCanvas : System.Windows.Forms.Panel {
         foreach (var n in Doc.Nodes) if (!n.Hidden && n.Box.Contains(w)) hit = n;          // the last drawn wins
         return hit;
     }
+    public DgGroup GroupAt(System.Drawing.PointF w) {
+        DgGroup hit = null;
+        foreach (var g in Doc.Groups) if (!g.Box.IsEmpty && g.Box.Contains(w) && (hit == null || g.Box.Width * g.Box.Height < hit.Box.Width * hit.Box.Height)) hit = g;
+        return hit;
+    }
     public DgEdge EdgeAt(System.Drawing.PointF w) {
         float best = 6 / Zoom; DgEdge hit = null;
         foreach (var e in Doc.Edges) for (int i = 1; i < e.Pts.Count; i++) { float dd = Dist(w, e.Pts[i - 1], e.Pts[i]); if (dd < best) { best = dd; hit = e; } }
@@ -23242,6 +23266,15 @@ public class DgCanvas : System.Windows.Forms.Panel {
         }
         var ed = EdgeAt(w);
         if (ed != null) { View.Selected.Clear(); View.SelectedEdge = ed.Id; Invalidate(); if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); return; }
+        var gr = GroupAt(w);
+        if (gr != null && Editable && (System.Windows.Forms.Control.ModifierKeys & System.Windows.Forms.Keys.Shift) == 0) {
+            var ms = gr.Members.Where(id => Doc.Find(id) != null).ToList();
+            View.Selected = new HashSet<string>(ms); View.SelectedEdge = "";
+            if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty);
+            mode = Mode.Drag; dragAnchor = w; dragFrom.Clear();
+            foreach (var id in ms) { var m = Doc.Find(id); dragFrom[id] = new System.Drawing.PointF(m.X, m.Y); }
+            Invalidate(); return;
+        }
         bool shift = (System.Windows.Forms.Control.ModifierKeys & System.Windows.Forms.Keys.Shift) != 0;
         if (shift && Editable) { mode = Mode.Box; box = new System.Drawing.RectangleF(w, System.Drawing.SizeF.Empty); return; }
         mode = Mode.Pan; panFrom = Pan;
@@ -23249,6 +23282,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
     protected override void OnMouseMove(System.Windows.Forms.MouseEventArgs e) {
         base.OnMouseMove(e);
         var w = W(e.Location);
+        MouseCanvas = w; MouseInside = true;
         if (Math.Abs(e.X - down.X) + Math.Abs(e.Y - down.Y) > 3) moved = true;
         switch (mode) {
             case Mode.Pan: if (moved) { UserView = true; Pan = new System.Drawing.PointF(panFrom.X - (e.X - down.X) / Zoom, panFrom.Y - (e.Y - down.Y) / Zoom); Invalidate(); } return;
@@ -23266,7 +23300,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
         if (h != View.Hover) { View.Hover = HoverDim ? h : ""; hoverId = h; Invalidate(); }
     }
     string hoverId = "";
-    protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); if (View.Hover.Length > 0 || hoverId.Length > 0) { View.Hover = ""; hoverId = ""; Invalidate(); } }
+    protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); MouseInside = false; if (View.Hover.Length > 0 || hoverId.Length > 0) { View.Hover = ""; hoverId = ""; Invalidate(); } }
     protected override void OnMouseUp(System.Windows.Forms.MouseEventArgs e) {
         base.OnMouseUp(e);
         var w = W(e.Location);
@@ -23302,6 +23336,9 @@ public class DgCanvas : System.Windows.Forms.Panel {
         else if (e.Control && (e.KeyCode == System.Windows.Forms.Keys.OemMinus || e.KeyCode == System.Windows.Forms.Keys.Subtract)) { SetZoom(Zoom / 1.2f); e.Handled = true; }
         else if (e.Control && e.KeyCode == System.Windows.Forms.Keys.D0) { ZoomToFit(); UserView = false; e.Handled = true; }
         else if (e.Control && e.KeyCode == System.Windows.Forms.Keys.A) { Select(Doc.Nodes.Where(n => !n.Hidden).Select(n => n.Id)); e.Handled = true; }
+        else if (e.Control && e.KeyCode == System.Windows.Forms.Keys.C) { if (CopyRequested != null) CopyRequested(this, EventArgs.Empty); e.Handled = true; }
+        else if (e.Control && e.KeyCode == System.Windows.Forms.Keys.V && Editable) { if (PasteRequested != null) PasteRequested(this, EventArgs.Empty); e.Handled = true; }
+        else if (e.Control && e.KeyCode == System.Windows.Forms.Keys.D && Editable) { if (DuplicateRequested != null) DuplicateRequested(this, EventArgs.Empty); e.Handled = true; }
         else if (e.KeyCode == System.Windows.Forms.Keys.Delete && Editable) { if (DeleteRequested != null) DeleteRequested(this, EventArgs.Empty); e.Handled = true; }
         else if (Editable && View.Selected.Count > 0 && (e.KeyCode == System.Windows.Forms.Keys.Left || e.KeyCode == System.Windows.Forms.Keys.Right || e.KeyCode == System.Windows.Forms.Keys.Up || e.KeyCode == System.Windows.Forms.Keys.Down)) {
             float step = e.Shift ? 24 : 4;
@@ -23387,6 +23424,9 @@ public class DgCanvas : System.Windows.Forms.Panel {
         g.TranslateTransform(-Pan.X, -Pan.Y);
         if (Doc.On("grid")) Dots(g, c, new System.Drawing.RectangleF(Pan.X, Pan.Y, Width / Zoom, Height / Zoom));
         View.Editing = Editable;
+        if (Editable && View.Selected.Count > 1)
+            foreach (var gr in Doc.Groups) if (!gr.Box.IsEmpty && gr.Members.Count > 0 && gr.Members.All(View.Selected.Contains))
+                using (var pen = new System.Drawing.Pen(DgColors.Parse(c.Raw("sel")), 2f / Zoom)) using (var gp = DgGdiPainter.RoundRect(gr.Box.X - 4, gr.Box.Y - 4, gr.Box.Width + 8, gr.Box.Height + 8, Doc.Radius + 6)) g.DrawPath(pen, gp);
         DgRender.Draw(Doc, c, new DgGdiPainter(g), View);
         // packets
         if (Animate) {
@@ -23479,6 +23519,636 @@ public class DgCanvas : System.Windows.Forms.Panel {
     }
 }
 
+// ---- Interactive web page / widget / React component: the SVG plus a small script (no libraries).
+public class DgHtmlOptions {
+    public string Kind = "page";             // page, widget, react
+    public string Prefix = "dg", Mode = "auto", Height = "";
+    public bool Header = true, Flows = true, ThemeSwitch = true, Zoom = true, Legend = true, Panel = true, Hover = true, Outage = true, Hint = true, Glow = true, WebFont = true;
+}
+
+public static class DgHtml {
+    static string J(string s) {
+        var sb = new StringBuilder("\"");
+        foreach (char ch in s ?? "") {
+            switch (ch) {
+                case '"': sb.Append("\\\""); break; case '\\': sb.Append("\\\\"); break; case '\n': sb.Append("\\n"); break; case '\r': break; case '\t': sb.Append("\\t"); break;
+                case '<': sb.Append("\\u003c"); break; case '>': sb.Append("\\u003e"); break; case '&': sb.Append("\\u0026"); break;
+                default: if (ch < 32 || ch > 126) sb.Append("\\u" + ((int)ch).ToString("x4")); else sb.Append(ch); break;
+            }
+        }
+        return sb.Append('"').ToString();
+    }
+    static string Nm(float v) { return DgRoute.N(v); }
+    static string B(bool b) { return b ? "true" : "false"; }
+
+    public static string Data(DgDoc d, DgHtmlOptions o, string prefix) {
+        var sb = new StringBuilder("{");
+        sb.Append("\"p\":" + J(prefix) + ",\"title\":" + J(d.Title) + ",\"theme\":" + J(o.Mode) + ",");
+        var b = d.Bounds;
+        sb.Append("\"bounds\":[" + Nm(b.X) + "," + Nm(b.Y) + "," + Nm(b.Width) + "," + Nm(b.Height) + "],");
+        sb.Append("\"opt\":{\"hover\":" + B(o.Hover) + ",\"panel\":" + B(o.Panel) + ",\"flows\":" + B(o.Flows) + ",\"outage\":" + B(o.Outage) + ",\"glow\":" + B(o.Glow) + "},");
+        sb.Append("\"cats\":{");
+        sb.Append(string.Join(",", d.Cats.Select(c => J(DgText.CssId(c.Id)) + ":" + J(c.Name))));
+        sb.Append("},\"nodes\":{");
+        var parts = new List<string>();
+        foreach (var n in d.Nodes) {
+            if (n.Hidden) continue;
+            var g = d.FindGroup(n.Group); var cat = d.FindCat(n.Cat);
+            var x = new StringBuilder(J(n.Id) + ":{\"t\":" + J(n.Title.Replace("\n", " ")));
+            if (n.Badge.Length > 0) x.Append(",\"b\":" + J(n.Badge));
+            if (cat != null) x.Append(",\"c\":" + J(DgText.CssId(cat.Id)) + ",\"cn\":" + J(cat.Name));
+            if (g != null) x.Append(",\"g\":" + J(g.Title));
+            if (n.Desc.Length > 0) x.Append(",\"d\":" + J(n.Desc));
+            if (n.Tags.Count > 0) x.Append(",\"tags\":[" + string.Join(",", n.Tags.Select(J)) + "]");
+            if (n.Status.Length > 0) x.Append(",\"s\":" + J(n.Status));
+            if (n.Metric.Length > 0) x.Append(",\"m\":" + J(n.Metric));
+            if (n.Url.Length > 0) x.Append(",\"u\":" + J(n.Url));
+            if (n.Spark && DgLayout.IsCard(n)) x.Append(",\"sp\":[" + Nm(n.X + 14) + "," + Nm(n.Y + n.H - 14 - 28) + "," + Nm(n.W - 28) + ",26]");
+            x.Append("}");
+            parts.Add(x.ToString());
+        }
+        sb.Append(string.Join(",", parts));
+        sb.Append("},\"links\":[");
+        var ls = new List<string>();
+        foreach (var e in d.Edges) {
+            if (e.Pts.Count < 2) continue;
+            var cat = d.FindCat(e.Cat);
+            ls.Add("{\"id\":" + J(e.Id) + ",\"f\":" + J(e.From) + ",\"t\":" + J(e.To) + (cat != null ? ",\"c\":" + J(DgText.CssId(cat.Id)) : "") +
+                   (e.Animate ? ",\"a\":1" : "") + (e.Both ? ",\"b\":1" : "") + (e.Density != 1 ? ",\"n\":" + Nm(e.Density) : "") +
+                   ",\"p\":[" + string.Join(",", e.Pts.Select(p => Nm(p.X) + "," + Nm(p.Y))) + "]}");
+        }
+        sb.Append(string.Join(",", ls));
+        sb.Append("]}");
+        return sb.ToString();
+    }
+
+    public static string Svg(DgDoc d, DgTheme t) {
+        var c = new DgColors(d, t, true, true);
+        var p = new DgSvgPainter { Pretty = true };
+        var v = new DgView();
+        foreach (var n in d.Nodes) if (DgLayout.IsCard(n) && (n.Badge.Length > 0 || n.Status.Length > 0 || n.Metric.Length > 0) && n.Metric.Length == 0) v.Rate[n.Id] = " ";
+        DgRender.Draw(d, c, p, v);
+        return "<svg xmlns=\"http://www.w3.org/2000/svg\" class=\"dg-svg\" role=\"img\" aria-label=\"" + DgSvgPainter.Esc(string.IsNullOrEmpty(d.Title) ? "Diagram" : d.Title) + "\">\n" +
+               "  <defs><filter id=\"dg-glow\" x=\"-100%\" y=\"-100%\" width=\"300%\" height=\"300%\"><feGaussianBlur stdDeviation=\"2.4\" result=\"b\"/><feMerge><feMergeNode in=\"b\"/><feMergeNode in=\"SourceGraphic\"/></feMerge></filter></defs>\n" +
+               "  <g class=\"dg-vp\">\n" + p.Sb.ToString() + "  <g class=\"dg-pk\"></g>\n  </g>\n</svg>";
+    }
+
+    // the root element with its parts (no script)
+    static string Markup(DgDoc d, DgTheme t, DgHtmlOptions o, string height) {
+        var sb = new StringBuilder();
+        string mode = o.Mode == "light" ? "light" : "dark";
+        sb.Append("<div class=\"dg-root\" id=\"dg-root\" data-theme=\"" + mode + "\">\n");
+        sb.Append("<div class=\"dg-stage\">\n" + Svg(d, t) + "\n</div>\n");
+        sb.Append("<div class=\"dg-bar\">\n");
+        if (o.Header) sb.Append("  <div class=\"dg-head\"><div class=\"dg-ttl\"><span class=\"dg-live\"></span><span>" + DgSvgPainter.Esc(string.IsNullOrEmpty(d.Title) ? "Diagram" : d.Title) + "</span></div>" + (o.Flows ? "<div class=\"dg-stats\"></div>" : "") + "</div>\n");
+        else sb.Append("  <span></span>\n");
+        if (o.Flows || o.ThemeSwitch || o.Zoom) {
+            sb.Append("  <div class=\"dg-tools\">");
+            if (o.Flows) sb.Append("<button class=\"dg-pause\">Pause</button><div class=\"dg-seg dg-speed\"><button data-v=\"0.5\">0.5x</button><button data-v=\"1\" class=\"dg-act\">1x</button><button data-v=\"2\">2x</button><button data-v=\"4\">4x</button></div>");
+            if (o.ThemeSwitch) sb.Append("<div class=\"dg-seg dg-theme\"><button data-v=\"dark\">Dark</button><button data-v=\"light\">Light</button></div>");
+            if (o.Zoom) sb.Append("<button class=\"dg-zout\" title=\"Zoom out\">\u2212</button><span class=\"dg-zoom\">100%</span><button class=\"dg-zin\" title=\"Zoom in\">+</button><button class=\"dg-fit\">Fit</button>");
+            sb.Append("</div>\n");
+        }
+        sb.Append("</div>\n");
+        sb.Append("<div class=\"dg-foot\">" + (o.Legend ? "<div class=\"dg-legend\"></div>" : "<span></span>") +
+                  (o.Hint ? "<span class=\"dg-hint\">Drag to pan \u00B7 Ctrl + wheel to zoom" + (o.Panel ? " \u00B7 Click a component for details" : "") + "</span>" : "") + "</div>\n");
+        if (o.Panel) sb.Append("<aside class=\"dg-panel\" hidden></aside>\n");
+        sb.Append("</div>\n");
+        string css = DgSvg.Css(d, t, ".dg-root", o.Mode, false, false) + DgAssets.Css.Replace("__P__", "dg").Replace("__H__", height);
+        sb.Append("<style>\n" + css + "</style>\n");
+        return sb.ToString();
+    }
+
+    static string FontLink(DgDoc d) {
+        var fams = new List<string>();
+        if (d.Font.Length > 0) fams.Add("family=" + d.Font.Replace(' ', '+') + ":wght@400;500;600");
+        if (d.Mono.Length > 0) fams.Add("family=" + d.Mono.Replace(' ', '+') + ":wght@400;500;600");
+        if (fams.Count == 0) return "";
+        return "<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n<link href=\"https://fonts.googleapis.com/css2?" + string.Join("&amp;", fams) + "&amp;display=swap\" rel=\"stylesheet\">\n";
+    }
+
+    public static string Build(DgDoc d, DgTheme t, DgHtmlOptions o) {
+        string prefix = DgSvg.P(o.Prefix);
+        string kind = (o.Kind ?? "page").ToLowerInvariant();
+        string height = !string.IsNullOrEmpty(o.Height) ? o.Height : (kind == "page" ? "100vh" : "640px");
+        string data = Data(d, o, prefix);
+        string font = o.WebFont ? FontLink(d) : "";
+        string markup = Markup(d, t, o, height);
+        string js = DgAssets.Js.Trim();
+        string outText;
+        if (kind == "react") {
+            var words = Regex.Matches(string.IsNullOrEmpty(d.Title) ? "diagram" : d.Title, "[A-Za-z0-9]+").Cast<Match>().Select(m => m.Value).Take(4).ToList();
+            string comp = string.Concat(words.Select(w => char.ToUpperInvariant(w[0]) + w.Substring(1).ToLowerInvariant()));
+            if (comp.Length == 0 || char.IsDigit(comp[0])) comp = "Diagram" + comp;
+            string tpl = (font + markup).Replace("\\", "\\\\").Replace("`", "\\`").Replace("${", "\\${");
+            outText = "import { useEffect, useRef } from 'react';\n\n" +
+                "// " + (string.IsNullOrEmpty(d.Title) ? "Diagram" : d.Title).Replace("\n", " ") + " - made with DevTools Diagram studio.\n" +
+                "// Props: theme ('dark' | 'light'), onSelect(id) when a component is clicked. The instance API is on window.diagrams['" + prefix + "'].\n" +
+                "const html = `" + tpl + "`;\n\n" +
+                "const data = " + data + ";\n\n" +
+                "export default function " + comp + "({ theme, onSelect }) {\n" +
+                "  const ref = useRef(null);\n" +
+                "  const api = useRef(null);\n" +
+                "  useEffect(() => {\n" +
+                "    api.current = init(ref.current.querySelector('.dg-root'), JSON.parse(JSON.stringify(data)));\n" +
+                "    if (onSelect) api.current.on('select', onSelect);\n" +
+                "    return () => api.current.destroy();\n" +
+                "  }, []);\n" +
+                "  useEffect(() => { if (theme && api.current) api.current.theme(theme); }, [theme]);\n" +
+                "  return <div ref={ref} dangerouslySetInnerHTML={{ __html: html }} />;\n" +
+                "}\n\n" +
+                "const init = " + js + ";\n";
+        } else {
+            string script = "<script>\n(function () {\n  var init = " + js + ";\n  init(document.getElementById('dg-root'), " + data + ");\n})();\n</script>\n";
+            if (kind == "widget") {
+                outText = "<!-- " + (string.IsNullOrEmpty(d.Title) ? "Diagram" : d.Title).Replace("--", "-") + ": made with DevTools Diagram studio. Paste anywhere in a page; window.diagrams['" + prefix + "'] is its API. -->\n" + font + markup + script;
+            } else {
+                outText = "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>" + DgSvgPainter.Esc(string.IsNullOrEmpty(d.Title) ? "Diagram" : d.Title) + "</title>\n" + font +
+                          "<style>html,body{margin:0;height:100%;overflow:hidden}</style>\n</head>\n<body>\n" + markup + script + "</body>\n</html>\n";
+            }
+        }
+        // ids, classes and selectors get the prefix (data-* attributes and CSS variables are scoped by the root)
+        outText = DgSvg.ApplyPrefix(outText, prefix).Replace("id=\"" + prefix + "-root\"", "id=\"" + prefix + "-root\"");
+        if (prefix != "dg") outText = outText.Replace("'dg-root'", "'" + prefix + "-root'").Replace("'.dg-root'", "'." + prefix + "-root'");
+        return outText;
+    }
+}
+
+// ---- Copy / paste between diagrams: the selection as diagram text (shapes with their look and place, the links
+//      between them, whole groups, the categories they use); pasted with new names where they clash.
+public static class DgClip {
+    public const string Marker = "%% DevTools diagram selection";
+    static string Q(string s) { return "\"" + (s ?? "").Replace("\"", "'").Replace("\r\n", "\\n").Replace("\n", "\\n") + "\""; }
+    static string N(float v) { return ((int)Math.Round(v)).ToString(CultureInfo.InvariantCulture); }
+
+    public static string NodeLine(DgNode n, string id, float dx, float dy, bool lanes, string group) {
+        var a = new List<string>();
+        if (n.Badge.Length > 0) a.Add("badge " + n.Badge.Replace(",", " "));
+        if (n.Cat.Length > 0) a.Add("cat " + n.Cat);
+        if (n.Shape.Length > 0) a.Add("shape " + n.Shape);
+        if (lanes && n.Lane >= 0) a.Add("lane " + (n.Lane + 1));
+        if (n.Status.Length > 0) a.Add("status " + n.Status);
+        if (n.Spark) a.Add("spark");
+        if (n.Lines.Count > 0) a.Add("lines " + string.Join(" ", n.Lines.Select(Q)));
+        if (n.Items.Count > 0) a.Add("items " + string.Join(" ", n.Items.Select(Q)));
+        if (n.Desc.Length > 0) a.Add("desc " + Q(n.Desc));
+        if (n.Tags.Count > 0) a.Add("tags " + string.Join("; ", n.Tags.Select(t => t.Replace(",", " ").Replace(";", " "))));
+        if (n.Metric.Length > 0) a.Add("metric " + Q(n.Metric));
+        if (n.Url.Length > 0) a.Add("url " + Q(n.Url));
+        if (n.Icon.Length > 0) a.Add("icon " + Q(n.Icon));
+        if (n.Fill.Length > 0) a.Add("fill " + n.Fill);
+        if (n.Stroke.Length > 0) a.Add("stroke " + n.Stroke);
+        if (n.TextColor.Length > 0) a.Add("color " + n.TextColor);
+        if (n.FontSize > 0) a.Add("font " + N(n.FontSize));
+        if (n.Bold) a.Add("bold");
+        if (n.Dashed) a.Add("dashed");
+        if (n.SetW > 0 || n.SetH > 0) a.Add("size " + N(n.SetW > 0 ? n.SetW : n.W) + " " + N(n.SetH > 0 ? n.SetH : n.H));
+        if (!string.IsNullOrEmpty(group)) a.Add("in " + group);
+        a.Add("at " + N(n.X + dx) + " " + N(n.Y + dy));
+        return id + ": " + n.Title.Replace("\r\n", "\\n").Replace("\n", "\\n") + " [" + string.Join(", ", a) + "]";
+    }
+
+    public static string EdgeLine(DgEdge e, string from, string to) {
+        var a = new List<string>();
+        if (e.Cat.Length > 0) a.Add("cat " + e.Cat);
+        if (e.Dash == 1) a.Add("dashed"); else if (e.Dash == 2) a.Add("dotted");
+        if (e.Width > 0) a.Add("width " + e.Width.ToString(CultureInfo.InvariantCulture));
+        if (e.Label.Length > 0) a.Add("label " + Q(e.Label));
+        if (e.Route.Length > 0) a.Add("route " + e.Route);
+        if (e.Animate) a.Add("animate");
+        if (e.Animate && e.Density != 1) a.Add("density " + e.Density.ToString(CultureInfo.InvariantCulture));
+        if (e.Both) a.Add("both");
+        if (e.ArrowSet) a.Add("arrow " + (e.ArrowStart && e.ArrowEnd ? "both" : e.ArrowStart ? "start" : e.ArrowEnd ? "end" : "none"));
+        if (e.Color.Length > 0) a.Add("color " + e.Color);
+        if (e.GlowSet) a.Add(e.Glow ? "glow" : "noglow");
+        if (e.FromSide.Length > 0) a.Add("from " + e.FromSide);
+        if (e.ToSide.Length > 0) a.Add("to " + e.ToSide);
+        string f = from + (e.FromItem.Length > 0 ? "." + Item(e.FromItem) : ""), t = to + (e.ToItem.Length > 0 ? "." + Item(e.ToItem) : "");
+        return f + " -> " + t + (a.Count > 0 ? " [" + string.Join(", ", a) + "]" : "");
+    }
+    static string Item(string s) { return Regex.IsMatch(s, @"^[\w\-]+$") ? s : Q(s); }
+
+    static string CatLine(DgDoc d, DgCategory c, DgTheme t) {
+        var cl = new DgColors(d, t, false, false); var cd = new DgColors(d, t, true, false);
+        return "category " + c.Id + " " + Q(c.Name) + " " + cl.Raw("c:" + c.Id) + " / " + cd.Raw("c:" + c.Id);
+    }
+
+    // the selected shapes (and groups whose shapes are all selected) as text
+    public static string Copy(DgDoc d, DgTheme t, IEnumerable<string> ids) {
+        var sel = new HashSet<string>(ids);
+        var nodes = d.Nodes.Where(n => sel.Contains(n.Id) && !n.Hidden).ToList();
+        if (nodes.Count == 0) return "";
+        var groups = d.Groups.Where(g => g.Members.Count > 0 && g.Members.All(sel.Contains)).ToList();
+        var gset = new HashSet<string>(groups.Select(g => g.Id));
+        var edges = d.Edges.Where(e => sel.Contains(e.From) && sel.Contains(e.To)).ToList();
+        var cats = new HashSet<string>(nodes.Select(n => n.Cat).Concat(edges.Select(e => e.Cat)).Concat(groups.Select(g => g.Cat)).Where(c => c.Length > 0), StringComparer.OrdinalIgnoreCase);
+        var sb = new StringBuilder(Marker + "\r\n");
+        foreach (var c in d.Cats) if (cats.Contains(c.Id)) sb.Append(CatLine(d, c, t) + "\r\n");
+        foreach (var g in groups) {
+            var a = new List<string>();
+            if (g.Cat.Length > 0) a.Add("cat " + g.Cat);
+            a.Add(g.Dashed ? "dashed" : "solid");
+            if (g.Fill.Length > 0) a.Add("fill " + g.Fill);
+            if (g.Stroke.Length > 0) a.Add("stroke " + g.Stroke);
+            sb.Append("group " + g.Id + " " + Q(g.Title) + " [" + string.Join(", ", a) + "]\r\n");
+        }
+        foreach (var n in nodes) sb.Append(NodeLine(n, n.Id, 0, 0, d.LaneMode, gset.Contains(n.Group) ? n.Group : "") + "\r\n");
+        foreach (var e in edges) sb.Append(EdgeLine(e, e.From, e.To) + "\r\n");
+        return sb.ToString();
+    }
+
+    // adds pasted diagram text to the target text: new names where they clash, placed with its top-left at (x, y)
+    // (NaN = 40 to the right / below where it was); returns the new text, the new shape ids in Pasted
+    public static List<string> Pasted = new List<string>();
+    public static string Paste(string text, DgDoc target, string clip, float x, float y) {
+        Pasted = new List<string>();
+        var src = DgText.Parse(clip);
+        if (src.Nodes.Count == 0) return text;
+        DgLayout.Apply(src);
+        var used = new HashSet<string>(target.Nodes.Select(n => n.Id).Concat(target.Groups.Select(g => g.Id)), StringComparer.Ordinal);
+        Func<string, string> fresh = id => {
+            if (!used.Contains(id)) { used.Add(id); return id; }
+            var bare = Regex.Replace(id, @"_\d+$", "");
+            int k = 2; while (used.Contains(bare + "_" + k)) k++;
+            var nid = bare + "_" + k; used.Add(nid); return nid;
+        };
+        var map = new Dictionary<string, string>();
+        foreach (var g in src.Groups) map["g:" + g.Id] = fresh(g.Id);
+        foreach (var n in src.Nodes) map[n.Id] = fresh(n.Id);
+        float minX = src.Nodes.Min(n => n.X), minY = src.Nodes.Min(n => n.Y);
+        float dx = float.IsNaN(x) ? 40 : x - minX, dy = float.IsNaN(y) ? 40 : y - minY;
+        var sb = new StringBuilder();
+        var tcats = new HashSet<string>(target.Cats.Select(c => c.Id), StringComparer.OrdinalIgnoreCase);
+        var lines = clip.Replace("\r\n", "\n").Split('\n');
+        foreach (var c in src.Cats) {
+            if (tcats.Contains(c.Id)) continue;
+            var line = lines.FirstOrDefault(l => Regex.IsMatch(l, "^\\s*(category|cat|flow)\\s+" + Regex.Escape(c.Id) + "\\b", RegexOptions.IgnoreCase));
+            sb.Append((line != null ? line.Trim() : "category " + c.Id + " " + Q(c.Name)) + "\r\n");
+        }
+        foreach (var g in src.Groups) {
+            var a = new List<string>();
+            if (g.Cat.Length > 0) a.Add("cat " + g.Cat);
+            a.Add(g.Dashed ? "dashed" : "solid");
+            if (g.Fill.Length > 0) a.Add("fill " + g.Fill);
+            if (g.Stroke.Length > 0) a.Add("stroke " + g.Stroke);
+            sb.Append("group " + map["g:" + g.Id] + " " + Q(g.Title) + " [" + string.Join(", ", a) + "]\r\n");
+        }
+        foreach (var n in src.Nodes) {
+            if (n.Hidden) continue;
+            string grp = !string.IsNullOrEmpty(n.Group) && map.ContainsKey("g:" + n.Group) ? map["g:" + n.Group] : "";
+            sb.Append(NodeLine(n, map[n.Id], dx, dy, target.LaneMode, grp) + "\r\n");
+            Pasted.Add(map[n.Id]);
+        }
+        foreach (var e in src.Edges) if (map.ContainsKey(e.From) && map.ContainsKey(e.To)) sb.Append(EdgeLine(e, map[e.From], map[e.To]) + "\r\n");
+        var t = (text ?? "").TrimEnd();
+        return (t.Length > 0 ? t + "\r\n\r\n" : "") + "%% pasted\r\n" + sb.ToString().TrimEnd();
+    }
+}
+
+public static class DgAssets {
+    public static readonly string Js = @"function (root, D) {
+  var P = D.p, NS = 'http://www.w3.org/2000/svg', O = D.opt;
+  function q(s) { return root.querySelector(s); }
+  function qa(s) { return Array.prototype.slice.call(root.querySelectorAll(s)); }
+  function cls(n) { return '.' + P + '-' + n; }
+  var stage = q(cls('stage')), svg = stage.querySelector('svg'), vp = svg.querySelector(cls('vp')), pk = svg.querySelector(cls('pk'));
+  var st = { paused: false, speed: 1, hidden: {}, down: {}, sel: null, hover: null };
+  var view = { x: 0, y: 0, k: 1 }, userMoved = false, drag = null, justDragged = false;
+  var listeners = {}, fixed = {}, alive = true, raf = 0;
+  var nodeEls = qa('[data-node]'), linkEls = qa('[data-link]');
+  var byNode = {};
+  nodeEls.forEach(function (el) { var id = el.getAttribute('data-node'); (byNode[id] = byNode[id] || []).push(el); });
+  function emit(ev, a) { (listeners[ev] || []).forEach(function (f) { try { f(a); } catch (e) { } }); }
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>""']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '""': '&quot;', ""'"": '&#39;' }[c]; }); }
+  function fmt(v) { return v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(1) + 'k' : String(Math.round(v)); }
+
+  // ---- theme
+  function setTheme(t) {
+    if (t !== 'dark' && t !== 'light') t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+    root.setAttribute('data-theme', t);
+    pk.setAttribute('filter', t === 'dark' && O.glow ? 'url(#' + P + '-glow)' : 'none');
+    qa(cls('theme') + ' button').forEach(function (b) { b.classList.toggle(P + '-act', b.getAttribute('data-v') === t); });
+    emit('theme', t);
+  }
+
+  // ---- pan / zoom / fit
+  function headH() { var h = q(cls('head')); return h && h.offsetParent ? Math.round(h.getBoundingClientRect().bottom - stage.getBoundingClientRect().top + 10) : 16; }
+  function footH() { var f = q(cls('foot')); return f && f.offsetParent ? Math.round(stage.getBoundingClientRect().bottom - f.getBoundingClientRect().top + 10) : 16; }
+  function apply() {
+    vp.setAttribute('transform', 'translate(' + view.x.toFixed(1) + ',' + view.y.toFixed(1) + ') scale(' + view.k.toFixed(4) + ')');
+    stage.style.backgroundSize = (24 * view.k) + 'px ' + (24 * view.k) + 'px';
+    stage.style.backgroundPosition = view.x + 'px ' + view.y + 'px';
+    var z = q(cls('zoom')); if (z) z.textContent = Math.round(view.k * 100) + '%';
+  }
+  function fit(manual) {
+    var w = stage.clientWidth, h = stage.clientHeight, b = D.bounds, top = headH(), bot = footH();
+    if (!w || !h) return;
+    var k = clamp(Math.min((w - 32) / b[2], (h - top - bot) / b[3]), 0.15, 2);
+    view = { k: k, x: (w - b[2] * k) / 2 - b[0] * k, y: top + Math.max(0, (h - top - bot - b[3] * k) / 2) - b[1] * k };
+    if (manual) userMoved = false;
+    apply();
+  }
+  function zoomAt(cx, cy, f) {
+    var k = clamp(view.k * f, 0.15, 4);
+    view.x = cx - (cx - view.x) * k / view.k; view.y = cy - (cy - view.y) * k / view.k; view.k = k;
+    userMoved = true; apply();
+  }
+  function onWheel(e) {
+    e.preventDefault();
+    var r = stage.getBoundingClientRect();
+    if (e.ctrlKey || e.metaKey) zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * 0.0018));
+    else { if (e.shiftKey) view.x -= e.deltaY || e.deltaX; else { view.x -= e.deltaX; view.y -= e.deltaY; } userMoved = true; apply(); }
+  }
+  function onDown(e) { if (e.button !== 0) return; drag = { sx: e.clientX, sy: e.clientY, x0: view.x, y0: view.y, moved: false }; stage.style.cursor = 'grabbing'; }
+  function nodeAt(t) { var n = t && t.closest ? t.closest('[data-node]') : null; return n && root.contains(n) ? n.getAttribute('data-node') : null; }
+  function onMove(e) {
+    if (drag) {
+      var dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
+      if (Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true;
+      if (drag.moved) { view.x = drag.x0 + dx; view.y = drag.y0 + dy; userMoved = true; apply(); }
+      return;
+    }
+    if (!stage.contains(e.target)) return;
+    var id = nodeAt(e.target);
+    if (id !== st.hover) { st.hover = id; highlight(); }
+  }
+  function onUp() { if (!drag) return; justDragged = drag.moved; drag = null; stage.style.cursor = ''; }
+  function onClick(e) {
+    if (justDragged) { justDragged = false; return; }
+    var id = nodeAt(e.target);
+    if (id && !O.panel && D.nodes[id] && D.nodes[id].u) { window.open(D.nodes[id].u, '_blank', 'noopener'); return; }
+    select(id);
+  }
+  function onLeave() { st.hover = null; highlight(); }
+
+  // ---- highlight: hover / selection dims what is not related
+  function related(id) { var r = {}; r[id] = 1; D.links.forEach(function (l) { if (l.f === id) r[l.t] = 1; if (l.t === id) r[l.f] = 1; }); return r; }
+  function highlight() {
+    var id = O.hover ? (st.hover || st.sel) : st.sel;
+    var rel = id ? related(id) : null;
+    root.classList.toggle(P + '-dim', !!rel);
+    nodeEls.forEach(function (el) { var n = el.getAttribute('data-node'); el.classList.toggle(P + '-on', !rel || !!rel[n]); el.classList.toggle(P + '-down', !!st.down[n]); el.classList.toggle(P + '-sel', n === st.sel); });
+    linkEls.forEach(function (el) {
+      var f = el.getAttribute('data-from'), t = el.getAttribute('data-to'), c = el.getAttribute('data-cat');
+      el.classList.toggle(P + '-on', !rel || f === id || t === id);
+      el.classList.toggle(P + '-off', !!(c && st.hidden[c]));
+      el.classList.toggle(P + '-cut', !!(st.down[f] || st.down[t]));
+    });
+    qa(cls('status')).forEach(function (el) { var g = el.closest('[data-node]'); if (!g) return; var n = g.getAttribute('data-node'); var s = st.down[n] ? 'down' : (D.nodes[n] && D.nodes[n].s) || 'ok'; el.style.fill = 'var(--' + (s === 'down' || s === 'bad' ? 'bad' : s === 'warn' ? 'warn' : 'ok') + ')'; });
+  }
+
+  // ---- packets along animated links
+  var L = D.links.map(function (l) {
+    var p = [], c = [0];
+    for (var i = 0; i + 1 < l.p.length; i += 2) p.push([l.p[i], l.p[i + 1]]);
+    for (var j = 1; j < p.length; j++) c.push(c[j - 1] + Math.hypot(p[j][0] - p[j - 1][0], p[j][1] - p[j - 1][1]));
+    return { l: l, pts: p, cum: c, total: c[c.length - 1] || 1, acc: 0 };
+  });
+  var outs = {}; D.links.forEach(function (l) { if (l.a) outs[l.f] = (outs[l.f] || 0) + 1; });
+  function pointAt(o, d) {
+    var p = o.pts, c = o.cum;
+    if (d <= 0) return p[0]; if (d >= o.total) return p[p.length - 1];
+    var i = 0; while (c[i + 1] < d) i++;
+    var f = (d - c[i]) / ((c[i + 1] - c[i]) || 1);
+    return [p[i][0] + (p[i + 1][0] - p[i][0]) * f, p[i][1] + (p[i + 1][1] - p[i][1]) * f];
+  }
+  var packets = [], pool = [], arrivals = {}, drops = {}, seen = {}, hist = {}, totals = { sent: 0, delivered: 0, dropped: 0 }, last = 0, lastSample = 0, perSec = { sent: 0, delivered: 0, dropped: 0 };
+  Object.keys(D.nodes).forEach(function (id) { hist[id] = []; for (var i = 0; i < 40; i++) hist[id].push(0); seen[id] = 0; drops[id] = 0; });
+  function step(ts) {
+    if (!alive) return;
+    raf = requestAnimationFrame(step);
+    if (!last) { last = ts; lastSample = ts; }
+    var dt = Math.min(0.1, (ts - last) / 1000); last = ts;
+    if (!st.paused && O.flows) {
+      L.forEach(function (o) {
+        var l = o.l;
+        if (!l.a || st.down[l.f] || (l.c && st.hidden[l.c])) return;
+        o.acc += dt * st.speed * 1.6 * (l.n || 1);
+        while (o.acc >= 1) {
+          o.acc -= 1; totals.sent++; perSec.sent++;
+          packets.push({ o: o, d: 0, back: false });
+          if (l.b && Math.random() < 0.9) packets.push({ o: o, d: -Math.random() * 40, back: true });
+        }
+      });
+      var v = 120 * st.speed;
+      for (var i = packets.length - 1; i >= 0; i--) {
+        var p = packets[i]; p.d += v * dt;
+        if (p.d >= p.o.total) {
+          packets.splice(i, 1);
+          var to = p.back ? p.o.l.f : p.o.l.t;
+          if (st.down[to]) { drops[to]++; totals.dropped++; perSec.dropped++; }
+          else { arrivals[to] = (arrivals[to] || 0) + 1; seen[to]++; if (!outs[to]) { totals.delivered++; perSec.delivered++; } }
+        }
+      }
+      if (packets.length > 3000) packets.splice(0, packets.length - 3000);
+    }
+    draw();
+    if (ts - lastSample >= 1000) { sample((ts - lastSample) / 1000); lastSample = ts; }
+  }
+  function draw() {
+    var rel = (O.hover ? (st.hover || st.sel) : st.sel); rel = rel ? related(rel) : null;
+    var id = O.hover ? (st.hover || st.sel) : st.sel;
+    while (pool.length < packets.length) { var c = document.createElementNS(NS, 'circle'); c.setAttribute('r', '2.6'); pk.appendChild(c); pool.push(c); }
+    for (var i = 0; i < pool.length; i++) {
+      var el = pool[i];
+      if (i >= packets.length || packets[i].d < 0) { el.style.display = 'none'; continue; }
+      var p = packets[i], l = p.o.l, pt = pointAt(p.o, p.back ? p.o.total - p.d : p.d);
+      el.style.display = '';
+      el.setAttribute('cx', pt[0].toFixed(1)); el.setAttribute('cy', pt[1].toFixed(1));
+      el.style.fill = l.c ? 'var(--c-' + l.c + ')' : 'var(--pkt)';
+      el.style.opacity = !rel || l.f === id || l.t === id ? 1 : 0.15;
+    }
+  }
+  function sample(secs) {
+    Object.keys(D.nodes).forEach(function (id) {
+      var r = (arrivals[id] || 0) / secs * 1180;
+      hist[id].push(r); if (hist[id].length > 40) hist[id].shift();
+      var n = D.nodes[id];
+      var txt = fixed[id] != null ? fixed[id] : (n.m ? n.m : (D.links.some(function (l) { return l.a && l.t === id; }) ? fmt(r) + ' pps' : ''));
+      (byNode[id] || []).forEach(function (g) { var t = g.querySelector(cls('rate')); if (t) t.textContent = st.down[id] ? 'DOWN' : txt; });
+      if (n.sp) (byNode[id] || []).forEach(function (g) { var s = g.querySelector(cls('spark')); if (s) s.setAttribute('d', spark(hist[id], n.sp)); });
+    });
+    arrivals = {};
+    var h = q(cls('stats'));
+    if (h) {
+      var down = Object.keys(st.down).length;
+      h.innerHTML = '<span><b>' + fmt(perSec.sent / secs * 1180) + '</b> pps sent</span><span><b>' + fmt(perSec.delivered / secs * 1180) + '</b> delivered</span>' +
+        '<span class=""' + (totals.dropped ? P + '-bad' : '') + '""><b>' + fmt(totals.dropped * 1180) + '</b> dropped</span><span>' + (down ? '<b class=""' + P + '-bad"">' + down + ' down</b>' : 'all up') + '</span>';
+      var dot = q(cls('live')); if (dot) dot.classList.toggle(P + '-bad', down > 0);
+    }
+    perSec = { sent: 0, delivered: 0, dropped: 0 };
+    if (st.sel) panelSpark();
+  }
+  function spark(h, b) {
+    var max = Math.max.apply(null, h.concat([1])), s = '';
+    for (var i = 0; i < h.length; i++) s += (i ? ' L' : 'M') + (b[0] + b[2] * i / (h.length - 1)).toFixed(1) + ',' + (b[1] + b[3] - h[i] / max * b[3]).toFixed(1);
+    return s;
+  }
+
+  // ---- details panel
+  var panel = q(cls('panel'));
+  function title(id) { return D.nodes[id] ? D.nodes[id].t : id; }
+  function uniq(a) { return a.filter(function (x, i) { return a.indexOf(x) === i; }); }
+  function select(id) {
+    st.sel = id && D.nodes[id] ? id : null;
+    highlight();
+    emit('select', st.sel);
+    if (!panel || !O.panel) return;
+    if (!st.sel) { panel.hidden = true; return; }
+    var n = D.nodes[st.sel];
+    var ins = uniq(D.links.filter(function (l) { return l.t === st.sel && l.f !== st.sel; }).map(function (l) { return title(l.f); }));
+    var out = uniq(D.links.filter(function (l) { return l.f === st.sel && l.t !== st.sel; }).map(function (l) { return title(l.t); }));
+    var col = n.c ? 'var(--c-' + n.c + ')' : 'var(--ink)', down = !!st.down[st.sel];
+    panel.innerHTML =
+      '<div class=""' + P + '-ph""><div><div class=""' + P + '-pk2"">' + (n.b ? '<span class=""' + P + '-chip"" style=""color:' + col + '"">' + esc(n.b) + '</span>' : '') +
+      '<span class=""' + P + '-grp"">' + esc(n.g || (n.cn && n.cn !== n.b ? n.cn : '')) + '</span></div><div class=""' + P + '-pt"">' + esc(n.t) + '</div></div><button class=""' + P + '-x"" title=""Close"">\u2715</button></div>' +
+      (n.d ? '<p class=""' + P + '-pd"">' + esc(n.d) + '</p>' : '') +
+      (n.tags && n.tags.length ? '<div class=""' + P + '-tags"">' + n.tags.map(function (t) { return '<span>' + esc(t) + '</span>'; }).join('') + '</div>' : '') +
+      '<div class=""' + P + '-ps""><div class=""' + P + '-psh""><span>Last 40 seconds</span><span class=""' + P + '-pr""></span></div><svg width=""100%"" height=""56"" viewBox=""0 0 300 56"" preserveAspectRatio=""none""><path class=""' + P + '-psp"" style=""fill:none;stroke:' + col + ';stroke-width:1.8;stroke-linejoin:round"" vector-effect=""non-scaling-stroke""/></svg></div>' +
+      '<div class=""' + P + '-pg""><div><span>Packets observed</span><b class=""' + P + '-po"">0</b></div><div><span>Dropped here</span><b class=""' + P + '-pdr"">0</b></div></div>' +
+      '<div class=""' + P + '-pio""><div><span>Receives from</span>' + esc(ins.join(', ') || '-') + '</div><div><span>Sends to</span>' + esc(out.join(', ') || '-') + '</div></div>' +
+      (n.u ? '<a class=""' + P + '-lnk"" href=""' + esc(n.u) + '"" target=""_blank"" rel=""noopener"">Open link \u2197</a>' : '') +
+      '<div class=""' + P + '-pf""><span class=""' + P + '-st' + (down ? ' ' + P + '-bad' : '') + '""><i></i>' + (down ? 'Down' : 'Operational') + '</span>' +
+      (O.outage ? '<button class=""' + P + '-out"">' + (down ? 'End outage' : 'Simulate outage') + '</button>' : '') + '</div>';
+    panel.hidden = false;
+    panel.querySelector(cls('x')).onclick = function () { select(null); };
+    var ob = panel.querySelector(cls('out'));
+    if (ob) ob.onclick = function () { api.setStatus(st.sel, st.down[st.sel] ? (D.nodes[st.sel].s || 'ok') : 'down'); select(st.sel); };
+    panelSpark();
+  }
+  function panelSpark() {
+    if (!panel || panel.hidden || !st.sel) return;
+    var h = hist[st.sel], s = panel.querySelector(cls('psp'));
+    if (s) s.setAttribute('d', spark(h, [0, 4, 300, 48]));
+    var r = panel.querySelector(cls('pr')); if (r) r.textContent = fmt(h[h.length - 1]) + ' pps';
+    var po = panel.querySelector(cls('po')); if (po) po.textContent = fmt(seen[st.sel] * 1180);
+    var pd = panel.querySelector(cls('pdr')); if (pd) pd.textContent = fmt(drops[st.sel] * 1180);
+  }
+
+  // ---- legend: one chip per flow
+  var leg = q(cls('legend'));
+  if (leg) {
+    var used = {}; D.links.forEach(function (l) { if (l.c) used[l.c] = 1; });
+    Object.keys(D.cats).forEach(function (c) {
+      if (!used[c]) return;
+      var b = document.createElement('button');
+      b.innerHTML = '<i style=""background:var(--c-' + c + ')""></i><span>' + esc(D.cats[c]) + '</span>';
+      b.onclick = function () { if (st.hidden[c]) delete st.hidden[c]; else st.hidden[c] = 1; b.classList.toggle(P + '-offc', !!st.hidden[c]); highlight(); emit('flows', Object.keys(st.hidden)); };
+      leg.appendChild(b);
+    });
+  }
+
+  // ---- controls
+  function on(sel, ev, f) { var el = q(sel); if (el) el.addEventListener(ev, f); }
+  on(cls('pause'), 'click', function () { st.paused = !st.paused; this.textContent = st.paused ? 'Play' : 'Pause'; });
+  qa(cls('speed') + ' button').forEach(function (b) { b.addEventListener('click', function () { st.speed = parseFloat(b.getAttribute('data-v')); qa(cls('speed') + ' button').forEach(function (x) { x.classList.toggle(P + '-act', x === b); }); }); });
+  qa(cls('theme') + ' button').forEach(function (b) { b.addEventListener('click', function () { setTheme(b.getAttribute('data-v')); }); });
+  on(cls('zin'), 'click', function () { zoomAt(stage.clientWidth / 2, stage.clientHeight / 2, 1.2); });
+  on(cls('zout'), 'click', function () { zoomAt(stage.clientWidth / 2, stage.clientHeight / 2, 1 / 1.2); });
+  on(cls('fit'), 'click', function () { fit(true); });
+
+  stage.addEventListener('wheel', onWheel, { passive: false });
+  stage.addEventListener('pointerdown', onDown);
+  stage.addEventListener('click', onClick);
+  stage.addEventListener('pointerleave', onLeave);
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+  var ro = window.ResizeObserver ? new ResizeObserver(function () { if (!userMoved) fit(); }) : null;
+  if (ro) ro.observe(stage);
+
+  var api = {
+    setStatus: function (id, s) { if (!D.nodes[id]) return; if (s === 'down') st.down[id] = 1; else { delete st.down[id]; D.nodes[id].s = s || 'ok'; } highlight(); if (st.sel === id) select(id); emit('status', { id: id, status: s }); },
+    setMetric: function (id, text) { if (text == null) delete fixed[id]; else fixed[id] = String(text); },
+    select: function (id) { select(id); },
+    on: function (ev, f) { (listeners[ev] = listeners[ev] || []).push(f); return api; },
+    pause: function (b) { st.paused = b !== false; var pb = q(cls('pause')); if (pb) pb.textContent = st.paused ? 'Play' : 'Pause'; },
+    speed: function (v) { st.speed = v; },
+    theme: function (t) { setTheme(t); },
+    fit: function () { fit(true); },
+    showFlow: function (c, show) { if (show === false) st.hidden[c] = 1; else delete st.hidden[c]; highlight(); },
+    destroy: function () {
+      alive = false; cancelAnimationFrame(raf); if (ro) ro.disconnect();
+      window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp);
+      stage.removeEventListener('wheel', onWheel); stage.removeEventListener('pointerdown', onDown); stage.removeEventListener('click', onClick); stage.removeEventListener('pointerleave', onLeave);
+    }
+  };
+  setTheme(D.theme);
+  Object.keys(D.nodes).forEach(function (id) { if (D.nodes[id].s === 'down') st.down[id] = 1; });
+  highlight();
+  fit();
+  if (!O.flows) pk.style.display = 'none';
+  raf = requestAnimationFrame(step);
+  window.diagrams = window.diagrams || {};
+  window.diagrams[P] = api;
+  window.diagram = api;
+  return api;
+}
+";
+    public static readonly string Css = @".__P__-root{position:relative;width:100%;height:__H__;min-height:420px;overflow:hidden;background:var(--bg);color:var(--ink);font-family:var(--font);user-select:none;transition:background .3s;box-sizing:border-box}
+.__P__-root *{box-sizing:border-box}
+.__P__-stage{position:absolute;inset:0;cursor:grab;touch-action:none;background-image:radial-gradient(circle,var(--grid) 1px,transparent 1.4px);background-size:24px 24px}
+.__P__-stage svg{display:block;width:100%;height:100%}
+.__P__-stage text{font-family:var(--font)}
+.__P__-node,.__P__-link,.__P__-group{transition:opacity .25s}
+.__P__-node{cursor:pointer}
+.__P__-dim .__P__-node:not(.__P__-on){opacity:.22}
+.__P__-dim .__P__-link:not(.__P__-on){opacity:.15}
+.__P__-link.__P__-off{opacity:.1!important}
+.__P__-link.__P__-cut .__P__-line{stroke-dasharray:3 5}
+.__P__-down .__P__-box{stroke:var(--bad)!important;stroke-width:2!important}
+.__P__-sel .__P__-box{stroke:var(--sel)!important;stroke-width:2!important}
+.__P__-bar{position:absolute;top:14px;left:14px;right:14px;display:flex;justify-content:space-between;align-items:stretch;gap:10px;flex-wrap:wrap;pointer-events:none}
+.__P__-head,.__P__-tools,.__P__-legend button,.__P__-hint,.__P__-panel{background:var(--panel);border:1px solid var(--btnLine);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+.__P__-head{pointer-events:auto;display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:10px 16px;border-radius:10px}
+.__P__-ttl{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:600;white-space:nowrap}
+.__P__-live{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok)}
+.__P__-live.__P__-bad{background:var(--bad);box-shadow:0 0 10px var(--bad)}
+.__P__-stats{display:flex;gap:16px;font-family:var(--mono);font-size:12px;color:var(--muted);white-space:nowrap;flex-wrap:wrap}
+.__P__-stats b{color:var(--ink);font-weight:500}
+.__P__-bad,.__P__-stats .__P__-bad b{color:var(--bad)!important}
+.__P__-tools{pointer-events:auto;display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:8px;border-radius:10px;font-family:var(--mono);font-size:12px}
+.__P__-tools button{height:30px;padding:0 11px;border-radius:6px;border:1px solid var(--btnLine);background:var(--btn);color:var(--ink);font:inherit;cursor:pointer;white-space:nowrap}
+.__P__-tools button:hover{background:var(--btnHover)}
+.__P__-seg{display:flex;gap:2px;padding:2px;border-radius:7px;border:1px solid var(--btnLine)}
+.__P__-seg button{height:26px;border:none;background:transparent;color:var(--muted);padding:0 9px}
+.__P__-seg button.__P__-act{background:var(--sel);color:var(--bg)}
+.__P__-zoom{min-width:44px;text-align:center}
+.__P__-foot{position:absolute;left:14px;right:14px;bottom:14px;display:flex;justify-content:space-between;align-items:flex-end;gap:10px;flex-wrap:wrap;pointer-events:none}
+.__P__-legend{display:flex;gap:8px;flex-wrap:wrap;pointer-events:auto}
+.__P__-legend button{display:flex;align-items:center;gap:8px;height:32px;padding:0 14px;border-radius:16px;color:var(--ink);font-family:var(--font);font-size:12.5px;cursor:pointer;white-space:nowrap}
+.__P__-legend i{width:9px;height:9px;border-radius:50%;display:inline-block}
+.__P__-legend .__P__-offc{opacity:.45}
+.__P__-legend .__P__-offc span{text-decoration:line-through}
+.__P__-hint{font-size:11.5px;white-space:nowrap;color:var(--muted);padding:6px 10px;border-radius:6px;pointer-events:auto}
+.__P__-panel{position:absolute;top:84px;right:14px;width:330px;max-width:calc(100% - 28px);max-height:calc(100% - 150px);overflow-y:auto;display:flex;flex-direction:column;gap:14px;padding:20px;border-radius:12px;box-shadow:0 20px 50px rgba(0,0,0,.3);user-select:text}
+.__P__-panel[hidden]{display:none}
+.__P__-ph{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.__P__-pk2{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.__P__-chip{font-family:var(--mono);font-size:10.5px;font-weight:600;padding:3px 7px;border-radius:4px;background:var(--chip)}
+.__P__-grp{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.__P__-pt{font-size:19px;font-weight:600}
+.__P__-x{width:28px;height:28px;flex-shrink:0;border-radius:6px;border:1px solid var(--btnLine);background:var(--btn);color:var(--muted);cursor:pointer;font-size:13px}
+.__P__-pd{margin:0;font-size:13px;line-height:1.5;color:var(--muted)}
+.__P__-tags{display:flex;flex-wrap:wrap;gap:6px}
+.__P__-tags span{font-size:12px;padding:4px 9px;border-radius:12px;border:1px solid var(--btnLine)}
+.__P__-psh{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-bottom:6px}
+.__P__-pr{font-family:var(--mono);color:var(--ink)}
+.__P__-ps svg{display:block;border-radius:6px;background:var(--chip)}
+.__P__-pg{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.__P__-pg div{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border-radius:8px;background:var(--chip)}
+.__P__-pg span,.__P__-pio span{font-size:11px;color:var(--muted)}
+.__P__-pg b{font-family:var(--mono);font-size:16px;font-weight:500}
+.__P__-pio{display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:12px;line-height:1.5}
+.__P__-pio div{display:flex;flex-direction:column;gap:4px}
+.__P__-lnk{color:var(--sel);font-size:12.5px}
+.__P__-pf{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-top:14px;border-top:1px solid var(--btnLine)}
+.__P__-st{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ok)}
+.__P__-st i{width:8px;height:8px;border-radius:50%;background:currentColor}
+.__P__-out{height:30px;padding:0 12px;border-radius:6px;border:1px solid var(--bad);background:transparent;color:var(--bad);font-family:var(--font);font-size:12px;cursor:pointer}
+@media (max-width:640px){.__P__-panel{top:auto;bottom:60px;left:14px;width:auto}.__P__-hint{display:none}}
+";
+}
 '@
 
 function Initialize-Diagrams {
@@ -23498,7 +24168,7 @@ $DgUI = @{ Form = $null; Text = ''; Undo = (New-Object System.Collections.Generi
 
 function Get-DiagramExamples {
     $ex = [ordered]@{}
-    $ex['Network visibility map'] = @'
+    $ex['Architecture/Network visibility map'] = @'
 title Network visibility architecture
 theme midnight dark
 font IBM Plex Sans
@@ -23571,20 +24241,86 @@ gigamon -> netscout, allegro, endace, vectra [gigamon, animate]
 netscout -> gs1 [mgmt, dashed, animate, density 0.5]
 gs1 <-> gs2 [mgmt, dashed, label "sync"]
 '@
-    $ex['Flowchart (Mermaid)'] = @'
-%% Mermaid flowcharts work as they are: paste one from your docs
-graph TD
-    A([Request comes in]) --> B{Logged in?}
-    B -- yes --> C[Load the dashboard]
-    B -- no --> D[Show the sign-in page]
-    D --> E[(Users DB)]
-    E --> F{Password OK?}
-    F -->|yes| C
-    F -->|no| G[/Show an error/]
-    G --> D
-    C --> H((Done))
+    $ex['Architecture/Cloud web app'] = @'
+title Cloud web application
+theme midnight dark
+
+category edge "Edge" #0b5fc2 / #4ea8ff
+category app "App tier" #06804f / #3ddc97
+category data "Data" #a86f00 / #f5b94a
+category async "Async" #6340d6 / #b29dff
+
+lanes "Users" | "Edge" | "Application" | "Data" | "Background"
+
+users: Users [shape actor, lane 1]
+cdn: CDN [badge CDN, edge, lane 2, spark, lines "Static files, cache"]
+  desc Serves pictures, scripts and styles from the nearest location.
+waf: Firewall [badge WAF, edge, lane 2, lines "Blocks bad traffic"]
+lb: Load balancer [badge LB, edge, lane 2, spark, status ok]
+  desc Spreads requests over the healthy app servers.
+
+group asg "Auto scaling group" [app] {
+  app1: App server 1 [badge EC2, app, lane 3, spark]
+  app2: App server 2 [badge EC2, app, lane 3, spark]
+  app3: App server 3 [badge EC2, app, lane 3, spark, status warn]
+}
+
+cache: Redis cache [data, shape cylinder, lane 4]
+db: Postgres primary [badge RDS, data, lane 4, lines "Multi-AZ"]
+replica: Read replica [data, shape cylinder, lane 4]
+queue: Job queue [badge SQS, async, lane 4]
+workers: Workers [badge JOBS, async, lane 5, spark, lines "Thumbnails, e-mails"]
+store: Object storage [async, shape cylinder, lane 5]
+
+users -> cdn, waf [edge, animate]
+waf -> lb [edge, animate]
+lb -> app1, app2, app3 [app, animate]
+app1, app2, app3 -> cache [data, animate, density 0.6]
+app1, app2, app3 -> db [data, animate, density 0.4]
+db -> replica [data, dashed, label "replication"]
+app1, app2, app3 -> queue [async, dashed, animate, density 0.3]
+queue -> workers [async, animate]
+workers -> store [async, animate]
+cdn -> store [edge, dashed]
 '@
-    $ex['Microservices'] = @'
+    $ex['Architecture/Kubernetes cluster'] = @'
+title Kubernetes cluster
+theme blueprint dark
+
+category ing "Ingress"
+category svc "Services"
+category pod "Workers"
+category st "Storage"
+category mon "Monitoring"
+
+lanes "Outside" | "Ingress" | "namespace: shop" | "namespace: data" | "Volumes"
+
+internet: Internet [shape circle, lane 1]
+ingress: Ingress controller [badge NGINX, ing, lane 2, spark, lines "TLS, routing by host"]
+prom: Prometheus [badge MON, mon, lane 2, status ok, lines "scrapes every 15 s"]
+group shop "shop" [svc] {
+  web: web [badge SVC, svc, lane 3, spark, items "pod" "pod" "pod"]
+  api: api [badge SVC, svc, lane 3, spark, items "pod" "pod"]
+  worker: worker [badge DEPLOY, pod, lane 3, items "pod"]
+}
+group data "data" [st] {
+  pg: postgres [badge STS, st, lane 4, lines "StatefulSet, 3 replicas"]
+  kafka: kafka [badge STS, st, lane 4, spark, lines "3 brokers"]
+}
+pv1: pvc-postgres [st, shape cylinder, lane 5]
+pv2: pvc-kafka [st, shape cylinder, lane 5]
+
+internet -> ingress [ing, animate, density 2]
+ingress -> web, api [svc, animate]
+web -> api [svc, animate]
+api -> pg [st, animate, density 0.6]
+api -> kafka [st, animate]
+kafka -> worker [pod, dashed, animate]
+pg -> pv1 [st, dashed]
+kafka -> pv2 [st, dashed]
+prom -> web, api, worker [mon, dotted, label "metrics"]
+'@
+    $ex['Architecture/Microservices'] = @'
 title Shop platform
 theme corporate light
 direction LR
@@ -23615,7 +24351,278 @@ orders -> bus [async, dashed, animate]
 bus -> mail [async, dashed, animate]
 pay -> bus [async, dashed, animate]
 '@
-    $ex['Org chart'] = @'
+    $ex['Architecture/Failover pair'] = @'
+title Active / standby failover
+theme midnight dark
+hint Click a load balancer and press Simulate outage
+
+category live "Live traffic" #0b5fc2 / #4ea8ff
+category hb "Heartbeat" #cc2638 / #ff5d6c
+category repl "Replication" #a86f00 / #f5b94a
+
+lanes "Clients" | "Entry" | "Load balancers" | "Sites" | "Databases"
+
+clients: Clients [shape actor, lane 1]
+vip: Virtual IP [badge VIP, live, shape pill, lane 2]
+lb1: Load balancer A [badge ACTIVE, live, lane 3, spark, status ok]
+  desc Takes all traffic while it is healthy.
+lb2: Load balancer B [badge STANDBY, live, lane 3, spark, status warn]
+  desc Takes over within seconds if A stops answering heartbeats.
+app1: Site 1 [badge APP, live, lane 4, spark]
+app2: Site 2 [badge APP, live, lane 4, spark]
+db1: Database 1 [shape cylinder, repl, lane 5]
+db2: Database 2 [shape cylinder, repl, lane 5]
+
+clients -> vip [live, animate, density 2]
+vip -> lb1 [live, animate, density 2]
+vip -> lb2 [live, dashed, animate, density 0.2]
+lb1 <-> lb2 [hb, dotted, label "heartbeat"]
+lb1 -> app1, app2 [live, animate]
+lb2 -> app1, app2 [live, dashed]
+app1 -> db1 [repl, animate, density 0.5]
+app2 -> db2 [repl, animate, density 0.5]
+db1 <-> db2 [repl, dashed, label "sync"]
+'@
+    $ex['Architecture/Home network'] = @'
+title Home network
+theme blueprint light
+direction TB
+
+category wan "Internet"
+category lan "Wired"
+category wifi "Wi-Fi"
+
+isp((ISP))
+router: Router [badge GW, wan, status ok, lines "192.168.1.1"]
+fw: Firewall [badge FW, wan, lines "IPS on"]
+switch: Switch [badge SW, lan, items "1" "2" "3" "4"]
+ap: Wi-Fi access point [badge AP, wifi, spark]
+nas: NAS [lan, shape cylinder, status warn]
+pc: Desktop [lan, shape rect]
+tv: TV [lan, shape rect]
+phone: Phones [wifi, shape pill]
+laptop: Laptops [wifi, shape pill]
+iot: Smart home [wifi, shape hexagon, status down]
+
+isp -> router [wan, animate, density 2]
+router -> fw [wan, animate, density 2]
+fw -> switch [lan, animate, density 2]
+switch.1 -> pc [lan, animate]
+switch.2 -> tv [lan, animate]
+switch.3 -> nas [lan, animate]
+switch.4 -> ap [wifi, animate]
+ap -> phone, laptop, iot [wifi, animate, dashed]
+'@
+    $ex['Flows/Deploy pipeline'] = @'
+title Deploy pipeline
+theme neon dark
+direction LR
+
+commit: Commit [shape circle]
+build: Build [badge CI]
+test: Tests [badge CI, status ok]
+review: Review [shape diamond]
+deploy: Deploy [badge CD, status warn]
+users((Users))
+
+commit -> build -> test -> review [animate]
+review -approved-> deploy [animate]
+review -changes-> commit [dashed, curve]
+deploy -> users [animate, density 2]
+'@
+    $ex['Flows/CI/CD stages'] = @'
+title Delivery pipeline
+theme corporate dark
+
+category ok "Passed" #1a7f37 / #3fb950
+category run "Running" #0969da / #58a6ff
+category wait "Waiting" #9a6700 / #d29922
+
+lanes "Source" | "Build" | "Test" | "Stage" | "Production"
+
+repo: main branch [badge GIT, ok, lane 1, lines "a1b2c3d by Ada"]
+compile: Compile [badge BUILD, ok, lane 2, lines "2m 14s"]
+image: Docker image [badge IMG, ok, lane 2, lines "app:1.42.0"]
+unit: Unit tests [badge TEST, ok, lane 3, lines "1,284 passed"]
+e2e: E2E tests [badge TEST, run, lane 3, spark, lines "running 61%"]
+sec: Security scan [badge SCAN, ok, lane 3, lines "0 critical"]
+staging: Staging [badge ENV, wait, lane 4, lines "waiting for tests"]
+approve{Approve?}
+prod: Production [badge ENV, wait, lane 5, lines "1.41.3 live"]
+
+approve [lane 5]
+repo -> compile -> image [ok, animate]
+image -> unit, e2e, sec [run, animate]
+unit, e2e, sec -> staging [wait, dashed]
+staging -> approve [wait, dashed]
+approve -yes-> prod [wait, dashed]
+'@
+    $ex['Flows/Login flow (Mermaid)'] = @'
+%% Mermaid flowcharts work as they are: paste one from your docs
+graph TD
+    A([Request comes in]) --> B{Logged in?}
+    B -- yes --> C[Load the dashboard]
+    B -- no --> D[Show the sign-in page]
+    D --> E[(Users DB)]
+    E --> F{Password OK?}
+    F -->|yes| C
+    F -->|no| G[/Show an error/]
+    G --> D
+    C --> H((Done))
+'@
+    $ex['Flows/Incident runbook'] = @'
+title Incident runbook
+theme mono dark
+direction TB
+route ortho
+
+alert([Alert fires])
+sev{Customers affected?}
+page: Page the on-call [badge P1, status down]
+ticket: Open a ticket [badge P3]
+diag{Recent deploy?}
+rollback: Roll back [badge FIX]
+mitigate: Mitigate: scale up, fail over [badge FIX]
+verify{Fixed?}
+post[/Write the post-mortem/]
+done((Closed))
+
+alert -> sev
+sev -yes-> page
+sev -no-> ticket
+page -> diag
+diag -yes-> rollback
+diag -no-> mitigate
+rollback, mitigate -> verify
+verify -no-> page [dashed]
+verify -yes-> post -> done
+ticket -> done [dotted]
+'@
+    $ex['Flows/Order state machine'] = @'
+title Order states
+theme pastel light
+route curve
+direction LR
+
+new((New))
+paid((Paid))
+packed((Packed))
+shipped((Shipped))
+delivered((Delivered))
+cancelled((Cancelled))
+refunded((Refunded))
+
+new -pay-> paid -pick-> packed -ship-> shipped -deliver-> delivered
+new -cancel-> cancelled
+paid -cancel-> refunded
+shipped -return-> refunded [dashed]
+'@
+    $ex['Flows/Customer journey'] = @'
+title Customer journey
+theme pastel light
+direction LR
+route curve
+
+category aw "Awareness"
+category co "Consider"
+category bu "Buy"
+category ke "Keep"
+
+ad: Sees an ad [aw, shape pill, tags Social; Search]
+blog: Reads the blog [aw, shape pill]
+site: Visits the site [co, badge 42%, spark]
+trial: Starts a trial [co, badge 11%]
+buy: Buys [bu, badge 3.1%, status ok]
+onboard: Onboarding mails [ke, shape doc]
+renew: Renews [ke, badge 87%, shape pill]
+
+ad, blog -> site [aw, animate]
+site -> trial [co, animate]
+trial -> buy [bu, animate, density 0.5]
+buy -> onboard [ke, animate]
+onboard -> renew [ke, animate]
+renew -upsell-> site [dashed]
+'@
+    $ex['Data/Data pipeline'] = @'
+title Analytics pipeline
+theme daylight light
+
+category src "Sources"
+category ing "Ingest"
+category lake "Lake"
+category wh "Warehouse"
+category bi "Reports"
+
+lanes "Sources" | "Ingest" | "Lake" | "Transform" | "Serve"
+
+crm: CRM [src, lane 1, shape cylinder]
+shop: Shop DB [src, lane 1, shape cylinder]
+events: Click events [badge API, src, lane 1, spark]
+files: CSV drops [src, lane 1, shape doc]
+etl: Ingest jobs [badge AIRFLOW, ing, lane 2, spark, lines "every 15 min"]
+stream: Stream [badge KAFKA, ing, lane 2, spark]
+raw: Raw zone [badge S3, lake, lane 3, lines "parquet, partitioned"]
+dbt: dbt models [badge DBT, wh, lane 4, items "staging" "marts"]
+wh: Warehouse [badge SNOWFLAKE, wh, lane 5, spark]
+dash: Dashboards [bi, lane 5, shape pill]
+ml: ML features [bi, lane 5, shape hexagon]
+
+crm, shop, files -> etl [ing, animate]
+events -> stream [ing, animate, density 3]
+etl, stream -> raw [lake, animate]
+raw -> dbt.1 [wh, animate]
+dbt.1 -> dbt.2 [wh, animate]
+dbt.2 -> wh [wh, animate]
+wh -> dash, ml [bi, animate]
+'@
+    $ex['Data/Database schema'] = @'
+title Shop database
+theme corporate light
+direction LR
+route ortho
+
+customers: customers [shape table, lines "id int PK" "email varchar(200)" "name varchar(100)" "created datetime"]
+orders: orders [shape table, lines "id int PK" "customer_id int FK" "status varchar(20)" "total decimal" "created datetime"]
+order_lines: order_lines [shape table, lines "id int PK" "order_id int FK" "product_id int FK" "qty int" "price decimal"]
+products: products [shape table, lines "id int PK" "sku varchar(40)" "name varchar(200)" "price decimal"]
+payments: payments [shape table, lines "id int PK" "order_id int FK" "amount decimal" "provider varchar(30)"]
+
+customers -> orders [label "1 : n"]
+orders -> order_lines [label "1 : n"]
+products -> order_lines [label "1 : n"]
+orders -> payments [label "1 : n"]
+'@
+    $ex['Data/Event streaming'] = @'
+title Event streaming
+theme neon dark
+direction LR
+
+category in "Producers"
+category topic "Topics"
+category out "Consumers"
+
+web: Web app [in, badge WEB, spark]
+mobile: Mobile app [in, badge APP, spark]
+iot: Sensors [in, badge IOT, spark, lines "50k devices"]
+group kafka "Kafka cluster" [topic] {
+  t1: clicks [topic, badge TOPIC, lines "12 partitions"]
+  t2: orders [topic, badge TOPIC, lines "6 partitions"]
+  t3: telemetry [topic, badge TOPIC, lines "48 partitions"]
+}
+search: Search index [out, shape cylinder]
+fraud: Fraud check [out, badge ML, status warn, spark]
+lake: Data lake [out, shape cylinder]
+alerts: Alerts [out, shape note]
+
+web -> t1, t2 [in, animate, density 2]
+mobile -> t1, t2 [in, animate]
+iot -> t3 [in, animate, density 4]
+t1 -> search, lake [topic, animate]
+t2 -> fraud, lake [topic, animate]
+t3 -> lake, alerts [topic, animate, density 2]
+fraud -> alerts [out, dashed, animate]
+'@
+    $ex['Org/Org chart'] = @'
 title Engineering
 theme pastel light
 direction TB
@@ -23633,22 +24640,88 @@ cto -> vpe, vpp
 vpe -> web, apps
 vpp -> infra, sec
 '@
-    $ex['Simple flow'] = @'
-title Deploy pipeline
+    $ex['Org/Team responsibilities'] = @'
+title Who owns what
+theme daylight dark
+layout grid
+hide header
+
+category fe "Frontend"
+category be "Backend"
+category ops "Ops"
+
+web: Web app [fe, badge WEB, tags React; TypeScript, lines "Team Pixel"]
+mobile: Mobile [fe, badge APP, lines "Team Pocket"]
+api: Public API [be, badge API, lines "Team Gate"]
+billing: Billing [be, badge PAY, lines "Team Ledger", status warn]
+search: Search [be, badge SRCH, lines "Team Find"]
+infra: Cloud and CI [ops, badge OPS, lines "Team Rails"]
+oncall: On-call [ops, badge 24/7, lines "Rotating"]
+data: Analytics [be, badge DATA, lines "Team Insight"]
+'@
+    $ex['Ideas/Mind map'] = @'
+title Product launch
 theme neon dark
+layout circle
+route curve
+
+launch((Launch v2))
+mkt: Marketing [badge MKT, shape pill]
+docs: Docs [badge DOC, shape pill]
+sales: Sales [badge SAL, shape pill]
+support: Support [badge SUP, shape pill]
+eng: Engineering [badge ENG, shape pill]
+legal: Legal [badge LAW, shape pill]
+
+launch -> mkt, docs, sales, support, eng, legal [animate, density 0.6]
+'@
+    $ex['Ideas/Shape gallery'] = @'
+title Every shape
+theme midnight dark
+layout grid
+hide header
+
+card: Card [badge BADGE, lines "Lines under the title", status ok, spark]
+rounded: Rounded [shape rounded]
+rect: Rectangle [shape rect]
+pill: Pill [shape pill]
+circle: Circle [shape circle]
+diamond: Diamond [shape diamond]
+hexagon: Hexagon [shape hexagon]
+para: Parallelogram [shape parallelogram]
+cyl: Cylinder [shape cylinder]
+doc: Document [shape doc]
+note: Note [shape note]
+actor: Actor [shape actor]
+table: table [shape table, lines "id int PK" "name text" "ref_id int FK"]
+items: Items inside [badge BOX, items "A" "B" "C"]
+dashed: Dashed border [shape rounded, dashed]
+styled: Your colours [shape rounded, fill #ffd166, stroke #ef476f, color #1b1b1b, bold]
+'@
+    $ex['Ideas/Link styles'] = @'
+title Link styles
+theme daylight light
 direction LR
 
-commit: Commit [shape circle]
-build: Build [badge CI]
-test: Tests [badge CI, status ok]
-review: Review [shape diamond]
-deploy: Deploy [badge CD, status warn]
-users((Users))
+category a "Flow A"
+category b "Flow B"
 
-commit -> build -> test -> review [animate]
-review -approved-> deploy [animate]
-review -changes-> commit [dashed, curve]
-deploy -> users [animate, density 2]
+s1: Solid [shape pill]
+t1: Arrow [shape pill]
+s2: Dashed [shape pill]
+t2: No arrow [shape pill]
+s3: Thick [shape pill]
+t3: Both ways [shape pill]
+s4: Curved [shape pill]
+t4: Animated [shape pill]
+s5: Dotted [shape pill]
+t5: Labelled [shape pill]
+
+s1 -> t1 [a]
+s2 -.- t2 [b]
+s3 ==> t3 [a, both, arrow both]
+s4 -> t4 [b, curve, animate, density 3]
+s5 -> t5 [a, dotted, label "a label"]
 '@
     $ex
 }
@@ -23799,6 +24872,30 @@ function Remove-DiagramSelection {
     } else { return }
     Set-DiagramText $t
 }
+
+# ---- copy / paste between diagrams (the clipboard holds diagram text)
+function Copy-DiagramSelection([switch]$Quiet) {
+    $cv = $DgUI.Canvas
+    $t = [DgClip]::Copy($DgUI.Doc, $cv.Theme, [string[]]@($cv.View.Selected))
+    if (-not $t) { return '' }
+    if (-not $Quiet) { try { [System.Windows.Forms.Clipboard]::SetText($t) } catch { } }
+    $t
+}
+function Paste-DiagramClip([string]$Clip = '', [switch]$Offset) {
+    if (-not $Clip) { try { $Clip = [System.Windows.Forms.Clipboard]::GetText() } catch { $Clip = '' } }
+    if (-not $Clip.Trim()) { return }
+    $cv = $DgUI.Canvas
+    $x = [float]::NaN; $y = [float]::NaN
+    if (-not $Offset) {
+        if ($cv.MouseInside) { $x = $cv.MouseCanvas.X; $y = $cv.MouseCanvas.Y }
+        else { $b = $DgUI.Doc.Bounds; $x = $b.Right + 40; $y = $b.Y + 40 }     # free space to the right
+    }
+    $new = [DgClip]::Paste($DgUI.Text, $DgUI.Doc, $Clip, $x, $y)
+    if ($new -ceq $DgUI.Text) { return }
+    Set-DiagramText $new
+    $cv.Select([string[]]@([DgClip]::Pasted))
+}
+function Copy-DiagramDuplicate { $t = Copy-DiagramSelection -Quiet; if ($t) { Paste-DiagramClip $t -Offset } }
 
 function Edit-DiagramLabel {
     $cv = $DgUI.Canvas
@@ -23967,7 +25064,7 @@ function Update-DiagramProps {
                 $p.Controls.Add($row)
             }
         }
-        New-TbLabel $p "Tips: drag shapes to move them; drag from a shape's dot to another shape to link them; double-click a shape to rename it; right-click for more. Shift+drag selects several." -Dim | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0); $_.Margin = New-Object System.Windows.Forms.Padding(0, (Px 14), 0, 0) }
+        New-TbLabel $p "Tips: drag shapes to move them; drag from a shape's dot to another shape to link them; double-click a shape to rename it; right-click for more. Shift+drag selects several; click inside a group's frame to select (and drag) the whole group. Ctrl+C / Ctrl+V copy shapes and groups into any other diagram; Ctrl+D duplicates." -Dim | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0); $_.Margin = New-Object System.Windows.Forms.Padding(0, (Px 14), 0, 0) }
     }
     Set-ControlTheme $p $null $script:IsDark
     $p.ResumeLayout()
@@ -24009,72 +25106,114 @@ function Save-DiagramPng([float]$Scale) {
     try { $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png) } finally { $bmp.Dispose() }
 }
 
-function Show-DiagramCode {
+function Show-DiagramCode([string]$Kind = 'page') {
     $f = New-Object System.Windows.Forms.Form
-    $f.Text = 'SVG code'; $f.Icon = $IconActive; $f.StartPosition = 'CenterParent'
-    $f.Size = New-Object System.Drawing.Size((Px 1000), (Px 720)); $f.BackColor = $C.Panel; $f.ForeColor = $C.Fore; $f.Font = $FontMain; $f.KeyPreview = $true
+    $f.Text = 'Diagram code'; $f.Icon = $IconActive; $f.StartPosition = 'CenterParent'
+    $f.Size = New-Object System.Drawing.Size((Px 1100), (Px 760)); $f.BackColor = $C.Panel; $f.ForeColor = $C.Fore; $f.Font = $FontMain; $f.KeyPreview = $true
     $f.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Escape') { $src.Close() } })
-    $st = @{ Form = $f }
+    $st = @{ Form = $f; Ready = $false }
     $opt = New-Object System.Windows.Forms.FlowLayoutPanel
     $opt.Dock = 'Top'; $opt.AutoSize = $true; $opt.WrapContents = $true; $opt.BackColor = $C.Panel; $opt.Padding = New-Object System.Windows.Forms.Padding((Px 10), (Px 8), (Px 10), (Px 6))
-    $st.Kind = New-TbCombo $opt @('Plain SVG') 170
-    $st.Kind.SelectedIndex = 0
+    New-TbLabel $opt 'Output' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding(0, (Px 9), (Px 4), 0) }
+    $kinds = @('Interactive web page', 'Embeddable widget (paste into a page)', 'React component', 'Plain SVG')
+    $st.Kind = New-TbCombo $opt $kinds 270
+    $st.Kind.SelectedIndex = [Math]::Max(0, @('page', 'widget', 'react', 'svg').IndexOf($Kind))
+    New-TbLabel $opt 'Colours' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding((Px 8), (Px 9), (Px 4), 0) }
     $st.Mode = New-TbCombo $opt @('Follows the system theme', 'Dark', 'Light') 190
     $st.Mode.SelectedIndex = if ($DgUI.Canvas.Dark) { 1 } else { 2 }
-    $st.Vars = New-CheckBox $opt 'Colours as CSS variables' $true
-    $st.Bg = New-CheckBox $opt 'Background' $true
-    $st.Resp = New-CheckBox $opt 'Scales to its container' $true
-    $st.Acc = New-CheckBox $opt 'Title and description (accessibility)' $true
-    $st.Hover = New-CheckBox $opt 'Hover highlight' $true
-    $st.Draw = New-CheckBox $opt 'Draw-in animation' $false
-    $st.Min = New-CheckBox $opt 'Minified' $false
-    New-TbLabel $opt 'Prefix for classes and ids' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding((Px 12), (Px 9), (Px 4), 0) }
-    $st.Prefix = New-TbBox -Mono; $st.Prefix.Width = Px 150; $st.Prefix.Text = [DgSvg]::SuggestPrefix($DgUI.Doc); $st.Prefix.Margin = New-Object System.Windows.Forms.Padding(0, (Px 5), 0, 0)
+    New-TbLabel $opt 'Prefix' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding((Px 8), (Px 9), (Px 4), 0) }
+    $st.Prefix = New-TbBox -Mono; $st.Prefix.Width = Px 140; $st.Prefix.Text = [DgSvg]::SuggestPrefix($DgUI.Doc); $st.Prefix.Margin = New-Object System.Windows.Forms.Padding(0, (Px 5), (Px 8), 0)
     $tooltip.SetToolTip($st.Prefix, 'Every class and id starts with this, so several diagrams can sit on the same page without clashing')
     $opt.Controls.Add($st.Prefix)
+    $st.HLabel = New-TbLabel $opt 'Height' -Dim; $st.HLabel.Margin = New-Object System.Windows.Forms.Padding((Px 8), (Px 9), (Px 4), 0)
+    $st.Height = New-TbBox -Mono; $st.Height.Width = Px 80; $st.Height.Text = '640px'; $st.Height.Margin = New-Object System.Windows.Forms.Padding(0, (Px 5), 0, 0)
+    $opt.Controls.Add($st.Height)
+    # interactive options
+    $io = New-Object System.Windows.Forms.FlowLayoutPanel; $io.AutoSize = $true; $io.WrapContents = $true; $io.BackColor = $C.Panel; $io.MaximumSize = New-Object System.Drawing.Size((Px 1060), 0)
+    $st.Feat = [ordered]@{}
+    foreach ($ft in @(@('Header', 'Title and live totals'), @('Flows', 'Flowing packets, pause and speed'), @('ThemeSwitch', 'Dark / light switch'), @('Zoom', 'Zoom and fit buttons'), @('Legend', 'Legend (hide flows)'),
+                      @('Panel', 'Details panel on click'), @('Hover', 'Hover dimming'), @('Outage', 'Simulate outage'), @('Hint', 'Hint text'), @('Glow', 'Glow on packets'), @('WebFont', 'Load the web font'))) {
+        $cb = New-CheckBox $io $ft[1] $true; $st.Feat[$ft[0]] = $cb
+    }
+    $opt.Controls.Add($io); $opt.SetFlowBreak($st.Height, $true)
+    $st.IO = $io
+    # plain SVG options
+    $so = New-Object System.Windows.Forms.FlowLayoutPanel; $so.AutoSize = $true; $so.WrapContents = $true; $so.BackColor = $C.Panel
+    $st.Vars = New-CheckBox $so 'Colours as CSS variables' $true
+    $st.Bg = New-CheckBox $so 'Background' $true
+    $st.Resp = New-CheckBox $so 'Scales to its container' $true
+    $st.Acc = New-CheckBox $so 'Title and description (accessibility)' $true
+    $st.Hover = New-CheckBox $so 'Hover highlight' $true
+    $st.Draw = New-CheckBox $so 'Draw-in animation' $false
+    $st.Min = New-CheckBox $so 'Minified' $false
+    $opt.Controls.Add($so)
+    $st.SO = $so
     $bar = New-Object System.Windows.Forms.FlowLayoutPanel
     $bar.Dock = 'Bottom'; $bar.AutoSize = $true; $bar.BackColor = $C.Panel; $bar.Padding = New-Object System.Windows.Forms.Padding((Px 10), (Px 6), (Px 10), (Px 8))
     $code = New-TbRtb -ReadOnly; $code.Dock = 'Fill'; $code.WordWrap = $false
     $st.Code = $code
-    $st.Info = $null
     $f.Controls.Add($code); $f.Controls.Add($opt); $f.Controls.Add($bar)
     $f.Tag = $st
-    $make = {
+    $st.Make = {
         param($s)
-        $o = New-Object DgSvgOptions
-        $o.Vars = $s.Vars.Checked; $o.Background = $s.Bg.Checked; $o.Responsive = $s.Resp.Checked; $o.Accessible = $s.Acc.Checked
-        $o.Hover = $s.Hover.Checked; $o.DrawIn = $s.Draw.Checked; $o.Pretty = -not $s.Min.Checked
-        $o.Mode = @('auto', 'dark', 'light')[$s.Mode.SelectedIndex]
-        $o.Prefix = $s.Prefix.Text
-        if (-not $o.Vars -and $o.Mode -eq 'auto') { $o.Mode = if ($DgUI.Canvas.Dark) { 'dark' } else { 'light' } }
-        [DgSvg]::Document($DgUI.Doc, $DgUI.Canvas.Theme, $o)
+        $kind = @('page', 'widget', 'react', 'svg')[$s.Kind.SelectedIndex]
+        $mode = @('auto', 'dark', 'light')[$s.Mode.SelectedIndex]
+        if ($kind -eq 'svg') {
+            $o = New-Object DgSvgOptions
+            $o.Vars = $s.Vars.Checked; $o.Background = $s.Bg.Checked; $o.Responsive = $s.Resp.Checked; $o.Accessible = $s.Acc.Checked
+            $o.Hover = $s.Hover.Checked; $o.DrawIn = $s.Draw.Checked; $o.Pretty = -not $s.Min.Checked; $o.Prefix = $s.Prefix.Text
+            $o.Mode = $mode
+            if (-not $o.Vars -and $o.Mode -eq 'auto') { $o.Mode = if ($DgUI.Canvas.Dark) { 'dark' } else { 'light' } }
+            return [DgSvg]::Document($DgUI.Doc, $DgUI.Canvas.Theme, $o)
+        }
+        $o = New-Object DgHtmlOptions
+        $o.Kind = $kind; $o.Prefix = $s.Prefix.Text; $o.Mode = $mode
+        if ($kind -ne 'page') { $o.Height = $s.Height.Text.Trim() }
+        foreach ($k in $s.Feat.Keys) { $o.$k = $s.Feat[$k].Checked }
+        [DgHtml]::Build($DgUI.Doc, $DgUI.Canvas.Theme, $o)
     }
-    $st.Make = $make
-    $refresh = { param($s) $t = & $s.Make $s; $s.Text = $t; Set-RtbCode $s.Code $(if ($t.Length -gt 200000) { $t.Substring(0, 200000) + "`n... (copy or save to get all of it)" } else { $t }) 'svg'; $s.Info.Text = "$([Math]::Round($t.Length / 1KB, 1)) KB" }
-    $st.Refresh = $refresh
+    $st.Refresh = {
+        param($s)
+        if (-not $s.Ready) { return }
+        $kind = @('page', 'widget', 'react', 'svg')[$s.Kind.SelectedIndex]
+        $s.IO.Visible = $kind -ne 'svg'; $s.SO.Visible = $kind -eq 'svg'
+        $s.Height.Visible = $kind -eq 'widget' -or $kind -eq 'react'; $s.HLabel.Visible = $s.Height.Visible
+        $s.OpenBtn.Enabled = $kind -ne 'react'
+        try { $t = & $s.Make $s } catch { $t = "Couldn't make it: $($_.Exception.Message)" }
+        $s.Text = $t
+        $lang = if ($kind -eq 'react') { 'js' } elseif ($kind -eq 'svg') { 'svg' } else { 'html' }
+        Set-RtbCode $s.Code $(if ($t.Length -gt 150000) { $t.Substring(0, 150000) + "`n... (copy or save to get all of it)" } else { $t }) $lang
+        $s.Info.Text = "$([Math]::Round($t.Length / 1KB, 1)) KB" + $(switch ($kind) { 'page' { '  -  a complete page: save it and open it, or put it on any web server' } 'widget' { '  -  paste into any page; give each diagram its own prefix' } 'react' { '  -  save as a .jsx file; props: theme, onSelect' } default { '' } })
+    }
     [void](New-Button 'Copy' 'Copy the code' { $s = $this.FindForm().Tag; [System.Windows.Forms.Clipboard]::SetText($s.Text); $s.Info.Text = 'Copied.' } $bar $Glyph.Copy 1)
     [void](New-Button 'Save...' 'Save as a file' {
         $s = $this.FindForm().Tag
-        $dd = New-Object System.Windows.Forms.SaveFileDialog; $dd.Filter = 'SVG picture|*.svg'; $dd.FileName = "$(if ($DgUI.Doc.Title) { $DgUI.Doc.Title } else { 'diagram' }).svg" -replace '[\\/:*?"<>|]', '_'
+        $kind = @('page', 'widget', 'react', 'svg')[$s.Kind.SelectedIndex]
+        $ext = @{ page = 'html'; widget = 'html'; react = 'jsx'; svg = 'svg' }[$kind]
+        $base = $(if ($DgUI.Doc.Title) { $DgUI.Doc.Title } else { 'diagram' }) -replace '[\\/:*?"<>|]', '_'
+        $dd = New-Object System.Windows.Forms.SaveFileDialog; $dd.Filter = "$($ext.ToUpper()) file|*.$ext"; $dd.FileName = "$base.$ext"
         $script:Modal = $true
         try { if ($dd.ShowDialog($s.Form) -eq 'OK') { [IO.File]::WriteAllText($dd.FileName, $s.Text, (New-Object System.Text.UTF8Encoding $false)); $s.Info.Text = "Saved $(Split-Path -Leaf $dd.FileName)." } } finally { $script:Modal = $false; $dd.Dispose() }
     } $bar $Glyph.Save 2)
-    [void](New-Button 'Open in browser' 'See it in your web browser (a temporary file on this PC)' {
+    $st.OpenBtn = New-Button 'Open in browser' 'See it in your web browser (a temporary file on this PC)' {
         $s = $this.FindForm().Tag
+        $kind = @('page', 'widget', 'react', 'svg')[$s.Kind.SelectedIndex]
         $tmp = Join-Path ([IO.Path]::GetTempPath()) ('devtools-diagram-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.html')
-        $page = "<!doctype html><html><head><meta charset=""utf-8""><title>Diagram</title><style>html,body{margin:0;background:#888}body{padding:16px}</style></head><body>`n" + $s.Text + "`n</body></html>"
+        $page = if ($kind -eq 'page') { $s.Text } else { "<!doctype html><html><head><meta charset=""utf-8""><title>Diagram</title><style>html,body{margin:0;background:#8a8f99}body{padding:16px}</style></head><body>`n" + $s.Text + "`n</body></html>" }
         [IO.File]::WriteAllText($tmp, $page, (New-Object System.Text.UTF8Encoding $false))
         Start-Process $tmp
-    } $bar $Glyph.Open 2)
+    } $bar $Glyph.Open 2
     $st.Info = New-TbLabel $bar '' -Dim
     $st.Info.Margin = New-Object System.Windows.Forms.Padding((Px 10), (Px 8), 0, 0)
-    $st.Prefix.add_TextChanged({ param($src, $e) $s = $src.FindForm().Tag; if ($s.Refresh) { & $s.Refresh $s } })
-    foreach ($ctl in @($st.Mode)) { $ctl.add_SelectedIndexChanged({ param($src, $e) $s = $src.FindForm().Tag; if ($s.Refresh) { & $s.Refresh $s } }) }
-    foreach ($ctl in @($st.Vars, $st.Bg, $st.Resp, $st.Acc, $st.Hover, $st.Draw, $st.Min)) { $ctl.add_CheckedChanged({ param($src, $e) $s = $src.FindForm().Tag; & $s.Refresh $s }) }
+    $st.Timer = New-TbDebounce 300 { $fm = [System.Windows.Forms.Form]::ActiveForm; if ($fm -and $fm.Tag -is [hashtable] -and $fm.Tag.Refresh) { & $fm.Tag.Refresh $fm.Tag } }
+    foreach ($ctl in @($st.Kind, $st.Mode)) { $ctl.add_SelectedIndexChanged({ param($src, $e) $s = $src.FindForm().Tag; & $s.Refresh $s }) }
+    foreach ($ctl in @($st.Prefix, $st.Height)) { $ctl.add_TextChanged({ param($src, $e) $s = $src.FindForm().Tag; $s.Timer.Stop(); $s.Timer.Start() }) }
+    foreach ($ctl in @($st.Vars, $st.Bg, $st.Resp, $st.Acc, $st.Hover, $st.Draw, $st.Min) + @($st.Feat.Values)) { $ctl.add_CheckedChanged({ param($src, $e) $s = $src.FindForm().Tag; & $s.Refresh $s }) }
     Register-ThemedWindow $f
-    & $refresh $st
+    $st.Ready = $true
+    & $st.Refresh $st
     $script:Modal = $true
-    try { [void]$f.ShowDialog($DgUI.Form) } finally { $script:Modal = $false; $f.Dispose() }
+    try { [void]$f.ShowDialog($DgUI.Form) } finally { $script:Modal = $false; $st.Timer.Dispose(); $f.Dispose() }
 }
 
 function Show-DiagramExportMenu($Anchor) {
@@ -24086,15 +25225,22 @@ function Show-DiagramExportMenu($Anchor) {
     $tp = Add-MenuItem $m 'Transparent PNG background' { $DgUI.Transparent = -not $DgUI.Transparent }
     $tp.Checked = [bool]$DgUI.Transparent
     [void]$m.Items.Add('-')
-    [void](Add-MenuItem $m 'SVG code...' { Show-DiagramCode } $Glyph.Code)
+    [void](Add-MenuItem $m 'Interactive web page...' { Show-DiagramCode 'page' } $Glyph.Code)
+    [void](Add-MenuItem $m 'Embeddable widget...' { Show-DiagramCode 'widget' } $Glyph.Code)
+    [void](Add-MenuItem $m 'React component...' { Show-DiagramCode 'react' } $Glyph.Code)
+    [void](Add-MenuItem $m 'SVG code...' { Show-DiagramCode 'svg' } $Glyph.Code)
     $m.Show($Anchor, (New-Object System.Drawing.Point(0, $Anchor.Height)))
 }
 
 function Show-DiagramExamplesMenu($Anchor) {
     $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $subs = @{}
     foreach ($k in (Get-DiagramExamples).Keys) {
-        $it = Add-MenuItem $m $k { param($src, $e) New-DiagramFromText $src.Tag ((Get-DiagramExamples)[$src.Tag]) } $Glyph.Apps
+        $grp, $name = $k -split '/', 2
+        if (-not $subs[$grp]) { $subs[$grp] = New-Object System.Windows.Forms.ToolStripMenuItem($grp, (New-GlyphImage $Glyph.Apps)); [void]$m.Items.Add($subs[$grp]) }
+        $it = New-Object System.Windows.Forms.ToolStripMenuItem($name, $null, { param($src, $e) New-DiagramFromText ($src.Tag -split '/', 2)[1] ((Get-DiagramExamples)[$src.Tag]) })
         $it.Tag = $k
+        [void]$subs[$grp].DropDownItems.Add($it)
     }
     $m.Show($Anchor, (New-Object System.Drawing.Point(0, $Anchor.Height)))
 }
@@ -24187,7 +25333,7 @@ function Show-DiagramStudio([string]$Text = '') {
         foreach ($n in $DgUI.Doc.Nodes) { if ($n.HasPos) { $t = [DgText]::SetNodeAttr($t, $n.Id, 'at', $null) } }
         Set-DiagramText $t -Fit
     } $top $Glyph.Refresh 2)
-    $exp = New-Button 'Export' 'Picture, PNG, SVG code' { Show-DiagramExportMenu $this } $top $Glyph.Save 1
+    $exp = New-Button 'Export' 'Picture, PNG, SVG, an interactive web page, a widget or a React component' { Show-DiagramExportMenu $this } $top $Glyph.Save 1
 
     # middle: canvas
     $cv = New-Object DgCanvas
@@ -24203,6 +25349,9 @@ function Show-DiagramStudio([string]$Text = '') {
     $cv.add_EdgeAdded({ param($src, $e) Set-DiagramText ([DgText]::AddLine($DgUI.Text, "$($src.NewEdgeFrom) -> $($src.NewEdgeTo)")) })
     $cv.add_DeleteRequested({ Remove-DiagramSelection })
     $cv.add_NodeOpened({ if ($DgUI.Canvas.Editable) { Edit-DiagramLabel } })
+    $cv.add_CopyRequested({ [void](Copy-DiagramSelection) })
+    $cv.add_PasteRequested({ Paste-DiagramClip })
+    $cv.add_DuplicateRequested({ Copy-DiagramDuplicate })
     $cm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
     $cm.add_Opening({
         param($src, $e)
@@ -24214,6 +25363,14 @@ function Show-DiagramStudio([string]$Text = '') {
         $n = $cv.NodeAt($w)
         if ($n -and -not $cv.View.Selected.Contains($n.Id)) { $cv.Select([string[]]@($n.Id)) }
         [void](Add-MenuItem $src 'Add a shape here' { Add-DiagramNode $DgUI.MenuAt.X $DgUI.MenuAt.Y } $Glyph.Add)
+        $g = if (-not $n) { $cv.GroupAt($w) } else { $null }
+        if ($g) { $cv.Select([string[]]@($g.Members)) }
+        if ($cv.View.Selected.Count) {
+            [void](Add-MenuItem $src $(if ($g) { "Copy the group ""$($g.Title)""" } else { 'Copy (to paste into any diagram)' }) { [void](Copy-DiagramSelection) } $Glyph.Copy 'Ctrl+C')
+            [void](Add-MenuItem $src 'Duplicate' { Copy-DiagramDuplicate } $Glyph.Copy 'Ctrl+D')
+        }
+        $clipText = ''; try { $clipText = [System.Windows.Forms.Clipboard]::GetText() } catch { }
+        if ($clipText.Trim()) { [void](Add-MenuItem $src 'Paste here' { Paste-DiagramClip } $Glyph.Paste 'Ctrl+V') }
         if ($n) {
             [void](Add-MenuItem $src 'Rename' { Edit-DiagramLabel } $Glyph.Edit 'Double-click')
             [void](Add-MenuItem $src 'Auto position' { $t = $DgUI.Text; foreach ($id in @($DgUI.Canvas.View.Selected)) { $t = [DgText]::SetNodeAttr($t, $id, 'at', $null) }; Set-DiagramText $t } $Glyph.Refresh)
@@ -24250,7 +25407,7 @@ function Show-DiagramStudio([string]$Text = '') {
     $files = Get-DiagramFiles
     if ($Text) { New-DiagramFromText 'Diagram' $Text }
     elseif ($files.Count) { Open-DiagramFile $files[0].FullName }
-    else { New-DiagramFromText 'Network visibility map' ((Get-DiagramExamples)['Network visibility map']) }
+    else { New-DiagramFromText 'Network visibility map' ((Get-DiagramExamples)['Architecture/Network visibility map']) }
     Update-DiagramList
 }
 

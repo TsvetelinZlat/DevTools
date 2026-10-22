@@ -416,7 +416,13 @@ Diagrams from a few lines of text: architecture maps, flowcharts, org charts and
   - **Groups**: dashed frames.
   - **Links**: right-angled, curved or straight; dashed, thick, two-way, labelled; **animated**, so packets flow along them.
 
-  **Syntax help** (bottom left) lists it all, and **Examples** has a network visibility map, a Mermaid flowchart, microservices, an org chart and a deploy flow.
+  **Syntax help** (bottom left) lists it all.
+- **Examples**: 20 ready-made interactive diagrams to start from. Each opens as a new diagram you can change.
+  - **Architecture**: network visibility map, cloud web app, Kubernetes cluster, microservices, active / standby failover, home network.
+  - **Flows**: deploy pipeline, CI/CD stages, login flow (Mermaid), incident runbook, order state machine, customer journey.
+  - **Data**: analytics pipeline, database schema, event streaming.
+  - **Org**: org chart, team responsibilities.
+  - **Ideas**: mind map, every shape, every link style.
   ```
   title Shop platform
   theme corporate light
@@ -430,6 +436,8 @@ Diagrams from a few lines of text: architecture maps, flowcharts, org charts and
   - Drag from a shape's dot to another shape to link them.
   - Double-click a shape to rename it; right-click for **Add a shape here**.
   - Shift+drag selects several; the arrow keys nudge the selection; Del deletes.
+  - Click inside a group's frame to select the whole group; drag it to move it all.
+  - **Ctrl+C / Ctrl+V** copy shapes and groups, with their links, looks and categories, into **any other diagram**. They paste where the mouse is, or in free space; clashing names get `_2`. **Ctrl+D** duplicates. The clipboard holds plain diagram text, so you can also paste it into the text editor or keep it in Notes.
   - Everything you do is written back into the text, so the text is always the whole diagram.
   - **Undo / Redo** with Ctrl+Z / Ctrl+Y.
 - **Properties** (right):
@@ -444,12 +452,21 @@ Diagrams from a few lines of text: architecture maps, flowcharts, org charts and
   - The legend chips hide or show each flow. **Pause** and the speed stop or change the packets; **Dark / Light** switches the colours.
 - **Export**:
   - **Copy as picture**, or **PNG** at 1x / 2x / 3x (with a transparent option).
+  - **Interactive web page**: the whole experience of the canvas in one self-contained `.html` file (no libraries).
+    - pan, Ctrl+wheel zoom and Fit; a dark / light switch
+    - hover dimming; a **details panel** on click with the description, tags, a live sparkline, packets seen / dropped, what it receives from and sends to, and **Simulate outage**
+    - flowing packets with pause and speed; live rates on the cards and totals in the header
+    - legend chips that hide or show each flow; links open from the panel
+
+    Each part can be switched off. The page has a small API, so you can feed in real data: `window.diagrams['prefix'].setStatus('db', 'down')`, `.setMetric(id, '12 ms')`, `.select(id)`, `.on('select', fn)`, `.theme('light')`, `.pause()`.
+  - **Embeddable widget**: the same as a block to paste into any existing page (its own height); give each diagram its own prefix and several can share a page.
+  - **React component**: a `.jsx` file with `theme` and `onSelect` props.
   - **SVG code**, with a live preview of the code and options:
     - colours as **CSS variables** that follow the system's light / dark theme, or fixed dark or light
     - background, scaling to its container, accessibility title and description
     - hover highlight, draw-in animation, minified
     - a **prefix for every class and id**, so several diagrams can sit on the same page without clashing
-  - **Copy**, **Save** or **Open in browser** to see the result.
+  - Every output has a live code view with **Copy**, **Save** and **Open in browser** to see the result.
 - Diagrams are saved as you go under `data\diagrams\` (one `.dgm` text file each; **Saved** lists them, right-click to rename or delete).
 
 ## Git
