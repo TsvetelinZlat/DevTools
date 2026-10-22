@@ -21463,6 +21463,8 @@ public class DgEdge {
     public string PathD = "";                                                     // the route as SVG path data
     public bool Curved;
     public float Detour = float.NaN;                                              // corridor around the shapes in between
+    public System.Drawing.PointF LabelAt = new System.Drawing.PointF(float.NaN, float.NaN);   // where the label was dragged to
+    public System.Drawing.RectangleF LabelBox;                                    // where the label is drawn (after drawing)
 }
 
 public class DgGroup {
@@ -21485,7 +21487,8 @@ public class DgDoc {
     public float Spacing = 1f, Radius = 10f;
     public bool LaneMode { get { return Lanes.Count > 0 || Nodes.Any(n => n.Lane >= 0); } }
     public System.Drawing.RectangleF Bounds;                                                 // everything drawn (after layout)
-    public List<float> LaneX = new List<float>(), LaneW = new List<float>();                  // lane columns (after layout)
+    public List<float> LaneX = new List<float>(), LaneW = new List<float>();
+    public DgChart Chart;                                                                     // a chart instead of shapes                  // lane columns (after layout)
 
     public DgNode Find(string id) {
         if (id == null) return null;
@@ -21645,9 +21648,11 @@ public static class DgText {
         DgNode last = null;
         var groupStack = new Stack<DgGroup>();
         int order = 0;
+        bool inData = false;
         for (int li = 0; li < lines.Length; li++) {
             string raw = lines[li];
             string line = raw.Trim();
+            if (inData) { if (line.ToLowerInvariant() == "end") inData = false; else if (line.Length > 0) d.Chart.Raw.Add(raw); continue; }
             if (line.Length == 0 || line.StartsWith("%%") || line.StartsWith("//") || (line.StartsWith("#") && !Regex.IsMatch(line, "^#[0-9a-fA-F]{3,8}\\b"))) continue;
             bool indented = raw.Length > 0 && (raw[0] == ' ' || raw[0] == '\t');
             try {
@@ -21683,6 +21688,24 @@ public static class DgText {
                         }
                         case "end": if (rest.Length == 0) { if (groupStack.Count > 0) groupStack.Pop(); continue; } break;
                         case "style": StyleLine(d, rest); continue;
+                        case "chart": {
+                            if (d.Chart == null) d.Chart = new DgChart();
+                            var w = rest.ToLowerInvariant();
+                            d.Chart.Stacked = w.Contains("stack");
+                            d.Chart.Type = w.Contains("donut") || w.Contains("doughnut") ? "donut" : w.Contains("pie") ? "pie" : w.Contains("scatter") ? "scatter" : w.Contains("area") ? "area" : w.Contains("line") ? "line"
+                                         : w.Contains("bar") || w.Contains("horizontal") ? "bar" : "column";
+                            continue;
+                        }
+                        case "data": if (d.Chart != null) { inData = true; continue; } break;
+                        case "x": if (d.Chart != null) { d.Chart.X = Unq(rest); continue; } break;
+                        case "y": case "series": case "values": if (d.Chart != null) { d.Chart.Y = SplitTop(rest, ',').Select(x => Unq(x.Trim())).Where(x => x.Length > 0).ToList(); continue; } break;
+                        case "agg": case "aggregate": if (d.Chart != null) { d.Chart.Agg = rest.Trim().ToLowerInvariant(); continue; } break;
+                        case "sort": if (d.Chart != null) { d.Chart.Sort = rest.Trim().ToLowerInvariant(); continue; } break;
+                        case "top": if (d.Chart != null) { int tn; d.Chart.Top = int.TryParse(rest.Trim(), out tn) ? tn : 0; continue; } break;
+                        case "labels": if (d.Chart != null) { d.Chart.Labels = !rest.ToLowerInvariant().StartsWith("off") && !rest.ToLowerInvariant().StartsWith("no"); continue; } break;
+                        case "stacked": if (d.Chart != null) { d.Chart.Stacked = true; continue; } break;
+                        case "prefix": if (d.Chart != null) { d.Chart.Prefix = Unq(rest); continue; } break;
+                        case "suffix": case "unit": if (d.Chart != null) { d.Chart.Suffix = Unq(rest); continue; } break;
                         case "classdef": case "class": case "linkstyle": continue;
                         case "click": { var m = Regex.Match(rest, "^(" + IdRx + ")\\s+(?:href\\s+)?\"([^\"]+)\""); if (m.Success) { var n = Node(d, m.Groups[1].Value, ref order); n.Url = m.Groups[2].Value; } continue; }
                     }
@@ -21842,7 +21865,7 @@ public static class DgText {
         switch (k) {
             case "badge": case "lane": case "at": case "size": case "w": case "width": case "h": case "height": case "shape": case "fill": case "stroke": case "border": case "color": case "text":
             case "icon": case "status": case "metric": case "url": case "link": case "font": case "lines": case "items": case "in": case "group": case "cat": case "category": case "flow":
-            case "desc": case "tags": case "label": case "via": case "density": case "arrow": case "from": case "to": case "route": return true;
+            case "desc": case "tags": case "label": case "via": case "density": case "arrow": case "from": case "to": case "route": case "labelat": return true;
         }
         return false;
     }
@@ -21866,7 +21889,7 @@ public static class DgText {
                 case "shape": n.Shape = v.ToLowerInvariant(); break;
                 case "fill": n.Fill = v; break;
                 case "stroke": case "border": n.Stroke = v; break;
-                case "color": case "text": n.TextColor = v; break;
+                case "color": case "text": if (v.Length == 0) n.Shape = "text"; else n.TextColor = v; break;
                 case "icon": n.Icon = Unq(v); break;
                 case "status": n.Status = v.ToLowerInvariant(); break;
                 case "metric": n.Metric = Unq(v); break;
@@ -22009,6 +22032,7 @@ public static class DgText {
                 case "ortho": case "elbow": e.Route = "ortho"; break;
                 case "route": e.Route = v.ToLowerInvariant(); break;
                 case "via": e.Via = Points(v); break;
+                case "labelat": { var lp = Points(v); if (lp.Count > 0) e.LabelAt = lp[0]; break; }
                 case "animate": case "animated": case "flowing": e.Animate = true; break;
                 case "density": e.Density = Math.Max(0.1f, Math.Min(5, F(v, 1))); e.Animate = true; break;
                 case "both": case "twoway": e.Both = true; break;
@@ -22070,7 +22094,7 @@ public static class DgText {
         else items.Add(Attr(key, value));
         return items.Count > 0 ? head + " [" + string.Join(", ", items) + "]" : head;
     }
-    static bool IsShapeWord(string w) { return w == "card" || w == "rect" || w == "rounded" || w == "pill" || w == "diamond" || w == "circle" || w == "cylinder" || w == "db" || w == "doc" || w == "hexagon" || w == "parallelogram" || w == "note" || w == "actor" || w == "table"; }
+    static bool IsShapeWord(string w) { return w == "text" || w == "card" || w == "rect" || w == "rounded" || w == "pill" || w == "diamond" || w == "circle" || w == "cylinder" || w == "db" || w == "doc" || w == "hexagon" || w == "parallelogram" || w == "note" || w == "actor" || w == "table"; }
 
     // the label: "id: Label" lines get the new label; a Mermaid "id[Label]" keeps its brackets
     public static string SetNodeLabel(string text, string id, string label) {
@@ -22202,7 +22226,11 @@ public static class DgLayout {
             float bw = n.Badge.Length > 0 ? DgMeasure.Width(n.Badge, 10.5f, 600, true) + 14 + 22 + (n.Metric.Length > 0 ? DgMeasure.Width(n.Metric, 10f, 400, true) + 16 : 0) : 0;
             float iw = n.Items.Sum(x => Math.Max(32, DgMeasure.Width(x, 10.5f, 400, false) + 18)) + Math.Max(0, n.Items.Count - 1) * 40;
             w = Math.Max(220, Math.Max(Math.Max(tw, lw), Math.Max(bw, iw)) + Pad * 2 + 8);
-            h = Pad + (n.Badge.Length > 0 || n.Metric.Length > 0 ? 28 : 0) + ts + 8 + n.Lines.Count * 16 + (n.Items.Count > 0 ? 42 : 0) + (n.Spark ? 38 : 0) + Pad - 2;
+            h = Pad + (n.Badge.Length > 0 || n.Status.Length > 0 || n.Metric.Length > 0 ? 28 : 0) + ts + 8 + n.Lines.Count * 16 + (n.Items.Count > 0 ? 42 : 0) + (n.Spark ? 38 : 0) + Pad - 2;
+        } else if (shape == "text") {
+            var tl = n.Title.Split('\n');
+            float tsz = n.FontSize > 0 ? n.FontSize : 13.5f;
+            w = tl.Max(x => DgMeasure.Width(x, tsz, n.Bold ? 600 : 400, false)) + 10; h = tl.Length * (tsz + 5) + 6;
         } else if (shape == "table") {
             float tw = DgMeasure.Width(n.Title, 13.5f, 600, false);
             float lw = n.Lines.Count == 0 ? 0 : n.Lines.Max(x => DgMeasure.Width(x, 11.5f, 400, true) + 44);
@@ -22236,6 +22264,7 @@ public static class DgLayout {
     }
 
     public static void Apply(DgDoc d) {
+        if (d.Chart != null) { DgChartCalc.Layout(d); return; }
         foreach (var n in d.Nodes) { Measure(d, n); n.Rank = -1; }
         var vis = d.Nodes.Where(n => !n.Hidden).ToList();
         string mode = string.IsNullOrEmpty(d.Layout) ? (d.LaneMode ? "lanes" : "layered") : d.Layout;
@@ -22812,6 +22841,7 @@ public class DgView {
     public bool Editing;            // selection outlines, connect handles
     public Dictionary<string, List<float>> Spark = new Dictionary<string, List<float>>();
     public Dictionary<string, string> Rate = new Dictionary<string, string>();
+    public bool ChartLegend = true;      // the chart draws its own legend (pictures); the window and the web page show clickable chips
 }
 
 // ---- The drawing itself.
@@ -22829,6 +22859,7 @@ public static class DgRender {
 
     public static void Draw(DgDoc d, DgColors c, IDgPainter p, DgView v) {
         if (v == null) v = new DgView();
+        if (d.Chart != null) { DgChartRender.Draw(d, c, p, v); return; }
         var rel = string.IsNullOrEmpty(v.Hover) ? null : Related(d, v.Hover);
         // lane headings
         if (d.Lanes.Count > 0 && d.LaneX.Count > 0) {
@@ -22879,7 +22910,9 @@ public static class DgRender {
             if (arrowStart) Arrow(p, e.Pts[1], e.Pts[0], col, sw, o, e.Curved ? e.Pts : null, true);
             if (e.Label.Length > 0) {
                 float a; var m = DgRoute.At(e.Pts, DgRoute.Length(e.Pts) / 2, out a);
+                if (!float.IsNaN(e.LabelAt.X)) m = e.LabelAt;
                 float tw = DgMeasure.Width(e.Label, 10.5f, 500, false) + 12;
+                e.LabelBox = new System.Drawing.RectangleF(m.X - tw / 2, m.Y - 9, tw, 18);
                 p.Rect(m.X - tw / 2, m.Y - 9, tw, 18, 9, c.Get("bg"), c.Mix("line", "80", "bg"), 1, 0, o);
                 p.Text(m.X, m.Y + 3.8f, e.Label, 10.5f, 500, c.Get("muted"), "middle", false, o, 0, null);
             }
@@ -22913,7 +22946,7 @@ public static class DgRender {
         string data = "data-node=\"" + DgSvgPainter.Esc(n.Id) + "\"" + (n.Cat.Length > 0 ? " data-cat=\"" + DgSvgPainter.Esc(n.Cat) + "\"" : "");
         p.Begin("dg-node" + (n.Url.Length > 0 ? " dg-link-node" : ""), "dg-node-" + DgText.CssId(n.Id), data);
         float x = n.X, y = n.Y, w = n.W, h = n.H;
-        if (v.Editing && v.Selected.Contains(n.Id)) p.Rect(x - 4, y - 4, w + 8, h + 8, d.Radius + 4, null, c.Get("sel"), 2, 0, 0.9f);
+        if (v.Editing && v.Selected.Contains(n.Id) && shape != "text") p.Rect(x - 4, y - 4, w + 8, h + 8, d.Radius + 4, null, c.Get("sel"), 2, 0, 0.9f);
         if (shape == "card") {
             p.Rect(x, y, w, h, d.Radius, fill, stroke, sw, n.Dashed ? 1 : 0, o, "dg-box");
             float ty = y + 14;
@@ -22946,6 +22979,10 @@ public static class DgRender {
                 List<float> s; if (!v.Spark.TryGetValue(n.Id, out s)) s = DemoSpark(n.Id);
                 p.Path(SparkPath(s, sx, sy, sww, 26), null, ck != null ? c.Get(ck) : c.Get("muted"), 1.5f, 0, o, "dg-spark");
             }
+        } else if (shape == "text") {
+            float tsz = n.FontSize > 0 ? n.FontSize : 13.5f; float ty2 = y + tsz;
+            if (v.Editing && v.Selected.Contains(n.Id)) p.Rect(x - 2, y - 2, w + 4, h + 4, 4, null, c.Get("sel"), 1, 1, 0.8f);
+            foreach (var tl in n.Title.Split('\n')) { p.Text(x + 5, ty2, tl, tsz, n.Bold ? 600 : 400, n.TextColor.Length > 0 ? n.TextColor : (ck != null ? c.Get(ck) : c.Get("muted")), "start", false, o, 0, "dg-text"); ty2 += tsz + 5; }
         } else if (shape == "table") {
             p.Rect(x, y, w, h, 8, c.Get("card"), stroke, 1.3f, 0, o, "dg-box");
             p.Path(TopRound(x, y, w, 30, 8), ck != null ? c.Mix(ck, "28", "card") : c.Get("chip"), null, 0, 0, o, null);
@@ -23121,7 +23158,9 @@ public class DgCanvas : System.Windows.Forms.Panel {
     public float Zoom = 1f;
     public System.Drawing.PointF Pan = new System.Drawing.PointF(0, 0);       // canvas units at the top-left
     public System.Drawing.Color UiBack = System.Drawing.Color.FromArgb(30, 30, 30), UiFore = System.Drawing.Color.White, UiLine = System.Drawing.Color.Gray, UiAccent = System.Drawing.Color.DodgerBlue;
-    public event EventHandler SelectionChanged, NodeOpened, Moved, EdgeAdded, DeleteRequested, LegendChanged, CopyRequested, PasteRequested, DuplicateRequested;
+    public event EventHandler SelectionChanged, NodeOpened, Moved, EdgeAdded, DeleteRequested, LegendChanged, CopyRequested, PasteRequested, DuplicateRequested, LabelMoved;
+    public DgEdge MovedLabel;
+    DgEdge labelEdge;
     public System.Drawing.PointF MouseCanvas;       // where the mouse is (canvas units)
     public bool MouseInside;
     public string NewEdgeFrom = "", NewEdgeTo = "";
@@ -23135,7 +23174,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
     DateTime last = DateTime.Now, lastSample = DateTime.Now;
     Random rnd = new Random(7);
 
-    enum Mode { None, Pan, Drag, Box, Link }
+    enum Mode { None, Pan, Drag, Box, Link, Label }
     Mode mode = Mode.None;
     System.Drawing.Point down;
     System.Drawing.PointF dragAnchor;
@@ -23250,6 +23289,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
             Invalidate(); if (LegendChanged != null) LegendChanged(this, EventArgs.Empty); return;
         }
         if (ZoomClick(e.Location)) return;
+        if (Editable) foreach (var le in Doc.Edges) if (le.Label.Length > 0 && !le.LabelBox.IsEmpty && le.LabelBox.Contains(w)) { mode = Mode.Label; labelEdge = le; View.Selected.Clear(); View.SelectedEdge = le.Id; if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); return; }
         var n = NodeAt(w);
         if (n != null && OnHandle(n, w)) { mode = Mode.Link; linkFrom = n.Id; mouseW = w; return; }
         if (n != null) {
@@ -23293,19 +23333,29 @@ public class DgCanvas : System.Windows.Forms.Panel {
                 DgRoute.All(Doc); packets.Clear(); Invalidate(); return;
             case Mode.Box: box = System.Drawing.RectangleF.FromLTRB(Math.Min(box.X, w.X), Math.Min(box.Y, w.Y), Math.Max(box.X, w.X), Math.Max(box.Y, w.Y)); mouseW = w; Invalidate(); return;
             case Mode.Link: mouseW = w; Invalidate(); return;
+            case Mode.Label: if (moved && labelEdge != null) { labelEdge.LabelAt = new System.Drawing.PointF((float)Math.Round(w.X), (float)Math.Round(w.Y)); Invalidate(); } return;
+        }
+        if (Doc.Chart != null) {
+            var hit = DgChartRender.HitAt(Doc.Chart, w);
+            string hs = hit == null ? "" : hit.Series;
+            Cursor = hit != null ? System.Windows.Forms.Cursors.Hand : System.Windows.Forms.Cursors.Default;
+            if (hs != View.Hover || (hit != null && tipAt != e.Location)) { View.Hover = hs; tip = hit == null ? "" : hit.Tip; tipAt = e.Location; Invalidate(); }
+            return;
         }
         var n = NodeAt(w);
         string h = n == null ? "" : n.Id;
         Cursor = n != null ? (OnHandle(n, w) ? System.Windows.Forms.Cursors.Cross : System.Windows.Forms.Cursors.Hand) : (EdgeAt(w) != null ? System.Windows.Forms.Cursors.Hand : System.Windows.Forms.Cursors.Default);
         if (h != View.Hover) { View.Hover = HoverDim ? h : ""; hoverId = h; Invalidate(); }
     }
-    string hoverId = "";
+    string hoverId = "", tip = "";
+    System.Drawing.Point tipAt;
     protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); MouseInside = false; if (View.Hover.Length > 0 || hoverId.Length > 0) { View.Hover = ""; hoverId = ""; Invalidate(); } }
     protected override void OnMouseUp(System.Windows.Forms.MouseEventArgs e) {
         base.OnMouseUp(e);
         var w = W(e.Location);
         var m = mode; mode = Mode.None;
-        if (m == Mode.Drag && moved) { MovedIds = dragFrom.Keys.ToList(); if (Moved != null) Moved(this, EventArgs.Empty); }
+        if (m == Mode.Label && moved && labelEdge != null) { MovedLabel = labelEdge; if (LabelMoved != null) LabelMoved(this, EventArgs.Empty); }
+        else if (m == Mode.Drag && moved) { MovedIds = dragFrom.Keys.ToList(); if (Moved != null) Moved(this, EventArgs.Empty); }
         else if (m == Mode.Box) {
             var ids = Doc.Nodes.Where(n => !n.Hidden && box.IntersectsWith(n.Box)).Select(n => n.Id).ToList();
             Select(ids); box = System.Drawing.RectangleF.Empty;
@@ -23424,6 +23474,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
         g.TranslateTransform(-Pan.X, -Pan.Y);
         if (Doc.On("grid")) Dots(g, c, new System.Drawing.RectangleF(Pan.X, Pan.Y, Width / Zoom, Height / Zoom));
         View.Editing = Editable;
+        View.ChartLegend = false;
         if (Editable && View.Selected.Count > 1)
             foreach (var gr in Doc.Groups) if (!gr.Box.IsEmpty && gr.Members.Count > 0 && gr.Members.All(View.Selected.Contains))
                 using (var pen = new System.Drawing.Pen(DgColors.Parse(c.Raw("sel")), 2f / Zoom)) using (var gp = DgGdiPainter.RoundRect(gr.Box.X - 4, gr.Box.Y - 4, gr.Box.Width + 8, gr.Box.Height + 8, Doc.Radius + 6)) g.DrawPath(pen, gp);
@@ -23468,7 +23519,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
         var panel = DgColors.Parse(c.Raw("panel")); var line = DgColors.Parse(c.Raw("btnLine")); var ink = DgColors.Parse(c.Raw("ink")); var muted = DgColors.Parse(c.Raw("muted"));
         var fUi = DgMeasure.Font(12.5f * s, 400, false); var fBold = DgMeasure.Font(14.5f * s, 600, false); var fMono = DgMeasure.Font(12f * s, 400, true); var fSmall = DgMeasure.Font(10.5f * s, 400, false);
         // header: title and totals
-        if (Doc.On("header") && (Doc.Title.Length > 0)) {
+        if (Doc.On("header") && Doc.Title.Length > 0 && Doc.Chart == null) {
             int down = Doc.Nodes.Count(n => View.Down.Contains(n.Id) || n.Status == "down");
             float total = View.Rate.Count == 0 ? 0 : Doc.Nodes.Where(n => Doc.Edges.Any(e => e.Animate && e.To == n.Id) && !Doc.Edges.Any(e => e.Animate && e.From == n.Id)).Sum(n => View.Spark.ContainsKey(n.Id) && View.Spark[n.Id].Count > 0 ? View.Spark[n.Id].Last() : 0);
             string stats = Doc.Nodes.Count(n => !n.Hidden) + " components   " + (down > 0 ? down + " down" : "all up") + (total > 0 ? "   " + Fmt(total) + " pps delivered" : "");
@@ -23483,7 +23534,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
         // legend: one chip per flow / category used by links (click to hide)
         legendHits.Clear();
         if (Doc.On("legend")) {
-            var cats = Doc.Cats.Where(k => Doc.Edges.Any(e => e.Cat == k.Id) || Doc.Nodes.Any(n => n.Cat == k.Id)).ToList();
+            var cats = Doc.Chart != null ? Doc.Cats.ToList() : Doc.Cats.Where(k => Doc.Edges.Any(e => e.Cat == k.Id) || Doc.Nodes.Any(n => n.Cat == k.Id)).ToList();
             float maxX = ZoomButtons()[0].X - 12 * s;
             // rows from the bottom: measure first, then lay out so the last row sits at the bottom
             var widths = cats.Select(k => g.MeasureString(k.Name, fUi).Width + 38 * s).ToList();
@@ -23506,6 +23557,14 @@ public class DgCanvas : System.Windows.Forms.Panel {
                 legendHits.Add(new KeyValuePair<System.Drawing.RectangleF, string>(r, k.Id));
                 x += w + 8 * s;
             }
+        }
+        // chart tooltip
+        if (tip.Length > 0 && Doc.Chart != null) {
+            var sz = g.MeasureString(tip, fUi);
+            var r = new System.Drawing.RectangleF(tipAt.X + 14, tipAt.Y + 14, sz.Width + 18 * s, sz.Height + 10 * s);
+            if (r.Right > Width - 6) r.X = tipAt.X - r.Width - 10;
+            using (var gp = DgGdiPainter.RoundRect(r.X, r.Y, r.Width, r.Height, 6 * s)) { using (var b = new System.Drawing.SolidBrush(panel)) g.FillPath(b, gp); using (var pn = new System.Drawing.Pen(line)) g.DrawPath(pn, gp); }
+            using (var b = new System.Drawing.SolidBrush(ink)) g.DrawString(tip, fUi, b, r.X + 9 * s, r.Y + 5 * s);
         }
         // zoom buttons
         var zb = ZoomButtons();
@@ -23543,7 +23602,7 @@ public static class DgHtml {
 
     public static string Data(DgDoc d, DgHtmlOptions o, string prefix) {
         var sb = new StringBuilder("{");
-        sb.Append("\"p\":" + J(prefix) + ",\"title\":" + J(d.Title) + ",\"theme\":" + J(o.Mode) + ",");
+        sb.Append("\"p\":" + J(prefix) + ",\"title\":" + J(d.Title) + ",\"theme\":" + J(o.Mode) + "," + (d.Chart != null ? "\"chart\":1," : ""));
         var b = d.Bounds;
         sb.Append("\"bounds\":[" + Nm(b.X) + "," + Nm(b.Y) + "," + Nm(b.Width) + "," + Nm(b.Height) + "],");
         sb.Append("\"opt\":{\"hover\":" + B(o.Hover) + ",\"panel\":" + B(o.Panel) + ",\"flows\":" + B(o.Flows) + ",\"outage\":" + B(o.Outage) + ",\"glow\":" + B(o.Glow) + "},");
@@ -23585,7 +23644,7 @@ public static class DgHtml {
     public static string Svg(DgDoc d, DgTheme t) {
         var c = new DgColors(d, t, true, true);
         var p = new DgSvgPainter { Pretty = true };
-        var v = new DgView();
+        var v = new DgView { ChartLegend = false };
         foreach (var n in d.Nodes) if (DgLayout.IsCard(n) && (n.Badge.Length > 0 || n.Status.Length > 0 || n.Metric.Length > 0) && n.Metric.Length == 0) v.Rate[n.Id] = " ";
         DgRender.Draw(d, c, p, v);
         return "<svg xmlns=\"http://www.w3.org/2000/svg\" class=\"dg-svg\" role=\"img\" aria-label=\"" + DgSvgPainter.Esc(string.IsNullOrEmpty(d.Title) ? "Diagram" : d.Title) + "\">\n" +
@@ -23611,7 +23670,7 @@ public static class DgHtml {
         }
         sb.Append("</div>\n");
         sb.Append("<div class=\"dg-foot\">" + (o.Legend ? "<div class=\"dg-legend\"></div>" : "<span></span>") +
-                  (o.Hint ? "<span class=\"dg-hint\">Drag to pan \u00B7 Ctrl + wheel to zoom" + (o.Panel ? " \u00B7 Click a component for details" : "") + "</span>" : "") + "</div>\n");
+                  (o.Hint ? "<span class=\"dg-hint\">" + (d.Chart != null ? "Point at a bar or a dot for its value \u00B7 click the legend to hide a series" : "Drag to pan \u00B7 Ctrl + wheel to zoom" + (o.Panel ? " \u00B7 Click a component for details" : "")) + "</span>" : "") + "</div>\n");
         if (o.Panel) sb.Append("<aside class=\"dg-panel\" hidden></aside>\n");
         sb.Append("</div>\n");
         string css = DgSvg.Css(d, t, ".dg-root", o.Mode, false, false) + DgAssets.Css.Replace("__P__", "dg").Replace("__H__", height);
@@ -23629,6 +23688,7 @@ public static class DgHtml {
 
     public static string Build(DgDoc d, DgTheme t, DgHtmlOptions o) {
         string prefix = DgSvg.P(o.Prefix);
+        if (d.Chart != null) { o.Flows = false; o.Panel = false; o.Outage = false; }
         string kind = (o.Kind ?? "page").ToLowerInvariant();
         string height = !string.IsNullOrEmpty(o.Height) ? o.Height : (kind == "page" ? "100vh" : "640px");
         string data = Data(d, o, prefix);
@@ -23723,6 +23783,7 @@ public static class DgClip {
         if (e.GlowSet) a.Add(e.Glow ? "glow" : "noglow");
         if (e.FromSide.Length > 0) a.Add("from " + e.FromSide);
         if (e.ToSide.Length > 0) a.Add("to " + e.ToSide);
+        if (!float.IsNaN(e.LabelAt.X)) a.Add("labelat " + N(e.LabelAt.X) + " " + N(e.LabelAt.Y));
         string f = from + (e.FromItem.Length > 0 ? "." + Item(e.FromItem) : ""), t = to + (e.ToItem.Length > 0 ? "." + Item(e.ToItem) : "");
         return f + " -> " + t + (a.Count > 0 ? " [" + string.Join(", ", a) + "]" : "");
     }
@@ -23805,6 +23866,483 @@ public static class DgClip {
     }
 }
 
+// ---- Charts: column, bar, stacked, line, area, pie, donut, scatter from a data block in the diagram text.
+public class DgHit { public System.Drawing.RectangleF R; public string Tip = "", Series = ""; public System.Drawing.PointF C; public float Radius; }
+
+public class DgChart {
+    public string Type = "column", X = "", Agg = "sum", Sort = "", Prefix = "", Suffix = "";
+    public List<string> Y = new List<string>();
+    public int Top;
+    public bool Labels, Stacked;
+    public List<string> Raw = new List<string>();
+    // computed
+    public List<string> Headers = new List<string>(), Cats = new List<string>(), Series = new List<string>();
+    public double[,] Values = new double[0, 0];
+    public List<double[]> Points = new List<double[]>();       // scatter: x, y per series index
+    public List<DgHit> Hits = new List<DgHit>();
+    public System.Drawing.RectangleF Plot;
+    public double Min, Max, Step;
+    public string Error = "";
+}
+
+public static class DgChartCalc {
+    public static double? Num(string s) {
+        if (s == null) return null;
+        s = s.Trim().Replace("\u00A0", "").Replace(" ", "").Replace("'", "");
+        s = Regex.Replace(s, @"^[\$\u20AC\u00A3\u00A5]|[\$\u20AC\u00A3\u00A5%]$", "");
+        if (s.Length == 0) return null;
+        bool comma = s.Contains(","), dot = s.Contains(".");
+        if (comma && dot) { if (s.LastIndexOf(',') > s.LastIndexOf('.')) s = s.Replace(".", "").Replace(',', '.'); else s = s.Replace(",", ""); }
+        else if (comma) { if (Regex.IsMatch(s, @"^-?\d{1,3}(,\d{3})+$")) s = s.Replace(",", ""); else s = s.Replace(',', '.'); }
+        double v;
+        return double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out v) ? (double?)v : null;
+    }
+    public static List<List<string>> Rows(List<string> raw) {
+        var text = string.Join("\n", raw.Where(l => l.Trim().Length > 0));
+        var first = raw.FirstOrDefault(l => l.Trim().Length > 0) ?? "";
+        char sep = first.Contains("\t") ? '\t' : first.Count(ch => ch == ';') > first.Count(ch => ch == ',') ? ';' : first.Contains("|") && !first.Contains(",") ? '|' : ',';
+        var rows = new List<List<string>>();
+        foreach (var line in text.Split('\n')) {
+            var cells = new List<string>(); var sb = new StringBuilder(); bool q = false;
+            var l = line.TrimEnd('\r');
+            for (int i = 0; i < l.Length; i++) {
+                char ch = l[i];
+                if (q) { if (ch == '"') { if (i + 1 < l.Length && l[i + 1] == '"') { sb.Append('"'); i++; } else q = false; } else sb.Append(ch); }
+                else if (ch == '"') q = true;
+                else if (ch == sep) { cells.Add(sb.ToString().Trim()); sb.Clear(); }
+                else sb.Append(ch);
+            }
+            cells.Add(sb.ToString().Trim());
+            rows.Add(cells);
+        }
+        return rows;
+    }
+
+    // headers, categories (x), series and aggregated values
+    public static void Compute(DgDoc d) {
+        var c = d.Chart;
+        c.Error = ""; c.Cats.Clear(); c.Series.Clear(); c.Points.Clear();
+        var rows = Rows(c.Raw);
+        if (rows.Count < 2) { c.Error = "No data: put rows after 'data' (first row = column names) and end with 'end'."; c.Values = new double[0, 0]; return; }
+        c.Headers = rows[0];
+        var body = rows.Skip(1).ToList();
+        Func<string, int> col = name => { int i = c.Headers.FindIndex(h => string.Equals(h, name, StringComparison.OrdinalIgnoreCase)); if (i < 0) { int n; if (int.TryParse(name, out n) && n >= 1 && n <= c.Headers.Count) i = n - 1; } return i; };
+        int xi = c.X.Length > 0 ? col(c.X) : 0;
+        if (xi < 0) { c.Error = "No column '" + c.X + "'."; xi = 0; }
+        var ys = new List<int>();
+        if (c.Y.Count > 0) foreach (var y in c.Y) { int i = col(y); if (i >= 0 && i != xi) ys.Add(i); else c.Error = "No column '" + y + "'."; }
+        else for (int i = 0; i < c.Headers.Count; i++) if (i != xi && body.Any(r => i < r.Count && Num(r[i]).HasValue)) ys.Add(i);
+        string agg = c.Agg.ToLowerInvariant();
+        if (ys.Count == 0) { if (agg == "count") ys.Add(xi); else { c.Error = c.Error.Length > 0 ? c.Error : "No number columns to show."; c.Values = new double[0, 0]; return; } }
+        foreach (var i in ys) c.Series.Add(agg == "count" && i == xi ? "Count" : c.Headers[i]);
+        if (c.Type == "scatter") {
+            for (int s = 0; s < ys.Count; s++) foreach (var r in body) {
+                var xv = xi < r.Count ? Num(r[xi]) : null; var yv = ys[s] < r.Count ? Num(r[ys[s]]) : null;
+                if (xv.HasValue && yv.HasValue) c.Points.Add(new[] { xv.Value, yv.Value, s });
+            }
+            return;
+        }
+        // group by x (first appearance order)
+        var order = new List<string>(); var groups = new Dictionary<string, List<List<string>>>();
+        foreach (var r in body) {
+            string k = xi < r.Count ? r[xi] : "";
+            if (k.Length == 0) continue;
+            List<List<string>> g; if (!groups.TryGetValue(k, out g)) { g = new List<List<string>>(); groups[k] = g; order.Add(k); }
+            g.Add(r);
+        }
+        var vals = new Dictionary<string, double[]>();
+        foreach (var k in order) {
+            var g = groups[k]; var v = new double[ys.Count];
+            for (int s = 0; s < ys.Count; s++) {
+                var nums = g.Select(r => ys[s] < r.Count ? Num(r[ys[s]]) : null).Where(x => x.HasValue).Select(x => x.Value).ToList();
+                switch (agg) {
+                    case "count": v[s] = g.Count; break;
+                    case "avg": case "average": case "mean": v[s] = nums.Count > 0 ? nums.Average() : 0; break;
+                    case "min": v[s] = nums.Count > 0 ? nums.Min() : 0; break;
+                    case "max": v[s] = nums.Count > 0 ? nums.Max() : 0; break;
+                    case "first": case "none": v[s] = nums.Count > 0 ? nums[0] : 0; break;
+                    default: v[s] = nums.Sum(); break;
+                }
+            }
+            vals[k] = v;
+        }
+        var sort = c.Sort.ToLowerInvariant();
+        if (sort == "asc" || sort == "a-z") order = order.OrderBy(k => Num(k).HasValue ? Num(k).Value.ToString("000000000000.####", CultureInfo.InvariantCulture) : k, StringComparer.CurrentCultureIgnoreCase).ToList();
+        else if (sort == "desc" || sort == "z-a") order = order.OrderByDescending(k => k, StringComparer.CurrentCultureIgnoreCase).ToList();
+        else if (sort == "value" || sort == "largest") order = order.OrderByDescending(k => vals[k].Sum()).ToList();
+        else if (sort == "smallest") order = order.OrderBy(k => vals[k].Sum()).ToList();
+        if (c.Top > 0 && order.Count > c.Top) {
+            if (sort == "") order = order.OrderByDescending(k => vals[k].Sum()).Take(c.Top).ToList(); else order = order.Take(c.Top).ToList();
+        }
+        c.Cats = order;
+        c.Values = new double[order.Count, ys.Count];
+        for (int i = 0; i < order.Count; i++) for (int s = 0; s < ys.Count; s++) c.Values[i, s] = vals[order[i]][s];
+    }
+
+    public static double Nice(double v, bool round) {
+        if (v <= 0) return 1;
+        double e = Math.Pow(10, Math.Floor(Math.Log10(v))), f = v / e, n;
+        if (round) n = f < 1.5 ? 1 : f < 3 ? 2 : f < 7 ? 5 : 10; else n = f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10;
+        return n * e;
+    }
+    public static string Short(double v) {
+        double a = Math.Abs(v);
+        if (a >= 1e9) return (v / 1e9).ToString("0.#", CultureInfo.InvariantCulture) + "B";
+        if (a >= 1e6) return (v / 1e6).ToString("0.#", CultureInfo.InvariantCulture) + "M";
+        if (a >= 1e4) return (v / 1e3).ToString("0.#", CultureInfo.InvariantCulture) + "k";
+        return v.ToString(a < 10 && v != Math.Floor(v) ? "0.##" : "#,0.##", CultureInfo.InvariantCulture);
+    }
+    public static string Full(DgChart c, double v) { return c.Prefix + v.ToString(Math.Abs(v) < 10 && v != Math.Floor(v) ? "#,0.###" : "#,0.##", CultureInfo.InvariantCulture) + c.Suffix; }
+
+    // the categories used for colours: one per series (pie: one per x value)
+    public static void Colors(DgDoc d) {
+        var c = d.Chart;
+        var names = c.Type == "pie" || c.Type == "donut" ? c.Cats : c.Series;
+        foreach (var n in names) {
+            var id = "s-" + DgText.Squash(n);
+            if (id == "s-") id = "s-" + Math.Abs(n.GetHashCode());
+            if (d.FindCat(id) == null) d.Cats.Add(new DgCategory { Id = id, Name = n, Auto = true });
+        }
+    }
+    public static string CatId(string n) { var id = "s-" + DgText.Squash(n); return id == "s-" ? "s-" + Math.Abs(n.GetHashCode()) : id; }
+
+    public static void Layout(DgDoc d) {
+        var c = d.Chart;
+        Compute(d);
+        Colors(d);
+        bool pie = c.Type == "pie" || c.Type == "donut", bar = c.Type == "bar";
+        int n = c.Type == "scatter" ? 0 : c.Cats.Count, s = Math.Max(1, c.Series.Count);
+        float left = 70, top = 70, w, h;
+        if (pie) { w = 360; h = 360; left = 40; top = 70; }
+        else if (bar) {
+            float lw = c.Cats.Count == 0 ? 60 : c.Cats.Max(x => DgMeasure.Width(x, 11.5f, 400, false));
+            left = Math.Min(260, Math.Max(70, lw + 22));
+            w = 620; h = Math.Max(160, n * ((c.Stacked || c.Type == "stacked") ? 30 : 12 + 18 * s));
+        } else { w = Math.Max(560, n * (c.Type == "line" || c.Type == "area" ? 46 : (c.Stacked || c.Type == "stacked" ? 44 : 18 + 20 * s))); h = 340; }
+        c.Plot = new System.Drawing.RectangleF(left, top, w, h);
+        // value range
+        double lo = 0, hi = 0;
+        if (c.Type == "scatter") {
+            if (c.Points.Count > 0) { lo = Math.Min(0, c.Points.Min(p => p[1])); hi = c.Points.Max(p => p[1]); }
+        } else if (c.Stacked || c.Type == "stacked") {
+            for (int i = 0; i < n; i++) { double pos = 0, neg = 0; for (int k = 0; k < c.Series.Count; k++) { var v = c.Values[i, k]; if (v >= 0) pos += v; else neg += v; } hi = Math.Max(hi, pos); lo = Math.Min(lo, neg); }
+        } else if (n > 0) {
+            for (int i = 0; i < n; i++) for (int k = 0; k < c.Series.Count; k++) { hi = Math.Max(hi, c.Values[i, k]); lo = Math.Min(lo, c.Values[i, k]); }
+        }
+        if (hi <= lo) hi = lo + 1;
+        double step = Nice((hi - lo) / 5, true);
+        c.Step = step; c.Min = Math.Floor(lo / step) * step; c.Max = Math.Ceiling(hi / step) * step;
+        if (c.Max == c.Min) c.Max = c.Min + step;
+        float legendW = c.Series.Count > 1 || pie ? (pie ? c.Cats : c.Series).Sum(x => DgMeasure.Width(x, 11.5f, 400, false) + 34) : 0;
+        float right = pie ? left + w + 40 + Math.Min(260, (c.Cats.Count == 0 ? 0 : c.Cats.Max(x => DgMeasure.Width(x, 11.5f, 400, false))) + 90) : c.Plot.Right + 30;
+        d.Bounds = System.Drawing.RectangleF.FromLTRB(0, 0, Math.Max(right, Math.Min(legendW, 900) + 60), c.Plot.Bottom + (bar ? 40 : 64));
+    }
+}
+
+public static class DgChartRender {
+    static string N(float v) { return DgRoute.N(v); }
+    public static void Draw(DgDoc d, DgColors c, IDgPainter p, DgView v) {
+        var ch = d.Chart;
+        ch.Hits.Clear();
+        var pl = ch.Plot;
+        string ink = c.Get("ink"), muted = c.Get("muted"), grid = c.Mix("line", "55", "bg");
+        p.Text(24, 34, string.IsNullOrEmpty(d.Title) ? "Chart" : d.Title, 17, 600, ink, "start", false, 1, 0, "dg-ctitle");
+        if (d.Subtitle.Length > 0) p.Text(24, 54, d.Subtitle, 12, 400, muted, "start", false, 1, 0, null);
+        if (ch.Error.Length > 0) { p.Text(24, 80, ch.Error, 12.5f, 500, c.Get("bad"), "start", false, 1, 0, null); return; }
+        bool pie = ch.Type == "pie" || ch.Type == "donut";
+        if (v.ChartLegend) Legend(d, c, p, v);
+        if (pie) { Pie(d, c, p, v); return; }
+        bool bar = ch.Type == "bar", stacked = ch.Stacked || ch.Type == "stacked";
+        Func<double, float> Y = val => pl.Bottom - (float)((val - ch.Min) / (ch.Max - ch.Min)) * pl.Height;
+        Func<double, float> X = val => pl.X + (float)((val - ch.Min) / (ch.Max - ch.Min)) * pl.Width;
+        // grid and value axis
+        p.Begin("dg-axis", null, null);
+        for (double t = ch.Min; t <= ch.Max + ch.Step / 2; t += ch.Step) {
+            if (bar) { float x = X(t); p.Path("M" + N(x) + "," + N(pl.Y) + " L" + N(x) + "," + N(pl.Bottom), null, Math.Abs(t) < 1e-9 ? c.Get("muted") : grid, 1, 0, Math.Abs(t) < 1e-9 ? 0.6f : 1, null); p.Text(x, pl.Bottom + 18, DgChartCalc.Short(t), 10.5f, 400, muted, "middle", true, 1, 0, null); }
+            else { float y = Y(t); p.Path("M" + N(pl.X) + "," + N(y) + " L" + N(pl.Right) + "," + N(y), null, Math.Abs(t) < 1e-9 ? c.Get("muted") : grid, 1, 0, Math.Abs(t) < 1e-9 ? 0.6f : 1, null); p.Text(pl.X - 10, y + 4, DgChartCalc.Short(t), 10.5f, 400, muted, "end", true, 1, 0, null); }
+        }
+        p.End();
+        if (ch.Type == "scatter") { Scatter(d, c, p, v, X, Y); return; }
+        int n = ch.Cats.Count, s = ch.Series.Count;
+        if (n == 0) return;
+        float band = (bar ? pl.Height : pl.Width) / n;
+        // category labels (thinned out when crowded)
+        int every = 1;
+        if (!bar) { float maxw = ch.Cats.Max(x => DgMeasure.Width(x, 11, 400, false)) + 10; every = Math.Max(1, (int)Math.Ceiling(maxw / band)); }
+        for (int i = 0; i < n; i++) {
+            if (i % every != 0) continue;
+            if (bar) p.Text(pl.X - 10, pl.Y + band * i + band / 2 + 4, ch.Cats[i], 11.5f, 400, ink, "end", false, 1, 0, null);
+            else p.Text(pl.X + band * i + band / 2, pl.Bottom + 20, Trunc(ch.Cats[i], band * every - 6), 11, 400, ink, "middle", false, 1, 0, null);
+        }
+        if (ch.Type == "line" || ch.Type == "area") { Lines(d, c, p, v, Y, band); return; }
+        for (int i = 0; i < n; i++) {
+            double posAcc = 0, negAcc = 0;
+            for (int k = 0; k < s; k++) {
+                string sid = DgChartCalc.CatId(ch.Series[k]);
+                if (v.HiddenCats.Contains(sid)) continue;
+                double val = ch.Values[i, k];
+                float a0, a1, b0, b1;
+                if (stacked) {
+                    double from = val >= 0 ? posAcc : negAcc, to = from + val;
+                    if (val >= 0) posAcc = to; else negAcc = to;
+                    float pad = band * 0.18f;
+                    if (bar) { a0 = X(from); a1 = X(to); b0 = pl.Y + band * i + pad; b1 = pl.Y + band * (i + 1) - pad; }
+                    else { a0 = pl.X + band * i + pad; a1 = pl.X + band * (i + 1) - pad; b0 = Y(to); b1 = Y(from); }
+                } else {
+                    float pad = band * 0.16f, bw = (band - 2 * pad) / s;
+                    if (bar) { a0 = X(Math.Min(0, val)); a1 = X(Math.Max(0, val)); b0 = pl.Y + band * i + pad + bw * k + 1; b1 = b0 + bw - 2; }
+                    else { a0 = pl.X + band * i + pad + bw * k + 1; a1 = a0 + bw - 2; b0 = Y(Math.Max(0, val)); b1 = Y(Math.Min(0, val)); }
+                }
+                var r = bar ? System.Drawing.RectangleF.FromLTRB(Math.Min(a0, a1), b0, Math.Max(a0, a1), b1) : System.Drawing.RectangleF.FromLTRB(a0, Math.Min(b0, b1), a1, Math.Max(b0, b1));
+                string tip = ch.Cats[i] + (s > 1 ? "  \u00B7  " + ch.Series[k] : "") + ": " + DgChartCalc.Full(ch, val);
+                bool hov = v.Hover == "h" + i + "_" + k;
+                p.Begin("dg-bar", null, "data-series=\"" + sid + "\" data-tip=\"" + DgSvgPainter.Esc(tip) + "\"");
+                float rad = Math.Min(4, Math.Min(r.Width, r.Height) / 2);
+                p.Rect(r.X, r.Y, Math.Max(0.5f, r.Width), Math.Max(0.5f, r.Height), stacked ? 1.5f : rad, c.Get("c:" + sid), hov ? c.Get("ink") : null, 1.5f, 0, hov ? 1 : 0.92f, "dg-bv");
+                if (ch.Labels && !stacked) {
+                    if (bar) p.Text(r.Right + 5, r.Y + r.Height / 2 + 4, DgChartCalc.Short(val), 10.5f, 500, muted, "start", true, 1, 0, null);
+                    else p.Text(r.X + r.Width / 2, r.Y - 5, DgChartCalc.Short(val), 10.5f, 500, muted, "middle", true, 1, 0, null);
+                } else if (ch.Labels && stacked && (bar ? r.Width : r.Height) > 16) p.Text(r.X + r.Width / 2, r.Y + r.Height / 2 + 4, DgChartCalc.Short(val), 10, 600, c.Get("bg"), "middle", true, 1, 0, null);
+                p.End();
+                ch.Hits.Add(new DgHit { R = r, Tip = tip, Series = "h" + i + "_" + k });
+            }
+        }
+    }
+
+    static string Trunc(string s, float w) {
+        if (DgMeasure.Width(s, 11, 400, false) <= w || s.Length < 4) return s;
+        while (s.Length > 3 && DgMeasure.Width(s + "\u2026", 11, 400, false) > w) s = s.Substring(0, s.Length - 1);
+        return s + "\u2026";
+    }
+
+    static void Lines(DgDoc d, DgColors c, IDgPainter p, DgView v, Func<double, float> Y, float band) {
+        var ch = d.Chart; var pl = ch.Plot; int n = ch.Cats.Count;
+        for (int k = 0; k < ch.Series.Count; k++) {
+            string sid = DgChartCalc.CatId(ch.Series[k]);
+            if (v.HiddenCats.Contains(sid)) continue;
+            var pts = new List<System.Drawing.PointF>();
+            for (int i = 0; i < n; i++) pts.Add(new System.Drawing.PointF(pl.X + band * i + band / 2, Y(ch.Values[i, k])));
+            p.Begin("dg-series", null, "data-series=\"" + sid + "\"");
+            var line = new StringBuilder();
+            for (int i = 0; i < pts.Count; i++) line.Append((i == 0 ? "M" : " L") + DgRoute.P(pts[i]));
+            if (ch.Type == "area" && pts.Count > 1) {
+                float base0 = Y(Math.Max(ch.Min, 0));
+                p.Path(line + " L" + N(pts[pts.Count - 1].X) + "," + N(base0) + " L" + N(pts[0].X) + "," + N(base0) + " Z", c.Get("c:" + sid), null, 0, 0, 0.18f, "dg-area");
+            }
+            p.Path(line.ToString(), null, c.Get("c:" + sid), 2.4f, 0, 1, "dg-cline");
+            for (int i = 0; i < pts.Count; i++) {
+                string tip = ch.Cats[i] + (ch.Series.Count > 1 ? "  \u00B7  " + ch.Series[k] : "") + ": " + DgChartCalc.Full(ch, ch.Values[i, k]);
+                bool hov = v.Hover == "h" + i + "_" + k;
+                p.Begin("dg-pt", null, "data-series=\"" + sid + "\" data-tip=\"" + DgSvgPainter.Esc(tip) + "\"");
+                p.Ellipse(pts[i].X, pts[i].Y, hov ? 6 : 4, hov ? 6 : 4, c.Get("bg"), c.Get("c:" + sid), 2.2f, 1, "dg-dot");
+                if (ch.Labels) p.Text(pts[i].X, pts[i].Y - 10, DgChartCalc.Short(ch.Values[i, k]), 10.5f, 500, c.Get("muted"), "middle", true, 1, 0, null);
+                p.End();
+                ch.Hits.Add(new DgHit { R = new System.Drawing.RectangleF(pts[i].X - 9, pts[i].Y - 9, 18, 18), Tip = tip, Series = "h" + i + "_" + k });
+            }
+            p.End();
+        }
+    }
+
+    static void Scatter(DgDoc d, DgColors c, IDgPainter p, DgView v, Func<double, float> Xv, Func<double, float> Y) {
+        var ch = d.Chart; var pl = ch.Plot;
+        if (ch.Points.Count == 0) return;
+        double xlo = ch.Points.Min(q => q[0]), xhi = ch.Points.Max(q => q[0]);
+        if (xhi <= xlo) xhi = xlo + 1;
+        double st = DgChartCalc.Nice((xhi - xlo) / 6, true), x0 = Math.Floor(xlo / st) * st, x1 = Math.Ceiling(xhi / st) * st;
+        Func<double, float> X = val => pl.X + (float)((val - x0) / (x1 - x0)) * pl.Width;
+        for (double t = x0; t <= x1 + st / 2; t += st) p.Text(X(t), pl.Bottom + 18, DgChartCalc.Short(t), 10.5f, 400, c.Get("muted"), "middle", true, 1, 0, null);
+        p.Text(pl.X + pl.Width / 2, pl.Bottom + 40, ch.X.Length > 0 ? ch.X : (ch.Headers.Count > 0 ? ch.Headers[0] : ""), 11.5f, 500, c.Get("muted"), "middle", false, 1, 0, null);
+        int idx = 0;
+        foreach (var q in ch.Points) {
+            string sid = DgChartCalc.CatId(ch.Series[(int)q[2]]);
+            if (v.HiddenCats.Contains(sid)) { idx++; continue; }
+            string tip = ch.Series[(int)q[2]] + ": " + DgChartCalc.Short(q[0]) + ", " + DgChartCalc.Full(ch, q[1]);
+            bool hov = v.Hover == "h" + idx;
+            p.Begin("dg-pt", null, "data-series=\"" + sid + "\" data-tip=\"" + DgSvgPainter.Esc(tip) + "\"");
+            p.Ellipse(X(q[0]), Y(q[1]), hov ? 7 : 5, hov ? 7 : 5, c.Get("c:" + sid), hov ? c.Get("ink") : null, 1.5f, 0.85f, "dg-dot");
+            p.End();
+            ch.Hits.Add(new DgHit { R = new System.Drawing.RectangleF(X(q[0]) - 7, Y(q[1]) - 7, 14, 14), Tip = tip, Series = "h" + idx });
+            idx++;
+        }
+    }
+
+    static void Pie(DgDoc d, DgColors c, IDgPainter p, DgView v) {
+        var ch = d.Chart; var pl = ch.Plot;
+        int n = ch.Cats.Count; if (n == 0 || ch.Series.Count == 0) return;
+        var ids = ch.Cats.Select(DgChartCalc.CatId).ToList();
+        double total = 0; for (int i = 0; i < n; i++) if (!v.HiddenCats.Contains(ids[i])) total += Math.Max(0, ch.Values[i, 0]);
+        if (total <= 0) return;
+        float cx = pl.X + pl.Width / 2, cy = pl.Y + pl.Height / 2, r = pl.Width / 2, ri = ch.Type == "donut" ? r * 0.58f : 0;
+        double a = -Math.PI / 2;
+        for (int i = 0; i < n; i++) {
+            if (v.HiddenCats.Contains(ids[i])) continue;
+            double val = Math.Max(0, ch.Values[i, 0]), sweep = val / total * Math.PI * 2;
+            bool hov = v.Hover == "h" + i;
+            float rr = hov ? r + 6 : r;
+            var sb = new StringBuilder();
+            int steps = Math.Max(2, (int)(sweep / (Math.PI * 2) * 120));
+            for (int k = 0; k <= steps; k++) { double t = a + sweep * k / steps; sb.Append((k == 0 ? "M" : " L") + N(cx + (float)Math.Cos(t) * rr) + "," + N(cy + (float)Math.Sin(t) * rr)); }
+            if (ri > 0) for (int k = steps; k >= 0; k--) { double t = a + sweep * k / steps; sb.Append(" L" + N(cx + (float)Math.Cos(t) * ri) + "," + N(cy + (float)Math.Sin(t) * ri)); }
+            else sb.Append(" L" + N(cx) + "," + N(cy));
+            sb.Append(" Z");
+            string tip = ch.Cats[i] + ": " + DgChartCalc.Full(ch, val) + "  (" + (val / total * 100).ToString("0.#", CultureInfo.InvariantCulture) + "%)";
+            p.Begin("dg-slice", null, "data-series=\"" + ids[i] + "\" data-tip=\"" + DgSvgPainter.Esc(tip) + "\"");
+            p.Path(sb.ToString(), c.Get("c:" + ids[i]), c.Get("bg"), 1.5f, 0, 0.95f, "dg-sv");
+            double mid = a + sweep / 2;
+            if (sweep > 0.25) {
+                float lr = ri > 0 ? (r + ri) / 2 : r * 0.64f;
+                p.Text(cx + (float)Math.Cos(mid) * lr, cy + (float)Math.Sin(mid) * lr + 4, (val / total * 100).ToString("0", CultureInfo.InvariantCulture) + "%", 11.5f, 600, "#ffffff", "middle", false, 1, 0, null);
+            }
+            p.End();
+            ch.Hits.Add(new DgHit { C = new System.Drawing.PointF(cx, cy), Radius = r, R = new System.Drawing.RectangleF((float)a, (float)(a + sweep), ri, 0), Tip = tip, Series = "h" + i });
+            a += sweep;
+        }
+        if (ri > 0) {
+            p.Text(cx, cy - 2, DgChartCalc.Short(total), 22, 600, c.Get("ink"), "middle", false, 1, 0, null);
+            p.Text(cx, cy + 18, ch.Series[0], 11.5f, 400, c.Get("muted"), "middle", false, 1, 0, null);
+        }
+        // the slices listed on the right
+        float lx = pl.Right + 40, ly = pl.Y + 10;
+        for (int i = 0; i < n && i < 16; i++) {
+            float o = v.HiddenCats.Contains(ids[i]) ? 0.35f : 1;
+            p.Rect(lx, ly - 9, 11, 11, 3, c.Get("c:" + ids[i]), null, 0, 0, o);
+            p.Text(lx + 18, ly, ch.Cats[i], 11.5f, 400, c.Get("ink"), "start", false, o, 0, null);
+            p.Text(lx + 18, ly + 15, DgChartCalc.Full(ch, ch.Values[i, 0]), 10.5f, 400, c.Get("muted"), "start", true, o, 0, null);
+            ly += 34;
+        }
+    }
+
+    static void Legend(DgDoc d, DgColors c, IDgPainter p, DgView v) {
+        var ch = d.Chart;
+        if (ch.Type == "pie" || ch.Type == "donut" || ch.Series.Count < 2) return;
+        float x = ch.Plot.X, y = 58;
+        foreach (var s in ch.Series) {
+            string sid = DgChartCalc.CatId(s);
+            float o = v.HiddenCats.Contains(sid) ? 0.35f : 1;
+            p.Rect(x, y - 9, 11, 11, 3, c.Get("c:" + sid), null, 0, 0, o);
+            p.Text(x + 17, y, s, 11.5f, 400, c.Get("ink"), "start", false, o, 0, null);
+            x += DgMeasure.Width(s, 11.5f, 400, false) + 34;
+        }
+    }
+    // the hit under a point (canvas units)
+    public static DgHit HitAt(DgChart ch, System.Drawing.PointF w) {
+        foreach (var h in ch.Hits) {
+            if (h.Radius > 0) {
+                float dx = w.X - h.C.X, dy = w.Y - h.C.Y, dist = (float)Math.Sqrt(dx * dx + dy * dy);
+                if (dist > h.Radius + 6 || dist < h.R.Width) continue;
+                double ang = Math.Atan2(dy, dx); while (ang < h.R.X) ang += Math.PI * 2; while (ang > h.R.X + Math.PI * 2) ang -= Math.PI * 2;
+                if (ang >= h.R.X && ang <= h.R.Y) return h;
+            } else if (h.R.Contains(w)) return h;
+        }
+        return null;
+    }
+}
+
+// ---- Excel .xlsx files (a zip of XML): sheet names and the cells of a sheet as text; dates as yyyy-MM-dd.
+public static class DgXlsx {
+    static readonly System.Xml.Linq.XNamespace M = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    static readonly System.Xml.Linq.XNamespace R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    static readonly System.Xml.Linq.XNamespace PR = "http://schemas.openxmlformats.org/package/2006/relationships";
+
+    static System.Xml.Linq.XDocument Load(System.IO.Compression.ZipArchive z, string name) {
+        var e = z.GetEntry(name) ?? z.Entries.FirstOrDefault(x => string.Equals(x.FullName, name, StringComparison.OrdinalIgnoreCase));
+        if (e == null) return null;
+        using (var s = e.Open()) return System.Xml.Linq.XDocument.Load(s);
+    }
+    static System.IO.Compression.ZipArchive Open(string path) {
+        var fs = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete);
+        return new System.IO.Compression.ZipArchive(fs, System.IO.Compression.ZipArchiveMode.Read, false);
+    }
+
+    public static List<string> Sheets(string path) {
+        using (var z = Open(path)) {
+            var wb = Load(z, "xl/workbook.xml");
+            return wb == null ? new List<string>() : wb.Descendants(M + "sheet").Select(x => (string)x.Attribute("name")).ToList();
+        }
+    }
+
+    static int Col(string cellRef) {
+        int n = 0;
+        foreach (char ch in cellRef) { if (ch >= 'A' && ch <= 'Z') n = n * 26 + (ch - 'A' + 1); else if (ch >= 'a' && ch <= 'z') n = n * 26 + (ch - 'a' + 1); else break; }
+        return n - 1;
+    }
+
+    public static List<List<string>> Read(string path, string sheet, int maxRows) {
+        var rows = new List<List<string>>();
+        using (var z = Open(path)) {
+            var wb = Load(z, "xl/workbook.xml");
+            if (wb == null) throw new Exception("Not an Excel workbook (.xlsx).");
+            var sheets = wb.Descendants(M + "sheet").ToList();
+            var sh = sheets.FirstOrDefault(x => string.Equals((string)x.Attribute("name"), sheet, StringComparison.OrdinalIgnoreCase)) ?? sheets.FirstOrDefault();
+            if (sh == null) return rows;
+            string rid = (string)sh.Attribute(R + "id");
+            var rels = Load(z, "xl/_rels/workbook.xml.rels");
+            string target = rels == null ? null : rels.Descendants(PR + "Relationship").Where(r => (string)r.Attribute("Id") == rid).Select(r => (string)r.Attribute("Target")).FirstOrDefault();
+            if (target == null) target = "worksheets/sheet1.xml";
+            target = target.StartsWith("/") ? target.Substring(1) : "xl/" + target;
+            // shared strings
+            var shared = new List<string>();
+            var ss = Load(z, "xl/sharedStrings.xml");
+            if (ss != null) foreach (var si in ss.Root.Elements(M + "si")) shared.Add(string.Concat(si.Descendants(M + "t").Select(t => t.Value)));
+            // which styles are dates
+            var isDate = new List<bool>();
+            var st = Load(z, "xl/styles.xml");
+            if (st != null) {
+                var custom = new Dictionary<int, string>();
+                var nf = st.Root.Element(M + "numFmts");
+                if (nf != null) foreach (var f in nf.Elements(M + "numFmt")) custom[(int)f.Attribute("numFmtId")] = (string)f.Attribute("formatCode");
+                var xfs = st.Root.Element(M + "cellXfs");
+                if (xfs != null) foreach (var xf in xfs.Elements(M + "xf")) {
+                    int id = (int?)xf.Attribute("numFmtId") ?? 0; string code;
+                    bool date = (id >= 14 && id <= 22) || (id >= 45 && id <= 47) || (custom.TryGetValue(id, out code) && Regex.IsMatch(Regex.Replace(code, "\"[^\"]*\"|\\[[^\\]]*\\]", ""), "[dmyhs]", RegexOptions.IgnoreCase) && !code.Contains("0.0"));
+                    isDate.Add(date);
+                }
+            }
+            var ws = Load(z, target);
+            if (ws == null) return rows;
+            foreach (var row in ws.Descendants(M + "row")) {
+                var cells = new List<string>();
+                foreach (var c in row.Elements(M + "c")) {
+                    string rf = (string)c.Attribute("r");
+                    int ci = rf != null ? Col(rf) : cells.Count;
+                    while (cells.Count < ci) cells.Add("");
+                    string t = (string)c.Attribute("t") ?? "", v = (string)c.Element(M + "v") ?? "";
+                    string val;
+                    if (t == "s") { int k; val = int.TryParse(v, out k) && k < shared.Count ? shared[k] : ""; }
+                    else if (t == "inlineStr") val = string.Concat(c.Descendants(M + "t").Select(x => x.Value));
+                    else if (t == "b") val = v == "1" ? "TRUE" : "FALSE";
+                    else if (t == "str" || t == "e") val = v;
+                    else {
+                        int s = (int?)c.Attribute("s") ?? 0; double num;
+                        if (v.Length > 0 && s < isDate.Count && isDate[s] && double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out num) && num > 0 && num < 2958466) {
+                            var dt = DateTime.FromOADate(num);
+                            val = dt.TimeOfDay.TotalSeconds < 1 ? dt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) : (num < 1 ? dt.ToString("HH:mm:ss", CultureInfo.InvariantCulture) : dt.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture));
+                        } else if (double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out num)) val = num.ToString("R", CultureInfo.InvariantCulture);
+                        else val = v;
+                    }
+                    if (cells.Count == ci) cells.Add(val); else cells[ci] = val;
+                }
+                int rn; var rr = (string)row.Attribute("r");
+                if (rr != null && int.TryParse(rr, out rn)) while (rows.Count < rn - 1) rows.Add(new List<string>());
+                rows.Add(cells);
+                if (maxRows > 0 && rows.Count >= maxRows) break;
+            }
+        }
+        while (rows.Count > 0 && rows[rows.Count - 1].All(x => x.Length == 0)) rows.RemoveAt(rows.Count - 1);
+        while (rows.Count > 0 && rows[0].All(x => x.Length == 0)) rows.RemoveAt(0);
+        int w = rows.Count == 0 ? 0 : rows.Max(r => r.Count);
+        foreach (var r in rows) while (r.Count < w) r.Add("");
+        return rows;
+    }
+
+    // rows as CSV text (quoted where needed)
+    public static string ToCsv(List<List<string>> rows) {
+        var sb = new StringBuilder();
+        foreach (var r in rows) sb.Append(string.Join(",", r.Select(x => x.IndexOfAny(new[] { ',', '"', '\n', '\r' }) >= 0 ? "\"" + x.Replace("\"", "\"\"").Replace("\r", " ").Replace("\n", " ") + "\"" : x)) + "\r\n");
+        return sb.ToString();
+    }
+}
+
 public static class DgAssets {
     public static readonly string Js = @"function (root, D) {
   var P = D.p, NS = 'http://www.w3.org/2000/svg', O = D.opt;
@@ -23872,7 +24410,18 @@ public static class DgAssets {
     if (!stage.contains(e.target)) return;
     var id = nodeAt(e.target);
     if (id !== st.hover) { st.hover = id; highlight(); }
+    var tp = e.target.closest ? e.target.closest('[data-tip]') : null;
+    if (tp && root.contains(tp) && !tp.classList.contains(P + '-off')) {
+      if (!tipEl) { tipEl = document.createElement('div'); tipEl.className = P + '-tip'; root.appendChild(tipEl); }
+      var rr = root.getBoundingClientRect();
+      tipEl.textContent = tp.getAttribute('data-tip'); tipEl.style.display = 'block';
+      var x = e.clientX - rr.left + 14, y = e.clientY - rr.top + 14;
+      if (x + tipEl.offsetWidth > rr.width - 6) x = e.clientX - rr.left - tipEl.offsetWidth - 10;
+      tipEl.style.left = x + 'px'; tipEl.style.top = y + 'px';
+      qa('.' + P + '-hov').forEach(function (h) { if (h !== tp) h.classList.remove(P + '-hov'); }); tp.classList.add(P + '-hov');
+    } else if (tipEl && tipEl.style.display !== 'none') { tipEl.style.display = 'none'; qa('.' + P + '-hov').forEach(function (h) { h.classList.remove(P + '-hov'); }); }
   }
+  var tipEl = null;
   function onUp() { if (!drag) return; justDragged = drag.moved; drag = null; stage.style.cursor = ''; }
   function onClick(e) {
     if (justDragged) { justDragged = false; return; }
@@ -23895,6 +24444,7 @@ public static class DgAssets {
       el.classList.toggle(P + '-off', !!(c && st.hidden[c]));
       el.classList.toggle(P + '-cut', !!(st.down[f] || st.down[t]));
     });
+    qa('[data-series]').forEach(function (el) { el.classList.toggle(P + '-off', !!st.hidden[el.getAttribute('data-series')]); });
     qa(cls('status')).forEach(function (el) { var g = el.closest('[data-node]'); if (!g) return; var n = g.getAttribute('data-node'); var s = st.down[n] ? 'down' : (D.nodes[n] && D.nodes[n].s) || 'ok'; el.style.fill = 'var(--' + (s === 'down' || s === 'bad' ? 'bad' : s === 'warn' ? 'warn' : 'ok') + ')'; });
   }
 
@@ -24030,6 +24580,7 @@ public static class DgAssets {
   var leg = q(cls('legend'));
   if (leg) {
     var used = {}; D.links.forEach(function (l) { if (l.c) used[l.c] = 1; });
+    if (D.chart) Object.keys(D.cats).forEach(function (c) { used[c] = 1; });
     Object.keys(D.cats).forEach(function (c) {
       if (!used[c]) return;
       var b = document.createElement('button');
@@ -24095,6 +24646,12 @@ public static class DgAssets {
 .__P__-dim .__P__-node:not(.__P__-on){opacity:.22}
 .__P__-dim .__P__-link:not(.__P__-on){opacity:.15}
 .__P__-link.__P__-off{opacity:.1!important}
+[data-series].__P__-off{opacity:.06}
+[data-series]{transition:opacity .25s}
+.__P__-hov .__P__-bv,.__P__-hov .__P__-sv{stroke:var(--ink);stroke-width:1.5}
+.__P__-hov .__P__-dot{stroke-width:3.5}
+.__P__-bar,.__P__-pt,.__P__-slice{cursor:pointer}
+.__P__-tip{position:absolute;z-index:9;display:none;pointer-events:none;padding:6px 10px;border-radius:6px;background:var(--panel);border:1px solid var(--btnLine);font-size:12.5px;white-space:nowrap;box-shadow:0 8px 20px rgba(0,0,0,.25)}
 .__P__-link.__P__-cut .__P__-line{stroke-dasharray:3 5}
 .__P__-down .__P__-box{stroke:var(--bad)!important;stroke-width:2!important}
 .__P__-sel .__P__-box{stroke:var(--sel)!important;stroke-width:2!important}
@@ -24154,7 +24711,7 @@ public static class DgAssets {
 function Initialize-Diagrams {
     if ('DgDoc' -as [type]) { return $true }
     $old = [System.Windows.Forms.Cursor]::Current; [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::WaitCursor
-    try { Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing, System.Core -TypeDefinition $DgSource -ErrorAction Stop; $true }
+    try { Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem; Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing, System.Core, System.Xml, System.Xml.Linq, System.IO.Compression, System.IO.Compression.FileSystem -TypeDefinition $DgSource -ErrorAction Stop; $true }
     catch { Write-Log "diagram engine: $_"; [void][System.Windows.Forms.MessageBox]::Show("The diagram engine couldn't start:`n$($_.Exception.Message)", 'Diagram studio'); $false }
     finally { [System.Windows.Forms.Cursor]::Current = $old }
 }
@@ -24799,7 +25356,7 @@ function Set-DiagramColors {
     try {
         $ed.SelectAll(); $ed.SelectionColor = $C.Fore
         $paint = { param($rx, $col, $grp) foreach ($m in [regex]::Matches($t, $rx, 'Multiline')) { $g = $m.Groups[$grp]; if ($g.Length) { $ed.Select($g.Index, $g.Length); $ed.SelectionColor = $col } } }
-        & $paint '^\s*(title|subtitle|theme|mode|font|mono|layout|direction|dir|graph|flowchart|route|routing|spacing|radius|hide|show|category|cat|flow|lanes|lane|group|subgraph|end|style|hint|click)\b' $C.Accent 1
+        & $paint '^\s*(title|subtitle|theme|mode|font|mono|layout|direction|dir|graph|flowchart|route|routing|spacing|radius|hide|show|category|cat|flow|lanes|lane|group|subgraph|end|style|hint|click|chart|data|x|y|series|agg|sort|top|labels|stacked|prefix|suffix)\b' $C.Accent 1
         & $paint '^\s*([A-Za-z_][\w\-]*)\s*:' $C.Purple 1
         & $paint '^\s+(desc|description|tags|lines|line|items|url|link|metric|badge|status|note)\b' $C.Green 1
         & $paint '(\s\[[^\]\r\n]*\])\s*$' $C.Dim 1
@@ -24854,10 +25411,11 @@ function Update-DiagramList {
 function Set-DiagramNodeAttr([string]$Id, [string]$Key, $Value) { Set-DiagramText ([DgText]::SetNodeAttr($DgUI.Text, $Id, $Key, $Value)) }
 function Format-DiagramWords($Lines) { (@($Lines | Where-Object { $_ -ne '' } | ForEach-Object { '"' + ($_ -replace '"', "'") + '"' }) -join ' ') }
 
-function Add-DiagramNode([float]$X, [float]$Y) {
-    $i = 1; while ($DgUI.Doc.Find("n$i")) { $i++ }
-    $id = "n$i"
-    $line = "${id}: New shape [at $([int]$X) $([int]$Y)]"
+function Add-DiagramNode([float]$X, [float]$Y, [switch]$Text) {
+    $pre = if ($Text) { 't' } else { 'n' }
+    $i = 1; while ($DgUI.Doc.Find("$pre$i")) { $i++ }
+    $id = "$pre$i"
+    $line = if ($Text) { "${id}: Your text [shape text, at $([int]$X) $([int]$Y)]" } else { "${id}: New shape [at $([int]$X) $([int]$Y)]" }
     Set-DiagramText ([DgText]::AddLine($DgUI.Text, $line))
     $DgUI.Canvas.Select([string[]]@($id))
 }
@@ -24975,7 +25533,7 @@ function Update-DiagramProps {
         Add-DgProp $p 'Title' (New-DgBox $node.Label { param($v) Set-DiagramText ([DgText]::SetNodeLabel($DgUI.Text, $DgUI.PropId, $v)) }) | Out-Null
         Add-DgProp $p 'Badge (short code on the card)' (New-DgBox $node.Badge { param($v) Set-DiagramNodeAttr $DgUI.PropId 'badge' $(if ($v) { $v } else { $null }) }) 140 | Out-Null
         Add-DgProp $p 'Category (colour; type a new name to add one)' (New-DgCombo (@('(none)') + $cats) $(if ($node.Cat) { $node.Cat } else { '(none)' }) { param($v) Set-DiagramNodeAttr $DgUI.PropId 'cat' $(if ($v -and $v -ne '(none)') { $v -replace '\W', '' } else { $null }) } -Editable) | Out-Null
-        $shapes = @('auto', 'card', 'rounded', 'rect', 'pill', 'circle', 'diamond', 'hexagon', 'parallelogram', 'cylinder', 'doc', 'note', 'actor', 'table')
+        $shapes = @('auto', 'card', 'rounded', 'rect', 'pill', 'circle', 'diamond', 'hexagon', 'parallelogram', 'cylinder', 'doc', 'note', 'actor', 'table', 'text')
         Add-DgProp $p 'Shape' (New-DgCombo $shapes $(if ($node.Shape) { $node.Shape } else { 'auto' }) { param($v) Set-DiagramNodeAttr $DgUI.PropId 'shape' $(if ($v -ne 'auto') { $v } else { $null }) }) 160 | Out-Null
         if ($d.LaneMode) {
             $lanes = @('auto') + @(for ($i = 0; $i -lt [Math]::Max($d.Lanes.Count, 1); $i++) { "$($i + 1)  $(if ($i -lt $d.Lanes.Count) { $d.Lanes[$i] })" })
@@ -25018,6 +25576,7 @@ function Update-DiagramProps {
         $row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.AutoSize = $true; $row.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0)
         [void](New-DgColorButton $row 'Colour' $edge.Color { param($v) & $DgUI.SetEdge 'color' $v })
         [void](New-Button 'Delete' 'Delete this link (its whole line in the text)' { Remove-DiagramSelection } $row $Glyph.Delete 2)
+        if (-not [float]::IsNaN($edge.LabelAt.X)) { [void](New-Button 'Label back' 'Put the label back in the middle of the link' { & $DgUI.SetEdge 'labelat' $null } $row $Glyph.Refresh 2) }
         $p.Controls.Add($row)
         New-TbLabel $p 'A line like  a -> b, c  makes several links: changes here apply to all of them.' -Dim | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0) }
     } else {
@@ -25271,6 +25830,8 @@ function Show-DiagramStudio([string]$Text = '') {
     $left.Dock = 'Left'; $left.Width = Px 430; $left.BackColor = $C.Bg
     $tabs = New-TabSet $left
     $pText = Add-ApiTab $tabs 'Text'
+    $DgUI.Tabs = $tabs
+    Add-DiagramDataTab $tabs
     $pSaved = Add-ApiTab $tabs 'Saved'
     $ed = New-TbRtb; $ed.Dock = 'Fill'; $ed.AcceptsTab = $true; $ed.WordWrap = $false
     $DgUI.Editor = $ed
@@ -25350,6 +25911,7 @@ function Show-DiagramStudio([string]$Text = '') {
     $cv.add_DeleteRequested({ Remove-DiagramSelection })
     $cv.add_NodeOpened({ if ($DgUI.Canvas.Editable) { Edit-DiagramLabel } })
     $cv.add_CopyRequested({ [void](Copy-DiagramSelection) })
+    $cv.add_LabelMoved({ param($src, $e) $le = $src.MovedLabel; if ($le -and $le.SrcLine -ge 0) { Set-DiagramText ([DgText]::SetEdgeAttr($DgUI.Text, $le.SrcLine, 'labelat', "$([int]$le.LabelAt.X) $([int]$le.LabelAt.Y)")) } })
     $cv.add_PasteRequested({ Paste-DiagramClip })
     $cv.add_DuplicateRequested({ Copy-DiagramDuplicate })
     $cm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
@@ -25363,6 +25925,7 @@ function Show-DiagramStudio([string]$Text = '') {
         $n = $cv.NodeAt($w)
         if ($n -and -not $cv.View.Selected.Contains($n.Id)) { $cv.Select([string[]]@($n.Id)) }
         [void](Add-MenuItem $src 'Add a shape here' { Add-DiagramNode $DgUI.MenuAt.X $DgUI.MenuAt.Y } $Glyph.Add)
+        [void](Add-MenuItem $src 'Add text here' { Add-DiagramNode $DgUI.MenuAt.X $DgUI.MenuAt.Y -Text } $Glyph.Edit)
         $g = if (-not $n) { $cv.GroupAt($w) } else { $null }
         if ($g) { $cv.Select([string[]]@($g.Members)) }
         if ($cv.View.Selected.Count) {
@@ -25429,13 +25992,14 @@ web: Web app [badge WEB, prod, lane 1, status ok, spark]
   lines "First line under the title" "Second line"
   items "Device A" "TAP" "Device B"              small boxes inside; link them as web.1 or web.TAP
 db[(Orders DB)]   a([Pill])   b{Decision?}   c((Circle))   d{{Hex}}   e[/Lean/]    (Mermaid shapes)
-[shape card|rounded|rect|pill|circle|diamond|hexagon|parallelogram|cylinder|doc|note|actor|table]
+[shape card|rounded|rect|pill|circle|diamond|hexagon|parallelogram|cylinder|doc|note|actor|table|text]   (text = free text, no box)
 [fill #123456, stroke #..., color #..., font 16, bold, dashed, size 240 90, at 120 80, url "https://..."]
 
 LINKS
 a -> b            a --> b        a -.-> b (dashed)     a ==> b (thick)      a --- b (no arrow)     a <-> b (both)
 a -yes-> b        a -- yes --> b     a -->|yes| b      a -> b, c, d     a & b -> c     a -> b -> c
 a -> b [prod, animate, density 2, dashed, dotted, curve, straight, both, noarrow, arrow both, label "x", via 300 120]
+                  labelat 340 120  = where the label sits (drag it on the canvas)
 
 GROUPS
 group core "Core services" [svc, dashed] { a, b, c }      or      subgraph core [Core services] ... end
@@ -25451,6 +26015,206 @@ Graph TD / flowchart LR Mermaid text works as it is.
     $f.Show($DgUI.Form)
 }
 
+# ---- Data tab: CSV / TSV / Excel (pasted or a file) into a chart, a graph (from -> to) or a tree (id -> parent).
+function Add-DiagramDataTab($Tabs) {
+    $pData = Add-ApiTab $Tabs 'Data'
+    $fl = New-Object System.Windows.Forms.FlowLayoutPanel
+    $fl.Dock = 'Fill'; $fl.FlowDirection = 'TopDown'; $fl.WrapContents = $false; $fl.AutoScroll = $true; $fl.BackColor = $C.Bg
+    $fl.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 8))
+    $pData.Controls.Add($fl)
+    $st = @{ Name = 'Data'; File = ''; Busy = $false }
+    $DgUI.Data = $st
+    $row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.AutoSize = $true; $row.WrapContents = $true; $row.BackColor = $C.Bg; $row.MaximumSize = New-Object System.Drawing.Size((Px 410), 0)
+    [void](New-Button 'Open file...' 'A .csv, .tsv, .txt or Excel .xlsx file' { Open-DiagramDataFile } $row $Glyph.Open 2)
+    [void](New-Button 'Paste' 'Cells copied from Excel, a database tool or CSV text' { $t = ''; try { $t = [System.Windows.Forms.Clipboard]::GetText() } catch { }; if ($t) { $DgUI.Data.Name = 'Data'; $DgUI.Data.File = ''; $DgUI.Data.Sheet.Visible = $false; $DgUI.Data.SheetLabel.Visible = $false; $DgUI.Data.Box.Text = $t } } $row $Glyph.Paste 2)
+    [void](New-Button 'Sample' 'Example sales data to try it' { $DgUI.Data.Name = 'Sales'; $DgUI.Data.Box.Text = "Month,Region,Sales,Costs`r`nJan,EU,1200,800`r`nFeb,EU,1400,950`r`nMar,US,1100,1020`r`nApr,US,1700,990`r`nMay,EU,2100,1200`r`nJun,US,1950,1300`r`nJan,US,300,150" } $row $Glyph.Apps 2)
+    $fl.Controls.Add($row)
+    $st.SheetLabel = New-TbLabel $fl 'Sheet' -Dim; $st.SheetLabel.Visible = $false
+    $st.Sheet = New-TbCombo $fl @() 250; $st.Sheet.Visible = $false
+    $fl.Controls.SetChildIndex($st.SheetLabel, $fl.Controls.IndexOf($st.Sheet))
+    $st.Sheet.add_SelectedIndexChanged({ param($src, $e) if (-not $DgUI.Data.Busy) { Read-DiagramDataSheet } })
+    New-TbLabel $fl 'Data (first row = column names)' -Dim | Out-Null
+    $box = New-TbBox -Mono -Multi; $box.ScrollBars = 'Both'; $box.WordWrap = $false; $box.AcceptsReturn = $true; $box.Height = Px 170; $box.Width = Px 400
+    $fl.Controls.Add($box); $st.Box = $box
+    $st.Info = New-TbLabel $fl '' -Dim
+    New-TbLabel $fl 'Make' -Dim | Out-Null
+    $st.Kind = New-TbCombo $fl @('Chart', 'Links (from -> to)', 'Tree (id -> parent)') 250; $st.Kind.SelectedIndex = 0
+    $st.L1 = New-TbLabel $fl 'X axis / categories' -Dim
+    $st.C1 = New-TbCombo $fl @() 250
+    $st.L2 = New-TbLabel $fl 'Values (tick one or more)' -Dim
+    $st.Vals = New-Object System.Windows.Forms.CheckedListBox
+    $st.Vals.CheckOnClick = $true; $st.Vals.BorderStyle = 'FixedSingle'; $st.Vals.BackColor = $C.Bg; $st.Vals.ForeColor = $C.Fore; $st.Vals.Width = Px 250; $st.Vals.Height = Px 90; $st.Vals.IntegralHeight = $false
+    $fl.Controls.Add($st.Vals)
+    $st.C2 = New-TbCombo $fl @() 250
+    $st.L3 = New-TbLabel $fl 'Label (optional)' -Dim
+    $st.C3 = New-TbCombo $fl @() 250
+    $st.L4 = New-TbLabel $fl 'Colour by (optional)' -Dim
+    $st.C4 = New-TbCombo $fl @() 250
+    $st.LT = New-TbLabel $fl 'Chart' -Dim
+    $st.Type = New-TbCombo $fl @('column', 'bar', 'stacked column', 'stacked bar', 'line', 'area', 'pie', 'donut', 'scatter') 160; $st.Type.SelectedIndex = 0
+    $st.LA = New-TbLabel $fl 'Combine rows with the same X by' -Dim
+    $st.Agg = New-TbCombo $fl @('sum', 'count', 'avg', 'min', 'max', 'first') 120; $st.Agg.SelectedIndex = 0
+    $st.LS = New-TbLabel $fl 'Order' -Dim
+    $st.Sort = New-TbCombo $fl @('as in the data', 'largest first', 'A-Z', 'Z-A') 160; $st.Sort.SelectedIndex = 0
+    New-TbLabel $fl 'Theme' -Dim | Out-Null
+    $st.Theme = New-TbCombo $fl ([DgTheme]::Names) 160; $st.Theme.SelectedItem = 'corporate'
+    $go = New-Button 'Create the diagram' 'Make a new diagram from this data' { New-DiagramFromData } $fl $Glyph.Add 1
+    $go.Margin = New-Object System.Windows.Forms.Padding(0, (Px 12), 0, 0)
+    New-TbLabel $fl 'The chart keeps its data in the diagram text (data ... end), so it can be edited there later.' -Dim | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 400), 0); $_.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0) }
+    $st.Kind.add_SelectedIndexChanged({ Update-DiagramDataForm })
+    $st.Timer = New-TbDebounce 400 { if ($DgUI.Form) { Update-DiagramDataColumns } }
+    $box.add_TextChanged({ $DgUI.Data.Timer.Stop(); $DgUI.Data.Timer.Start() })
+    Update-DiagramDataForm
+}
+
+function Get-DiagramDataRows { , [DgChartCalc]::Rows([System.Collections.Generic.List[string]]@($DgUI.Data.Box.Text -split "`r?`n")) }
+
+function Update-DiagramDataColumns {
+    $st = $DgUI.Data
+    $rows = Get-DiagramDataRows
+    $heads = if ($rows.Count) { @($rows[0]) } else { @() }
+    $st.Info.Text = if ($rows.Count -gt 1) { "$($rows.Count - 1) rows, $($heads.Count) columns" } else { 'No data yet' }
+    $keep = @{ C1 = $st.C1.SelectedItem; C2 = $st.C2.SelectedItem; C3 = $st.C3.SelectedItem; C4 = $st.C4.SelectedItem }
+    $checked = @($st.Vals.CheckedItems)
+    foreach ($k in 'C1', 'C2', 'C3', 'C4') {
+        $cb = $st[$k]; $cb.Items.Clear()
+        if ($k -in 'C3', 'C4') { [void]$cb.Items.Add('(none)') }
+        foreach ($h in $heads) { [void]$cb.Items.Add($h) }
+        if ($keep[$k] -and $cb.Items.Contains($keep[$k])) { $cb.SelectedItem = $keep[$k] } elseif ($cb.Items.Count) { $cb.SelectedIndex = $(if ($k -eq 'C2' -and $cb.Items.Count -gt 1) { 1 } else { 0 }) }
+    }
+    $st.Vals.Items.Clear()
+    # number columns are ticked at first
+    $body = @($rows | Select-Object -Skip 1 -First 50)
+    for ($i = 0; $i -lt $heads.Count; $i++) {
+        $isNum = @($body | Where-Object { $i -lt $_.Count -and $null -ne [DgChartCalc]::Num($_[$i]) }).Count -gt [Math]::Max(0, $body.Count / 2)
+        $on = if ($checked.Count) { $checked -contains $heads[$i] } else { $isNum -and $i -gt 0 }
+        [void]$st.Vals.Items.Add($heads[$i], $on)
+    }
+}
+
+function Update-DiagramDataForm {
+    $st = $DgUI.Data
+    $k = $st.Kind.SelectedIndex
+    $chart = $k -eq 0
+    $st.L1.Text = @('X axis / categories', 'From (one end of a link)', 'Id')[$k]
+    $st.L2.Text = @('Values (tick one or more)', 'To (the other end)', 'Parent id')[$k]
+    $st.Vals.Visible = $chart; $st.C2.Visible = -not $chart
+    $st.L3.Text = @('Label (optional)', 'Link label (optional)', 'Name shown (optional)')[$k]
+    $st.L3.Visible = -not $chart; $st.C3.Visible = -not $chart
+    $st.L4.Visible = $k -eq 1; $st.C4.Visible = $k -eq 1
+    foreach ($kk in 'LT', 'Type', 'LA', 'Agg', 'LS', 'Sort') { $st[$kk].Visible = $chart }
+}
+
+function Open-DiagramDataFile {
+    $d = New-Object System.Windows.Forms.OpenFileDialog
+    $d.Filter = 'Data files|*.csv;*.tsv;*.txt;*.xlsx|Excel|*.xlsx|CSV|*.csv;*.tsv;*.txt|All files|*.*'
+    $script:Modal = $true
+    try { if ($d.ShowDialog($DgUI.Form) -ne 'OK') { return }; $path = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
+    Import-DiagramDataFile $path
+}
+
+function Import-DiagramDataFile([string]$Path) {
+    $st = $DgUI.Data
+    $st.File = $Path; $st.Name = [IO.Path]::GetFileNameWithoutExtension($Path)
+    if ($Path -match '\.xlsx$') {
+        try { $sheets = @([DgXlsx]::Sheets($Path)) } catch { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, "Couldn't read it: $($_.Exception.Message)", 'Diagram studio'); return }
+        $st.Busy = $true
+        $st.Sheet.Items.Clear(); foreach ($s in $sheets) { [void]$st.Sheet.Items.Add($s) }
+        $st.Sheet.Visible = $sheets.Count -gt 0; $st.SheetLabel.Visible = $st.Sheet.Visible
+        if ($sheets.Count) { $st.Sheet.SelectedIndex = 0 }
+        $st.Busy = $false
+        Read-DiagramDataSheet
+    } else {
+        $st.Sheet.Visible = $false; $st.SheetLabel.Visible = $false
+        try { $st.Box.Text = [IO.File]::ReadAllText($Path) } catch { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, "Couldn't read it: $($_.Exception.Message)", 'Diagram studio') }
+    }
+}
+
+function Read-DiagramDataSheet {
+    $st = $DgUI.Data
+    if (-not $st.File -or $st.File -notmatch '\.xlsx$') { return }
+    try {
+        $rows = [DgXlsx]::Read($st.File, [string]$st.Sheet.SelectedItem, 20000)
+        $st.Box.Text = [DgXlsx]::ToCsv($rows)
+        if ($st.Sheet.SelectedItem) { $st.Name = "$([IO.Path]::GetFileNameWithoutExtension($st.File)) - $($st.Sheet.SelectedItem)" }
+    } catch { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, "Couldn't read the sheet: $($_.Exception.Message)", 'Diagram studio') }
+}
+
+# a name that works as a diagram id
+function ConvertTo-DiagramId([string]$Name, $Used) {
+    $b = ($Name -replace '[^\w]+', '_').Trim('_')
+    if (-not $b) { $b = 'n' }
+    if ($b -match '^\d') { $b = "n$b" }
+    if (-not $Used.ContainsKey($b) -or $Used[$b] -eq $Name) { $Used[$b] = $Name; return $b }
+    $i = 2; while ($Used.ContainsKey("${b}_$i") -and $Used["${b}_$i"] -ne $Name) { $i++ }
+    $Used["${b}_$i"] = $Name; "${b}_$i"
+}
+
+function New-DiagramFromData {
+    $st = $DgUI.Data
+    $rows = Get-DiagramDataRows
+    if ($rows.Count -lt 2) { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, 'There is no data yet: paste some, open a file or try the sample.', 'Diagram studio'); return }
+    $heads = @($rows[0]); $body = @($rows | Select-Object -Skip 1)
+    $title = $st.Name
+    $theme = [string]$st.Theme.SelectedItem
+    $q = { param($s) '"' + ($s -replace '"', "'") + '"' }
+    $col = { param($name) [Array]::IndexOf($heads, $name) }
+    $sb = New-Object System.Text.StringBuilder
+    switch ($st.Kind.SelectedIndex) {
+        0 {
+            $vals = @($st.Vals.CheckedItems | ForEach-Object { [string]$_ })
+            $agg = [string]$st.Agg.SelectedItem
+            if (-not $vals.Count -and $agg -ne 'count') { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, 'Tick at least one column with values (or combine by count).', 'Diagram studio'); return }
+            $type = [string]$st.Type.SelectedItem
+            [void]$sb.AppendLine("title $title").AppendLine("theme $theme light").AppendLine("chart $type")
+            [void]$sb.AppendLine("x $($st.C1.SelectedItem)")
+            if ($vals.Count) { [void]$sb.AppendLine("y " + (($vals | ForEach-Object { if ($_ -match ',') { & $q $_ } else { $_ } }) -join ', ')) }
+            [void]$sb.AppendLine("agg $agg")
+            $so = @('', 'value', 'asc', 'desc')[$st.Sort.SelectedIndex]; if ($so) { [void]$sb.AppendLine("sort $so") }
+            if ($body.Count -le 24) { [void]$sb.AppendLine('labels on') }
+            [void]$sb.AppendLine('data')
+            foreach ($l in ($st.Box.Text -split "`r?`n")) { if ($l.Trim() -and $l.Trim() -ne 'end') { [void]$sb.AppendLine($l) } }
+            [void]$sb.Append('end')
+        }
+        1 {
+            $fi = & $col $st.C1.SelectedItem; $ti = & $col $st.C2.SelectedItem
+            $li = if ($st.C3.SelectedIndex -gt 0) { & $col $st.C3.SelectedItem } else { -1 }
+            $ci = if ($st.C4.SelectedIndex -gt 0) { & $col $st.C4.SelectedItem } else { -1 }
+            [void]$sb.AppendLine("title $title").AppendLine("theme $theme light").AppendLine('direction LR').AppendLine()
+            $used = @{}; $ids = @{}; $nodes = New-Object System.Collections.Generic.List[string]
+            foreach ($r in $body) { foreach ($i in $fi, $ti) { $v = if ($i -lt $r.Count) { $r[$i] } else { '' }; if ($v -and -not $ids.ContainsKey($v)) { $ids[$v] = ConvertTo-DiagramId $v $used; $nodes.Add($v) } } }
+            foreach ($v in $nodes) { [void]$sb.AppendLine("$($ids[$v]): $v") }
+            [void]$sb.AppendLine()
+            foreach ($r in $body) {
+                $f = if ($fi -lt $r.Count) { $r[$fi] } else { '' }; $t = if ($ti -lt $r.Count) { $r[$ti] } else { '' }
+                if (-not $f -or -not $t) { continue }
+                $at = @()
+                if ($ci -ge 0 -and $ci -lt $r.Count -and $r[$ci]) { $at += ('cat ' + (($r[$ci] -replace '[^\w]+', '_').Trim('_'))) }
+                if ($li -ge 0 -and $li -lt $r.Count -and $r[$li]) { $at += ('label ' + (& $q $r[$li])) }
+                [void]$sb.AppendLine("$($ids[$f]) -> $($ids[$t])" + $(if ($at) { ' [' + ($at -join ', ') + ']' }))
+            }
+        }
+        2 {
+            $ii = & $col $st.C1.SelectedItem; $pi = & $col $st.C2.SelectedItem
+            $ni = if ($st.C3.SelectedIndex -gt 0) { & $col $st.C3.SelectedItem } else { -1 }
+            [void]$sb.AppendLine("title $title").AppendLine("theme $theme light").AppendLine('direction TB').AppendLine('route ortho').AppendLine()
+            $used = @{}; $ids = @{}
+            foreach ($r in $body) { $v = if ($ii -lt $r.Count) { $r[$ii] } else { '' }; if ($v -and -not $ids.ContainsKey($v)) { $ids[$v] = ConvertTo-DiagramId $v $used } }
+            foreach ($r in $body) {
+                $v = if ($ii -lt $r.Count) { $r[$ii] } else { '' }; if (-not $v) { continue }
+                $name = if ($ni -ge 0 -and $ni -lt $r.Count -and $r[$ni]) { $r[$ni] } else { $v }
+                [void]$sb.AppendLine("$($ids[$v]): $name")
+            }
+            [void]$sb.AppendLine()
+            foreach ($r in $body) {
+                $v = if ($ii -lt $r.Count) { $r[$ii] } else { '' }; $p = if ($pi -lt $r.Count) { $r[$pi] } else { '' }
+                if ($v -and $p -and $ids.ContainsKey($p)) { [void]$sb.AppendLine("$($ids[$p]) -> $($ids[$v])") }
+            }
+        }
+    }
+    New-DiagramFromText $title $sb.ToString()
+    Select-ApiTab $DgUI.Tabs 'Text'
+}
 
 Register-PaletteCommand 'Diagram studio' '' $Glyph.Apps { Show-DiagramStudio } 'diagram flowchart mermaid svg architecture network map draw chart graph org'
 

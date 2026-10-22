@@ -417,7 +417,23 @@ Diagrams from a few lines of text: architecture maps, flowcharts, org charts and
   - **Links**: right-angled, curved or straight; dashed, thick, two-way, labelled; **animated**, so packets flow along them.
 
   **Syntax help** (bottom left) lists it all.
-- **Examples**: 20 ready-made interactive diagrams to start from. Each opens as a new diagram you can change.
+- **Charts** live in the same text: `chart column` (or bar, stacked column / bar, line, area, pie, donut, scatter), `x Month`, `y Sales, Costs`, `agg sum` (count, avg, min, max, first), `sort value` (asc, desc), `top 10`, `labels on`, `prefix $` / `suffix %`, then the rows between `data` and `end` (CSV or tab-separated; the first row names the columns). Rows with the same X are combined. Point at a bar, slice or dot for its value; click a legend chip to hide a series. They export like any diagram: PNG, SVG, an interactive page with tooltips and legend.
+  ```
+  title Monthly sales
+  chart column
+  x Month
+  y Sales, Costs
+  data
+  Month,Sales,Costs
+  Jan,1200,800
+  Feb,1400,950
+  end
+  ```
+- **Data** tab: **Paste** cells from Excel or a database tool, **Open file...** (`.csv`, `.tsv`, `.txt`, or Excel `.xlsx`, read directly with nothing installed, any sheet, dates as dates) or try the **Sample**, then **Make**:
+  - a **chart**: pick the X column and tick the value columns, the type, how rows with the same X are combined and the order
+  - **links**: a from and a to column, optionally a label and a column that colours the links
+  - a **tree**: id and parent columns, and optionally the name shown (org charts, folder structures)
+- **Examples**: 20 ready-made interactive diagrams to start from. Each opens as a **new copy**: the examples themselves never change.
   - **Architecture**: network visibility map, cloud web app, Kubernetes cluster, microservices, active / standby failover, home network.
   - **Flows**: deploy pipeline, CI/CD stages, login flow (Mermaid), incident runbook, order state machine, customer journey.
   - **Data**: analytics pipeline, database schema, event streaming.
@@ -437,6 +453,7 @@ Diagrams from a few lines of text: architecture maps, flowcharts, org charts and
   - Double-click a shape to rename it; right-click for **Add a shape here**.
   - Shift+drag selects several; the arrow keys nudge the selection; Del deletes.
   - Click inside a group's frame to select the whole group; drag it to move it all.
+  - **Drag a link's label** to wherever it reads best (**Label back** in its properties puts it back). Right-click > **Add text here** places free text (a `text` shape, no box) anywhere, for notes and captions.
   - **Ctrl+C / Ctrl+V** copy shapes and groups, with their links, looks and categories, into **any other diagram**. They paste where the mouse is, or in free space; clashing names get `_2`. **Ctrl+D** duplicates. The clipboard holds plain diagram text, so you can also paste it into the text editor or keep it in Notes.
   - Everything you do is written back into the text, so the text is always the whole diagram.
   - **Undo / Redo** with Ctrl+Z / Ctrl+Y.
