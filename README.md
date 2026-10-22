@@ -130,7 +130,7 @@ An encrypted vault for passwords, API keys and tokens: the lock icon, **Ctrl+Shi
 | Encode & share | QR code, Hide secret messages, Code to image |
 | Files | Compare, Find in files, File hash, Log viewer |
 | Web & API | API tester, API chains, Test API |
-| Data | Diagram studio |
+| Data | Diagram studio, SQL client |
 | Network | Network tools, DNS lookup & whois, Subnet calculator, Host monitor, Ports, Certificates, Certificate maker |
 | System | Environment & PATH, Processes & services, Git |
 | Screen & productivity | Screenshot, Text from a picture (OCR), Edit clipboard picture, Colour picker, Screen recorder (GIF), Timer & Pomodoro, Reminder, Mouse mover & clicker |
@@ -453,6 +453,7 @@ Diagrams from a few lines of text: architecture maps, flowcharts, org charts and
   - Double-click a shape to rename it; right-click for **Add a shape here**.
   - Shift+drag selects several; the arrow keys nudge the selection; Del deletes.
   - Click inside a group's frame to select the whole group; drag it to move it all.
+  - **Move links**: click a link and drag the dots at its ends to **any point on any side** of their cards (`from top 0.25` / `to left 0.8` in the text), or drag the link itself to move its bend (`via x y`). The link's properties also pick the sides; **Reset route** makes it automatic again. A line with several links (`a -> b, c, d`) is split when you change one of them, so the others stay as they were.
   - **Drag a link's label** to wherever it reads best (**Label back** in its properties puts it back). Right-click > **Add text here** places free text (a `text` shape, no box) anywhere, for notes and captions.
   - **Ctrl+C / Ctrl+V** copy shapes and groups, with their links, looks and categories, into **any other diagram**. They paste where the mouse is, or in free space; clashing names get `_2`. **Ctrl+D** duplicates. The clipboard holds plain diagram text, so you can also paste it into the text editor or keep it in Notes.
   - Everything you do is written back into the text, so the text is always the whole diagram.
@@ -485,6 +486,27 @@ Diagrams from a few lines of text: architecture maps, flowcharts, org charts and
     - a **prefix for every class and id**, so several diagrams can sit on the same page without clashing
   - Every output has a live code view with **Copy**, **Save** and **Open in browser** to see the result.
 - Diagrams are saved as you go under `data\diagrams\` (one `.dgm` text file each; **Saved** lists them, right-click to rename or delete).
+
+## SQL client
+
+A SQL Server client with nothing to install (it uses the SQL Server support built into .NET). Open it from the Toolbox (**Data** group) or the command palette.
+
+- **Connections**: the list at the top left, then **New connection...**.
+  - Server: `localhost`, `.\SQLEXPRESS`, `(localdb)\MSSQLLocalDB` or `server.company.com,1433`.
+  - Sign in with your **Windows account** or a **SQL Server login**. The password is kept protected for your Windows account.
+  - Database: the **Databases** button lists them.
+  - Options: encrypt, trust the server certificate, and **ask before running statements that change data** (on by default).
+  - **Test** shows the server, database, login and version.
+- **Objects**: databases > tables, views, procedures and functions > columns, with their types and PK / FK keys.
+  - Double-click a name to insert it.
+  - Right-click a table: **SELECT TOP 100**, its definition, or an **ER diagram from here** (with the tables linked to it). Right-click a database: **ER diagram of all tables**.
+- **Editor** with SQL colours. **F5** or **Ctrl+Enter** runs the selection, or everything; `GO` lines separate batches (as in SSMS). **Cancel** (or Esc) stops a long query. **Max rows** caps what is shown per result.
+- **Results**: a tab per result set, plus **Messages** (rows affected, PRINT output, errors).
+  - An error selects the line it happened on.
+  - **Copy** (with headers, pastes into Excel), **CSV...**, **JSON...**.
+  - **Chart this** / **Diagram this** send the result to the Diagram studio's Data tab, ready to become a chart, a link graph or a tree.
+  - **ER diagram** draws the tables of the database with their columns, keys and the 1 : n links between them.
+- **Saved** queries and the **History** of the last 200 runs (double-click to load one). Everything is kept under `data\sql\`.
 
 ## Git
 

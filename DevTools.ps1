@@ -21464,7 +21464,8 @@ public class DgEdge {
     public bool Curved;
     public float Detour = float.NaN;                                              // corridor around the shapes in between
     public System.Drawing.PointF LabelAt = new System.Drawing.PointF(float.NaN, float.NaN);   // where the label was dragged to
-    public System.Drawing.RectangleF LabelBox;                                    // where the label is drawn (after drawing)
+    public System.Drawing.RectangleF LabelBox;
+    public float FromT = float.NaN, ToT = float.NaN;                               // where along the side an end sits (0..1), NaN = spread automatically                                    // where the label is drawn (after drawing)
 }
 
 public class DgGroup {
@@ -22041,8 +22042,12 @@ public static class DgText {
                 case "glow": e.Glow = true; e.GlowSet = true; break;
                 case "noglow": e.Glow = false; e.GlowSet = true; break;
                 case "hidden": e.Hidden = true; break;
-                case "from": e.FromSide = v.ToLowerInvariant(); break;
-                case "to": e.ToSide = v.ToLowerInvariant(); break;
+                case "from": case "to": {
+                    var w = v.ToLowerInvariant().Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries);
+                    string side = w.Length > 0 ? w[0] : ""; float t = w.Length > 1 ? F(w[1], float.NaN) : float.NaN;
+                    if (a.Key == "from") { e.FromSide = side; e.FromT = t; } else { e.ToSide = side; e.ToT = t; }
+                    break;
+                }
                 case "cat": case "category": case "flow": e.Cat = AutoCat(d, v.Trim()).Id; break;
                 case "": if (v.Length > 0 && !v.Contains(" ")) e.Label = Unq(v); else if (v.Length > 0) e.Label = Unq(v); break;
                 default: e.Cat = AutoCat(d, a.Key).Id; break;
@@ -22145,6 +22150,22 @@ public static class DgText {
         for (int i = 0; i < l.Count; i++) if (Regex.IsMatch(l[i], @"^\s*(title|subtitle|theme|mode|font|mono|layout|direction|spacing|radius|hide|show|category|cat|graph|flowchart)\b", RegexOptions.IgnoreCase)) at = i + 1;
         l.Insert(at, line);
         return Join(l.ToArray());
+    }
+
+    public static string EdgeSetAttr(string text, DgDoc d, DgEdge e, string key, string value) {
+        if (e.SrcLine < 0) return text;
+        var same = d.Edges.Where(x => x.SrcLine == e.SrcLine).ToList();
+        if (same.Count <= 1) return SetEdgeAttr(text, e.SrcLine, key, value);
+        var l = Lines(text).ToList();
+        if (e.SrcLine >= l.Count) return text;
+        var repl = new List<string>();
+        string indent = Regex.Match(l[e.SrcLine], @"^\s*").Value;
+        // shapes declared inside the line (Mermaid "A[Label] --> B{Ask}") keep their label and shape
+        foreach (var n in d.Nodes) if (n.SrcLine == e.SrcLine && !n.Declared) repl.Add(indent + n.Id + ": " + n.Title.Replace("\n", "\\n") + (n.Shape.Length > 0 ? " [shape " + n.Shape + "]" : ""));
+        int at = -1;
+        foreach (var x in same) { if (x == e) at = repl.Count; repl.Add(indent + DgClip.EdgeLine(x, x.From, x.To)); }
+        l.RemoveAt(e.SrcLine); l.InsertRange(e.SrcLine, repl);
+        return SetEdgeAttr(Join(l.ToArray()), e.SrcLine + at, key, value);
     }
 
     public static string AddLine(string text, string line) { var t = (text ?? "").TrimEnd(); return (t.Length > 0 ? t + "\r\n" : "") + line; }
@@ -22496,7 +22517,7 @@ public static class DgLayout {
 public static class DgRoute {
     class End { public DgEdge E; public bool Src; public System.Drawing.RectangleF Box; public string Side; public float Other; public System.Drawing.PointF P; }
 
-    static System.Drawing.RectangleF BoxOf(DgDoc d, string id, string item) {
+    public static System.Drawing.RectangleF BoxOf(DgDoc d, string id, string item) {
         var n = d.Find(id);
         if (n == null) return System.Drawing.RectangleF.Empty;
         int i = n.ItemIndex(item);
@@ -22561,6 +22582,8 @@ public static class DgRoute {
             bool isItem = l[0].Src ? !string.IsNullOrEmpty(l[0].E.FromItem) : !string.IsNullOrEmpty(l[0].E.ToItem);
             for (int i = 0; i < l.Count; i++) {
                 float t = l.Count == 1 || len < 40 || isItem ? len / 2 : tip ? len / 2 + (i - (l.Count - 1) / 2f) * 9 : margin + (len - 2 * margin) * (i + 0.5f) / l.Count;
+                float ft = l[i].Src ? l[i].E.FromT : l[i].E.ToT;
+                if (!float.IsNaN(ft)) t = Math.Max(0, Math.Min(1, ft)) * len;
                 l[i].P = side == "left" ? new System.Drawing.PointF(r.X, r.Y + t) : side == "right" ? new System.Drawing.PointF(r.Right, r.Y + t)
                        : side == "top" ? new System.Drawing.PointF(r.X + t, r.Y) : new System.Drawing.PointF(r.X + t, r.Bottom);
             }
@@ -22568,7 +22591,7 @@ public static class DgRoute {
         var byEdge = ends.GroupBy(x => x.E).ToDictionary(g => g.Key, g => g.ToList());
         // a few pixels apart: one straight line instead of a tiny step
         foreach (var kv in byEdge) {
-            if (kv.Value.Count < 2 || !float.IsNaN(kv.Key.Detour)) continue;
+            if (kv.Value.Count < 2 || !float.IsNaN(kv.Key.Detour) || !float.IsNaN(kv.Key.FromT) || !float.IsNaN(kv.Key.ToT)) continue;
             var s0 = kv.Value[0]; var t0 = kv.Value[1];
             bool hs = IsH(s0.Side) && IsH(t0.Side) && s0.Side != t0.Side, vs = !IsH(s0.Side) && !IsH(t0.Side) && s0.Side != t0.Side;
             if (hs && Math.Abs(s0.P.Y - t0.P.Y) < 14) {
@@ -23159,8 +23182,11 @@ public class DgCanvas : System.Windows.Forms.Panel {
     public System.Drawing.PointF Pan = new System.Drawing.PointF(0, 0);       // canvas units at the top-left
     public System.Drawing.Color UiBack = System.Drawing.Color.FromArgb(30, 30, 30), UiFore = System.Drawing.Color.White, UiLine = System.Drawing.Color.Gray, UiAccent = System.Drawing.Color.DodgerBlue;
     public event EventHandler SelectionChanged, NodeOpened, Moved, EdgeAdded, DeleteRequested, LegendChanged, CopyRequested, PasteRequested, DuplicateRequested, LabelMoved;
-    public DgEdge MovedLabel;
-    DgEdge labelEdge;
+    public DgEdge MovedLabel, MovedEdge;
+    public bool MovedSource;
+    public event EventHandler EndMoved, RouteMoved;
+    DgEdge labelEdge, endEdge;
+    bool endSource;
     public System.Drawing.PointF MouseCanvas;       // where the mouse is (canvas units)
     public bool MouseInside;
     public string NewEdgeFrom = "", NewEdgeTo = "";
@@ -23174,7 +23200,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
     DateTime last = DateTime.Now, lastSample = DateTime.Now;
     Random rnd = new Random(7);
 
-    enum Mode { None, Pan, Drag, Box, Link, Label }
+    enum Mode { None, Pan, Drag, Box, Link, Label, End, Route }
     Mode mode = Mode.None;
     System.Drawing.Point down;
     System.Drawing.PointF dragAnchor;
@@ -23271,6 +23297,18 @@ public class DgCanvas : System.Windows.Forms.Panel {
         float x = a.X + t * dx - p.X, y = a.Y + t * dy - p.Y;
         return (float)Math.Sqrt(x * x + y * y);
     }
+    // puts an end of a link on the side of its card nearest to w, at that point along the side
+    public void SnapEnd(DgEdge e, bool source, System.Drawing.PointF w) {
+        var r = DgRoute.BoxOf(Doc, source ? e.From : e.To, source ? e.FromItem : e.ToItem);
+        if (r.IsEmpty) return;
+        float dl = Math.Abs(w.X - r.X), dr = Math.Abs(w.X - r.Right), dt = Math.Abs(w.Y - r.Y), db = Math.Abs(w.Y - r.Bottom);
+        string side; float t;
+        float m = Math.Min(Math.Min(dl, dr), Math.Min(dt, db));
+        if (m == dl) side = "left"; else if (m == dr) side = "right"; else if (m == dt) side = "top"; else side = "bottom";
+        if (side == "left" || side == "right") t = (w.Y - r.Y) / Math.Max(1, r.Height); else t = (w.X - r.X) / Math.Max(1, r.Width);
+        t = (float)Math.Round(Math.Max(0.05f, Math.Min(0.95f, t)), 2);
+        if (source) { e.FromSide = side; e.FromT = t; } else { e.ToSide = side; e.ToT = t; }
+    }
     System.Drawing.PointF LinkHandle(DgNode n) { return new System.Drawing.PointF(n.X + n.W, n.Y + n.H / 2); }
     bool OnHandle(DgNode n, System.Drawing.PointF w) { var h = LinkHandle(n); float r = 8 / Zoom; return Editable && Math.Abs(w.X - h.X) <= r && Math.Abs(w.Y - h.Y) <= r; }
 
@@ -23289,6 +23327,16 @@ public class DgCanvas : System.Windows.Forms.Panel {
             Invalidate(); if (LegendChanged != null) LegendChanged(this, EventArgs.Empty); return;
         }
         if (ZoomClick(e.Location)) return;
+        if (Editable && Doc.Chart == null) {
+            DgEdge best = null; bool src = false; float bd = 9 / Zoom;
+            foreach (var ee in Doc.Edges) {
+                if (ee.Pts.Count < 2) continue;
+                float d0 = Dist(w, ee.Pts[0], ee.Pts[0]), d1 = Dist(w, ee.Pts[ee.Pts.Count - 1], ee.Pts[ee.Pts.Count - 1]);
+                if (d0 < bd && (ee.Id == View.SelectedEdge || NodeAt(w) == null || d0 < 5 / Zoom)) { bd = d0; best = ee; src = true; }
+                if (d1 < bd && (ee.Id == View.SelectedEdge || NodeAt(w) == null || d1 < 5 / Zoom)) { bd = d1; best = ee; src = false; }
+            }
+            if (best != null) { mode = Mode.End; endEdge = best; endSource = src; View.Selected.Clear(); View.SelectedEdge = best.Id; if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); Invalidate(); return; }
+        }
         if (Editable) foreach (var le in Doc.Edges) if (le.Label.Length > 0 && !le.LabelBox.IsEmpty && le.LabelBox.Contains(w)) { mode = Mode.Label; labelEdge = le; View.Selected.Clear(); View.SelectedEdge = le.Id; if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); return; }
         var n = NodeAt(w);
         if (n != null && OnHandle(n, w)) { mode = Mode.Link; linkFrom = n.Id; mouseW = w; return; }
@@ -23305,7 +23353,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
             Invalidate(); return;
         }
         var ed = EdgeAt(w);
-        if (ed != null) { View.Selected.Clear(); View.SelectedEdge = ed.Id; Invalidate(); if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); return; }
+        if (ed != null) { View.Selected.Clear(); View.SelectedEdge = ed.Id; if (Editable) { mode = Mode.Route; endEdge = ed; } Invalidate(); if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); return; }
         var gr = GroupAt(w);
         if (gr != null && Editable && (System.Windows.Forms.Control.ModifierKeys & System.Windows.Forms.Keys.Shift) == 0) {
             var ms = gr.Members.Where(id => Doc.Find(id) != null).ToList();
@@ -23333,6 +23381,8 @@ public class DgCanvas : System.Windows.Forms.Panel {
                 DgRoute.All(Doc); packets.Clear(); Invalidate(); return;
             case Mode.Box: box = System.Drawing.RectangleF.FromLTRB(Math.Min(box.X, w.X), Math.Min(box.Y, w.Y), Math.Max(box.X, w.X), Math.Max(box.Y, w.Y)); mouseW = w; Invalidate(); return;
             case Mode.Link: mouseW = w; Invalidate(); return;
+            case Mode.End: if (moved && endEdge != null) { SnapEnd(endEdge, endSource, w); DgRoute.All(Doc); packets.Clear(); Invalidate(); } return;
+            case Mode.Route: if (moved && endEdge != null) { endEdge.Via = new List<System.Drawing.PointF> { new System.Drawing.PointF((float)Math.Round(w.X), (float)Math.Round(w.Y)) }; endEdge.Route = endEdge.Route == "straight" ? "" : endEdge.Route; DgRoute.All(Doc); packets.Clear(); Invalidate(); } return;
             case Mode.Label: if (moved && labelEdge != null) { labelEdge.LabelAt = new System.Drawing.PointF((float)Math.Round(w.X), (float)Math.Round(w.Y)); Invalidate(); } return;
         }
         if (Doc.Chart != null) {
@@ -23354,7 +23404,9 @@ public class DgCanvas : System.Windows.Forms.Panel {
         base.OnMouseUp(e);
         var w = W(e.Location);
         var m = mode; mode = Mode.None;
-        if (m == Mode.Label && moved && labelEdge != null) { MovedLabel = labelEdge; if (LabelMoved != null) LabelMoved(this, EventArgs.Empty); }
+        if (m == Mode.End && moved && endEdge != null) { MovedEdge = endEdge; MovedSource = endSource; if (EndMoved != null) EndMoved(this, EventArgs.Empty); }
+        else if (m == Mode.Route && moved && endEdge != null) { MovedEdge = endEdge; if (RouteMoved != null) RouteMoved(this, EventArgs.Empty); }
+        else if (m == Mode.Label && moved && labelEdge != null) { MovedLabel = labelEdge; if (LabelMoved != null) LabelMoved(this, EventArgs.Empty); }
         else if (m == Mode.Drag && moved) { MovedIds = dragFrom.Keys.ToList(); if (Moved != null) Moved(this, EventArgs.Empty); }
         else if (m == Mode.Box) {
             var ids = Doc.Nodes.Where(n => !n.Hidden && box.IntersectsWith(n.Box)).Select(n => n.Id).ToList();
@@ -23479,6 +23531,17 @@ public class DgCanvas : System.Windows.Forms.Panel {
             foreach (var gr in Doc.Groups) if (!gr.Box.IsEmpty && gr.Members.Count > 0 && gr.Members.All(View.Selected.Contains))
                 using (var pen = new System.Drawing.Pen(DgColors.Parse(c.Raw("sel")), 2f / Zoom)) using (var gp = DgGdiPainter.RoundRect(gr.Box.X - 4, gr.Box.Y - 4, gr.Box.Width + 8, gr.Box.Height + 8, Doc.Radius + 6)) g.DrawPath(pen, gp);
         DgRender.Draw(Doc, c, new DgGdiPainter(g), View);
+        // the selected link: its two ends can be dragged to any side of their cards, its middle moves the bend
+        if (Editable && View.SelectedEdge.Length > 0) {
+            var se = Doc.Edges.FirstOrDefault(x => x.Id == View.SelectedEdge);
+            if (se != null && se.Pts.Count > 1) {
+                var selc = DgColors.Parse(c.Raw("sel"));
+                foreach (var hp in new[] { se.Pts[0], se.Pts[se.Pts.Count - 1] }) {
+                    using (var b = new System.Drawing.SolidBrush(selc)) g.FillEllipse(b, hp.X - 5, hp.Y - 5, 10, 10);
+                    using (var pen = new System.Drawing.Pen(DgColors.Parse(c.Raw("bg")), 1.5f)) g.DrawEllipse(pen, hp.X - 5, hp.Y - 5, 10, 10);
+                }
+            }
+        }
         // packets
         if (Animate) {
             var rel = string.IsNullOrEmpty(View.Hover) ? null : DgRender.Related(Doc, View.Hover);
@@ -23781,8 +23844,9 @@ public static class DgClip {
         if (e.ArrowSet) a.Add("arrow " + (e.ArrowStart && e.ArrowEnd ? "both" : e.ArrowStart ? "start" : e.ArrowEnd ? "end" : "none"));
         if (e.Color.Length > 0) a.Add("color " + e.Color);
         if (e.GlowSet) a.Add(e.Glow ? "glow" : "noglow");
-        if (e.FromSide.Length > 0) a.Add("from " + e.FromSide);
-        if (e.ToSide.Length > 0) a.Add("to " + e.ToSide);
+        if (e.FromSide.Length > 0) a.Add("from " + e.FromSide + (float.IsNaN(e.FromT) ? "" : " " + e.FromT.ToString("0.###", CultureInfo.InvariantCulture)));
+        if (e.ToSide.Length > 0) a.Add("to " + e.ToSide + (float.IsNaN(e.ToT) ? "" : " " + e.ToT.ToString("0.###", CultureInfo.InvariantCulture)));
+        if (e.Via.Count > 0) a.Add("via " + string.Join(" ", e.Via.Select(p => N(p.X) + " " + N(p.Y))));
         if (!float.IsNaN(e.LabelAt.X)) a.Add("labelat " + N(e.LabelAt.X) + " " + N(e.LabelAt.Y));
         string f = from + (e.FromItem.Length > 0 ? "." + Item(e.FromItem) : ""), t = to + (e.ToItem.Length > 0 ? "." + Item(e.ToItem) : "");
         return f + " -> " + t + (a.Count > 0 ? " [" + string.Join(", ", a) + "]" : "");
@@ -24343,6 +24407,233 @@ public static class DgXlsx {
     }
 }
 
+// ---- SQL client: SQL Server through System.Data.SqlClient (part of .NET, nothing to install).
+public class DgSqlResult {
+    public List<System.Data.DataTable> Tables = new List<System.Data.DataTable>();
+    public List<string> Messages = new List<string>();
+    public string Error = "";
+    public int ErrorLine;
+    public long Ms;
+    public bool Cancelled, Truncated;
+}
+
+public class DgSqlRun {
+    public volatile bool Done;
+    public DgSqlResult Result = new DgSqlResult();
+    System.Data.SqlClient.SqlCommand cmd;
+    volatile bool cancel;
+    readonly object gate = new object();
+
+    // runs the batches (split at GO lines) one after another on a background thread
+    public static DgSqlRun Start(string conn, string sql, int maxRows, int timeoutSec) {
+        var r = new DgSqlRun();
+        var t = new System.Threading.Thread(() => r.Run(conn, sql, maxRows, timeoutSec)) { IsBackground = true, Name = "DevTools SQL" };
+        t.Start();
+        return r;
+    }
+    public void Cancel() { cancel = true; lock (gate) { try { if (cmd != null) cmd.Cancel(); } catch { } } }
+
+    public static List<KeyValuePair<int, string>> Batches(string sql) {
+        var r = new List<KeyValuePair<int, string>>();
+        var lines = (sql ?? "").Replace("\r\n", "\n").Split('\n');
+        var sb = new StringBuilder(); int start = 0;
+        for (int i = 0; i < lines.Length; i++) {
+            var m = Regex.Match(lines[i], @"^\s*GO(?:\s+(\d+))?\s*(--.*)?$", RegexOptions.IgnoreCase);
+            if (m.Success) {
+                int times = m.Groups[1].Success ? Math.Max(1, Math.Min(1000, int.Parse(m.Groups[1].Value))) : 1;
+                if (sb.ToString().Trim().Length > 0) for (int k = 0; k < times; k++) r.Add(new KeyValuePair<int, string>(start, sb.ToString()));
+                sb.Clear(); start = i + 1; continue;
+            }
+            sb.Append(lines[i]).Append('\n');
+        }
+        if (sb.ToString().Trim().Length > 0) r.Add(new KeyValuePair<int, string>(start, sb.ToString()));
+        return r;
+    }
+
+    void Run(string connStr, string sql, int maxRows, int timeoutSec) {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        try {
+            using (var conn = new System.Data.SqlClient.SqlConnection(connStr)) {
+                conn.InfoMessage += (s, e) => { lock (Result.Messages) foreach (System.Data.SqlClient.SqlError er in e.Errors) Result.Messages.Add(er.Message); };
+                conn.FireInfoMessageEventOnUserErrors = false;
+                conn.Open();
+                foreach (var batch in Batches(sql)) {
+                    if (cancel) { Result.Cancelled = true; break; }
+                    using (var c = new System.Data.SqlClient.SqlCommand(batch.Value, conn)) {
+                        c.CommandTimeout = Math.Max(0, timeoutSec);
+                        int counted = 0;
+                        c.StatementCompleted += (s, e) => { counted++; lock (Result.Messages) Result.Messages.Add("(" + e.RecordCount + " row" + (e.RecordCount == 1 ? "" : "s") + " affected)"); };
+                        lock (gate) cmd = c;
+                        try {
+                            using (var rd = c.ExecuteReader()) {
+                                do {
+                                    if (rd.FieldCount == 0) continue;
+                                    var tb = new System.Data.DataTable("Result " + (Result.Tables.Count + 1));
+                                    var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                                    for (int i = 0; i < rd.FieldCount; i++) {
+                                        string n = rd.GetName(i); if (string.IsNullOrEmpty(n)) n = "(no name)";
+                                        string u = n; int k = 2; while (names.Contains(u)) u = n + " (" + k++ + ")"; names.Add(u);
+                                        tb.Columns.Add(u, typeof(object));
+                                    }
+                                    var vals = new object[rd.FieldCount];
+                                    tb.BeginLoadData();
+                                    while (rd.Read()) {
+                                        if (cancel) { Result.Cancelled = true; break; }
+                                        if (maxRows > 0 && tb.Rows.Count >= maxRows) { Result.Truncated = true; break; }
+                                        rd.GetValues(vals);
+                                        for (int i = 0; i < vals.Length; i++) vals[i] = Show(vals[i]);
+                                        tb.LoadDataRow(vals, true);
+                                    }
+                                    tb.EndLoadData();
+                                    lock (Result.Tables) Result.Tables.Add(tb);
+                                    if (Result.Cancelled) break;
+                                } while (rd.NextResult());
+                            }
+                        } catch (System.Data.SqlClient.SqlException ex) {
+                            if (cancel) { Result.Cancelled = true; break; }
+                            var e0 = ex.Errors.Count > 0 ? ex.Errors[0] : null;
+                            Result.ErrorLine = e0 != null ? e0.LineNumber + batch.Key : 0;
+                            Result.Error = ex.Message + (Result.ErrorLine > 0 ? "  (line " + Result.ErrorLine + ")" : "");
+                            break;
+                        }
+                        lock (gate) cmd = null;
+                    }
+                }
+            }
+        } catch (Exception ex) { if (cancel) Result.Cancelled = true; else Result.Error = ex.Message; }
+        Result.Ms = sw.ElapsedMilliseconds;
+        Done = true;
+    }
+
+    // how a value is shown in the grid
+    static object Show(object v) {
+        if (v == null || v is DBNull) return DBNull.Value;
+        if (v is byte[]) { var b = (byte[])v; var sb = new StringBuilder("0x"); for (int i = 0; i < Math.Min(b.Length, 64); i++) sb.Append(b[i].ToString("X2")); if (b.Length > 64) sb.Append("..."); return sb.ToString(); }
+        if (v is DateTime) { var d = (DateTime)v; return d.TimeOfDay.Ticks == 0 ? d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) : d.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture); }
+        if (v is DateTimeOffset) return ((DateTimeOffset)v).ToString("yyyy-MM-dd HH:mm:ss.fff zzz", CultureInfo.InvariantCulture);
+        if (v is bool) return (bool)v ? "1" : "0";
+        if (v is IFormattable) return ((IFormattable)v).ToString(null, CultureInfo.InvariantCulture);
+        return v.ToString();
+    }
+}
+
+public static class DgSql {
+    public static string Build(string server, string db, bool windows, string user, string password, bool encrypt, bool trust, int timeoutSec) {
+        var b = new System.Data.SqlClient.SqlConnectionStringBuilder();
+        b.DataSource = server;
+        if (!string.IsNullOrEmpty(db)) b.InitialCatalog = db;
+        if (windows) b.IntegratedSecurity = true; else { b.UserID = user ?? ""; b.Password = password ?? ""; }
+        b.Encrypt = encrypt; b.TrustServerCertificate = trust;
+        b.ConnectTimeout = Math.Max(3, timeoutSec);
+        b.ApplicationName = "DevTools";
+        return b.ConnectionString;
+    }
+
+    // a quick query on the calling thread (schema, database list)
+    public static System.Data.DataTable Query(string conn, string sql, int timeoutSec) {
+        using (var c = new System.Data.SqlClient.SqlConnection(conn)) {
+            c.Open();
+            using (var cmd = new System.Data.SqlClient.SqlCommand(sql, c)) {
+                cmd.CommandTimeout = timeoutSec;
+                var t = new System.Data.DataTable();
+                using (var rd = cmd.ExecuteReader()) t.Load(rd);
+                return t;
+            }
+        }
+    }
+
+    // statements that change something (comments and strings are ignored)
+    public static string Writes(string sql) {
+        var s = Regex.Replace(sql ?? "", @"--[^\n]*|/\*[\s\S]*?\*/|'(?:[^']|'')*'|\[[^\]]*\]|""[^""]*""", " ");
+        var m = Regex.Matches(s, @"\b(insert|update|delete|merge|drop|alter|truncate|create|grant|revoke|deny|exec|execute|sp_rename|backup|restore|dbcc|shutdown|kill)\b", RegexOptions.IgnoreCase);
+        return string.Join(", ", m.Cast<Match>().Select(x => x.Value.ToUpperInvariant()).Distinct());
+    }
+
+    static string Csv(object v) { var s = v == null || v is DBNull ? "" : v.ToString(); return s.IndexOfAny(new[] { ',', '"', '\n', '\r' }) >= 0 ? "\"" + s.Replace("\"", "\"\"") + "\"" : s; }
+    public static string ToCsv(System.Data.DataTable t, char sep) {
+        var sb = new StringBuilder();
+        sb.Append(string.Join(sep.ToString(), t.Columns.Cast<System.Data.DataColumn>().Select(c => sep == '\t' ? c.ColumnName : Csv(c.ColumnName)))).Append("\r\n");
+        foreach (System.Data.DataRow r in t.Rows) sb.Append(string.Join(sep.ToString(), r.ItemArray.Select(v => sep == '\t' ? (v ?? "").ToString().Replace("\t", " ").Replace("\r", " ").Replace("\n", " ") : Csv(v)))).Append("\r\n");
+        return sb.ToString();
+    }
+    public static string ToJson(System.Data.DataTable t) {
+        var sb = new StringBuilder("[\n");
+        var cols = t.Columns.Cast<System.Data.DataColumn>().Select(c => c.ColumnName).ToList();
+        for (int i = 0; i < t.Rows.Count; i++) {
+            sb.Append("  {");
+            for (int k = 0; k < cols.Count; k++) {
+                var o = t.Rows[i][k];
+                var v = o == null || o is DBNull ? "" : o.ToString();
+                double num;
+                string jv = o == null || o is DBNull ? "null" : (Regex.IsMatch(v, @"^-?(0|[1-9]\d{0,14})(\.\d+)?$") && double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out num)) ? v : Js(v);
+                sb.Append((k > 0 ? ", " : "") + Js(cols[k]) + ": " + jv);
+            }
+            sb.Append(i < t.Rows.Count - 1 ? "},\n" : "}\n");
+        }
+        return sb.Append("]\n").ToString();
+    }
+    static string Js(string s) {
+        var sb = new StringBuilder("\"");
+        foreach (char ch in s) { if (ch == '"') sb.Append("\\\""); else if (ch == '\\') sb.Append("\\\\"); else if (ch == '\n') sb.Append("\\n"); else if (ch == '\r') sb.Append("\\r"); else if (ch == '\t') sb.Append("\\t"); else if (ch < 32) sb.Append("\\u" + ((int)ch).ToString("x4")); else sb.Append(ch); }
+        return sb.Append('"').ToString();
+    }
+
+    // ---- an ER diagram (diagram text) of tables: their columns, keys and the foreign keys between them
+    public const string ColumnsSql = @"SELECT s.name AS sch, t.name AS tbl, c.name AS col, TYPE_NAME(c.user_type_id) AS typ, c.max_length, c.precision, c.scale, c.is_nullable,
+  CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id WHERE i.is_primary_key = 1 AND ic.object_id = c.object_id AND ic.column_id = c.column_id) THEN 1 ELSE 0 END AS pk,
+  CASE WHEN EXISTS (SELECT 1 FROM sys.foreign_key_columns f WHERE f.parent_object_id = c.object_id AND f.parent_column_id = c.column_id) THEN 1 ELSE 0 END AS fk
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id JOIN sys.columns c ON c.object_id = t.object_id
+WHERE t.is_ms_shipped = 0 ORDER BY s.name, t.name, c.column_id";
+    public const string KeysSql = @"SELECT fk.name AS fkname, ps.name AS psch, pt.name AS ptbl, rs.name AS rsch, rt.name AS rtbl
+FROM sys.foreign_keys fk JOIN sys.tables pt ON pt.object_id = fk.parent_object_id JOIN sys.schemas ps ON ps.schema_id = pt.schema_id
+JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id JOIN sys.schemas rs ON rs.schema_id = rt.schema_id";
+
+    static string TypeText(System.Data.DataRow r) {
+        string t = r["typ"].ToString(); int len = Convert.ToInt32(r["max_length"]);
+        if (t == "varchar" || t == "char" || t == "varbinary" || t == "binary") return t + "(" + (len < 0 ? "max" : len.ToString()) + ")";
+        if (t == "nvarchar" || t == "nchar") return t + "(" + (len < 0 ? "max" : (len / 2).ToString()) + ")";
+        if (t == "decimal" || t == "numeric") return t + "(" + r["precision"] + "," + r["scale"] + ")";
+        return t;
+    }
+
+    // tables: null = all (at most 80), else these names (schema.table or table) and the tables they link to when 'related'
+    public static string ErText(string conn, string title, IEnumerable<string> tables, bool related) {
+        var cols = Query(conn, ColumnsSql, 60);
+        var keys = Query(conn, KeysSql, 60);
+        Func<string, string, string> full = (s, t) => s + "." + t;
+        var all = cols.Rows.Cast<System.Data.DataRow>().Select(r => full(r["sch"].ToString(), r["tbl"].ToString())).Distinct().ToList();
+        var want = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (tables == null) foreach (var t in all.Take(80)) want.Add(t);
+        else foreach (var t in tables) { var m = all.FirstOrDefault(a => string.Equals(a, t, StringComparison.OrdinalIgnoreCase) || a.EndsWith("." + t, StringComparison.OrdinalIgnoreCase)); if (m != null) want.Add(m); }
+        if (related && tables != null) {
+            foreach (System.Data.DataRow k in keys.Rows) {
+                string a = full(k["psch"].ToString(), k["ptbl"].ToString()), b = full(k["rsch"].ToString(), k["rtbl"].ToString());
+                if (want.Contains(a) || want.Contains(b)) { want.Add(a); want.Add(b); }
+            }
+        }
+        bool oneSchema = want.Select(x => x.Split('.')[0]).Distinct().Count() <= 1;
+        Func<string, string> id = t => Regex.Replace(t, @"[^\w]+", "_");
+        Func<string, string> label = t => oneSchema ? t.Substring(t.IndexOf('.') + 1) : t;
+        var sb = new StringBuilder();
+        sb.Append("title " + title + "\r\ntheme corporate light\r\ndirection LR\r\nroute ortho\r\nhide legend\r\n\r\n");
+        foreach (var t in all.Where(want.Contains)) {
+            var rows = cols.Rows.Cast<System.Data.DataRow>().Where(r => full(r["sch"].ToString(), r["tbl"].ToString()) == t).ToList();
+            var lines = rows.Take(40).Select(r => "\"" + r["col"].ToString().Replace("\"", "'").Replace(" ", "_") + " " + TypeText(r) + (Convert.ToInt32(r["pk"]) == 1 ? " PK" : "") + (Convert.ToInt32(r["fk"]) == 1 ? " FK" : "") + "\"").ToList();
+            if (rows.Count > 40) lines.Add("\"... " + (rows.Count - 40) + " more\"");
+            sb.Append(id(t) + ": " + label(t) + " [shape table, lines " + string.Join(" ", lines) + "]\r\n");
+        }
+        sb.Append("\r\n");
+        var seen = new HashSet<string>();
+        foreach (System.Data.DataRow k in keys.Rows) {
+            string a = full(k["psch"].ToString(), k["ptbl"].ToString()), b = full(k["rsch"].ToString(), k["rtbl"].ToString());
+            if (!want.Contains(a) || !want.Contains(b) || a == b) continue;
+            if (!seen.Add(b + ">" + a)) continue;
+            sb.Append(id(b) + " -> " + id(a) + " [label \"1 : n\"]\r\n");
+        }
+        return sb.ToString();
+    }
+}
+
 public static class DgAssets {
     public static readonly string Js = @"function (root, D) {
   var P = D.p, NS = 'http://www.w3.org/2000/svg', O = D.opt;
@@ -24711,7 +25002,7 @@ public static class DgAssets {
 function Initialize-Diagrams {
     if ('DgDoc' -as [type]) { return $true }
     $old = [System.Windows.Forms.Cursor]::Current; [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::WaitCursor
-    try { Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem; Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing, System.Core, System.Xml, System.Xml.Linq, System.IO.Compression, System.IO.Compression.FileSystem -TypeDefinition $DgSource -ErrorAction Stop; $true }
+    try { Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem, System.Data; Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing, System.Core, System.Xml, System.Xml.Linq, System.IO.Compression, System.IO.Compression.FileSystem, System.Data -TypeDefinition $DgSource -ErrorAction Stop; $true }
     catch { Write-Log "diagram engine: $_"; [void][System.Windows.Forms.MessageBox]::Show("The diagram engine couldn't start:`n$($_.Exception.Message)", 'Diagram studio'); $false }
     finally { [System.Windows.Forms.Cursor]::Current = $old }
 }
@@ -25431,6 +25722,15 @@ function Remove-DiagramSelection {
     Set-DiagramText $t
 }
 
+# after an edit the links are new objects: find the same link again (same ends and items) and select it
+function Find-DiagramEdgeLike($Doc, $Edge) {
+    $Doc.Edges | Where-Object { $_.From -eq $Edge.From -and $_.To -eq $Edge.To -and $_.FromItem -eq $Edge.FromItem -and $_.ToItem -eq $Edge.ToItem } | Select-Object -First 1
+}
+function Select-DiagramEdgeLike($Edge) {
+    $ne = Find-DiagramEdgeLike $DgUI.Doc $Edge
+    if ($ne) { $cv = $DgUI.Canvas; $cv.View.Selected.Clear(); $cv.View.SelectedEdge = $ne.Id; $cv.Invalidate(); Update-DiagramProps }
+}
+
 # ---- copy / paste between diagrams (the clipboard holds diagram text)
 function Copy-DiagramSelection([switch]$Quiet) {
     $cv = $DgUI.Canvas
@@ -25562,13 +25862,18 @@ function Update-DiagramProps {
         New-TbLabel $p 'Link' -Title | Out-Null
         $fromN = $d.Find($edge.From); $toN = $d.Find($edge.To)
         New-TbLabel $p "$($fromN.Title)$(if ($edge.FromItem) { " ($($edge.FromItem))" })  ->  $($toN.Title)$(if ($edge.ToItem) { " ($($edge.ToItem))" })" -Dim | Out-Null
-        $setE = { param($k, $v) Set-DiagramText ([DgText]::SetEdgeAttr($DgUI.Text, $DgUI.PropLine, $k, $v)) }
+        $DgUI.PropEdge = $edge
+        $setE = { param($k, $v) $pe = $DgUI.PropEdge; Set-DiagramText ([DgText]::EdgeSetAttr($DgUI.Text, $DgUI.Doc, $pe, $k, $v)); Select-DiagramEdgeLike $pe }
         $DgUI.SetEdge = $setE
         Add-DgProp $p 'Label' (New-DgBox $edge.Label { param($v) & $DgUI.SetEdge 'label' $(if ($v) { '"' + ($v -replace '"', "'") + '"' } else { $null }) }) | Out-Null
         Add-DgProp $p 'Category / flow (colour)' (New-DgCombo (@('(none)') + $cats) $(if ($edge.Cat) { $edge.Cat } else { '(none)' }) { param($v) & $DgUI.SetEdge 'cat' $(if ($v -and $v -ne '(none)') { $v -replace '\W', '' } else { $null }) } -Editable) | Out-Null
-        Add-DgProp $p 'Line' (New-DgCombo @('solid', 'dashed', 'dotted') @('solid', 'dashed', 'dotted')[$edge.Dash] { param($v) $t = $DgUI.Text; foreach ($k in 'dashed', 'dotted', 'solid') { $t = [DgText]::SetEdgeAttr($t, $DgUI.PropLine, $k, $null) }; if ($v -ne 'solid') { $t = [DgText]::SetEdgeAttr($t, $DgUI.PropLine, $v, '') }; Set-DiagramText $t }) 120 | Out-Null
+        Add-DgProp $p 'Line' (New-DgCombo @('solid', 'dashed', 'dotted') @('solid', 'dashed', 'dotted')[$edge.Dash] { param($v) & $DgUI.SetEdge 'dashed' $null; foreach ($k in 'dotted', 'solid') { & $DgUI.SetEdge $k $null }; if ($v -ne 'solid') { & $DgUI.SetEdge $v '' } }) 120 | Out-Null
         Add-DgProp $p 'Route' (New-DgCombo @('auto', 'ortho', 'curve', 'straight') $(if ($edge.Route) { $edge.Route } else { 'auto' }) { param($v) & $DgUI.SetEdge 'route' $(if ($v -ne 'auto') { $v } else { $null }) }) 120 | Out-Null
-        Add-DgProp $p 'Arrows' (New-DgCombo @('auto', 'end', 'both', 'start', 'none') $(if ($edge.ArrowAttr) { if ($edge.ArrowStart -and $edge.ArrowEnd) { 'both' } elseif ($edge.ArrowStart) { 'start' } elseif ($edge.ArrowEnd) { 'end' } else { 'none' } } else { 'auto' }) { param($v) $t = [DgText]::SetEdgeAttr($DgUI.Text, $DgUI.PropLine, 'noarrow', $null); $t = [DgText]::SetEdgeAttr($t, $DgUI.PropLine, 'arrow', $(if ($v -ne 'auto') { $v } else { $null })); Set-DiagramText $t }) 120 | Out-Null
+        Add-DgProp $p 'Arrows' (New-DgCombo @('auto', 'end', 'both', 'start', 'none') $(if ($edge.ArrowAttr) { if ($edge.ArrowStart -and $edge.ArrowEnd) { 'both' } elseif ($edge.ArrowStart) { 'start' } elseif ($edge.ArrowEnd) { 'end' } else { 'none' } } else { 'auto' }) { param($v) & $DgUI.SetEdge 'noarrow' $null; & $DgUI.SetEdge 'arrow' $(if ($v -ne 'auto') { $v } else { $null }) }) 120 | Out-Null
+        $sides = @('auto', 'left', 'right', 'top', 'bottom')
+        Add-DgProp $p 'Starts at the side' (New-DgCombo $sides $(if ($edge.FromSide) { $edge.FromSide } else { 'auto' }) { param($v) & $DgUI.SetEdge 'from' $(if ($v -ne 'auto') { $v } else { $null }) }) 120 | Out-Null
+        Add-DgProp $p 'Ends at the side' (New-DgCombo $sides $(if ($edge.ToSide) { $edge.ToSide } else { 'auto' }) { param($v) & $DgUI.SetEdge 'to' $(if ($v -ne 'auto') { $v } else { $null }) }) 120 | Out-Null
+        New-TbLabel $p 'Or drag the blue dots at its ends to any point on any side of the cards; drag the link itself to move its bend.' -Dim | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0) }
         $an = New-CheckBox $p 'Animated: packets flow along it' $edge.Animate; $an.Margin = New-Object System.Windows.Forms.Padding(0, (Px 10), 0, 0)
         $an.add_CheckedChanged({ param($src, $e) & $DgUI.SetEdge 'animate' $(if ($src.Checked) { '' } else { $null }) })
         $bo = New-CheckBox $p 'Both ways' $edge.Both; $bo.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), 0, 0)
@@ -25577,8 +25882,9 @@ function Update-DiagramProps {
         [void](New-DgColorButton $row 'Colour' $edge.Color { param($v) & $DgUI.SetEdge 'color' $v })
         [void](New-Button 'Delete' 'Delete this link (its whole line in the text)' { Remove-DiagramSelection } $row $Glyph.Delete 2)
         if (-not [float]::IsNaN($edge.LabelAt.X)) { [void](New-Button 'Label back' 'Put the label back in the middle of the link' { & $DgUI.SetEdge 'labelat' $null } $row $Glyph.Refresh 2) }
+        if ($edge.Via.Count -or $edge.FromSide -or $edge.ToSide) { [void](New-Button 'Reset route' 'Automatic route and ends again' { $pe = $DgUI.PropEdge; $t = $DgUI.Text; foreach ($k in 'via', 'from', 'to') { $t = [DgText]::EdgeSetAttr($t, [DgText]::Parse($t), (Find-DiagramEdgeLike ([DgText]::Parse($t)) $pe), $k, $null) }; Set-DiagramText $t; Select-DiagramEdgeLike $pe } $row $Glyph.Refresh 2) }
         $p.Controls.Add($row)
-        New-TbLabel $p 'A line like  a -> b, c  makes several links: changes here apply to all of them.' -Dim | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0) }
+
     } else {
         New-TbLabel $p 'Diagram' -Title | Out-Null
         Add-DgProp $p 'Title' (New-DgBox $d.Title { param($v) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'title', $(if ($v) { $v } else { $null }))) }) | Out-Null
@@ -25911,7 +26217,22 @@ function Show-DiagramStudio([string]$Text = '') {
     $cv.add_DeleteRequested({ Remove-DiagramSelection })
     $cv.add_NodeOpened({ if ($DgUI.Canvas.Editable) { Edit-DiagramLabel } })
     $cv.add_CopyRequested({ [void](Copy-DiagramSelection) })
-    $cv.add_LabelMoved({ param($src, $e) $le = $src.MovedLabel; if ($le -and $le.SrcLine -ge 0) { Set-DiagramText ([DgText]::SetEdgeAttr($DgUI.Text, $le.SrcLine, 'labelat', "$([int]$le.LabelAt.X) $([int]$le.LabelAt.Y)")) } })
+    $cv.add_EndMoved({
+        param($src, $e)
+        $le = $src.MovedEdge; if (-not $le) { return }
+        $k = if ($src.MovedSource) { 'from' } else { 'to' }
+        $sd = if ($src.MovedSource) { "$($le.FromSide) $($le.FromT.ToString([Globalization.CultureInfo]::InvariantCulture))" } else { "$($le.ToSide) $($le.ToT.ToString([Globalization.CultureInfo]::InvariantCulture))" }
+        $sel = $le.Id
+        Set-DiagramText ([DgText]::EdgeSetAttr($DgUI.Text, $DgUI.Doc, $le, $k, $sd))
+        Select-DiagramEdgeLike $le
+    })
+    $cv.add_RouteMoved({
+        param($src, $e)
+        $le = $src.MovedEdge; if (-not $le -or $le.Via.Count -eq 0) { return }
+        Set-DiagramText ([DgText]::EdgeSetAttr($DgUI.Text, $DgUI.Doc, $le, 'via', "$([int]$le.Via[0].X) $([int]$le.Via[0].Y)"))
+        Select-DiagramEdgeLike $le
+    })
+    $cv.add_LabelMoved({ param($src, $e) $le = $src.MovedLabel; if ($le -and $le.SrcLine -ge 0) { Set-DiagramText ([DgText]::EdgeSetAttr($DgUI.Text, $DgUI.Doc, $le, 'labelat', "$([int]$le.LabelAt.X) $([int]$le.LabelAt.Y)")); Select-DiagramEdgeLike $le } })
     $cv.add_PasteRequested({ Paste-DiagramClip })
     $cv.add_DuplicateRequested({ Copy-DiagramDuplicate })
     $cm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
@@ -26000,6 +26321,8 @@ a -> b            a --> b        a -.-> b (dashed)     a ==> b (thick)      a --
 a -yes-> b        a -- yes --> b     a -->|yes| b      a -> b, c, d     a & b -> c     a -> b -> c
 a -> b [prod, animate, density 2, dashed, dotted, curve, straight, both, noarrow, arrow both, label "x", via 300 120]
                   labelat 340 120  = where the label sits (drag it on the canvas)
+                  from top 0.25, to left 0.8  = which side of the card an end sits on, and where along it (drag the ends)
+                  via 300 120  = a bend the link goes through (drag the link)
 
 GROUPS
 group core "Core services" [svc, dashed] { a, b, c }      or      subgraph core [Core services] ... end
@@ -26216,6 +26539,431 @@ function New-DiagramFromData {
     Select-ApiTab $DgUI.Tabs 'Text'
 }
 
+# ======================================================================================
+# SQL client: SQL Server (Windows or SQL login) with nothing to install. Object browser, editor with colours,
+# runs in the background (Cancel), results in grids, export, history, saved queries, charts / ER diagrams.
+# ======================================================================================
+$SqlDir = Join-Path $DataDir 'sql'
+$SqlUI = @{ Form = $null; Conns = (New-Object System.Collections.Generic.List[object]); Queries = (New-Object System.Collections.Generic.List[object]); History = (New-Object System.Collections.Generic.List[object]); Run = $null }
+
+function Import-SqlData {
+    $SqlUI.Conns.Clear(); $SqlUI.Queries.Clear(); $SqlUI.History.Clear()
+    foreach ($pair in @(@('connections.json', $SqlUI.Conns), @('queries.json', $SqlUI.Queries), @('history.json', $SqlUI.History))) {
+        $p = Join-Path $SqlDir $pair[0]
+        if (Test-Path -LiteralPath $p) { try { foreach ($x in @(ConvertFrom-JsonList (Read-DataText $p))) { if ($x) { $pair[1].Add($x) } } } catch { Write-Log "sql $($pair[0]): $_" } }
+    }
+}
+function Save-SqlData([string]$What) {
+    if ($script:NoSave) { return }
+    if (-not (Test-Path -LiteralPath $SqlDir)) { [void](New-Item -ItemType Directory -Path $SqlDir -Force) }
+    $items = @(switch ($What) { 'connections' { $SqlUI.Conns } 'queries' { $SqlUI.Queries } default { $SqlUI.History } })     # switch unrolls the list
+    $json = ConvertTo-Json -InputObject $items -Depth 5
+    if (-not $json -or $json -eq 'null') { $json = '[]' }
+    try { Write-JsonFile (Join-Path $SqlDir "$What.json") $json } catch { Write-Log "sql save $What : $_" }
+}
+
+# passwords are kept protected for this Windows account (DPAPI)
+function Protect-SqlPassword([string]$Pw) { if (-not $Pw) { return '' }; [Convert]::ToBase64String([PowerClipVault]::ProtectForUser([Text.Encoding]::UTF8.GetBytes($Pw))) }
+function Unprotect-SqlPassword([string]$Blob) { if (-not $Blob) { return '' }; try { [Text.Encoding]::UTF8.GetString([PowerClipVault]::UnprotectForUser([Convert]::FromBase64String($Blob))) } catch { '' } }
+
+function Get-SqlConnString($Conn, [string]$Db = '') {
+    if (-not $Conn) { return $null }
+    $d = if ($Db) { $Db } else { [string]$Conn.Database }
+    [DgSql]::Build([string]$Conn.Server, $d, [bool]$Conn.Windows, [string]$Conn.User, (Unprotect-SqlPassword ([string]$Conn.Pw)), [bool]$Conn.Encrypt, [bool]$Conn.Trust, 15)
+}
+
+# ---- the connection dialog
+function Edit-SqlConnection($Conn = $null) {
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = if ($Conn) { 'Edit connection' } else { 'New connection' }; $f.Icon = $IconActive; $f.StartPosition = 'CenterParent'
+    $f.Size = New-Object System.Drawing.Size((Px 520), (Px 620)); $f.FormBorderStyle = 'FixedDialog'; $f.MaximizeBox = $false; $f.MinimizeBox = $false
+    $f.BackColor = $C.Bg; $f.ForeColor = $C.Fore; $f.Font = $FontMain
+    $p = New-Object System.Windows.Forms.FlowLayoutPanel
+    $p.Dock = 'Fill'; $p.FlowDirection = 'TopDown'; $p.WrapContents = $false; $p.AutoScroll = $true; $p.BackColor = $C.Bg; $p.Padding = New-Object System.Windows.Forms.Padding((Px 16), (Px 10), (Px 16), (Px 10))
+    $f.Controls.Add($p)
+    $st = @{ Form = $f }
+    $box = { param($label, $value, [switch]$pw) New-TbLabel $p $label -Dim | Out-Null; $b = New-TbBox; $b.Width = Px 440; $b.Text = $value; if ($pw) { $b.UseSystemPasswordChar = $true }; $p.Controls.Add($b); $b }
+    $st.Name = & $box 'Name' $(if ($Conn) { $Conn.Name } else { '' })
+    $st.Server = & $box 'Server   (localhost, .\SQLEXPRESS, (localdb)\MSSQLLocalDB, server.domain.com,1433)' $(if ($Conn) { $Conn.Server } else { 'localhost' })
+    New-TbLabel $p 'Sign in with' -Dim | Out-Null
+    $st.Auth = New-TbCombo $p @('Windows account', 'SQL Server login') 220
+    $st.Auth.SelectedIndex = if ($Conn -and -not $Conn.Windows) { 1 } else { 0 }
+    $st.User = & $box 'User' $(if ($Conn) { $Conn.User } else { '' })
+    $st.Pw = & $box 'Password  (kept protected for your Windows account)' $(if ($Conn) { Unprotect-SqlPassword $Conn.Pw } else { '' }) -pw
+    New-TbLabel $p 'Database' -Dim | Out-Null
+    $dbrow = New-Object System.Windows.Forms.FlowLayoutPanel; $dbrow.AutoSize = $true; $dbrow.WrapContents = $false; $dbrow.BackColor = $C.Bg
+    $st.Db = New-Object System.Windows.Forms.ComboBox; $st.Db.DropDownStyle = 'DropDown'; $st.Db.FlatStyle = 'Flat'; $st.Db.BackColor = $C.Bg; $st.Db.ForeColor = $C.Fore; $st.Db.Width = Px 300
+    $st.Db.Text = if ($Conn) { $Conn.Database } else { 'master' }
+    $dbrow.Controls.Add($st.Db)
+    $p.Controls.Add($dbrow)
+    $st.Encrypt = New-CheckBox $p 'Encrypt the connection' $(if ($Conn) { [bool]$Conn.Encrypt } else { $false })
+    $st.Trust = New-CheckBox $p 'Trust the server certificate (self-signed)' $(if ($Conn) { [bool]$Conn.Trust } else { $true })
+    $st.Confirm = New-CheckBox $p 'Ask before running statements that change data (INSERT, UPDATE, DELETE, DROP ...)' $(if ($Conn) { $Conn.Confirm -ne $false } else { $true })
+    foreach ($cb in $st.Encrypt, $st.Trust, $st.Confirm) { $cb.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0); $cb.MaximumSize = New-Object System.Drawing.Size((Px 440), 0) }
+    $st.Info = New-TbLabel $p '' -Dim; $st.Info.MaximumSize = New-Object System.Drawing.Size((Px 440), 0)
+    $st.Make = { param($s) [pscustomobject]@{ Name = $(if ($s.Name.Text.Trim()) { $s.Name.Text.Trim() } else { $s.Server.Text.Trim() }); Server = $s.Server.Text.Trim(); Database = $s.Db.Text.Trim(); Windows = ($s.Auth.SelectedIndex -eq 0)
+                                              User = $s.User.Text.Trim(); Pw = (Protect-SqlPassword $s.Pw.Text); Encrypt = $s.Encrypt.Checked; Trust = $s.Trust.Checked; Confirm = $s.Confirm.Checked } }
+    $f.Tag = $st
+    [void](New-Button 'Databases' 'Connect and list the databases' {
+        $s = $this.FindForm().Tag; $c0 = & $s.Make $s
+        $s.Form.Cursor = 'WaitCursor'
+        try {
+            $t = [DgSql]::Query((Get-SqlConnString $c0 'master'), 'SELECT name FROM sys.databases WHERE HAS_DBACCESS(name) = 1 ORDER BY CASE WHEN database_id <= 4 THEN 1 ELSE 0 END, name', 15)
+            $cur = $s.Db.Text; $s.Db.Items.Clear(); foreach ($r in $t.Rows) { [void]$s.Db.Items.Add([string]$r[0]) }; $s.Db.Text = $cur
+            $s.Info.Text = "Connected: $($t.Rows.Count) databases."; $s.Info.ForeColor = $C.Green
+            $s.Db.DroppedDown = $true
+        } catch { $s.Info.Text = $_.Exception.InnerException.Message; if (-not $s.Info.Text) { $s.Info.Text = $_.Exception.Message }; $s.Info.ForeColor = $C.Red } finally { $s.Form.Cursor = 'Default' }
+    } $dbrow $Glyph.Refresh 2)
+    $bar = New-Object System.Windows.Forms.FlowLayoutPanel; $bar.Dock = 'Bottom'; $bar.AutoSize = $true; $bar.BackColor = $C.Panel; $bar.Padding = New-Object System.Windows.Forms.Padding((Px 12), (Px 8), (Px 12), (Px 8)); $bar.FlowDirection = 'RightToLeft'
+    $f.Controls.Add($bar)
+    [void](New-Button 'Cancel' '' { $this.FindForm().DialogResult = 'Cancel' } $bar '' 2)
+    [void](New-Button 'Save' 'Save the connection' {
+        $s = $this.FindForm().Tag
+        if (-not $s.Server.Text.Trim()) { $s.Info.Text = 'The server is needed.'; $s.Info.ForeColor = $C.Red; return }
+        $s.Result = & $s.Make $s; $this.FindForm().DialogResult = 'OK'
+    } $bar $Glyph.Save 1)
+    [void](New-Button 'Test' 'Try to connect' {
+        $s = $this.FindForm().Tag; $c0 = & $s.Make $s
+        $s.Form.Cursor = 'WaitCursor'
+        try { $t = [DgSql]::Query((Get-SqlConnString $c0), 'SELECT @@SERVERNAME, DB_NAME(), SUSER_SNAME(), CAST(SERVERPROPERTY(''ProductVersion'') AS varchar(40))', 15); $r = $t.Rows[0]; $s.Info.Text = "Connected to $($r[0]), database $($r[1]) as $($r[2]) (SQL Server $($r[3]))."; $s.Info.ForeColor = $C.Green }
+        catch { $m = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }; $s.Info.Text = $m; $s.Info.ForeColor = $C.Red } finally { $s.Form.Cursor = 'Default' }
+    } $bar $Glyph.Play 2)
+    Register-ThemedWindow $f
+    $script:Modal = $true
+    try { if ($f.ShowDialog($SqlUI.Form) -eq 'OK') { return $st.Result } } finally { $script:Modal = $false; $f.Dispose() }
+    $null
+}
+
+function Update-SqlConnList([string]$Select = '') {
+    $cb = $SqlUI.ConnBox
+    $cb.Items.Clear()
+    foreach ($c0 in $SqlUI.Conns) { [void]$cb.Items.Add($c0.Name) }
+    [void]$cb.Items.Add('New connection...')
+    $i = if ($Select) { [Math]::Max(0, $cb.Items.IndexOf($Select)) } else { 0 }
+    if ($SqlUI.Conns.Count) { $cb.SelectedIndex = $i } else { $cb.SelectedIndex = -1 }
+}
+function Get-SqlConn { $i = $SqlUI.ConnBox.SelectedIndex; if ($i -ge 0 -and $i -lt $SqlUI.Conns.Count) { $SqlUI.Conns[$i] } else { $null } }
+
+# ---- object browser
+function Update-SqlTree {
+    $tv = $SqlUI.Tree; $tv.Nodes.Clear()
+    $c0 = Get-SqlConn
+    if (-not $c0) { return }
+    $root = $tv.Nodes.Add([string]$c0.Server); $root.Tag = @{ Kind = 'server' }
+    try {
+        $t = [DgSql]::Query((Get-SqlConnString $c0 'master'), 'SELECT name FROM sys.databases WHERE HAS_DBACCESS(name) = 1 ORDER BY CASE WHEN database_id <= 4 THEN 1 ELSE 0 END, name', 15)
+        foreach ($r in $t.Rows) { $n = $root.Nodes.Add([string]$r[0]); $n.Tag = @{ Kind = 'db'; Db = [string]$r[0] }; [void]$n.Nodes.Add('...') }
+        $root.Expand()
+        $cur = @($root.Nodes | Where-Object { $_.Text -eq [string]$SqlUI.DbBox.Text }) | Select-Object -First 1
+        if ($cur) { $cur.Expand() }
+    } catch { $n = $root.Nodes.Add("Can't connect: $($_.Exception.InnerException.Message)"); $n.ForeColor = $C.Red }
+}
+function Expand-SqlNode($Node) {
+    $tg = $Node.Tag
+    if (-not $tg -or $Node.Nodes.Count -ne 1 -or $Node.Nodes[0].Text -ne '...') { return }
+    $Node.Nodes.Clear()
+    $c0 = Get-SqlConn
+    try {
+        switch ($tg.Kind) {
+            'db' {
+                foreach ($k in @(@('Tables', 'U'), @('Views', 'V'), @('Procedures', 'P'), @('Functions', 'FN'))) { $n = $Node.Nodes.Add($k[0]); $n.Tag = @{ Kind = 'folder'; Db = $tg.Db; Type = $k[1] }; [void]$n.Nodes.Add('...') }
+            }
+            'folder' {
+                $types = if ($tg.Type -eq 'FN') { "'FN','IF','TF'" } else { "'$($tg.Type)'" }
+                $t = [DgSql]::Query((Get-SqlConnString $c0 $tg.Db), "SELECT s.name, o.name FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE o.type IN ($types) AND o.is_ms_shipped = 0 ORDER BY s.name, o.name", 15)
+                foreach ($r in $t.Rows) { $full = "$($r[0]).$($r[1])"; $n = $Node.Nodes.Add($full); $n.Tag = @{ Kind = 'object'; Db = $tg.Db; Name = $full; Type = $tg.Type }; if ($tg.Type -in 'U', 'V') { [void]$n.Nodes.Add('...') } }
+                if ($t.Rows.Count -eq 0) { $e = $Node.Nodes.Add('(none)'); $e.ForeColor = $C.Dim }
+            }
+            'object' {
+                $q = "SELECT c.name, TYPE_NAME(c.user_type_id), c.max_length, c.is_nullable, CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id WHERE i.is_primary_key = 1 AND ic.object_id = c.object_id AND ic.column_id = c.column_id) THEN 'PK' ELSE '' END, CASE WHEN EXISTS (SELECT 1 FROM sys.foreign_key_columns f WHERE f.parent_object_id = c.object_id AND f.parent_column_id = c.column_id) THEN 'FK' ELSE '' END FROM sys.columns c WHERE c.object_id = OBJECT_ID(@'" + ($tg.Name -replace "'", "''") + "') ORDER BY c.column_id"
+                $q = $q.Replace("@'", "'")
+                $t = [DgSql]::Query((Get-SqlConnString $c0 $tg.Db), $q, 15)
+                foreach ($r in $t.Rows) {
+                    $len = [int]$r[2]; $ty = [string]$r[1]
+                    if ($ty -match 'char|binary') { $ty += "($(if ($len -lt 0) { 'max' } elseif ($ty -match '^n') { $len / 2 } else { $len }))" }
+                    $keys = (@($r[4], $r[5]) | Where-Object { $_ }) -join ' '
+                    $n = $Node.Nodes.Add("$($r[0])   $ty$(if ($keys) { "  $keys" })$(if ([bool]$r[3]) { '' } else { '  not null' })"); $n.Tag = @{ Kind = 'column'; Name = [string]$r[0] }
+                    if ($keys) { $n.ForeColor = $C.Accent }
+                }
+            }
+        }
+    } catch { $n = $Node.Nodes.Add($_.Exception.InnerException.Message); $n.ForeColor = $C.Red }
+}
+
+function Insert-SqlText([string]$Text) { $ed = $SqlUI.Editor; $ed.SelectedText = $Text; $ed.Focus() }
+function ConvertTo-SqlName([string]$Full) { (($Full -split '\.') | ForEach-Object { "[$_]" }) -join '.' }
+
+# ---- run
+function Start-SqlRun {
+    if ($SqlUI.Run -and -not $SqlUI.Run.Done) { return }
+    $c0 = Get-SqlConn
+    if (-not $c0) { Set-SqlStatus 'Add a connection first (the list at the top left).' $C.Red; return }
+    $ed = $SqlUI.Editor
+    $sql = if ($ed.SelectionLength -gt 0) { $ed.SelectedText } else { $ed.Text }
+    if (-not $sql.Trim()) { return }
+    $w = [DgSql]::Writes($sql)
+    if ($w -and $c0.Confirm -ne $false) {
+        if ([System.Windows.Forms.MessageBox]::Show($SqlUI.Form, "This changes data or objects ($w) on $($c0.Name) / $($SqlUI.DbBox.Text).`n`nRun it?", 'SQL client', 'YesNo', 'Warning') -ne 'Yes') { return }
+    }
+    $SqlUI.RunSql = $sql
+    $SqlUI.Run = [DgSqlRun]::Start((Get-SqlConnString $c0 $SqlUI.DbBox.Text), $sql, [int]$SqlUI.MaxRows.Value, 0)
+    $SqlUI.RunBtn.Enabled = $false; $SqlUI.CancelBtn.Enabled = $true
+    Set-SqlStatus 'Running...' $C.Accent
+    $SqlUI.Started = Get-Date
+    $SqlUI.Timer.Start()
+}
+
+function Complete-SqlRun {
+    $r = $SqlUI.Run.Result
+    $SqlUI.RunBtn.Enabled = $true; $SqlUI.CancelBtn.Enabled = $false
+    $tabs = $SqlUI.ResTabs
+    foreach ($k in @($tabs.Panels.Keys)) { $p = $tabs.Panels[$k]; foreach ($ctl in @($p.Controls)) { $ctl.Dispose() }; $tabs.Host.Controls.Remove($p); $tabs.Strip.Controls.Remove($tabs.Buttons[$k]); $tabs.Buttons[$k].Dispose(); $p.Dispose() }
+    $tabs.Panels.Clear(); $tabs.Buttons.Clear()
+    $SqlUI.Tables = @($r.Tables)
+    $i = 0; $first = ''
+    foreach ($t in $r.Tables) {
+        $i++
+        $name = "Result $i  ($($t.Rows.Count))"
+        $p = Add-ApiTab $tabs $name
+        $g = New-SqlGrid $p; $g.DataSource = $t; $g.Tag = $t
+        if (-not $first) { $first = $name }
+    }
+    $mp = Add-ApiTab $tabs 'Messages'
+    $mb = New-TbRtb -ReadOnly; $mb.Dock = 'Fill'
+    $lines = @($r.Messages) + $(if ($r.Error) { "Error: $($r.Error)" }) + $(if ($r.Cancelled) { 'Cancelled.' }) + $(if ($r.Truncated) { "Only the first $($SqlUI.MaxRows.Value) rows of a result are shown (Max rows)." })
+    $mb.Text = (@($lines | Where-Object { $_ }) -join "`r`n")
+    if ($r.Error) { $mb.ForeColor = $C.Red }
+    $mp.Controls.Add($mb)
+    Select-ApiTab $tabs $(if ($first -and -not $r.Error) { $first } else { 'Messages' })
+    $rows = 0; foreach ($tt in $r.Tables) { $rows += $tt.Rows.Count }
+    if ($r.Error) {
+        Set-SqlStatus $r.Error $C.Red
+        if ($r.ErrorLine -gt 0 -and $SqlUI.Editor.SelectionLength -eq 0) {
+            $ln = $r.ErrorLine - 1; if ($ln -lt $SqlUI.Editor.Lines.Count) { $s0 = $SqlUI.Editor.GetFirstCharIndexFromLine($ln); $SqlUI.Editor.Select($s0, $SqlUI.Editor.Lines[$ln].Length) }
+        }
+    } elseif ($r.Cancelled) { Set-SqlStatus "Cancelled after $([Math]::Round($r.Ms / 1000, 1)) s." $C.Yellow }
+    else { Set-SqlStatus "$($r.Tables.Count) result$(if ($r.Tables.Count -ne 1) { 's' }), $rows row$(if ($rows -ne 1) { 's' })  -  $(if ($r.Ms -lt 1000) { "$($r.Ms) ms" } else { "$([Math]::Round($r.Ms / 1000, 2)) s" })$(if ($r.Truncated) { '  (rows cut at Max rows)' })" $C.Green }
+    # history
+    $c0 = Get-SqlConn
+    $SqlUI.History.Insert(0, [pscustomobject]@{ Time = (Get-Date).ToString('o'); Conn = $(if ($c0) { $c0.Name } else { '' }); Db = $SqlUI.DbBox.Text; Sql = $SqlUI.RunSql; Rows = [int]$rows; Ms = $r.Ms; Ok = -not $r.Error })
+    while ($SqlUI.History.Count -gt 200) { $SqlUI.History.RemoveAt($SqlUI.History.Count - 1) }
+    Save-SqlData 'history'
+    Update-SqlSideLists
+}
+
+function New-SqlGrid($Parent) {
+    $g = New-Object System.Windows.Forms.DataGridView
+    $g.Dock = 'Fill'; $g.BorderStyle = 'None'; $g.BackgroundColor = $C.Bg; $g.GridColor = $C.Line
+    $g.RowHeadersVisible = $false; $g.EnableHeadersVisualStyles = $false
+    $g.ColumnHeadersDefaultCellStyle.BackColor = $C.Panel; $g.ColumnHeadersDefaultCellStyle.ForeColor = $C.Dim
+    $g.ColumnHeadersDefaultCellStyle.SelectionBackColor = $C.Panel; $g.ColumnHeadersDefaultCellStyle.Font = $FontSmall
+    $g.ColumnHeadersBorderStyle = 'Single'; $g.ColumnHeadersHeight = Px 28
+    $g.DefaultCellStyle.BackColor = $C.Bg; $g.DefaultCellStyle.ForeColor = $C.Fore; $g.DefaultCellStyle.Font = New-Object System.Drawing.Font('Consolas', (Fz 10))
+    $g.DefaultCellStyle.SelectionBackColor = $C.Sel; $g.DefaultCellStyle.SelectionForeColor = $C.Fore
+    $g.DefaultCellStyle.NullValue = 'NULL'
+    $g.RowTemplate.Height = Px 24; $g.AllowUserToResizeRows = $false; $g.AutoSizeColumnsMode = 'None'
+    $g.CellBorderStyle = 'SingleHorizontal'; $g.SelectionMode = 'CellSelect'
+    $g.ReadOnly = $true; $g.AllowUserToAddRows = $false; $g.AllowUserToDeleteRows = $false
+    $g.ClipboardCopyMode = 'EnableAlwaysIncludeHeaderText'
+    $g.add_CellFormatting({ param($src, $e) if ($e.Value -is [DBNull]) { $e.CellStyle.ForeColor = $C.Dim } })
+    $g.add_DataBindingComplete({ param($src, $e) foreach ($col in $src.Columns) { $col.Width = [Math]::Min((Px 360), [Math]::Max([Math]::Max((Px 70), $col.GetPreferredWidth('AllCellsExceptHeader', $true) + (Px 12)), $col.GetPreferredWidth('ColumnHeader', $true))) } })
+    $Parent.Controls.Add($g)
+    $g
+}
+
+function Set-SqlStatus([string]$Text, $Color) { $SqlUI.Status.Text = $Text; $SqlUI.Status.ForeColor = $Color }
+function Get-SqlCurrentTable {
+    $tabs = $SqlUI.ResTabs
+    $p = $tabs.Panels[$tabs.Current]
+    if (-not $p) { return $null }
+    $g = @($p.Controls | Where-Object { $_ -is [System.Windows.Forms.DataGridView] }) | Select-Object -First 1
+    if ($g) { , $g.Tag } else { $null }     # the comma keeps PowerShell from turning the table into its rows
+}
+
+function Export-SqlResult([string]$As) {
+    $t = Get-SqlCurrentTable
+    if (-not $t) { Set-SqlStatus 'Run a query that returns rows first.' $C.Yellow; return }
+    if ($As -eq 'copy') { [System.Windows.Forms.Clipboard]::SetText([DgSql]::ToCsv($t, "`t")); Set-SqlStatus "Copied $($t.Rows.Count) rows with headers (paste into Excel)." $C.Green; return }
+    $d = New-Object System.Windows.Forms.SaveFileDialog
+    $d.Filter = if ($As -eq 'json') { 'JSON|*.json' } else { 'CSV|*.csv' }; $d.FileName = "result.$As"
+    $script:Modal = $true
+    try { if ($d.ShowDialog($SqlUI.Form) -ne 'OK') { return }; $path = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
+    $text = if ($As -eq 'json') { [DgSql]::ToJson($t) } else { [DgSql]::ToCsv($t, ',') }
+    [IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding $true))
+    Set-SqlStatus "Saved $($t.Rows.Count) rows to $(Split-Path -Leaf $path)." $C.Green
+}
+
+# the current result into the Diagram studio's Data tab (chart, links or tree)
+function Send-SqlToDiagram([int]$Kind) {
+    $t = Get-SqlCurrentTable
+    if (-not $t) { Set-SqlStatus 'Run a query that returns rows first.' $C.Yellow; return }
+    $csv = [DgSql]::ToCsv($t, ',')
+    Show-DiagramStudio
+    if (-not $DgUI.Data) { return }
+    Select-ApiTab $DgUI.Tabs 'Data'
+    $first = ($SqlUI.RunSql -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+    $DgUI.Data.Name = if ($first) { ($first.Trim() -replace '\s+', ' ').Substring(0, [Math]::Min(40, ($first.Trim() -replace '\s+', ' ').Length)) } else { 'Query' }
+    $DgUI.Data.Box.Text = $csv
+    Update-DiagramDataColumns
+    $DgUI.Data.Kind.SelectedIndex = $Kind
+}
+
+function New-SqlErDiagram([string[]]$Tables = $null) {
+    $c0 = Get-SqlConn
+    if (-not $c0) { return }
+    $db = $SqlUI.DbBox.Text
+    $SqlUI.Form.Cursor = 'WaitCursor'
+    try { $text = [DgSql]::ErText((Get-SqlConnString $c0 $db), $db, $Tables, [bool]$Tables) }
+    catch { Set-SqlStatus "Couldn't read the tables: $($_.Exception.InnerException.Message)" $C.Red; return } finally { $SqlUI.Form.Cursor = 'Default' }
+    Show-DiagramStudio
+    New-DiagramFromText "$db tables" $text
+}
+
+function Update-SqlSideLists {
+    $l = $SqlUI.HistList
+    if ($l) { $l.BeginUpdate(); $l.Items.Clear(); foreach ($h in $SqlUI.History) { $t = ($h.Sql -replace '\s+', ' ').Trim(); [void]$l.Items.Add("$(if (-not $h.Ok) { '! ' })$($t.Substring(0, [Math]::Min(90, $t.Length)))") }; $l.EndUpdate() }
+    $q = $SqlUI.QueryList
+    if ($q) { $q.BeginUpdate(); $q.Items.Clear(); foreach ($x in $SqlUI.Queries) { [void]$q.Items.Add($x.Name) }; $q.EndUpdate() }
+}
+
+function Show-SqlClient {
+    Hide-Picker
+    if (-not (Initialize-Diagrams)) { return }
+    if ($SqlUI.Form) { if ($SqlUI.Form.WindowState -eq 'Minimized') { $SqlUI.Form.WindowState = 'Normal' }; $SqlUI.Form.Activate(); return }
+    Import-SqlData
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'SQL client'; $f.Icon = $IconActive
+    $f.Size = New-Object System.Drawing.Size((Px 1400), (Px 880)); $f.MinimumSize = New-Object System.Drawing.Size((Px 900), (Px 560))
+    $f.StartPosition = 'CenterScreen'; $f.BackColor = $C.Panel; $f.ForeColor = $C.Fore; $f.Font = $FontMain; $f.KeyPreview = $true
+    $SqlUI.Form = $f
+
+    # left: object browser, saved queries, history
+    $left = New-Object System.Windows.Forms.Panel; $left.Dock = 'Left'; $left.Width = Px 330; $left.BackColor = $C.Bg
+    $ltabs = New-TabSet $left
+    $pObj = Add-ApiTab $ltabs 'Objects'; $pSaved = Add-ApiTab $ltabs 'Saved'; $pHist = Add-ApiTab $ltabs 'History'
+    $tv = New-Object System.Windows.Forms.TreeView
+    $tv.Dock = 'Fill'; $tv.BorderStyle = 'None'; $tv.BackColor = $C.Bg; $tv.ForeColor = $C.Fore; $tv.ItemHeight = $FontMain.Height + (Px 8); $tv.HideSelection = $false; $tv.ShowLines = $false
+    $tv.add_BeforeExpand({ param($src, $e) Expand-SqlNode $e.Node })
+    $tv.add_NodeMouseDoubleClick({ param($src, $e) $tg = $e.Node.Tag; if ($tg -and $tg.Kind -eq 'object') { Insert-SqlText (ConvertTo-SqlName $tg.Name) } elseif ($tg -and $tg.Kind -eq 'column') { Insert-SqlText "[$($tg.Name)]" } elseif ($tg -and $tg.Kind -eq 'db') { $SqlUI.DbBox.Text = $tg.Db } })
+    $tv.add_NodeMouseClick({ param($src, $e) if ($e.Button -eq 'Right') { $src.SelectedNode = $e.Node } })
+    $tm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $tm.add_Opening({
+        param($src, $e)
+        $src.Items.Clear()
+        $n = $SqlUI.Tree.SelectedNode; $tg = if ($n) { $n.Tag } else { $null }
+        if ($tg -and $tg.Kind -eq 'object') {
+            $SqlUI.MenuObj = $tg
+            if ($tg.Type -in 'U', 'V') { [void](Add-MenuItem $src 'SELECT TOP 100' { $o = $SqlUI.MenuObj; $SqlUI.DbBox.Text = $o.Db; $SqlUI.Editor.Text = "SELECT TOP 100 *`r`nFROM $(ConvertTo-SqlName $o.Name);"; Start-SqlRun } $Glyph.Play) }
+            [void](Add-MenuItem $src 'Script it (definition)' { $o = $SqlUI.MenuObj; $SqlUI.DbBox.Text = $o.Db; $SqlUI.Editor.Text = $(if ($o.Type -eq 'U') { "SELECT c.name, TYPE_NAME(c.user_type_id) AS type, c.max_length, c.is_nullable, c.is_identity`r`nFROM sys.columns c WHERE c.object_id = OBJECT_ID('$($o.Name)')`r`nORDER BY c.column_id;" } else { "SELECT OBJECT_DEFINITION(OBJECT_ID('$($o.Name)')) AS definition;" }); Start-SqlRun } $Glyph.Code)
+            if ($tg.Type -eq 'U') { [void](Add-MenuItem $src 'ER diagram from here (with linked tables)' { $o = $SqlUI.MenuObj; $SqlUI.DbBox.Text = $o.Db; New-SqlErDiagram @($o.Name) } $Glyph.Apps) }
+            [void](Add-MenuItem $src 'Insert the name' { Insert-SqlText (ConvertTo-SqlName $SqlUI.MenuObj.Name) } $Glyph.Paste)
+        } elseif ($tg -and $tg.Kind -eq 'db') {
+            $SqlUI.MenuObj = $tg
+            [void](Add-MenuItem $src 'Use this database' { $SqlUI.DbBox.Text = $SqlUI.MenuObj.Db } $Glyph.Play)
+            [void](Add-MenuItem $src 'ER diagram of all tables' { $SqlUI.DbBox.Text = $SqlUI.MenuObj.Db; New-SqlErDiagram } $Glyph.Apps)
+        }
+        [void](Add-MenuItem $src 'Refresh' { Update-SqlTree } $Glyph.Refresh)
+    })
+    $tv.ContextMenuStrip = $tm
+    $pObj.Controls.Add($tv); $SqlUI.Tree = $tv
+    $ql = New-Object System.Windows.Forms.ListBox; $ql.Dock = 'Fill'; $ql.BorderStyle = 'None'; $ql.BackColor = $C.Bg; $ql.ForeColor = $C.Fore; $ql.IntegralHeight = $false; $ql.ItemHeight = $FontMain.Height + (Px 8)
+    $ql.add_DoubleClick({ param($src, $e) $i = $src.SelectedIndex; if ($i -ge 0) { $SqlUI.Editor.Text = $SqlUI.Queries[$i].Sql } })
+    $qm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    [void](Add-MenuItem $qm 'Open' { $i = $SqlUI.QueryList.SelectedIndex; if ($i -ge 0) { $SqlUI.Editor.Text = $SqlUI.Queries[$i].Sql } } $Glyph.Open)
+    [void](Add-MenuItem $qm 'Delete' { $i = $SqlUI.QueryList.SelectedIndex; if ($i -ge 0) { $SqlUI.Queries.RemoveAt($i); Save-SqlData 'queries'; Update-SqlSideLists } } $Glyph.Delete)
+    $ql.ContextMenuStrip = $qm
+    $pSaved.Controls.Add($ql); $SqlUI.QueryList = $ql
+    $hl = New-Object System.Windows.Forms.ListBox; $hl.Dock = 'Fill'; $hl.BorderStyle = 'None'; $hl.BackColor = $C.Bg; $hl.ForeColor = $C.Fore; $hl.IntegralHeight = $false; $hl.ItemHeight = $FontMain.Height + (Px 8); $hl.HorizontalScrollbar = $true
+    $hl.add_DoubleClick({ param($src, $e) $i = $src.SelectedIndex; if ($i -ge 0) { $SqlUI.Editor.Text = $SqlUI.History[$i].Sql } })
+    $pHist.Controls.Add($hl); $SqlUI.HistList = $hl
+    Select-ApiTab $ltabs 'Objects'
+
+    # top: connection, database, run
+    $top = New-Object System.Windows.Forms.FlowLayoutPanel
+    $top.Dock = 'Top'; $top.AutoSize = $true; $top.WrapContents = $true; $top.BackColor = $C.Panel; $top.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 6))
+    $SqlUI.ConnBox = New-TbCombo $top @() 220
+    $SqlUI.ConnBox.add_SelectionChangeCommitted({
+        param($src, $e)
+        if ($src.SelectedIndex -eq $SqlUI.Conns.Count) {
+            $n = Edit-SqlConnection
+            if ($n) { $SqlUI.Conns.Add($n); Save-SqlData 'connections'; Update-SqlConnList $n.Name; $SqlUI.DbBox.Text = $n.Database; Update-SqlTree } else { Update-SqlConnList }
+            return
+        }
+        $c0 = Get-SqlConn; if ($c0) { $SqlUI.DbBox.Text = $c0.Database }; Update-SqlTree
+    })
+    [void](New-Button '' 'Edit the connection' {
+        $i = $SqlUI.ConnBox.SelectedIndex
+        if ($i -lt 0 -or $i -ge $SqlUI.Conns.Count) { $n = Edit-SqlConnection; if ($n) { $SqlUI.Conns.Add($n); Save-SqlData 'connections'; Update-SqlConnList $n.Name; $SqlUI.DbBox.Text = $n.Database; Update-SqlTree }; return }
+        $n = Edit-SqlConnection $SqlUI.Conns[$i]
+        if ($n) { $SqlUI.Conns[$i] = $n; Save-SqlData 'connections'; Update-SqlConnList $n.Name; $SqlUI.DbBox.Text = $n.Database; Update-SqlTree }
+    } $top $Glyph.Edit 2)
+    [void](New-Button '' 'Remove the connection' {
+        $i = $SqlUI.ConnBox.SelectedIndex; if ($i -lt 0 -or $i -ge $SqlUI.Conns.Count) { return }
+        if ([System.Windows.Forms.MessageBox]::Show($SqlUI.Form, "Remove the connection ""$($SqlUI.Conns[$i].Name)""?", 'SQL client', 'YesNo', 'Question') -ne 'Yes') { return }
+        $SqlUI.Conns.RemoveAt($i); Save-SqlData 'connections'; Update-SqlConnList; Update-SqlTree
+    } $top $Glyph.Delete 2)
+    New-TbLabel $top 'Database' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding((Px 10), (Px 9), (Px 4), 0) }
+    $SqlUI.DbBox = New-Object System.Windows.Forms.ComboBox; $SqlUI.DbBox.DropDownStyle = 'DropDown'; $SqlUI.DbBox.FlatStyle = 'Flat'; $SqlUI.DbBox.BackColor = $C.Bg; $SqlUI.DbBox.ForeColor = $C.Fore; $SqlUI.DbBox.Width = Px 180
+    $SqlUI.DbBox.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 10), 0)
+    $SqlUI.DbBox.add_DropDown({ param($src, $e) $src.Items.Clear(); $c0 = Get-SqlConn; if ($c0) { try { foreach ($r in ([DgSql]::Query((Get-SqlConnString $c0 'master'), 'SELECT name FROM sys.databases WHERE HAS_DBACCESS(name) = 1 ORDER BY name', 10)).Rows) { [void]$src.Items.Add([string]$r[0]) } } catch { } } })
+    $top.Controls.Add($SqlUI.DbBox)
+    $SqlUI.RunBtn = New-Button 'Run' 'Run the selection, or everything (F5 / Ctrl+Enter)' { Start-SqlRun } $top $Glyph.Play 1
+    $SqlUI.CancelBtn = New-Button 'Cancel' 'Stop the running query' { if ($SqlUI.Run) { $SqlUI.Run.Cancel() } } $top $Glyph.Pause 2
+    $SqlUI.CancelBtn.Enabled = $false
+    New-TbLabel $top 'Max rows' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding((Px 10), (Px 9), (Px 4), 0) }
+    $SqlUI.MaxRows = New-TbNumber $top 10000 1 1000000; $SqlUI.MaxRows.Width = Px 90
+    [void](New-Button 'Save query' 'Keep this query in Saved' {
+        $t = $SqlUI.Editor.Text; if (-not $t.Trim()) { return }
+        $n = Read-TextDialog 'Save query' 'Name' (($t -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1).Trim()) $SqlUI.Form
+        if (-not $n) { return }
+        $SqlUI.Queries.Insert(0, [pscustomobject]@{ Name = $n; Sql = $t }); Save-SqlData 'queries'; Update-SqlSideLists
+    } $top $Glyph.Save 2)
+    [void](New-Button 'ER diagram' 'A diagram of the tables of this database, their columns and keys' { New-SqlErDiagram } $top $Glyph.Apps 2)
+
+    # middle: editor over results
+    $split = New-Object System.Windows.Forms.SplitContainer
+    $split.Dock = 'Fill'; $split.Orientation = 'Horizontal'; $split.SplitterWidth = 5; $split.BackColor = $C.Line; $split.Panel1.BackColor = $C.Bg; $split.Panel2.BackColor = $C.Bg
+    $ed = New-TbRtb; $ed.Dock = 'Fill'; $ed.AcceptsTab = $true; $ed.WordWrap = $false
+    $ed.Text = "-- F5 or Ctrl+Enter runs the selection, or everything. GO separates batches.`r`nSELECT TOP 100 name, create_date FROM sys.tables ORDER BY create_date DESC;"
+    $split.Panel1.Controls.Add($ed); $SqlUI.Editor = $ed
+    $rb = New-Object System.Windows.Forms.FlowLayoutPanel; $rb.Dock = 'Bottom'; $rb.AutoSize = $true; $rb.BackColor = $C.Panel; $rb.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 4), (Px 6), (Px 4))
+    [void](New-Button 'Copy' 'Copy the result with headers (tab-separated, pastes into Excel)' { Export-SqlResult 'copy' } $rb $Glyph.Copy 2)
+    [void](New-Button 'CSV...' 'Save the result as CSV' { Export-SqlResult 'csv' } $rb $Glyph.Save 2)
+    [void](New-Button 'JSON...' 'Save the result as JSON' { Export-SqlResult 'json' } $rb $Glyph.Save 2)
+    [void](New-Button 'Chart this' 'Make a chart of this result in the Diagram studio' { Send-SqlToDiagram 0 } $rb $Glyph.Apps 2)
+    [void](New-Button 'Diagram this' 'Make a links / tree diagram of this result in the Diagram studio' { Send-SqlToDiagram 1 } $rb $Glyph.Apps 2)
+    $SqlUI.Status = New-TbLabel $rb '' -Dim; $SqlUI.Status.Margin = New-Object System.Windows.Forms.Padding((Px 12), (Px 9), 0, 0)
+    $resHost = New-Object System.Windows.Forms.Panel; $resHost.Dock = 'Fill'; $resHost.BackColor = $C.Bg
+    $split.Panel2.Controls.Add($resHost); $split.Panel2.Controls.Add($rb)
+    $SqlUI.ResTabs = New-TabSet $resHost
+
+    $f.Controls.Add($split); $f.Controls.Add($left); $f.Controls.Add($top)
+    $split.BringToFront()
+
+    $SqlUI.ColorTimer = New-TbDebounce 450 { if ($SqlUI.Form -and $SqlUI.Editor.TextLength -lt 60000) { $ss = $SqlUI.Editor.SelectionStart; $sl = $SqlUI.Editor.SelectionLength; Set-RtbCode $SqlUI.Editor $SqlUI.Editor.Text 'sql'; $SqlUI.Editor.Select($ss, $sl) } }
+    $ed.add_TextChanged({ $SqlUI.ColorTimer.Stop(); $SqlUI.ColorTimer.Start() })
+    $SqlUI.Timer = New-Object System.Windows.Forms.Timer; $SqlUI.Timer.Interval = 120
+    $SqlUI.Timer.add_Tick({ if (-not $SqlUI.Run) { $SqlUI.Timer.Stop(); return }; if ($SqlUI.Run.Done) { $SqlUI.Timer.Stop(); Complete-SqlRun } else { Set-SqlStatus "Running...  $([Math]::Round(((Get-Date) - $SqlUI.Started).TotalSeconds, 1)) s" $C.Accent } })
+    $f.add_KeyDown({
+        param($src, $e)
+        if ($e.KeyCode -eq 'F5' -or ($e.Control -and $e.KeyCode -eq 'Return')) { $e.SuppressKeyPress = $true; Start-SqlRun }
+        elseif ($e.KeyCode -eq 'Escape' -and $SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }
+    })
+    $f.add_FormClosed({ if ($SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }; foreach ($k in 'Timer', 'ColorTimer') { if ($SqlUI[$k]) { $SqlUI[$k].Dispose(); $SqlUI[$k] = $null } }; $SqlUI.Form = $null })
+    Register-ThemedWindow $f
+    $f.Show()
+    [PowerClipHost]::EnsureShown($f.Handle)
+    $split.SplitterDistance = [int]($split.Height * 0.42)
+    Update-SqlConnList
+    $c0 = Get-SqlConn; if ($c0) { $SqlUI.DbBox.Text = $c0.Database }
+    Update-SqlSideLists
+    Set-RtbCode $ed $ed.Text 'sql'
+    Update-SqlTree
+    if (-not $SqlUI.Conns.Count) { Set-SqlStatus 'Pick "New connection..." in the list at the top left to start.' $C.Accent }
+}
+
+
+Register-PaletteCommand 'SQL client' '' $Glyph.Code { Show-SqlClient } 'sql server database query select table er diagram mssql tsql'
 Register-PaletteCommand 'Diagram studio' '' $Glyph.Apps { Show-DiagramStudio } 'diagram flowchart mermaid svg architecture network map draw chart graph org'
 
 $ToolGroups = [ordered]@{
@@ -26224,7 +26972,7 @@ $ToolGroups = [ordered]@{
     'Encode & share'        = @('page:qr', 'page:stego', 'page:codeimg')
     'Files'                 = @('Compare', 'Find in files', 'page:hash', 'page:log')
     'Web & API'             = @('API tester', 'API chains', 'Test API=Test API: start / stop')
-    'Data'                  = @('Diagram studio')
+    'Data'                  = @('Diagram studio', 'SQL client')
     'Network'               = @('Network tools', 'page:dns', 'page:subnet', 'page:hosts', 'page:ports', 'page:cert', 'page:certmake')
     'System'                = @('page:env', 'page:procs', 'Git')
     'Screen & productivity' = @('Screenshot=Take a screenshot', 'Text from a picture (OCR)=Copy text from the clipboard picture (OCR)', 'Edit clipboard picture=Edit the picture on the clipboard', 'page:color', 'page:record', 'page:timer', 'Reminder=New reminder...', 'page:mouse')
