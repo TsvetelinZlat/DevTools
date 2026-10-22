@@ -505,6 +505,10 @@ A SQL Server client with nothing to install (it uses the SQL Server support buil
   - Joins as links from key column to key column, coloured by type (INNER, LEFT, RIGHT, FULL, CROSS / APPLY) and labelled with the ON condition.
   - Selected columns highlighted; columns used in joins (J), WHERE (W) and GROUP / ORDER BY (S) marked; unused ones dimmed; the WHERE conditions under their table. `INSERT INTO ... SELECT` shows where the rows go.
   - Click a table to find it in the SQL; **Open in Diagram studio** to style or export it.
+- **Query plan tuner**: **Plan** (Ctrl+L, the estimated plan; the query is not run) or **Run with plan** (Ctrl+M, the actual plan with real row counts). The **Plan** tab shows:
+  - the plan drawn right to left like SSMS, each step with its share of the cost (red = expensive) and links as thick as their rows
+  - **suggestions** in plain words, most important first: missing indexes with a ready `CREATE INDEX`, scans that filter rows, key lookups to cover, sorts and hash joins, implicit conversions, spills, estimates far from actual rows (`UPDATE STATISTICS`), missing statistics, joins without a condition, and from the SQL text: `SELECT *`, `LIKE '%...'`, functions on filtered columns, `NOT IN (SELECT ...)`, subqueries in the SELECT list
+  - **Copy** or **Into the editor** for each fix (nothing is run for you), **Save .sqlplan** for SSMS / Azure Data Studio, **Open in Diagram studio**
 - **Editor** with SQL colours. **F5** or **Ctrl+Enter** runs the selection, or everything; `GO` lines separate batches (as in SSMS). **Cancel** (or Esc) stops a long query. **Max rows** caps what is shown per result.
 - **Results**: a tab per result set, plus **Messages** (rows affected, PRINT output, errors).
   - An error selects the line it happened on.

@@ -25044,6 +25044,240 @@ public static class DgSqlViz {
     }
 }
 
+// ---- Query plan tuner: SQL Server's plan (estimated or actual) as a diagram, with suggestions and fixes.
+public class DgPlanOp {
+    public int Id, Parent = -1, Depth;
+    public string Physical = "", Logical = "", Table = "", Index = "", Alias = "", Warn = "";
+    public double SubtreeCost, OwnCost, Pct, EstRows, ActRows = -1, Executions = -1;
+    public List<string> Predicates = new List<string>(), Outputs = new List<string>();
+}
+public class DgPlanTip { public int Level; public string Title = "", Detail = "", Fix = ""; }     // level: 3 high, 2 medium, 1 low
+public class DgPlanReport {
+    public List<DgPlanOp> Ops = new List<DgPlanOp>();
+    public List<DgPlanTip> Tips = new List<DgPlanTip>();
+    public List<string> Xml = new List<string>();
+    public string Statement = "", Error = "";
+    public double TotalCost;
+    public bool Actual;
+    public long Ms;
+    public DgSqlResult Result;
+}
+
+public class DgPlanRun {
+    public volatile bool Done;
+    public DgPlanReport Report = new DgPlanReport();
+    System.Data.SqlClient.SqlCommand cmd;
+    volatile bool cancel;
+    public void Cancel() { cancel = true; try { if (cmd != null) cmd.Cancel(); } catch { } }
+
+    public static DgPlanRun Start(string conn, string sql, bool actual, int maxRows) {
+        var r = new DgPlanRun();
+        new System.Threading.Thread(() => r.Run(conn, sql, actual, maxRows)) { IsBackground = true, Name = "DevTools plan" }.Start();
+        return r;
+    }
+    void Run(string connStr, string sql, bool actual, int maxRows) {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        Report.Actual = actual;
+        var res = new DgSqlResult();
+        try {
+            using (var conn = new System.Data.SqlClient.SqlConnection(connStr)) {
+                conn.InfoMessage += (s, e) => { lock (res.Messages) foreach (System.Data.SqlClient.SqlError er in e.Errors) res.Messages.Add(er.Message); };
+                conn.Open();
+                using (var on = new System.Data.SqlClient.SqlCommand(actual ? "SET STATISTICS XML ON" : "SET SHOWPLAN_XML ON", conn)) on.ExecuteNonQuery();
+                try {
+                    foreach (var batch in DgSqlRun.Batches(sql)) {
+                        if (cancel) break;
+                        using (var c = new System.Data.SqlClient.SqlCommand(batch.Value, conn)) {
+                            c.CommandTimeout = 0; cmd = c;
+                            using (var rd = c.ExecuteReader()) {
+                                do {
+                                    if (rd.FieldCount == 1 && rd.GetName(0).IndexOf("Showplan", StringComparison.OrdinalIgnoreCase) >= 0) { while (rd.Read()) Report.Xml.Add(rd.GetValue(0).ToString()); continue; }
+                                    if (rd.FieldCount == 0) continue;
+                                    var tb = new System.Data.DataTable("Result " + (res.Tables.Count + 1));
+                                    for (int i = 0; i < rd.FieldCount; i++) tb.Columns.Add(i + ":" + rd.GetName(i), typeof(object));
+                                    var vals = new object[rd.FieldCount];
+                                    while (rd.Read()) { if (cancel || tb.Rows.Count >= maxRows) { if (!cancel) res.Truncated = true; break; } rd.GetValues(vals); tb.Rows.Add(vals); }
+                                    for (int i = 0; i < tb.Columns.Count; i++) tb.Columns[i].ColumnName = UniqueName(tb, rd.GetName(i), i);
+                                    res.Tables.Add(tb);
+                                } while (rd.NextResult());
+                            }
+                            cmd = null;
+                        }
+                    }
+                } finally {
+                    try { using (var off = new System.Data.SqlClient.SqlCommand(actual ? "SET STATISTICS XML OFF" : "SET SHOWPLAN_XML OFF", conn)) off.ExecuteNonQuery(); } catch { }
+                }
+            }
+        } catch (Exception ex) { Report.Error = cancel ? "Cancelled." : ex.Message; }
+        Report.Result = res;
+        Report.Ms = sw.ElapsedMilliseconds;
+        try { if (Report.Xml.Count > 0) DgPlan.Analyze(Report, sql); } catch (Exception ex) { Report.Error += (Report.Error.Length > 0 ? " / " : "") + "Plan: " + ex.Message; }
+        Done = true;
+    }
+    static string UniqueName(System.Data.DataTable t, string n, int i) {
+        if (string.IsNullOrEmpty(n)) n = "(no name)";
+        string u = n; int k = 2;
+        for (int j = 0; j < i; j++) if (string.Equals(t.Columns[j].ColumnName, u, StringComparison.OrdinalIgnoreCase)) { u = n + " (" + k++ + ")"; j = -1; }
+        return u;
+    }
+}
+
+public static class DgPlan {
+    static readonly System.Xml.Linq.XNamespace S = "http://schemas.microsoft.com/sqlserver/2004/07/showplan";
+    static double D(System.Xml.Linq.XAttribute a) { double v; return a != null && double.TryParse(a.Value, NumberStyles.Float, CultureInfo.InvariantCulture, out v) ? v : 0; }
+    static string Col(System.Xml.Linq.XElement c) {
+        var t = (string)c.Attribute("Table"); var a = (string)c.Attribute("Alias"); var n = (string)c.Attribute("Column");
+        return (a ?? t ?? "").Trim('[', ']') + (a != null || t != null ? "." : "") + (n ?? "").Trim('[', ']');
+    }
+    static string Name(string s) { return (s ?? "").Trim('[', ']'); }
+
+    public static void Analyze(DgPlanReport r, string sql) {
+        var seenIdx = new HashSet<string>();
+        foreach (var xml in r.Xml) {
+            var doc = System.Xml.Linq.XDocument.Parse(xml);
+            foreach (var stmt in doc.Descendants(S + "StmtSimple")) {
+                double cost = D(stmt.Attribute("StatementSubTreeCost"));
+                var qp = stmt.Element(S + "QueryPlan");
+                if (qp == null) continue;
+                if (cost > r.TotalCost) { r.TotalCost = cost; r.Statement = Regex.Replace((string)stmt.Attribute("StatementText") ?? "", @"\s+", " ").Trim(); }
+                int baseId = r.Ops.Count;
+                var root = qp.Element(S + "RelOp");
+                if (root != null) Walk(root, -1, 0, r, baseId);
+                // operator costs as a share of the statement
+                foreach (var op in r.Ops.Skip(baseId)) {
+                    double kids = r.Ops.Skip(baseId).Where(k => k.Parent == op.Id).Sum(k => k.SubtreeCost);
+                    op.OwnCost = Math.Max(0, op.SubtreeCost - kids);
+                    op.Pct = cost > 0 ? op.OwnCost / cost * 100 : 0;
+                }
+                // missing indexes that SQL Server itself suggests
+                foreach (var g in qp.Descendants(S + "MissingIndexGroup")) {
+                    double impact = D(g.Attribute("Impact"));
+                    foreach (var mi in g.Elements(S + "MissingIndex")) {
+                        string db = Name((string)mi.Attribute("Database")), sch = Name((string)mi.Attribute("Schema")), tb = Name((string)mi.Attribute("Table"));
+                        Func<string, List<string>> cols = u => mi.Elements(S + "ColumnGroup").Where(cg => (string)cg.Attribute("Usage") == u).SelectMany(cg => cg.Elements(S + "Column")).Select(c => Name((string)c.Attribute("Name"))).ToList();
+                        var eq = cols("EQUALITY"); var ineq = cols("INEQUALITY"); var inc = cols("INCLUDE");
+                        var keys = eq.Concat(ineq).ToList();
+                        if (keys.Count == 0) continue;
+                        string ixName = "IX_" + tb + "_" + string.Join("_", keys.Take(3));
+                        string fix = "CREATE NONCLUSTERED INDEX [" + ixName + "]\r\n    ON [" + sch + "].[" + tb + "] (" + string.Join(", ", keys.Select(k => "[" + k + "]")) + ")" + (inc.Count > 0 ? "\r\n    INCLUDE (" + string.Join(", ", inc.Select(k => "[" + k + "]")) + ")" : "") + ";";
+                        if (!seenIdx.Add(fix)) continue;
+                        r.Tips.Add(new DgPlanTip { Level = impact >= 50 ? 3 : 2, Title = "Missing index on " + sch + "." + tb + "  (SQL Server estimates " + impact.ToString("0") + "% less cost)",
+                            Detail = "Searched by " + string.Join(", ", eq.Concat(ineq)) + (inc.Count > 0 ? "; also reads " + string.Join(", ", inc) : "") + ". An index lets SQL Server seek straight to the rows instead of reading the whole table. Check it against the indexes you already have, and keep in mind every index slows inserts and updates a little.",
+                            Fix = fix });
+                    }
+                }
+                // statement warnings
+                foreach (var w in qp.Elements(S + "Warnings")) Warnings(w, null, r);
+            }
+        }
+        // operator rules
+        foreach (var op in r.Ops) {
+            bool scan = op.Physical == "Table Scan" || op.Physical == "Clustered Index Scan" || op.Physical == "Index Scan";
+            double rows = op.ActRows >= 0 ? op.ActRows : op.EstRows;
+            if (scan && op.Predicates.Count > 0 && (op.Pct >= 20 || rows >= 1000))
+                r.Tips.Add(new DgPlanTip { Level = op.Pct >= 40 ? 3 : 2, Title = op.Physical + " on " + op.Table + " (" + op.Pct.ToString("0") + "% of the cost) to filter rows",
+                    Detail = "It reads every row and then keeps only those where " + string.Join(" and ", op.Predicates.Take(2)) + ". An index on the filtered column(s) would let it seek instead; if the filter wraps the column in a function or compares it with a different type, the index can't be used." });
+            else if (scan && op.Pct >= 50 && rows >= 10000)
+                r.Tips.Add(new DgPlanTip { Level = 2, Title = op.Physical + " reads all of " + op.Table + " (" + DgChartCalc.Short(rows) + " rows, " + op.Pct.ToString("0") + "% of the cost)", Detail = "If you only need some rows, add a WHERE that an index can use; if you need all of them, select only the columns you need." });
+            if (op.Physical == "Key Lookup" || op.Physical == "RID Lookup") {
+                var cols = op.Outputs.Select(o => o.Substring(o.LastIndexOf('.') + 1)).Distinct().ToList();
+                r.Tips.Add(new DgPlanTip { Level = op.Pct >= 25 ? 3 : 2, Title = op.Physical + " into " + op.Table + " (" + op.Pct.ToString("0") + "% of the cost)",
+                    Detail = "For every row found through an index, SQL Server goes back to the table for " + (cols.Count > 0 ? string.Join(", ", cols) : "more columns") + ". Adding them to the index as INCLUDE columns (a covering index) removes the lookups.",
+                    Fix = cols.Count > 0 ? "-- add to the index the plan seeks on:\r\n-- CREATE INDEX ... ON " + op.Table + " (...) INCLUDE (" + string.Join(", ", cols.Select(k => "[" + k + "]")) + ") WITH (DROP_EXISTING = ON);" : "" });
+            }
+            if (op.Physical == "Sort" && op.Pct >= 25)
+                r.Tips.Add(new DgPlanTip { Level = 2, Title = "Sort is " + op.Pct.ToString("0") + "% of the cost", Detail = "An index whose key is in the ORDER BY / GROUP BY order returns the rows already sorted. Otherwise sort fewer rows (filter first, or TOP)." });
+            if (op.Physical == "Hash Match" && op.Pct >= 30 && op.Logical.Contains("Join"))
+                r.Tips.Add(new DgPlanTip { Level = 1, Title = "Hash join is " + op.Pct.ToString("0") + "% of the cost", Detail = "Big hash joins usually mean both sides are read in full. Indexes on the join columns allow nested loops or merge joins." });
+            if (op.ActRows >= 0 && op.EstRows > 0) {
+                double ratio = (op.ActRows + 1) / (op.EstRows + 1);
+                if ((ratio > 10 || ratio < 0.1) && Math.Abs(op.ActRows - op.EstRows) > 1000)
+                    r.Tips.Add(new DgPlanTip { Level = 2, Title = "Estimate far off at " + op.Physical + (op.Table.Length > 0 ? " on " + op.Table : "") + ": " + DgChartCalc.Short(op.EstRows) + " estimated, " + DgChartCalc.Short(op.ActRows) + " actual",
+                        Detail = "Wrong estimates lead to wrong join types and memory grants. Fresh statistics usually fix it.", Fix = op.Table.Length > 0 ? "UPDATE STATISTICS " + op.Table + " WITH FULLSCAN;" : "" });
+            }
+        }
+        // SQL text rules
+        var s0 = Regex.Replace(sql ?? "", @"--[^\n]*|/\*[\s\S]*?\*/|'(?:[^']|'')*'", m => m.Value.StartsWith("'") ? "''" : " ");
+        if (Regex.IsMatch(s0, @"\bSELECT\s+(TOP\s*\(?\s*\d+\s*\)?\s+)?(DISTINCT\s+)?\*", RegexOptions.IgnoreCase))
+            r.Tips.Add(new DgPlanTip { Level = 1, Title = "SELECT * reads every column", Detail = "Listing only the columns you need moves less data and lets narrower (covering) indexes be used." });
+        if (Regex.IsMatch(sql ?? "", @"LIKE\s+N?'%", RegexOptions.IgnoreCase))
+            r.Tips.Add(new DgPlanTip { Level = 2, Title = "LIKE '%...' can't use an index", Detail = "A pattern that starts with % has to check every row. If you search inside text often, consider full-text search or a computed column." });
+        var fn = Regex.Match(s0, @"\b(WHERE|AND|OR|ON)\s+(YEAR|MONTH|DAY|UPPER|LOWER|LTRIM|RTRIM|TRIM|CONVERT|CAST|ISNULL|COALESCE|DATEPART|LEFT|SUBSTRING|DATEADD)\s*\(\s*([\w\.\[\]]+)", RegexOptions.IgnoreCase);
+        if (fn.Success)
+            r.Tips.Add(new DgPlanTip { Level = 2, Title = "A function on a column in the filter: " + fn.Groups[2].Value.ToUpperInvariant() + "(" + fn.Groups[3].Value + ")", Detail = "Wrapping a column in a function hides it from its index (the filter is not 'sargable'). Compare the bare column instead, e.g. WHERE d >= '2024-01-01' AND d < '2025-01-01' instead of YEAR(d) = 2024." });
+        if (Regex.IsMatch(s0, @"\bNOT\s+IN\s*\(\s*SELECT\b", RegexOptions.IgnoreCase))
+            r.Tips.Add(new DgPlanTip { Level = 1, Title = "NOT IN (SELECT ...)", Detail = "If the subquery returns a NULL, NOT IN returns no rows at all. NOT EXISTS is safer and often faster." });
+        if (Regex.IsMatch(s0, @"\bSELECT\b[\s\S]*\(\s*SELECT\b", RegexOptions.IgnoreCase) && Regex.IsMatch(s0, @"\bSELECT\s+[^;]*?,\s*\(\s*SELECT\b", RegexOptions.IgnoreCase))
+            r.Tips.Add(new DgPlanTip { Level = 1, Title = "A subquery in the SELECT list", Detail = "It may run once per row. A JOIN (or OUTER APPLY) is often faster." });
+        if (r.Tips.Count == 0) r.Tips.Add(new DgPlanTip { Level = 0, Title = "Nothing obvious to improve", Detail = "The plan has no warnings, missing indexes or expensive scans" + (r.Actual ? "" : " (estimated plan; Run with plan shows real row counts)") + "." });
+        r.Tips = r.Tips.OrderByDescending(t => t.Level).ToList();
+    }
+
+    static void Warnings(System.Xml.Linq.XElement w, DgPlanOp op, DgPlanReport r) {
+        string at = op != null ? " at " + op.Physical + (op.Table.Length > 0 ? " on " + op.Table : "") : "";
+        foreach (var c in w.Elements(S + "PlanAffectingConvert")) {
+            var ex = (string)c.Attribute("Expression") ?? "";
+            r.Tips.Add(new DgPlanTip { Level = (string)c.Attribute("ConvertIssue") == "Seek Plan" ? 3 : 2, Title = "Implicit conversion" + at + ": " + ex,
+                Detail = "A column is compared with a value of another type, so it is converted row by row and its index can't be used for seeking. Compare with the same type (for example N'...' only for nvarchar columns, numbers without quotes for int columns)." });
+            if (op != null) op.Warn = "convert";
+        }
+        if (w.Element(S + "NoJoinPredicate") != null || (string)w.Attribute("NoJoinPredicate") == "true") { r.Tips.Add(new DgPlanTip { Level = 3, Title = "A join without a join condition" + at, Detail = "Every row is matched with every other row (a cartesian product). Check the ON clause." }); if (op != null) op.Warn = "nojoin"; }
+        foreach (var sp in w.Elements(S + "SpillToTempDb")) { r.Tips.Add(new DgPlanTip { Level = 2, Title = "Spilled to tempdb" + at, Detail = "The memory granted was too small, so it used disk. Fresh statistics, fewer rows (filter earlier) or an index that avoids the sort / hash help." }); if (op != null) op.Warn = "spill"; }
+        var nostat = w.Element(S + "ColumnsWithNoStatistics");
+        if (nostat != null) {
+            var cols = nostat.Elements(S + "ColumnReference").Select(Col).ToList();
+            r.Tips.Add(new DgPlanTip { Level = 2, Title = "No statistics on " + string.Join(", ", cols), Detail = "Without statistics the row estimates are guesses.", Fix = string.Join("\r\n", nostat.Elements(S + "ColumnReference").Select(c => "CREATE STATISTICS [st_" + Name((string)c.Attribute("Table")) + "_" + Name((string)c.Attribute("Column")) + "] ON " + (string)c.Attribute("Schema") + "." + (string)c.Attribute("Table") + " (" + (string)c.Attribute("Column") + ");")) });
+        }
+        var mg = w.Element(S + "MemoryGrantWarning");
+        if (mg != null) r.Tips.Add(new DgPlanTip { Level = 1, Title = "Memory grant warning: " + (string)mg.Attribute("GrantWarningKind"), Detail = "The query asked for much more (or less) memory than it used; usually a sign of wrong row estimates." });
+    }
+
+    static void Walk(System.Xml.Linq.XElement rel, int parent, int depth, DgPlanReport r, int baseId) {
+        var op = new DgPlanOp { Id = r.Ops.Count, Parent = parent, Depth = depth };
+        op.Physical = (string)rel.Attribute("PhysicalOp") ?? ""; op.Logical = (string)rel.Attribute("LogicalOp") ?? "";
+        op.SubtreeCost = D(rel.Attribute("EstimatedTotalSubtreeCost")); op.EstRows = D(rel.Attribute("EstimateRows"));
+        var rt = rel.Element(S + "RunTimeInformation");
+        if (rt != null) { op.ActRows = rt.Elements(S + "RunTimeCountersPerThread").Sum(x => D(x.Attribute("ActualRows"))); op.Executions = rt.Elements(S + "RunTimeCountersPerThread").Sum(x => D(x.Attribute("ActualExecutions"))); }
+        // this operator's own element (Children RelOps are nested inside it)
+        var own = rel.Elements().FirstOrDefault(e => e.Name != S + "OutputList" && e.Name != S + "RunTimeInformation" && e.Name != S + "Warnings" && e.Name != S + "MemoryFractions" && e.Name != S + "RunTimePartitionSummary" && e.Name != S + "InternalInfo");
+        var obj = own == null ? null : own.Elements(S + "Object").FirstOrDefault();
+        if (obj != null) { op.Table = (Name((string)obj.Attribute("Schema")) + "." + Name((string)obj.Attribute("Table"))).Trim('.'); op.Index = Name((string)obj.Attribute("Index")); op.Alias = Name((string)obj.Attribute("Alias")); }
+        if (own != null) {
+            foreach (var pr in own.Elements(S + "Predicate").Concat(own.Elements(S + "SeekPredicates")))
+                foreach (var so in pr.Descendants(S + "ScalarOperator").Take(1)) { var t = (string)so.Attribute("ScalarString"); if (!string.IsNullOrEmpty(t)) op.Predicates.Add(Regex.Replace(t, @"\[[^\]]*\]\.\[[^\]]*\]\.", "")); }
+        }
+        var ol = rel.Element(S + "OutputList");
+        if (ol != null) op.Outputs = ol.Elements(S + "ColumnReference").Select(Col).ToList();
+        r.Ops.Add(op);
+        var w = rel.Element(S + "Warnings"); if (w != null) Warnings(w, op, r);
+        if (own != null) foreach (var child in own.Descendants(S + "RelOp").Where(x => x.Ancestors(S + "RelOp").FirstOrDefault() == rel)) Walk(child, op.Id, depth + 1, r, baseId);
+    }
+
+    // the plan as diagram text: operators right to left like SSMS, coloured by cost, links as thick as their rows
+    public static string Diagram(DgPlanReport r, bool dark) {
+        var sb = new StringBuilder();
+        sb.Append("title Query plan" + (r.Actual ? " (actual)" : " (estimated)") + "\r\ntheme " + (dark ? "midnight dark" : "daylight light") + "\r\ndirection RL\r\nroute ortho\r\nhide header\r\nspacing 0.9\r\n");
+        sb.Append("category hot \"40%+ of the cost\" #cc2638 / #ff5d6c\r\ncategory warm \"10-40%\" #a86f00 / #f5b94a\r\ncategory cool \"under 10%\" #0b5fc2 / #4ea8ff\r\n\r\n");
+        foreach (var op in r.Ops.Take(150)) {
+            string cat = op.Pct >= 40 ? "hot" : op.Pct >= 10 ? "warm" : "cool";
+            var lines = new List<string>();
+            if (op.Table.Length > 0) lines.Add(op.Table + (op.Index.Length > 0 ? " (" + op.Index + ")" : ""));
+            if (op.Physical != op.Logical && op.Logical.Length > 0) lines.Add(op.Logical);
+            lines.Add("rows: " + DgChartCalc.Short(op.EstRows) + " est" + (op.ActRows >= 0 ? ", " + DgChartCalc.Short(op.ActRows) + " actual" : ""));
+            if (op.Predicates.Count > 0) lines.Add(op.Predicates[0].Length > 44 ? op.Predicates[0].Substring(0, 43) + "\u2026" : op.Predicates[0]);
+            sb.Append("op" + op.Id + ": " + op.Physical + " [badge " + op.Pct.ToString("0") + "%, cat " + cat + (op.Warn.Length > 0 ? ", status warn" : "") + ", lines " + string.Join(" ", lines.Select(l => "\"" + l.Replace("\"", "'").Replace("[", "").Replace("]", "") + "\"")) + "]\r\n");
+        }
+        sb.Append("\r\n");
+        foreach (var op in r.Ops.Take(150)) {
+            if (op.Parent < 0) continue;
+            double rows = op.ActRows >= 0 ? op.ActRows : op.EstRows;
+            float w = (float)Math.Max(1.2, Math.Min(7, 1.2 + Math.Log10(Math.Max(1, rows)) * 1.1));
+            sb.Append("op" + op.Id + " -> op" + op.Parent + " [width " + w.ToString("0.#", CultureInfo.InvariantCulture) + ", label \"" + DgChartCalc.Short(rows) + " rows\", animate, density " + Math.Max(0.2, Math.Min(4, Math.Log10(Math.Max(1, rows)) / 1.5)).ToString("0.#", CultureInfo.InvariantCulture) + "]\r\n");
+        }
+        return sb.ToString();
+    }
+}
+
 public static class DgAssets {
     public static readonly string Js = @"function (root, D) {
   var P = D.p, NS = 'http://www.w3.org/2000/svg', O = D.opt;
@@ -27126,6 +27360,10 @@ function Start-SqlRun {
 function Complete-SqlRun {
     $r = $SqlUI.Run.Result
     $SqlUI.RunBtn.Enabled = $true; $SqlUI.CancelBtn.Enabled = $false
+    Show-SqlResults $r
+}
+
+function Show-SqlResults($r, $Plan = $null) {
     $tabs = $SqlUI.ResTabs
     foreach ($k in @($tabs.Panels.Keys)) { $p = $tabs.Panels[$k]; foreach ($ctl in @($p.Controls)) { $ctl.Dispose() }; $tabs.Host.Controls.Remove($p); $tabs.Strip.Controls.Remove($tabs.Buttons[$k]); $tabs.Buttons[$k].Dispose(); $p.Dispose() }
     $tabs.Panels.Clear(); $tabs.Buttons.Clear()
@@ -27144,7 +27382,8 @@ function Complete-SqlRun {
     $mb.Text = (@($lines | Where-Object { $_ }) -join "`r`n")
     if ($r.Error) { $mb.ForeColor = $C.Red }
     $mp.Controls.Add($mb)
-    Select-ApiTab $tabs $(if ($first -and -not $r.Error) { $first } else { 'Messages' })
+    if ($Plan) { Add-SqlPlanTab $Plan }
+    Select-ApiTab $tabs $(if ($Plan -and $Plan.Ops.Count) { 'Plan' } elseif ($first -and -not $r.Error) { $first } else { 'Messages' })
     $rows = 0; foreach ($tt in $r.Tables) { $rows += $tt.Rows.Count }
     if ($r.Error) {
         Set-SqlStatus $r.Error $C.Red
@@ -27234,6 +27473,90 @@ function Update-SqlSideLists {
     if ($l) { $l.BeginUpdate(); $l.Items.Clear(); foreach ($h in $SqlUI.History) { $t = ($h.Sql -replace '\s+', ' ').Trim(); [void]$l.Items.Add("$(if (-not $h.Ok) { '! ' })$($t.Substring(0, [Math]::Min(90, $t.Length)))") }; $l.EndUpdate() }
     $q = $SqlUI.QueryList
     if ($q) { $q.BeginUpdate(); $q.Items.Clear(); foreach ($x in $SqlUI.Queries) { [void]$q.Items.Add($x.Name) }; $q.EndUpdate() }
+}
+
+# ---- query plan tuner: the plan (estimated, or actual by running it) drawn, with suggestions and fixes
+function Start-SqlPlan([bool]$Actual) {
+    if (($SqlUI.Run -and -not $SqlUI.Run.Done) -or ($SqlUI.PlanRun -and -not $SqlUI.PlanRun.Done)) { return }
+    $c0 = Get-SqlConn
+    if (-not $c0) { Set-SqlStatus 'Add a connection first (the list at the top left).' $C.Red; return }
+    $ed = $SqlUI.Editor
+    $sql = if ($ed.SelectionLength -gt 0) { $ed.SelectedText } else { $ed.Text }
+    if (-not $sql.Trim()) { return }
+    if ($Actual) {
+        $w = [DgSql]::Writes($sql)
+        if ($w -and $c0.Confirm -ne $false -and [System.Windows.Forms.MessageBox]::Show($SqlUI.Form, "Getting the actual plan runs the query, and it changes data or objects ($w).`n`nRun it?", 'SQL client', 'YesNo', 'Warning') -ne 'Yes') { return }
+    }
+    $SqlUI.RunSql = $sql
+    $SqlUI.PlanRun = [DgPlanRun]::Start((Get-SqlConnString $c0 $SqlUI.DbBox.Text), $sql, $Actual, [int]$SqlUI.MaxRows.Value)
+    $SqlUI.RunBtn.Enabled = $false; $SqlUI.CancelBtn.Enabled = $true
+    Set-SqlStatus $(if ($Actual) { 'Running with the plan...' } else { 'Asking for the plan (the query is not run)...' }) $C.Accent
+    $SqlUI.Started = Get-Date
+    $SqlUI.PlanTimer.Start()
+}
+
+function Complete-SqlPlan {
+    $p = $SqlUI.PlanRun.Report
+    $SqlUI.RunBtn.Enabled = $true; $SqlUI.CancelBtn.Enabled = $false
+    $SqlUI.Plan = $p
+    Show-SqlResults $p.Result $p
+    if ($p.Error) { Set-SqlStatus $p.Error $C.Red }
+    elseif (-not $p.Ops.Count) { Set-SqlStatus 'No plan came back (only SELECT / INSERT / UPDATE / DELETE statements have one).' $C.Yellow }
+    else {
+        $high = @($p.Tips | Where-Object { $_.Level -ge 3 }).Count
+        Set-SqlStatus "$(if ($p.Actual) { 'Actual' } else { 'Estimated' }) plan: $($p.Ops.Count) steps, cost $([Math]::Round($p.TotalCost, 3)), $(@($p.Tips | Where-Object { $_.Level -gt 0 }).Count) suggestion(s)$(if ($high) { ", $high important" })" $(if ($high) { $C.Yellow } else { $C.Green })
+    }
+}
+
+function Add-SqlPlanTab($Plan) {
+    $tabs = $SqlUI.ResTabs
+    $pp = Add-ApiTab $tabs 'Plan'
+    $sp = New-Object System.Windows.Forms.SplitContainer
+    $sp.Dock = 'Fill'; $sp.Orientation = 'Vertical'; $sp.SplitterWidth = 5; $sp.BackColor = $C.Line; $sp.Panel1.BackColor = $C.Bg; $sp.Panel2.BackColor = $C.Bg
+    $pp.Controls.Add($sp)
+    # suggestions
+    $fl = New-Object System.Windows.Forms.FlowLayoutPanel
+    $fl.Dock = 'Fill'; $fl.FlowDirection = 'TopDown'; $fl.WrapContents = $false; $fl.AutoScroll = $true; $fl.BackColor = $C.Bg; $fl.Padding = New-Object System.Windows.Forms.Padding((Px 10), (Px 8), (Px 10), (Px 8))
+    $sp.Panel1.Controls.Add($fl)
+    $wid = Px 440
+    $hd = New-TbLabel $fl 'Suggestions' -Title
+    foreach ($tip in $Plan.Tips) {
+        $t1 = New-TbLabel $fl $(switch ($tip.Level) { 3 { "!!  $($tip.Title)" } 2 { "!  $($tip.Title)" } 0 { $tip.Title } default { $tip.Title } })
+        $t1.Font = New-Object System.Drawing.Font($UiFont, (Fz 10), [System.Drawing.FontStyle]::Bold)
+        $t1.ForeColor = switch ($tip.Level) { 3 { $C.Red } 2 { $C.Orange } 0 { $C.Green } default { $C.Accent } }
+        $t1.MaximumSize = New-Object System.Drawing.Size($wid, 0); $t1.Margin = New-Object System.Windows.Forms.Padding(0, (Px 10), 0, (Px 2))
+        if ($tip.Detail) { $t2 = New-TbLabel $fl $tip.Detail -Dim; $t2.MaximumSize = New-Object System.Drawing.Size($wid, 0) }
+        if ($tip.Fix) {
+            $fx = New-TbBox -Mono -Multi -ReadOnly; $fx.Text = $tip.Fix; $fx.Width = $wid; $fx.Height = [Math]::Min((Px 120), ($fx.Font.Height * (@($tip.Fix -split "`r?`n").Count + 1)) + (Px 6)); $fx.ScrollBars = 'Vertical'
+            $fl.Controls.Add($fx)
+            $row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.AutoSize = $true; $row.BackColor = $C.Bg; $row.Margin = New-Object System.Windows.Forms.Padding(0, (Px 2), 0, 0)
+            $b1 = New-Button 'Copy' 'Copy the fix' { [System.Windows.Forms.Clipboard]::SetText($this.Tag); Set-SqlStatus 'Copied.' $C.Green } $row $Glyph.Copy 2; $b1.Tag = $tip.Fix
+            $b2 = New-Button 'Into the editor' 'Add the fix at the end of the editor (it is not run)' { $ed = $SqlUI.Editor; $ed.AppendText("`r`n`r`n" + $this.Tag); $ed.Select($ed.TextLength - $this.Tag.Length, $this.Tag.Length); $ed.ScrollToCaret(); $ed.Focus() } $row $Glyph.Paste 2; $b2.Tag = $tip.Fix
+            $fl.Controls.Add($row)
+        }
+    }
+    if ($Plan.Statement) { $st = New-TbLabel $fl "Most expensive statement: $($Plan.Statement.Substring(0, [Math]::Min(300, $Plan.Statement.Length)))" -Dim; $st.MaximumSize = New-Object System.Drawing.Size($wid, 0); $st.Margin = New-Object System.Windows.Forms.Padding(0, (Px 14), 0, 0) }
+    # the plan drawn
+    $right = New-Object System.Windows.Forms.Panel; $right.Dock = 'Fill'; $right.BackColor = $C.Bg
+    $sp.Panel2.Controls.Add($right)
+    $bar = New-Object System.Windows.Forms.FlowLayoutPanel; $bar.Dock = 'Top'; $bar.AutoSize = $true; $bar.BackColor = $C.Panel; $bar.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 3), (Px 6), (Px 3))
+    [void](New-Button 'Open in Diagram studio' 'Edit, style or export the plan diagram' { Show-DiagramStudio; New-DiagramFromText 'Query plan' ([DgPlan]::Diagram($SqlUI.Plan, $script:IsDark)) } $bar $Glyph.Apps 2)
+    [void](New-Button 'Save .sqlplan' 'The plan as XML: SQL Server Management Studio and Azure Data Studio open it' {
+        $d = New-Object System.Windows.Forms.SaveFileDialog; $d.Filter = 'SQL Server plan|*.sqlplan'; $d.FileName = 'query.sqlplan'
+        $script:Modal = $true
+        try { if ($d.ShowDialog($SqlUI.Form) -eq 'OK') { [IO.File]::WriteAllText($d.FileName, ($SqlUI.Plan.Xml | Select-Object -First 1), (New-Object System.Text.UTF8Encoding $false)); Set-SqlStatus "Saved $(Split-Path -Leaf $d.FileName)." $C.Green } } finally { $script:Modal = $false; $d.Dispose() }
+    } $bar $Glyph.Save 2)
+    New-TbLabel $bar 'Read right to left: data flows from the tables to the result. Red = expensive; thick = many rows.' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding((Px 8), (Px 8), 0, 0) }
+    $cv = New-Object DgCanvas
+    $cv.Dock = 'Fill'; $cv.UiScale = $Scale * $TextZoom; $cv.Font = $FontMain; $cv.Editable = $false
+    $right.Controls.Add($cv); $right.Controls.Add($bar)
+    if ($Plan.Ops.Count) {
+        $d = [DgText]::Parse([DgPlan]::Diagram($Plan, $script:IsDark)); [DgLayout]::Apply($d)
+        $cv.Theme = [DgTheme]::Get($d.Theme); $cv.Dark = $script:IsDark
+        $cv.SetDoc($d, $false)
+    }
+    $sp.SplitterDistance = [Math]::Min((Px 480), [int]($sp.Width * 0.45))
+    Set-ControlTheme $pp $null $script:IsDark
 }
 
 # ---- live query diagram (beside the editor): the statement under the cursor, redrawn as you type
@@ -27343,7 +27666,9 @@ function Show-SqlClient {
     $top.Controls.Add($SqlUI.DbBox)
     $SqlUI.DbBox.add_TextChanged({ if ($SqlUI.LiveTimer) { $SqlUI.LiveTimer.Stop(); $SqlUI.LiveTimer.Start() } })
     $SqlUI.RunBtn = New-Button 'Run' 'Run the selection, or everything (F5 / Ctrl+Enter)' { Start-SqlRun } $top $Glyph.Play 1
-    $SqlUI.CancelBtn = New-Button 'Cancel' 'Stop the running query' { if ($SqlUI.Run) { $SqlUI.Run.Cancel() } } $top $Glyph.Pause 2
+    $SqlUI.CancelBtn = New-Button 'Cancel' 'Stop the running query' { if ($SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }; if ($SqlUI.PlanRun -and -not $SqlUI.PlanRun.Done) { $SqlUI.PlanRun.Cancel() } } $top $Glyph.Pause 2
+    [void](New-Button 'Plan' 'The estimated plan and suggestions (the query is NOT run)  -  Ctrl+L' { Start-SqlPlan $false } $top $Glyph.View 2)
+    [void](New-Button 'Run with plan' 'Run the query and get the actual plan with real row counts  -  Ctrl+M' { Start-SqlPlan $true } $top $Glyph.Play 2)
     $SqlUI.CancelBtn.Enabled = $false
     New-TbLabel $top 'Max rows' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding((Px 10), (Px 9), (Px 4), 0) }
     $SqlUI.MaxRows = New-TbNumber $top 10000 1 1000000; $SqlUI.MaxRows.Width = Px 90
@@ -27401,14 +27726,18 @@ function Show-SqlClient {
     $ed.add_TextChanged({ $SqlUI.ColorTimer.Stop(); $SqlUI.ColorTimer.Start(); $SqlUI.LiveTimer.Stop(); $SqlUI.LiveTimer.Start() })
     $SqlUI.LiveTimer = New-TbDebounce 450 { if ($SqlUI.Form) { try { Update-SqlLive } catch { Write-Log "live diagram: $_" } } }
     $ed.add_SelectionChanged({ if (-not $SqlUI.LiveQuiet -and $SqlUI.LiveTimer) { $SqlUI.LiveTimer.Stop(); $SqlUI.LiveTimer.Start() } })
+    $SqlUI.PlanTimer = New-Object System.Windows.Forms.Timer; $SqlUI.PlanTimer.Interval = 120
+    $SqlUI.PlanTimer.add_Tick({ if (-not $SqlUI.PlanRun) { $SqlUI.PlanTimer.Stop(); return }; if ($SqlUI.PlanRun.Done) { $SqlUI.PlanTimer.Stop(); try { Complete-SqlPlan } catch { Set-SqlStatus "Plan: $_" $C.Red } } else { Set-SqlStatus "Working...  $([Math]::Round(((Get-Date) - $SqlUI.Started).TotalSeconds, 1)) s" $C.Accent } })
     $SqlUI.Timer = New-Object System.Windows.Forms.Timer; $SqlUI.Timer.Interval = 120
     $SqlUI.Timer.add_Tick({ if (-not $SqlUI.Run) { $SqlUI.Timer.Stop(); return }; if ($SqlUI.Run.Done) { $SqlUI.Timer.Stop(); Complete-SqlRun } else { Set-SqlStatus "Running...  $([Math]::Round(((Get-Date) - $SqlUI.Started).TotalSeconds, 1)) s" $C.Accent } })
     $f.add_KeyDown({
         param($src, $e)
         if ($e.KeyCode -eq 'F5' -or ($e.Control -and $e.KeyCode -eq 'Return')) { $e.SuppressKeyPress = $true; Start-SqlRun }
+        elseif ($e.Control -and $e.KeyCode -eq 'L') { $e.SuppressKeyPress = $true; Start-SqlPlan $false }
+        elseif ($e.Control -and $e.KeyCode -eq 'M') { $e.SuppressKeyPress = $true; Start-SqlPlan $true }
         elseif ($e.KeyCode -eq 'Escape' -and $SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }
     })
-    $f.add_FormClosed({ if ($SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }; foreach ($k in 'Timer', 'ColorTimer', 'LiveTimer') { if ($SqlUI[$k]) { $SqlUI[$k].Dispose(); $SqlUI[$k] = $null } }; $SqlUI.Form = $null; $SqlUI.SchemaKey = '' })
+    $f.add_FormClosed({ if ($SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }; foreach ($k in 'Timer', 'ColorTimer', 'LiveTimer', 'PlanTimer') { if ($SqlUI[$k]) { $SqlUI[$k].Dispose(); $SqlUI[$k] = $null } }; $SqlUI.Form = $null; $SqlUI.SchemaKey = '' })
     Register-ThemedWindow $f
     $f.Show()
     [PowerClipHost]::EnsureShown($f.Handle)
