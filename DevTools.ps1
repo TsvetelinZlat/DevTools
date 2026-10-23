@@ -23246,6 +23246,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
     public DgDoc Doc = new DgDoc();
     public DgTheme Theme = DgTheme.Get("midnight");
     public bool Dark = true, Animate = true, Editable = true, Paused, HoverDim = true;
+    public bool Draggable;      // shapes can be moved even when not Editable (the SQL client's live diagram)
     public float Speed = 1f, UiScale = 1f;
     public DgView View = new DgView();
     public float Zoom = 1f;
@@ -23416,7 +23417,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
             else if (!View.Selected.Contains(n.Id)) View.Selected = new HashSet<string> { n.Id };
             View.SelectedEdge = "";
             if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty);
-            if (Editable) {
+            if (Editable || Draggable) {
                 mode = Mode.Drag; dragAnchor = w; dragFrom.Clear();
                 foreach (var id in View.Selected) { var m = Doc.Find(id); if (m != null) dragFrom[id] = new System.Drawing.PointF(m.X, m.Y); }
             }
@@ -29734,7 +29735,10 @@ function Update-SqlLive {
     $SqlUI.LiveInfo.Text = if ($SqlUI.SchemaError -and -not $schema) { "Columns not loaded: $($SqlUI.SchemaError)" } else { [DgSqlViz]::Info }
     $cv = $SqlUI.LiveCanvas
     if (-not $text) { $cv.SetDoc((New-Object DgDoc), $true); return }
-    $d = [DgText]::Parse($text); [DgLayout]::Apply($d)
+    $d = [DgText]::Parse($text)
+    # tables you dragged stay where you put them (by table and alias), the others are laid out around them
+    if ($SqlUI.LivePos -and $SqlUI.LivePos.Count) { foreach ($n in $d.Nodes) { $p = $SqlUI.LivePos["$($n.Label)|$($n.Badge)"]; if ($p) { $n.X = $p[0]; $n.Y = $p[1]; $n.HasPos = $true } } }
+    [DgLayout]::Apply($d)
     $cv.Theme = [DgTheme]::Get($d.Theme); $cv.Dark = $script:IsDark
     $sig = (@($d.Nodes | ForEach-Object { $_.Label }) -join '|')
     $refit = $sig -ne $SqlUI.LiveSig
@@ -30448,7 +30452,9 @@ function Show-SqlClient {
     Register-SqlComplete $ed
     Register-SqlUndo $ed
     $lcv = New-Object DgCanvas
-    $lcv.Dock = 'Fill'; $lcv.UiScale = $Scale * $TextZoom; $lcv.Font = $FontMain; $lcv.Editable = $false; $lcv.Animate = $false
+    $lcv.Dock = 'Fill'; $lcv.UiScale = $Scale * $TextZoom; $lcv.Font = $FontMain; $lcv.Editable = $false; $lcv.Draggable = $true; $lcv.Animate = $false
+    $SqlUI.LivePos = @{}
+    $lcv.add_Moved({ param($src, $e) foreach ($id in $src.MovedIds) { $n = $src.Doc.Find($id); if ($n) { $SqlUI.LivePos["$($n.Label)|$($n.Badge)"] = @($n.X, $n.Y) } } })
     $lcv.add_SelectionChanged({
         param($src, $e)
         $id = $src.SelectedId; if (-not $id) { return }
@@ -30457,6 +30463,7 @@ function Show-SqlClient {
     $lbar = New-Object System.Windows.Forms.FlowLayoutPanel; $lbar.Dock = 'Top'; $lbar.AutoSize = $true; $lbar.WrapContents = $true; $lbar.BackColor = $C.Panel; $lbar.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 3), (Px 6), (Px 3))
     [void](New-Button 'Open in Diagram studio' 'Edit, style or export this diagram' { if ($SqlUI.LiveText) { Show-DiagramStudio; New-DiagramFromText 'Query' $SqlUI.LiveText } } $lbar $Glyph.Apps 2)
     [void](New-Button 'Refresh columns' 'Read the tables and columns of the database again' { $SqlUI.SchemaKey = '-'; $SqlUI.SourcesSig = ''; $SqlUI.DbNames = @{}; Update-SqlLive } $lbar $Glyph.Refresh 2)
+    [void](New-Button 'Tidy up' 'Lay the tables out again (forgets where you dragged them)' { $SqlUI.LivePos = @{}; $SqlUI.LiveSig = ''; Update-SqlLive } $lbar $Glyph.Apps 2)
     $SqlUI.LiveInfo = New-TbLabel $lbar '' -Dim; $SqlUI.LiveInfo.Margin = New-Object System.Windows.Forms.Padding((Px 8), (Px 8), 0, 0)
     $live.Panel2.Controls.Add($lcv); $live.Panel2.Controls.Add($lbar)
     $SqlUI.LiveCanvas = $lcv
