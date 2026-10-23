@@ -29476,6 +29476,8 @@ function Show-DiagramExportMenu($Anchor) {
     [void](Add-MenuItem $m 'Embeddable widget...' { Show-DiagramCode 'widget' } $Glyph.Code)
     [void](Add-MenuItem $m 'React component...' { Show-DiagramCode 'react' } $Glyph.Code)
     [void](Add-MenuItem $m 'SVG code...' { Show-DiagramCode 'svg' } $Glyph.Code)
+    [void]$m.Items.Add('-')
+    [void](Add-MenuItem $m 'Update old exports...' { Open-DiagramExportUpdate } $Glyph.Refresh)
     $m.Show($Anchor, (New-Object System.Drawing.Point(0, $Anchor.Height)))
 }
 
@@ -30245,6 +30247,62 @@ function Register-DiagramDrop($Control) {
     # (imported after the drop returns, so Explorer isn't kept waiting)
     $Control.add_DragDrop({ param($src, $e) $DgUI.DropFiles = @($e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)); if ($DgUI.DropFiles.Count) { [void]$DgUI.Form.BeginInvoke([Action]{ $files = $DgUI.DropFiles; $DgUI.DropFiles = $null; foreach ($p in $files) { Import-DiagramFile $p } }) } })
     foreach ($ch in $Control.Controls) { if ($ch -isnot [System.Windows.Forms.TextBox]) { Register-DiagramDrop $ch } }
+}
+
+# ---- updating old exports: an HTML page, widget or React component exported by DevTools carries its diagram text, so it can be
+#      rebuilt with this version (script, styles, packet logic) with the options it was made with. The old file is kept as a backup.
+function Get-DiagramExportOptions([string]$Raw, [string]$Ext) {
+    $kind = if ($Raw -match 'import \{ useEffect') { 'react' } elseif ($Raw -match '(?i)<!doctype html') { 'page' } else { 'widget' }
+    $m = [regex]::Match($Raw, 'class="([A-Za-z0-9_-]+?)-root"')
+    if (-not $m.Success) { return $null }
+    $px = $m.Groups[1].Value; $q = [regex]::Escape($px)
+    $o = New-Object DgHtmlOptions
+    $o.Kind = $kind; $o.Prefix = $px
+    $tm = [regex]::Match($Raw, '"theme":"(auto|dark|light)"'); if ($tm.Success) { $o.Mode = $tm.Groups[1].Value }
+    $hm = [regex]::Match($Raw, 'position:relative;width:100%;height:([^;]+);min-height'); if ($hm.Success -and $kind -ne 'page') { $o.Height = $hm.Groups[1].Value }
+    $om = [regex]::Match($Raw, '"opt":\{([^}]*)\}')
+    $opt = @{}; foreach ($kv in [regex]::Matches($om.Groups[1].Value, '"(\w+)":(true|false)')) { $opt[$kv.Groups[1].Value] = $kv.Groups[2].Value -eq 'true' }
+    foreach ($k in 'hover', 'panel', 'flows', 'outage', 'glow', 'drops') { if ($opt.ContainsKey($k)) { $o.($k.Substring(0, 1).ToUpper() + $k.Substring(1)) = $opt[$k] } }
+    $o.Header = $Raw -match "$q-head"; $o.ThemeSwitch = $Raw -match "$q-theme`""; $o.Zoom = $Raw -match "$q-zin"; $o.Legend = $Raw -match "$q-legend"; $o.Hint = $Raw -match "$q-hint"
+    $o.WebFont = $Raw -match 'fonts\.googleapis\.com'
+    @{ Options = $o; HasOu = $Raw -match '"ou":1' }
+}
+
+function Update-DiagramExport([string]$Path) {
+    $ext = [IO.Path]::GetExtension($Path).ToLowerInvariant()
+    if ($ext -eq '.svg') { return 'skipped: an SVG has no saved options; import it and export it again' }
+    $raw = [IO.File]::ReadAllText($Path)
+    $src = [DgImport]::FindSource($raw)
+    if (-not $src) { return 'skipped: no diagram text inside (only exports from DevTools carry it)' }
+    $info = Get-DiagramExportOptions $raw $ext
+    if (-not $info) { return 'skipped: not an interactive page, widget or React component from DevTools' }
+    $o = $info.Options
+    $d = [DgText]::Parse($src)
+    # made before the outage became a per-shape choice: every shape offered it then, so keep that
+    if ($o.Outage -and -not $info.HasOu -and -not @($d.Nodes | Where-Object { $_.Outage }).Count) {
+        foreach ($n in @($d.Nodes)) { if (-not $n.Hidden) { $src = [DgText]::SetNodeAttr($src, $n.Id, 'outage', '') } }
+        $d = [DgText]::Parse($src)
+    }
+    [DgLayout]::Apply($d)
+    $code = [DgImport]::AsciiSafe([DgHtml]::Build($d, [DgTheme]::Get($d.Theme), $o))
+    $mk = [DgImport]::Marker($src)
+    $code = if ($o.Kind -eq 'react') { $code.TrimEnd() + "`n/* $mk */`n" } else { $i = $code.LastIndexOf('</body>'); if ($i -ge 0) { $code.Substring(0, $i) + "<!-- $mk -->`n" + $code.Substring($i) } else { $code.TrimEnd() + "`n<!-- $mk -->`n" } }
+    $bdir = Join-Path $DataDir 'diagram-export-backups'
+    if (-not (Test-Path -LiteralPath $bdir)) { [void](New-Item -ItemType Directory -Path $bdir -Force) }
+    Copy-Item -LiteralPath $Path -Destination (Join-Path $bdir ("{0} {1}{2}" -f [IO.Path]::GetFileNameWithoutExtension($Path), (Get-Date).ToString('yyyy-MM-dd HHmmss'), $ext)) -Force
+    [IO.File]::WriteAllText($Path, $code, (New-Object Text.UTF8Encoding $false))
+    "updated ($($o.Kind), prefix $($o.Prefix), starts $($o.Mode))"
+}
+
+function Open-DiagramExportUpdate {
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title = 'Update old exports'; $dlg.Multiselect = $true
+    $dlg.Filter = 'Exported pages, widgets and React components (*.html;*.htm;*.jsx;*.tsx;*.js)|*.html;*.htm;*.jsx;*.tsx;*.js|All files (*.*)|*.*'
+    $script:Modal = $true
+    try { if ($dlg.ShowDialog($DgUI.Form) -ne 'OK') { return }; $files = @($dlg.FileNames) } finally { $script:Modal = $false; $dlg.Dispose() }
+    $lines = foreach ($f in $files) { $r = try { Update-DiagramExport $f } catch { "failed: $($_.Exception.Message)" }; "$([IO.Path]::GetFileName($f)): $r" }
+    $ok = @($lines | Where-Object { $_ -match ': updated' }).Count
+    [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, (($lines -join "`n") + "`n`n$ok of $($files.Count) updated to this version. The old files are kept in`n$(Join-Path $DataDir 'diagram-export-backups')"), 'Update old exports')
 }
 
 # ======================================================================================
