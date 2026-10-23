@@ -29081,10 +29081,39 @@ function New-DgBox([string]$Text, [scriptblock]$OnChange, [switch]$Multi, [int]$
     $b = New-TbBox -Multi:$Multi
     if ($Multi) { $b.ScrollBars = 'Vertical'; $b.AcceptsReturn = $true; $b.Height = Px $(if ($Height) { $Height } else { 70 }) }
     $b.Text = $Text
-    $b.Tag = @{ On = $OnChange; Old = $Text }
-    $b.add_Leave({ param($src, $e) if ($src.Text -cne $src.Tag.Old) { $src.Tag.Old = $src.Text; & $src.Tag.On $src.Text } })
-    if (-not $Multi) { $b.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Enter') { $e.SuppressKeyPress = $true; if ($src.Text -cne $src.Tag.Old) { $src.Tag.Old = $src.Text; & $src.Tag.On $src.Text } } }) }
+    $b.Tag = @{ On = $OnChange; Old = $Text; DgBox = $true }
+    # saved shortly after typing stops, on Enter, on leaving the box, and before the panel is rebuilt (another shape selected, Save, closing)
+    $b.add_TextChanged({ param($src, $e) if ($DgUI.PropTimer -and $src.Text -cne $src.Tag.Old) { $DgUI.PropTimer.Stop(); $DgUI.PropTimer.Start() } })
+    $b.add_Leave({ param($src, $e) Submit-DgBox $src })
+    if (-not $Multi) { $b.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Enter') { $e.SuppressKeyPress = $true; Submit-DgBox $src } }) }
     $b
+}
+# Writes a property box into the diagram text, for the shape / link it was made for, without rebuilding the panel (the box keeps focus and what is typed)
+function Submit-DgBox($Box) {
+    if (-not $Box -or $Box.IsDisposed -or $Box.Text -ceq $Box.Tag.Old) { return }
+    $Box.Tag.Old = $Box.Text
+    $keepId = $DgUI.PropId; $keepEdge = $DgUI.PropEdge; $busy = $DgUI.PropsBusy
+    if ($Box.Tag.ContainsKey('Id')) { $DgUI.PropId = $Box.Tag.Id }
+    if ($Box.Tag.ContainsKey('Edge')) { $DgUI.PropEdge = $Box.Tag.Edge }
+    $DgUI.PropsBusy = $true
+    try { & $Box.Tag.On $Box.Text }
+    catch { Write-Log "diagram property: $_" }
+    finally { $DgUI.PropsBusy = $busy; if ($Box.Tag.ContainsKey('Id')) { $DgUI.PropId = $keepId }; if ($Box.Tag.ContainsKey('Edge')) { $DgUI.PropEdge = $keepEdge } }
+}
+function Get-DgBoxes($Ctl) { foreach ($c in @($Ctl.Controls)) { if ($c -is [System.Windows.Forms.TextBox] -and $c.Tag -is [hashtable] -and $c.Tag.DgBox) { $c }; if ($c.Controls.Count) { Get-DgBoxes $c } } }
+# Everything typed in the properties panel that is not in the text yet
+function Save-DiagramPropEdits {
+    if ($DgUI.PropTimer) { $DgUI.PropTimer.Stop() }
+    if (-not $DgUI.Props -or $DgUI.PropsBusy) { return }
+    foreach ($b in @(Get-DgBoxes $DgUI.Props)) { Submit-DgBox $b }
+}
+# The Save button and Ctrl+S
+function Save-DiagramNow {
+    Save-DiagramPropEdits
+    $DgUI.TypeTimer.Stop(); $t = $DgUI.Editor.Text; if ($t -cne $DgUI.Text) { $DgUI.Undo.Add($DgUI.Text); $DgUI.Redo.Clear(); $DgUI.Text = $t; Update-Diagram }
+    if ($DgUI.SaveTimer) { $DgUI.SaveTimer.Stop() }
+    Save-DiagramFile
+    if ($DgUI.Warn) { $DgUI.Warn.Text = "Saved  $((Get-Date).ToString('HH:mm:ss'))"; $DgUI.Warn.ForeColor = $C.Green }
 }
 function New-DgCombo($Items, [string]$Value, [scriptblock]$OnChange, [switch]$Editable) {
     $cx = New-Object System.Windows.Forms.ComboBox
@@ -29112,7 +29141,11 @@ function New-DgColorButton($Parent, [string]$Label, [string]$Value, [scriptblock
 function Update-DiagramProps {
     $p = $DgUI.Props
     if (-not $p -or $DgUI.PropsBusy) { return }
+    Save-DiagramPropEdits                                                      # nothing typed is lost when the panel is rebuilt
     $cv = $DgUI.Canvas; $d = $DgUI.Doc
+    $key = "$(@($cv.View.Selected) -join ',')|$($cv.View.SelectedEdge)|$($cv.Editable)"
+    $scroll = if ($DgUI.PropKey -eq $key) { -$p.AutoScrollPosition.Y } else { 0 }      # same selection: keep the scroll position
+    $DgUI.PropKey = $key
     $p.SuspendLayout()
     foreach ($ctl in @($p.Controls)) { $p.Controls.Remove($ctl); $ctl.Dispose() }
     $cats = @($d.Cats | ForEach-Object { $_.Id })
@@ -29140,7 +29173,7 @@ function Update-DiagramProps {
         Add-DgProp $p 'Tags (comma separated)' (New-DgBox (@($node.Tags) -join ', ') { param($v) $w = (@($v -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join '; '); Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'tags', $(if ($w) { $w } else { $null }))) }) | Out-Null
         Add-DgProp $p 'Button text (empty: Open webpage)' (New-DgBox $node.LinkText { param($v) Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'linktext', $(if ($v) { '"' + ($v -replace '"', "'") + '"' } else { $null }))) }) | Out-Null
         Add-DgProp $p 'Link (opens when clicked in the web page)' (New-DgBox $node.Url { param($v) Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'url', $(if ($v) { '"' + $v + '"' } else { $null }))) }) | Out-Null
-        $gb = New-CheckBox $p 'Open webpage button on hover (web page)' ($node.Button.Length -gt 0); $gb.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, 0)
+        $gb = New-CheckBox $p 'Open webpage button on hover' ($node.Button.Length -gt 0); $gb.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, 0)
         $gb.add_CheckedChanged({ param($src, $e) Set-DiagramNodeAttr $DgUI.PropId 'button' $(if ($src.Checked) { '' } else { $null }) })
         $row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.AutoSize = $true; $row.WrapContents = $true; $row.MaximumSize = New-Object System.Drawing.Size((Px (260 * $TextZoom)), 0); $row.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0)
         [void](New-DgColorButton $row 'Fill' $node.Fill { param($v) Set-DiagramNodeAttr $DgUI.PropId 'fill' $v })
@@ -29230,8 +29263,13 @@ function Update-DiagramProps {
         }
         New-TbLabel $p "Tips: drag shapes to move them; drag from a shape's dot to another shape to link them; double-click a shape to rename it; right-click for more. Shift+drag selects several; click inside a group's frame to select (and drag) the whole group. Ctrl+C / Ctrl+V copy shapes and groups into any other diagram; Ctrl+D duplicates." -Dim | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0); $_.Margin = New-Object System.Windows.Forms.Padding(0, (Px 14), 0, 0) }
     }
+    # each box remembers the shape / link it was made for (saved later, even when something else is selected by then)
+    foreach ($b in @(Get-DgBoxes $p)) { if ($node) { $b.Tag.Id = $node.Id } elseif ($edge) { $b.Tag.Edge = $DgUI.PropEdge } }
+    # room below the last row: a scrolling FlowLayoutPanel leaves out its bottom padding, which hid the last buttons
+    $sp = New-Object System.Windows.Forms.Label; $sp.AutoSize = $false; $sp.Size = New-Object System.Drawing.Size((Px 10), (Px 40)); $p.Controls.Add($sp)
     Set-ControlTheme $p $null $script:IsDark
     $p.ResumeLayout()
+    if ($scroll -gt 0) { $p.AutoScrollPosition = New-Object System.Drawing.Point(0, $scroll) }
 }
 
 # Preview mode: what the web page shows when a shape is clicked.
@@ -29484,6 +29522,7 @@ function Show-DiagramStudio([string]$Text = '') {
     [void](New-Button 'New' 'A new, empty diagram (in the folder selected in Saved)' { New-DiagramNamed } $top $Glyph.Add 2)
     $exb = New-Button 'Examples' 'Start from an example' { Show-DiagramExamplesMenu $this } $top $Glyph.Apps 2
     [void](New-Button 'Import...' 'Open a diagram from a file (or drop it on this window): .dgm / .txt, Mermaid, draw.io, Graphviz DOT, CSV / Excel, or an SVG / HTML / PNG exported by DevTools' { Open-DiagramImport } $top $Glyph.Open 2)
+    [void](New-Button 'Save' 'Save this diagram now, with everything typed in the properties (Ctrl+S). It also saves by itself a moment after each change.' { Save-DiagramNow } $top $Glyph.Save 2)
     $exp = New-Button 'Export' 'Picture, PNG, SVG, an interactive web page, a widget or a React component' { Show-DiagramExportMenu $this } $top $Glyph.Save 1
     [void](New-Button '' 'Undo (Ctrl+Z)' { Undo-Diagram } $top ([string][char]0xE7A7) 2)
     [void](New-Button '' 'Redo (Ctrl+Y)' { Redo-Diagram } $top ([string][char]0xE7A6) 2)
@@ -29579,16 +29618,17 @@ function Show-DiagramStudio([string]$Text = '') {
         if ($t -cne $DgUI.Text) { $DgUI.Undo.Add($DgUI.Text); $DgUI.Redo.Clear(); $DgUI.Text = $t; Update-Diagram }
     }
     $DgUI.SaveTimer = New-TbDebounce 1500 { Save-DiagramFile }
+    $DgUI.PropTimer = New-TbDebounce 700 { Save-DiagramPropEdits }
     $ed.add_TextChanged({ if ($DgUI.Quiet) { return }; $DgUI.TypeTimer.Stop(); $DgUI.TypeTimer.Start(); $DgUI.ColorTimer.Stop(); $DgUI.ColorTimer.Start() })
     $f.add_KeyDown({
         param($src, $e)
         if ($e.Control -and $e.KeyCode -eq 'Z') { $e.SuppressKeyPress = $true; Undo-Diagram }
         elseif ($e.Control -and $e.KeyCode -eq 'Y') { $e.SuppressKeyPress = $true; Redo-Diagram }
-        elseif ($e.Control -and $e.KeyCode -eq 'S') { $e.SuppressKeyPress = $true; Save-DiagramFile }
+        elseif ($e.Control -and $e.KeyCode -eq 'S') { $e.SuppressKeyPress = $true; Save-DiagramNow }
     })
     Register-DiagramDrop $f
-    $f.add_FormClosing({ $DgUI.TypeTimer.Stop(); $t = $DgUI.Editor.Text; if ($t -cne $DgUI.Text) { $DgUI.Text = $t }; Save-DiagramFile })
-    $f.add_FormClosed({ foreach ($k in 'TypeTimer', 'ColorTimer', 'SaveTimer') { if ($DgUI[$k]) { $DgUI[$k].Dispose(); $DgUI[$k] = $null } }; $DgUI.Form = $null; $DgUI.Canvas = $null; $DgUI.Props = $null; $DgUI.List = $null; $DgUI.Folders = $null; $DgUI.ModeSet = $false })
+    $f.add_FormClosing({ Save-DiagramPropEdits; $DgUI.TypeTimer.Stop(); $t = $DgUI.Editor.Text; if ($t -cne $DgUI.Text) { $DgUI.Text = $t }; Save-DiagramFile })
+    $f.add_FormClosed({ foreach ($k in 'TypeTimer', 'ColorTimer', 'SaveTimer', 'PropTimer') { if ($DgUI[$k]) { $DgUI[$k].Dispose(); $DgUI[$k] = $null } }; $DgUI.Form = $null; $DgUI.Canvas = $null; $DgUI.Props = $null; $DgUI.List = $null; $DgUI.Folders = $null; $DgUI.ModeSet = $false })
     Register-ThemedWindow $f
     $f.Show()
     [PowerClipHost]::EnsureShown($f.Handle)
