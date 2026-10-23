@@ -481,6 +481,7 @@ Diagrams from a few lines of text: architecture maps, flowcharts, org charts and
     Each part can be switched off. The page has a small API, so you can feed in real data: `window.diagrams['prefix'].setStatus('db', 'down')`, `.setMetric(id, '12 ms')`, `.select(id)`, `.on('select', fn)`, `.theme('light')`, `.pause()`.
   - **Embeddable widget**: the same as a block to paste into any existing page (its own height); give each diagram its own prefix and several can share a page.
   - **React component**: a `.jsx` file with `theme` and `onSelect` props.
+  - Every export is **plain ASCII** (characters like `– → é` are written as `&#x2013;` in the markup and `\u2013` in scripts), so it shows the same in any page whatever its encoding, and it **needs no internet**: the system fonts are used (Segoe UI / Cascadia Mono / Consolas, with standard fallbacks). Tick **Load the font from Google Fonts** only if you set a `font` and want it downloaded.
   - **SVG code**, with a live preview of the code and options:
     - colours as **CSS variables** that follow the system's light / dark theme, or fixed dark or light
     - background, scaling to its container, accessibility title and description

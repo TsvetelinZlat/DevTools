@@ -23739,7 +23739,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
 public class DgHtmlOptions {
     public string Kind = "page";             // page, widget, react
     public string Prefix = "dg", Mode = "auto", Height = "";
-    public bool Header = true, Flows = true, ThemeSwitch = true, Zoom = true, Legend = true, Panel = true, Hover = true, Outage = true, Hint = true, Glow = true, WebFont = true;
+    public bool Header = true, Flows = true, ThemeSwitch = true, Zoom = true, Legend = true, Panel = true, Hover = true, Outage = true, Hint = true, Glow = true, WebFont = false;      // WebFont: a Google Fonts link (needs internet), off unless asked
 }
 
 public static class DgHtml {
@@ -26883,6 +26883,35 @@ public static class DgImport {
         try { return Encoding.UTF8.GetString(Convert.FromBase64String(m.Groups[1].Value)); } catch { return null; }
     }
 
+    // ---- exports in plain ASCII, so they show the same in any page, whatever its encoding: characters beyond ASCII
+    //      become &#x2013; in markup (SVG, HTML, JSX), \u2013 inside <script> and \2013 inside <style>
+    public static string AsciiSafe(string code) {
+        if (code == null) return "";
+        bool any = false; foreach (char ch in code) if (ch > 127) { any = true; break; }
+        if (!any) return code;
+        var sb = new StringBuilder(code.Length + 64);
+        string mode = "";                                                  // "", "script", "style"
+        int i = 0, n = code.Length;
+        while (i < n) {
+            char c = code[i];
+            if (c == '<') {
+                if (mode == "" && At(code, i, "<script")) mode = "script";
+                else if (mode == "" && At(code, i, "<style")) mode = "style";
+                else if (mode == "script" && At(code, i, "</script")) mode = "";
+                else if (mode == "style" && At(code, i, "</style")) mode = "";
+            }
+            if (c <= 127) { sb.Append(c); i++; continue; }
+            int cp = c;
+            if (char.IsHighSurrogate(c) && i + 1 < n && char.IsLowSurrogate(code[i + 1])) cp = char.ConvertToUtf32(c, code[i + 1]);
+            if (mode == "script") { sb.Append("\\u").Append(((int)c).ToString("x4")); if (cp > 0xFFFF) sb.Append("\\u").Append(((int)code[i + 1]).ToString("x4")); }
+            else if (mode == "style") sb.Append("\\").Append(cp.ToString("x")).Append(' ');
+            else sb.Append("&#x").Append(cp.ToString("X")).Append(';');
+            i += cp > 0xFFFF ? 2 : 1;
+        }
+        return sb.ToString();
+    }
+    static bool At(string s, int i, string w) { return string.Compare(s, i, w, 0, w.Length, StringComparison.OrdinalIgnoreCase) == 0; }
+
     // ---- PNG text chunks (tEXt / zTXt / iTXt): DevTools puts its text in one, draw.io its diagram ("mxfile")
     static uint Crc(byte[] b, int off, int len) {
         uint c = 0xFFFFFFFF;
@@ -27887,8 +27916,6 @@ function Get-DiagramExamples {
     $ex['Architecture/Network visibility map'] = @'
 title Network visibility architecture
 theme midnight dark
-font IBM Plex Sans
-mono IBM Plex Mono
 
 category prod "Production" #3f4fc4 / #8b97ff
 category tap "Capture" #b02a86 / #e879c6
@@ -29065,8 +29092,8 @@ function Show-DiagramCode([string]$Kind = 'page') {
     $io = New-Object System.Windows.Forms.FlowLayoutPanel; $io.AutoSize = $true; $io.WrapContents = $true; $io.BackColor = $C.Panel; $io.MaximumSize = New-Object System.Drawing.Size((Px 1060), 0)
     $st.Feat = [ordered]@{}
     foreach ($ft in @(@('Header', 'Title and live totals'), @('Flows', 'Flowing packets, pause and speed'), @('ThemeSwitch', 'Dark / light switch'), @('Zoom', 'Zoom and fit buttons'), @('Legend', 'Legend (hide flows)'),
-                      @('Panel', 'Details panel on click'), @('Hover', 'Hover dimming'), @('Outage', 'Simulate outage'), @('Hint', 'Hint text'), @('Glow', 'Glow on packets'), @('WebFont', 'Load the web font'))) {
-        $cb = New-CheckBox $io $ft[1] $true; $st.Feat[$ft[0]] = $cb
+                      @('Panel', 'Details panel on click'), @('Hover', 'Hover dimming'), @('Outage', 'Simulate outage'), @('Hint', 'Hint text'), @('Glow', 'Glow on packets'), @('WebFont', 'Load the font from Google Fonts (needs internet)'))) {
+        $cb = New-CheckBox $io $ft[1] ($ft[0] -ne 'WebFont'); $st.Feat[$ft[0]] = $cb      # pages work offline unless asked
     }
     $opt.Controls.Add($io); $opt.SetFlowBreak($st.Height, $true)
     $st.IO = $io
@@ -29372,7 +29399,7 @@ DIAGRAM TEXT  -  a line each; indent to add details to the shape above
 
 title My diagram                  theme midnight dark   (daylight blueprint pastel mono neon corporate; dark / light)
 direction LR                      LR TB RL BT  (auto layout)       layout lanes | layered | grid | circle | force
-route ortho                       ortho | curve | straight         spacing 1.2     radius 10     font IBM Plex Sans
+route ortho                       ortho | curve | straight         spacing 1.2     radius 10     font Segoe UI
 hide header legend grid           turn parts off
 category prod "Production" #3f4fc4 / #8b97ff      a colour for light / dark (bare words in [ ] become categories too)
 lanes "Clients" | "Servers" | "Storage"           columns; put shapes in them with  lane 2
@@ -29867,6 +29894,7 @@ function New-DiagramFromData {
 #      draw.io (.drawio / .xml, its SVG and PNG exports), Graphviz (.dot / .gv), CSV / Excel (into the Data tab), and the
 #      SVG / HTML / React / PNG exports of DevTools (they carry the diagram text, so it comes back as it was)
 function Add-DiagramSource([string]$Code, [string]$Kind) {
+    $Code = [DgImport]::AsciiSafe($Code)                 # plain ASCII: the same in any page, whatever its encoding
     $mk = [DgImport]::Marker($DgUI.Text)
     switch ($Kind) {
         'react' { return $Code.TrimEnd() + "`n/* $mk */`n" }
