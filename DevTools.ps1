@@ -30297,6 +30297,62 @@ function Show-SqlExamplesMenu($Button) {
     $m.Show($Button, (New-Object System.Drawing.Point(0, $Button.Height)))
 }
 
+# ---- undo / redo in the editor (Ctrl+Z; Ctrl+Y or Ctrl+Shift+Z). The RichTextBox's own undo can't be used: colouring the
+#      SQL counts as edits there, so Ctrl+Z took back colours instead of what you typed. Typing is undone a word at a time,
+#      a paste, an example or a suggestion all at once.
+function Register-SqlUndo($Ed) {
+    $SqlUI.UndoList = New-Object System.Collections.Generic.List[object]
+    $SqlUI.RedoList = New-Object System.Collections.Generic.List[object]
+    $SqlUI.UndoLast = @{ Text = $Ed.Text; Sel = 0 }
+    $SqlUI.UndoAt = [DateTime]::MinValue
+    $Ed.add_TextChanged({ Add-SqlUndoStep })
+    $Ed.add_KeyDown({
+        param($src, $e)
+        if (-not $e.Control -or $e.Alt) { return }
+        if ($e.KeyCode -eq 'Z' -and -not $e.Shift) { $e.SuppressKeyPress = $true; $e.Handled = $true; Undo-SqlEdit }
+        elseif ($e.KeyCode -eq 'Y' -or ($e.KeyCode -eq 'Z' -and $e.Shift)) { $e.SuppressKeyPress = $true; $e.Handled = $true; Undo-SqlEdit -Redo }
+    })
+}
+function Add-SqlUndoStep {
+    if ($SqlUI.Coloring -or $SqlUI.Restoring) { return }
+    $ed = $SqlUI.Editor; $t = $ed.Text
+    $last = $SqlUI.UndoLast
+    if ($t -ceq $last.Text) { return }
+    $now = Get-Date
+    $i = $ed.SelectionStart
+    $big = [Math]::Abs($t.Length - $last.Text.Length) -gt 1                                     # a paste, a cut, an example, a suggestion
+    $wordEnd = $t.Length -gt $last.Text.Length -and $i -gt 0 -and " `n`t;,()".Contains([string]$t[$i - 1])
+    if ($big -or $wordEnd -or ($now - $SqlUI.UndoAt).TotalMilliseconds -gt 1000 -or $SqlUI.UndoList.Count -eq 0) {
+        $SqlUI.UndoList.Add($last)
+        if ($SqlUI.UndoList.Count -gt 500) { $SqlUI.UndoList.RemoveAt(0) }
+    }
+    $SqlUI.RedoList.Clear()
+    $SqlUI.UndoLast = @{ Text = $t; Sel = $i }
+    $SqlUI.UndoAt = if ($big) { [DateTime]::MinValue } else { $now }                           # what comes after a paste is a new step
+}
+function Undo-SqlEdit([switch]$Redo) {
+    if ($Redo) { $from = $SqlUI.RedoList; $to = $SqlUI.UndoList } else { $from = $SqlUI.UndoList; $to = $SqlUI.RedoList }     # (not "$x = if ..." : that would unroll the lists)
+    if (-not $from -or $from.Count -eq 0) { Set-SqlStatus $(if ($Redo) { 'Nothing to redo.' } else { 'Nothing to undo.' }) $C.Dim; return }
+    Hide-SqlComplete
+    $ed = $SqlUI.Editor
+    $to.Add(@{ Text = $ed.Text; Sel = $ed.SelectionStart })
+    $st = $from[$from.Count - 1]; $from.RemoveAt($from.Count - 1)
+    $SqlUI.Restoring = $true
+    try {
+        $pos = [DgSql]::GetScroll($ed.Handle)
+        [PowerClipTheme]::Redraw($ed.Handle, $false)
+        try {
+            $ed.Text = $st.Text
+            $ed.Select([Math]::Min([int]$st.Sel, $ed.TextLength), 0)
+            [DgSql]::SetScroll($ed.Handle, $pos)
+        } finally { [PowerClipTheme]::Redraw($ed.Handle, $true); $ed.Invalidate() }
+    } finally { $SqlUI.Restoring = $false }
+    $SqlUI.UndoLast = @{ Text = $st.Text; Sel = $st.Sel }
+    $SqlUI.UndoAt = [DateTime]::MinValue
+    Set-SqlColors
+    $ed.ScrollToCaret()
+}
+
 function Show-SqlClient {
     Hide-Picker
     if (-not (Initialize-Diagrams)) { return }
@@ -30390,6 +30446,7 @@ function Show-SqlClient {
     $ed.Text = "-- F5 or Ctrl+Enter runs the selection, or everything. GO separates batches.`r`n-- Suggestions pop up as you type (Ctrl+Space opens them): Up / Down choose, Tab puts one in.`r`n-- Examples (top bar) adds ready queries: files, joins across connections, other databases.`r`n-- The diagram on the right follows the statement under the cursor as you write it.`r`nSELECT TOP 100 name, create_date FROM sys.tables ORDER BY create_date DESC;"
     $live.Panel1.Controls.Add($ed); $SqlUI.Editor = $ed
     Register-SqlComplete $ed
+    Register-SqlUndo $ed
     $lcv = New-Object DgCanvas
     $lcv.Dock = 'Fill'; $lcv.UiScale = $Scale * $TextZoom; $lcv.Font = $FontMain; $lcv.Editable = $false; $lcv.Animate = $false
     $lcv.add_SelectionChanged({
