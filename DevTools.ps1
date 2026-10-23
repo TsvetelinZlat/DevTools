@@ -24500,11 +24500,12 @@ public class DgSqlRun {
                                         tb.Columns.Add(u, typeof(object));
                                     }
                                     var vals = new object[rd.FieldCount];
+                                    var udt = Udt(rd);
                                     tb.BeginLoadData();
                                     while (rd.Read()) {
                                         if (cancel) { Result.Cancelled = true; break; }
                                         if (maxRows > 0 && tb.Rows.Count >= maxRows) { Result.Truncated = true; break; }
-                                        rd.GetValues(vals);
+                                        Read(rd, vals, udt);
                                         for (int i = 0; i < vals.Length; i++) vals[i] = Show(vals[i]);
                                         tb.LoadDataRow(vals, true);
                                     }
@@ -24530,6 +24531,27 @@ public class DgSqlRun {
     }
 
     // how a value is shown in the grid
+    // geography, geometry, hierarchyid and other CLR types need Microsoft.SqlServer.Types to be read as objects;
+    // they are read as their bytes instead (shown as 0x..., like SSMS does)
+    public static bool[] Udt(System.Data.SqlClient.SqlDataReader rd) {
+        var u = new bool[rd.FieldCount];
+        for (int i = 0; i < u.Length; i++) {
+            string t = "";
+            try { t = rd.GetDataTypeName(i) ?? ""; } catch { }
+            u[i] = t.IndexOf('.') >= 0 || t.EndsWith("geography", StringComparison.OrdinalIgnoreCase) || t.EndsWith("geometry", StringComparison.OrdinalIgnoreCase) || t.EndsWith("hierarchyid", StringComparison.OrdinalIgnoreCase);
+        }
+        return u;
+    }
+    public static void Read(System.Data.SqlClient.SqlDataReader rd, object[] vals, bool[] udt) {
+        bool any = false;
+        for (int i = 0; i < udt.Length; i++) if (udt[i]) { any = true; break; }
+        if (!any) { rd.GetValues(vals); return; }
+        for (int i = 0; i < vals.Length; i++) {
+            if (!udt[i]) { vals[i] = rd.GetValue(i); continue; }
+            var b = rd.GetSqlBytes(i);
+            vals[i] = b.IsNull ? (object)DBNull.Value : b.Value;
+        }
+    }
     static object Show(object v) {
         if (v == null || v is DBNull) return DBNull.Value;
         if (v is byte[]) { var b = (byte[])v; var sb = new StringBuilder("0x"); for (int i = 0; i < Math.Min(b.Length, 64); i++) sb.Append(b[i].ToString("X2")); if (b.Length > 64) sb.Append("..."); return sb.ToString(); }
@@ -24542,6 +24564,10 @@ public class DgSqlRun {
 }
 
 public static class DgSql {
+    // the scroll position of a RichTextBox (kept while the SQL is coloured)
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, ref System.Drawing.Point p);
+    public static System.Drawing.Point GetScroll(IntPtr h) { var p = new System.Drawing.Point(); SendMessage(h, 0x4DD, IntPtr.Zero, ref p); return p; }
+    public static void SetScroll(IntPtr h, System.Drawing.Point p) { SendMessage(h, 0x4DE, IntPtr.Zero, ref p); }
     public static string Build(string server, string db, bool windows, string user, string password, bool encrypt, bool trust, int timeoutSec) {
         var b = new System.Data.SqlClient.SqlConnectionStringBuilder();
         b.DataSource = server;
@@ -25096,7 +25122,8 @@ public class DgPlanRun {
                                     var tb = new System.Data.DataTable("Result " + (res.Tables.Count + 1));
                                     for (int i = 0; i < rd.FieldCount; i++) tb.Columns.Add(i + ":" + rd.GetName(i), typeof(object));
                                     var vals = new object[rd.FieldCount];
-                                    while (rd.Read()) { if (cancel || tb.Rows.Count >= maxRows) { if (!cancel) res.Truncated = true; break; } rd.GetValues(vals); tb.Rows.Add(vals); }
+                                    var udt = DgSqlRun.Udt(rd);
+                                    while (rd.Read()) { if (cancel || tb.Rows.Count >= maxRows) { if (!cancel) res.Truncated = true; break; } DgSqlRun.Read(rd, vals, udt); tb.Rows.Add(vals); }
                                     for (int i = 0; i < tb.Columns.Count; i++) tb.Columns[i].ColumnName = UniqueName(tb, rd.GetName(i), i);
                                     res.Tables.Add(tb);
                                 } while (rd.NextResult());
@@ -28251,6 +28278,25 @@ function New-SqlFolderList([string]$Kind, $Parent) {
     $fl
 }
 
+# colours the SQL in place: the text, the selection and the scroll position stay as they are (setting the text again
+# would count as a change, start the colouring again and lose what you marked)
+function Set-SqlColors {
+    $ed = $SqlUI.Editor
+    if (-not $ed -or $ed.TextLength -ge 60000) { return }
+    if ([System.Windows.Forms.Control]::MouseButtons -ne 'None') { $SqlUI.ColorTimer.Stop(); $SqlUI.ColorTimer.Start(); return }     # still marking with the mouse
+    $SqlUI.Coloring = $true
+    $ss = $ed.SelectionStart; $sl = $ed.SelectionLength
+    $pos = [DgSql]::GetScroll($ed.Handle)
+    [PowerClipTheme]::Redraw($ed.Handle, $false)
+    try {
+        $ed.SelectAll(); $ed.SelectionColor = $C.Fore
+        $col = @{ 1 = $C.Accent; 2 = $C.Orange; 3 = $C.Dim; 4 = $C.Purple; 5 = $C.Green }
+        foreach ($tk in [DevCode]::Tokens($ed.Text, 'sql')) { $ed.Select($tk[0], $tk[1]); $ed.SelectionColor = $col[[int]$tk[2]] }
+        $ed.Select($ss, $sl)
+        [DgSql]::SetScroll($ed.Handle, $pos)
+    } finally { [PowerClipTheme]::Redraw($ed.Handle, $true); $ed.Invalidate(); $SqlUI.Coloring = $false }
+}
+
 function Show-SqlClient {
     Hide-Picker
     if (-not (Initialize-Diagrams)) { return }
@@ -28369,10 +28415,10 @@ function Show-SqlClient {
     $f.Controls.Add($split); $f.Controls.Add($left); $f.Controls.Add($top)
     $split.BringToFront()
 
-    $SqlUI.ColorTimer = New-TbDebounce 450 { if ($SqlUI.Form -and $SqlUI.Editor.TextLength -lt 60000) { $ss = $SqlUI.Editor.SelectionStart; $sl = $SqlUI.Editor.SelectionLength; Set-RtbCode $SqlUI.Editor $SqlUI.Editor.Text 'sql'; $SqlUI.Editor.Select($ss, $sl) } }
-    $ed.add_TextChanged({ $SqlUI.ColorTimer.Stop(); $SqlUI.ColorTimer.Start(); $SqlUI.LiveTimer.Stop(); $SqlUI.LiveTimer.Start() })
+    $SqlUI.ColorTimer = New-TbDebounce 450 { if ($SqlUI.Form) { Set-SqlColors } }
+    $ed.add_TextChanged({ if ($SqlUI.Coloring) { return }; $SqlUI.ColorTimer.Stop(); $SqlUI.ColorTimer.Start(); $SqlUI.LiveTimer.Stop(); $SqlUI.LiveTimer.Start() })
     $SqlUI.LiveTimer = New-TbDebounce 450 { if ($SqlUI.Form) { try { Update-SqlLive } catch { Write-Log "live diagram: $_" } } }
-    $ed.add_SelectionChanged({ if (-not $SqlUI.LiveQuiet -and $SqlUI.LiveTimer) { $SqlUI.LiveTimer.Stop(); $SqlUI.LiveTimer.Start() } })
+    $ed.add_SelectionChanged({ if (-not $SqlUI.Coloring -and -not $SqlUI.LiveQuiet -and $SqlUI.LiveTimer) { $SqlUI.LiveTimer.Stop(); $SqlUI.LiveTimer.Start() } })
     $SqlUI.PlanTimer = New-Object System.Windows.Forms.Timer; $SqlUI.PlanTimer.Interval = 120
     $SqlUI.PlanTimer.add_Tick({ if (-not $SqlUI.PlanRun) { $SqlUI.PlanTimer.Stop(); return }; if ($SqlUI.PlanRun.Done) { $SqlUI.PlanTimer.Stop(); try { Complete-SqlPlan } catch { Set-SqlStatus "Plan: $_" $C.Red } } else { Set-SqlStatus "Working...  $([Math]::Round(((Get-Date) - $SqlUI.Started).TotalSeconds, 1)) s" $C.Accent } })
     $SqlUI.Timer = New-Object System.Windows.Forms.Timer; $SqlUI.Timer.Interval = 120
@@ -28393,7 +28439,7 @@ function Show-SqlClient {
     Update-SqlConnList
     $c0 = Get-SqlConn; if ($c0) { $SqlUI.DbBox.Text = $c0.Database }
     Update-SqlSideLists
-    Set-RtbCode $ed $ed.Text 'sql'
+    Set-SqlColors
     Update-SqlTree
     Update-SqlLive
     if (-not $SqlUI.Conns.Count) { Set-SqlStatus 'Pick "New connection..." in the list at the top left to start.' $C.Accent }
