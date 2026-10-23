@@ -24431,7 +24431,7 @@ public static class DgXlsx {
     }
 }
 
-// ---- SQL client: SQL Server through System.Data.SqlClient (part of .NET, nothing to install).
+// ---- SQL client: SQL Server through System.Data.SqlClient (part of .NET, nothing to install); PostgreSQL / Oracle through DgDb.
 public class DgSqlResult {
     public List<System.Data.DataTable> Tables = new List<System.Data.DataTable>();
     public List<string> Messages = new List<string>();
@@ -24444,7 +24444,7 @@ public class DgSqlResult {
 public class DgSqlRun {
     public volatile bool Done;
     public DgSqlResult Result = new DgSqlResult();
-    System.Data.SqlClient.SqlCommand cmd;
+    System.Data.Common.DbCommand cmd;
     volatile bool cancel;
     readonly object gate = new object();
 
@@ -24475,6 +24475,7 @@ public class DgSqlRun {
     }
 
     void Run(string connStr, string sql, int maxRows, int timeoutSec) {
+        if (DgDb.Parse(connStr).Kind != "sqlclient") { RunOther(connStr, sql, maxRows, timeoutSec); return; }
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try {
             using (var conn = new System.Data.SqlClient.SqlConnection(connStr)) {
@@ -24530,6 +24531,64 @@ public class DgSqlRun {
         Done = true;
     }
 
+    // PostgreSQL / Oracle: one statement at a time through the driver found on this PC
+    void RunOther(string connStr, string sql, int maxRows, int timeoutSec) {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        string dialect = DgDb.Dialect(connStr);
+        try {
+            using (var conn = DgDb.Open(connStr)) {
+                foreach (var st in DgDb.Statements(dialect, sql)) {
+                    if (cancel) { Result.Cancelled = true; break; }
+                    using (var c = conn.CreateCommand()) {
+                        c.CommandText = st.Value;
+                        c.CommandTimeout = Math.Max(0, timeoutSec);
+                        lock (gate) cmd = c;
+                        try {
+                            int tables = 0;
+                            using (var rd = c.ExecuteReader()) {
+                                do {
+                                    if (rd.FieldCount == 0) continue;
+                                    tables++;
+                                    var tb = new System.Data.DataTable("Result " + (Result.Tables.Count + 1));
+                                    var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                                    for (int i = 0; i < rd.FieldCount; i++) {
+                                        string n = rd.GetName(i); if (string.IsNullOrEmpty(n)) n = "(no name)";
+                                        string u = n; int k = 2; while (names.Contains(u)) u = n + " (" + k++ + ")"; names.Add(u);
+                                        tb.Columns.Add(u, typeof(object));
+                                    }
+                                    var vals = new object[rd.FieldCount];
+                                    tb.BeginLoadData();
+                                    while (rd.Read()) {
+                                        if (cancel) { Result.Cancelled = true; break; }
+                                        if (maxRows > 0 && tb.Rows.Count >= maxRows) { Result.Truncated = true; break; }
+                                        DgDb.ReadRow(rd, vals);
+                                        for (int i = 0; i < vals.Length; i++) vals[i] = Show(vals[i]);
+                                        tb.LoadDataRow(vals, true);
+                                    }
+                                    tb.EndLoadData();
+                                    lock (Result.Tables) Result.Tables.Add(tb);
+                                    if (Result.Cancelled) break;
+                                } while (rd.NextResult());
+                                int n0 = rd.RecordsAffected;
+                                if (tables == 0) lock (Result.Messages) Result.Messages.Add(n0 >= 0 ? "(" + n0 + " row" + (n0 == 1 ? "" : "s") + " affected)" : "Done: " + First(st.Value));
+                            }
+                        } catch (System.Data.Common.DbException ex) {
+                            if (cancel) { Result.Cancelled = true; break; }
+                            Result.ErrorLine = st.Key + 1;
+                            Result.Error = DgDb.ErrorText(ex) + "  (line " + Result.ErrorLine + ")";
+                            break;
+                        }
+                        lock (gate) cmd = null;
+                    }
+                }
+            }
+        } catch (Exception ex) { if (cancel) Result.Cancelled = true; else Result.Error = DgDb.ErrorText(ex); }
+        Result.Ms = sw.ElapsedMilliseconds;
+        Done = true;
+    }
+    static string First(string s) { s = Regex.Replace(s ?? "", @"\s+", " ").Trim(); return s.Length > 60 ? s.Substring(0, 60) + "..." : s; }
+    public static Exception Inner(Exception e) { while ((e is System.Reflection.TargetInvocationException || e is TypeInitializationException) && e.InnerException != null) e = e.InnerException; return e; }
+
     // how a value is shown in the grid
     // geography, geometry, hierarchyid and other CLR types need Microsoft.SqlServer.Types to be read as objects;
     // they are read as their bytes instead (shown as 0x..., like SSMS does)
@@ -24581,9 +24640,13 @@ public static class DgSql {
 
     // a quick query on the calling thread (schema, database list)
     public static System.Data.DataTable Query(string conn, string sql, int timeoutSec) {
-        using (var c = new System.Data.SqlClient.SqlConnection(conn)) {
-            c.Open();
-            using (var cmd = new System.Data.SqlClient.SqlCommand(sql, c)) {
+        if (DgDb.Parse(conn).Kind == "sqlclient") return QueryOn(conn, sql, timeoutSec);
+        try { return QueryOn(conn, sql, timeoutSec); } catch (Exception ex) { throw new Exception(DgDb.ErrorText(ex), ex); }
+    }
+    static System.Data.DataTable QueryOn(string conn, string sql, int timeoutSec) {
+        using (var c = DgDb.Open(conn)) {
+            using (var cmd = c.CreateCommand()) {
+                cmd.CommandText = sql;
                 cmd.CommandTimeout = timeoutSec;
                 var t = new System.Data.DataTable();
                 using (var rd = cmd.ExecuteReader()) t.Load(rd);
@@ -24593,7 +24656,13 @@ public static class DgSql {
     }
 
     // statements that change something (comments and strings are ignored)
-    public static string Writes(string sql) {
+    public static string Writes(string sql) { return Writes(sql, "mssql"); }
+    public static string Writes(string sql, string dialect) {
+        if (dialect != "mssql") {
+            var s0 = Regex.Replace(sql ?? "", @"--[^\n]*|/\*[\s\S]*?\*/|'(?:[^']|'')*'|""[^""]*""|\$[A-Za-z_]*\$[\s\S]*?\$[A-Za-z_]*\$", " ");
+            var m0 = Regex.Matches(s0, @"\b(insert|update|delete|merge|drop|alter|truncate|create|grant|revoke|call|exec|execute|begin|declare|comment|rename|vacuum|reindex|cluster|copy|purge|flashback|lock|refresh)\b", RegexOptions.IgnoreCase);
+            return string.Join(", ", m0.Cast<Match>().Select(x => x.Value.ToUpperInvariant()).Distinct());
+        }
         var s = Regex.Replace(sql ?? "", @"--[^\n]*|/\*[\s\S]*?\*/|'(?:[^']|'')*'|\[[^\]]*\]|""[^""]*""", " ");
         var m = Regex.Matches(s, @"\b(insert|update|delete|merge|drop|alter|truncate|create|grant|revoke|deny|exec|execute|sp_rename|backup|restore|dbcc|shutdown|kill)\b", RegexOptions.IgnoreCase);
         return string.Join(", ", m.Cast<Match>().Select(x => x.Value.ToUpperInvariant()).Distinct());
@@ -24648,8 +24717,9 @@ JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id JOIN sys.schemas rs
 
     // tables: null = all (at most 80), else these names (schema.table or table) and the tables they link to when 'related'
     public static string ErText(string conn, string title, IEnumerable<string> tables, bool related) {
-        var cols = Query(conn, ColumnsSql, 60);
-        var keys = Query(conn, KeysSql, 60);
+        var cols = DgDb.Columns(conn, null, null);
+        foreach (var vr in cols.Rows.Cast<System.Data.DataRow>().Where(r => r["kind"].ToString() == "V").ToList()) cols.Rows.Remove(vr);
+        var keys = DgDb.Keys(conn);
         Func<string, string, string> full = (s, t) => s + "." + t;
         var all = cols.Rows.Cast<System.Data.DataRow>().Select(r => full(r["sch"].ToString(), r["tbl"].ToString())).Distinct().ToList();
         var want = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -24668,7 +24738,7 @@ JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id JOIN sys.schemas rs
         sb.Append("title " + title + "\r\ntheme corporate light\r\ndirection LR\r\nroute ortho\r\nhide legend\r\n\r\n");
         foreach (var t in all.Where(want.Contains)) {
             var rows = cols.Rows.Cast<System.Data.DataRow>().Where(r => full(r["sch"].ToString(), r["tbl"].ToString()) == t).ToList();
-            var lines = rows.Take(40).Select(r => "\"" + r["col"].ToString().Replace("\"", "'").Replace(" ", "_") + " " + TypeText(r) + (Convert.ToInt32(r["pk"]) == 1 ? " PK" : "") + (Convert.ToInt32(r["fk"]) == 1 ? " FK" : "") + "\"").ToList();
+            var lines = rows.Take(40).Select(r => "\"" + r["col"].ToString().Replace("\"", "'").Replace(" ", "_") + " " + r["typ"] + (Convert.ToInt32(r["pk"]) == 1 ? " PK" : "") + (Convert.ToInt32(r["fk"]) == 1 ? " FK" : "") + "\"").ToList();
             if (rows.Count > 40) lines.Add("\"... " + (rows.Count - 40) + " more\"");
             sb.Append(id(t) + ": " + label(t) + " [shape table, lines " + string.Join(" ", lines) + "]\r\n");
         }
@@ -24684,22 +24754,391 @@ JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id JOIN sys.schemas rs
     }
 }
 
+// ---- Databases other than SQL Server: PostgreSQL and Oracle through a driver found on this PC (an ODBC driver,
+//      ODP.NET, Npgsql or Oracle.ManagedDataAccess). Nothing is installed by DevTools.
+// A connection is one string. SQL Server: a plain SqlClient connection string. Others:
+//   dgdb|<dialect: pg / oracle>|<kind: odbc / ado>|<driver: ODBC name, or "path;factory type", or "invariant:Name">|<schema>|<connection string>
+public static class DgDb {
+    public class Spec { public string Dialect = "mssql", Kind = "sqlclient", Driver = "", Schema = "", ConnStr = ""; }
+
+    public static Spec Parse(string conn) {
+        var s = new Spec();
+        if (conn == null || !conn.StartsWith("dgdb|")) { s.ConnStr = conn ?? ""; return s; }
+        var p = conn.Split(new[] { '|' }, 6);
+        s.Dialect = p.Length > 1 ? p[1] : "pg"; s.Kind = p.Length > 2 ? p[2] : "odbc"; s.Driver = p.Length > 3 ? p[3] : "";
+        s.Schema = p.Length > 4 ? p[4] : ""; s.ConnStr = p.Length > 5 ? p[5] : "";
+        return s;
+    }
+    public static string Dialect(string conn) { return Parse(conn).Dialect; }
+
+    // ---- drivers found on this PC: { id, label } (id = "odbc|<name>" or "ado|<driver>")
+    public static List<string[]> Drivers(string dialect, string dropDir) {
+        var r = new List<string[]>();
+        bool pg = dialect == "pg";
+        // ODBC drivers (the registry view matches this process: 64-bit PowerShell sees the 64-bit drivers)
+        try {
+            using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\ODBC\ODBCINST.INI\ODBC Drivers")) {
+                if (k != null) foreach (var n in k.GetValueNames()) {
+                    bool ok = pg ? n.IndexOf("PostgreSQL", StringComparison.OrdinalIgnoreCase) >= 0
+                                 : n.IndexOf("Oracle", StringComparison.OrdinalIgnoreCase) >= 0 && n.IndexOf("Microsoft", StringComparison.OrdinalIgnoreCase) < 0;
+                    if (ok) r.Add(new[] { "odbc|" + n, "ODBC: " + n });
+                }
+            }
+        } catch { }
+        // ADO.NET providers registered in machine.config
+        try {
+            foreach (System.Data.DataRow row in System.Data.Common.DbProviderFactories.GetFactoryClasses().Rows) {
+                string inv = row["InvariantName"].ToString();
+                if (pg ? inv.Equals("Npgsql", StringComparison.OrdinalIgnoreCase) : (inv.StartsWith("Oracle.ManagedDataAccess", StringComparison.OrdinalIgnoreCase) || inv.StartsWith("Oracle.DataAccess", StringComparison.OrdinalIgnoreCase)))
+                    r.Add(new[] { "ado|invariant:" + inv, row["Name"] + " (" + inv + ")" });
+            }
+        } catch { }
+        // driver DLLs: the drop folder (data\drivers), and for Oracle the ODP.NET in each Oracle home
+        var files = new List<string>();
+        var names = pg ? new[] { "Npgsql.dll" } : new[] { "Oracle.ManagedDataAccess.dll", "Oracle.DataAccess.dll" };
+        if (!string.IsNullOrEmpty(dropDir) && System.IO.Directory.Exists(dropDir))
+            foreach (var n in names) foreach (var f in System.IO.Directory.GetFiles(dropDir, n, System.IO.SearchOption.AllDirectories)) files.Add(f);
+        if (!pg) {
+            foreach (var home in OracleHomes()) {
+                files.Add(System.IO.Path.Combine(home, @"ODP.NET\managed\common\Oracle.ManagedDataAccess.dll"));
+                files.Add(System.IO.Path.Combine(home, @"ODP.NET\bin\4\Oracle.DataAccess.dll"));
+            }
+        }
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var f in files) {
+            if (!System.IO.File.Exists(f) || !seen.Add(f)) continue;
+            string leaf = System.IO.Path.GetFileNameWithoutExtension(f);
+            string type = leaf == "Npgsql" ? "Npgsql.NpgsqlFactory" : leaf + ".Client.OracleClientFactory";
+            string ver = "";
+            try { ver = System.Diagnostics.FileVersionInfo.GetVersionInfo(f).FileVersion; } catch { }
+            string what = leaf == "Oracle.DataAccess" ? "ODP.NET" : leaf == "Oracle.ManagedDataAccess" ? "ODP.NET managed" : "Npgsql";
+            r.Add(new[] { "ado|" + f + ";" + type, what + " " + ver + "  (" + f + ")" });
+        }
+        return r;
+    }
+    static List<string> OracleHomes() {
+        var r = new List<string>();
+        try {
+            using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\ORACLE")) {
+                if (k != null) foreach (var n in k.GetSubKeyNames()) {
+                    using (var h = k.OpenSubKey(n)) {
+                        var home = h == null ? null : h.GetValue("ORACLE_HOME") as string;
+                        if (!string.IsNullOrEmpty(home) && System.IO.Directory.Exists(home)) r.Add(home);
+                    }
+                }
+            }
+        } catch { }
+        return r;
+    }
+
+    // ---- the connection string for a driver. server: PostgreSQL "host" or "host:port"; Oracle "host:port/service" or a TNS alias.
+    public static string Build(string dialect, string driverId, string server, string db, string user, string password, bool encrypt, bool trust, int timeoutSec) {
+        string kind = driverId.StartsWith("ado|") ? "ado" : "odbc";
+        string driver = driverId.Length > 5 && driverId.IndexOf('|') > 0 ? driverId.Substring(driverId.IndexOf('|') + 1) : "";
+        string host = server ?? "", port = "";
+        string cs;
+        if (dialect == "pg") {
+            var m = Regex.Match(host, @"^(.*?)[:,](\d+)$");
+            if (m.Success) { host = m.Groups[1].Value; port = m.Groups[2].Value; }
+            if (kind == "odbc") {
+                cs = "Driver={" + driver + "};Server=" + Odbc(host) + ";Port=" + (port.Length > 0 ? port : "5432") + ";Database=" + Odbc(string.IsNullOrEmpty(db) ? "postgres" : db)
+                   + ";Uid=" + Odbc(user) + ";Pwd=" + Odbc(password) + ";" + (encrypt ? "SSLmode=require;" : "");
+            } else {
+                var b = new System.Data.Common.DbConnectionStringBuilder();
+                b["Host"] = host; if (port.Length > 0) b["Port"] = port;
+                b["Database"] = string.IsNullOrEmpty(db) ? "postgres" : db;
+                b["Username"] = user ?? ""; b["Password"] = password ?? "";
+                if (encrypt) { b["SSL Mode"] = "Require"; if (trust) b["Trust Server Certificate"] = "true"; }
+                b["Timeout"] = Math.Max(3, timeoutSec).ToString(); b["Application Name"] = "DevTools";
+                cs = b.ConnectionString;
+            }
+            return "dgdb|pg|" + kind + "|" + driver + "||" + cs;
+        }
+        // Oracle: the "database" box is the schema to work in
+        if (kind == "odbc") cs = "Driver={" + driver + "};Dbq=" + Odbc(host) + ";Uid=" + Odbc(user) + ";Pwd=" + Odbc(password) + ";";
+        else {
+            var b = new System.Data.Common.DbConnectionStringBuilder();
+            b["Data Source"] = host; b["User Id"] = user ?? ""; b["Password"] = password ?? "";
+            b["Connection Timeout"] = Math.Max(3, timeoutSec).ToString();
+            cs = b.ConnectionString;
+        }
+        return "dgdb|oracle|" + kind + "|" + driver + "|" + (db ?? "").Replace("|", "") + "|" + cs;
+    }
+    static string Odbc(string v) { v = v ?? ""; return v.IndexOfAny(new[] { ';', '{', '}', '=' }) >= 0 || v.Trim() != v ? "{" + v.Replace("}", "}}") + "}" : v; }
+
+    // ---- open a connection (any kind)
+    static readonly Dictionary<string, System.Data.Common.DbProviderFactory> factories = new Dictionary<string, System.Data.Common.DbProviderFactory>(StringComparer.OrdinalIgnoreCase);
+    static System.Data.Common.DbProviderFactory Factory(string driver) {
+        lock (factories) {
+            System.Data.Common.DbProviderFactory f;
+            if (factories.TryGetValue(driver, out f)) return f;
+            if (driver.StartsWith("invariant:")) f = System.Data.Common.DbProviderFactories.GetFactory(driver.Substring(10));
+            else {
+                int i = driver.LastIndexOf(';');
+                string path = i > 0 ? driver.Substring(0, i) : driver, type = i > 0 ? driver.Substring(i + 1) : "";
+                if (!System.IO.File.Exists(path)) throw new Exception("The driver file is gone: " + path);
+                var asm = System.Reflection.Assembly.LoadFrom(path);
+                var t = asm.GetType(type, false) ?? asm.GetTypes().FirstOrDefault(x => typeof(System.Data.Common.DbProviderFactory).IsAssignableFrom(x) && !x.IsAbstract);
+                if (t == null) throw new Exception("No database driver inside " + path);
+                var fi = t.GetField("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                f = (System.Data.Common.DbProviderFactory)(fi != null ? fi.GetValue(null) : Activator.CreateInstance(t));
+            }
+            factories[driver] = f;
+            return f;
+        }
+    }
+    public static System.Data.Common.DbConnection Create(string conn) {
+        var s = Parse(conn);
+        System.Data.Common.DbConnection c;
+        if (s.Kind == "sqlclient") c = new System.Data.SqlClient.SqlConnection(s.ConnStr);
+        else if (s.Kind == "odbc") c = new System.Data.Odbc.OdbcConnection(s.ConnStr);
+        else { c = Factory(s.Driver).CreateConnection(); c.ConnectionString = s.ConnStr; }
+        return c;
+    }
+    public static System.Data.Common.DbConnection Open(string conn) {
+        var s = Parse(conn);
+        var c = Create(conn);
+        try {
+            c.Open();
+            if (s.Dialect == "oracle" && s.Schema.Trim().Length > 0) {
+                using (var cmd = c.CreateCommand()) { cmd.CommandText = "ALTER SESSION SET CURRENT_SCHEMA = " + QuoteOracle(s.Schema.Trim()); cmd.ExecuteNonQuery(); }
+            }
+        } catch { c.Dispose(); throw; }
+        return c;
+    }
+    static string QuoteOracle(string n) { return Regex.IsMatch(n, @"^[A-Za-z][A-Za-z0-9_$#]*$") ? n.ToUpperInvariant() : "\"" + n.Replace("\"", "") + "\""; }
+
+    // a name as the editor should write it: [dbo].[T] / "Mixed"."Case" / plain when it needs no quotes
+    public static string QuoteName(string dialect, string full) {
+        var parts = (full ?? "").Split('.');
+        if (dialect == "mssql") return string.Join(".", parts.Select(p => "[" + p + "]"));
+        return string.Join(".", parts.Select(p => (dialect == "pg" ? Regex.IsMatch(p, @"^[a-z_][a-z0-9_$]*$") : Regex.IsMatch(p, @"^[A-Z][A-Z0-9_$#]*$")) ? p : "\"" + p.Replace("\"", "\"\"") + "\""));
+    }
+
+    // ---- statements: SQL Server runs batches split at GO; PostgreSQL and Oracle run one statement at a time
+    // (Oracle takes no ';' at the end, and a PL/SQL block ends with a line that holds only '/')
+    public static List<KeyValuePair<int, string>> Statements(string dialect, string sql) {
+        if (dialect == "mssql") return DgSqlRun.Batches(sql);
+        var r = new List<KeyValuePair<int, string>>();
+        string s = (sql ?? "").Replace("\r\n", "\n");
+        int n = s.Length, i = 0, start = 0;
+        bool block = false;
+        Action<int, bool> add = (end, keepSemi) => {
+            string t = s.Substring(start, end - start);
+            int lead = 0;
+            while (true) {
+                while (lead < t.Length && char.IsWhiteSpace(t[lead])) lead++;
+                if (lead + 1 < t.Length && t[lead] == '-' && t[lead + 1] == '-') { int e = t.IndexOf('\n', lead); if (e < 0) break; lead = e + 1; continue; }
+                if (lead + 1 < t.Length && t[lead] == '/' && t[lead + 1] == '*') { int e = t.IndexOf("*/", lead + 2); if (e < 0) break; lead = e + 2; continue; }
+                break;
+            }
+            string body = t.Trim();
+            if (!keepSemi) body = body.TrimEnd(';').TrimEnd();
+            if (body.Length > 0 && !Regex.IsMatch(body, @"^(\s*(--[^\n]*|/\*[\s\S]*?\*/))*\s*$")) {
+                int line = 0; for (int k = 0; k < start + lead && k < n; k++) if (s[k] == '\n') line++;
+                r.Add(new KeyValuePair<int, string>(line, body));
+            }
+        };
+        Func<bool> atStatementStart = () => s.Substring(start, i - start).Trim().Length == 0;
+        while (i < n) {
+            char c = s[i];
+            // a new statement: a PL/SQL block runs to the '/' line
+            if (dialect == "oracle" && !block && !char.IsWhiteSpace(c) && atStatementStart()) {
+                var m = Regex.Match(s.Substring(i, Math.Min(200, n - i)), @"^(BEGIN|DECLARE|CREATE\s+(OR\s+REPLACE\s+)?((NON)?EDITIONABLE\s+)?(PROCEDURE|FUNCTION|PACKAGE|TRIGGER|TYPE|LIBRARY|JAVA))\b", RegexOptions.IgnoreCase);
+                if (m.Success) block = true;
+            }
+            if (c == '-' && i + 1 < n && s[i + 1] == '-') { int e = s.IndexOf('\n', i); i = e < 0 ? n : e; continue; }
+            if (c == '/' && i + 1 < n && s[i + 1] == '*') { int e = s.IndexOf("*/", i + 2); i = e < 0 ? n : e + 2; continue; }
+            if (c == '\'') { i++; while (i < n) { if (s[i] == '\'') { if (i + 1 < n && s[i + 1] == '\'') { i += 2; continue; } i++; break; } i++; } continue; }
+            if (c == '"') { int e = s.IndexOf('"', i + 1); i = e < 0 ? n : e + 1; continue; }
+            if (dialect == "pg" && c == '$') {
+                var m = Regex.Match(s.Substring(i, Math.Min(64, n - i)), @"^\$[A-Za-z_]*\$");
+                if (m.Success) { int e = s.IndexOf(m.Value, i + m.Length); i = e < 0 ? n : e + m.Length; continue; }
+            }
+            // a line with only '/' ends an Oracle statement or block
+            if (dialect == "oracle" && c == '/' && (i == 0 || s[i - 1] == '\n')) {
+                int e = s.IndexOf('\n', i); string line = s.Substring(i, (e < 0 ? n : e) - i);
+                if (line.Trim() == "/") { add(i, block); block = false; i = e < 0 ? n : e + 1; start = i; continue; }
+            }
+            if (c == ';' && !block) { add(i, false); i++; start = i; continue; }
+            i++;
+        }
+        add(n, block);
+        return r;
+    }
+
+    // ---- what the object browser, the live diagram and the ER diagram read
+    public static string DatabasesSql(string dialect) {
+        if (dialect == "pg") return "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname";
+        if (dialect == "oracle") return "SELECT username FROM all_users WHERE oracle_maintained = 'N' OR username = USER ORDER BY CASE WHEN username = USER THEN 0 ELSE 1 END, username";
+        return "SELECT name FROM sys.databases WHERE HAS_DBACCESS(name) = 1 ORDER BY CASE WHEN database_id <= 4 THEN 1 ELSE 0 END, name";
+    }
+    public static System.Data.DataTable Databases(string conn) {
+        string d = Dialect(conn);
+        try { return DgSql.Query(conn, DatabasesSql(d), 15); }
+        catch { if (d == "oracle") return DgSql.Query(conn, "SELECT USER AS username FROM dual", 15); throw; }
+    }
+
+    // schema and name of the tables (U), views (V), procedures (P) or functions (FN)
+    public static System.Data.DataTable Objects(string conn, string type) {
+        string d = Dialect(conn), sql;
+        if (d == "pg") {
+            const string skip = "('pg_catalog', 'information_schema')";
+            if (type == "U" || type == "V") sql = "SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = '" + (type == "U" ? "BASE TABLE" : "VIEW") + "' AND table_schema NOT IN " + skip + " ORDER BY 1, 2";
+            else sql = "SELECT DISTINCT routine_schema, routine_name FROM information_schema.routines WHERE routine_type = '" + (type == "P" ? "PROCEDURE" : "FUNCTION") + "' AND routine_schema NOT IN " + skip + " ORDER BY 1, 2";
+        } else if (d == "oracle") {
+            string ot = type == "U" ? "'TABLE'" : type == "V" ? "'VIEW'" : type == "P" ? "'PROCEDURE', 'PACKAGE'" : "'FUNCTION'";
+            sql = "SELECT owner, object_name FROM all_objects WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AND object_type IN (" + ot + ") AND object_name NOT LIKE 'BIN$%' ORDER BY object_name";
+        } else {
+            string types = type == "FN" ? "'FN','IF','TF'" : "'" + type + "'";
+            sql = "SELECT s.name, o.name FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE o.type IN (" + types + ") AND o.is_ms_shipped = 0 ORDER BY s.name, o.name";
+        }
+        return DgSql.Query(conn, sql, 30);
+    }
+
+    // columns of every table and view (or of one): sch, tbl, col, typ (with its size), nul (1/0), pk (1/0), fk (1/0), kind (U / V)
+    public static System.Data.DataTable Columns(string conn, string onlySchema, string onlyTable) {
+        string d = Dialect(conn), sql;
+        Func<string, string> lit = v => "'" + (v ?? "").Replace("'", "''") + "'";
+        bool one = !string.IsNullOrEmpty(onlyTable);
+        if (d == "pg") {
+            sql = @"SELECT c.table_schema AS sch, c.table_name AS tbl, c.column_name AS col, c.data_type AS typ, c.character_maximum_length AS len, c.numeric_precision AS prec, c.numeric_scale AS scale,
+  CASE WHEN c.is_nullable = 'YES' THEN 1 ELSE 0 END AS nul,
+  CASE WHEN EXISTS (SELECT 1 FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage k ON k.constraint_schema = tc.constraint_schema AND k.constraint_name = tc.constraint_name
+     WHERE tc.constraint_type = 'PRIMARY KEY' AND k.table_schema = c.table_schema AND k.table_name = c.table_name AND k.column_name = c.column_name) THEN 1 ELSE 0 END AS pk,
+  CASE WHEN EXISTS (SELECT 1 FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage k ON k.constraint_schema = tc.constraint_schema AND k.constraint_name = tc.constraint_name
+     WHERE tc.constraint_type = 'FOREIGN KEY' AND k.table_schema = c.table_schema AND k.table_name = c.table_name AND k.column_name = c.column_name) THEN 1 ELSE 0 END AS fk,
+  CASE WHEN t.table_type = 'VIEW' THEN 'V' ELSE 'U' END AS kind
+FROM information_schema.columns c JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema')" + (one ? " AND c.table_schema = " + lit(onlySchema) + " AND c.table_name = " + lit(onlyTable) : "") + @"
+ORDER BY c.table_schema, c.table_name, c.ordinal_position";
+        } else if (d == "oracle") {
+            sql = @"SELECT c.owner AS sch, c.table_name AS tbl, c.column_name AS col, c.data_type AS typ, c.char_length AS len, c.data_precision AS prec, c.data_scale AS scale,
+  CASE c.nullable WHEN 'Y' THEN 1 ELSE 0 END AS nul,
+  CASE WHEN EXISTS (SELECT 1 FROM all_cons_columns cc JOIN all_constraints k ON k.owner = cc.owner AND k.constraint_name = cc.constraint_name
+     WHERE k.constraint_type = 'P' AND cc.owner = c.owner AND cc.table_name = c.table_name AND cc.column_name = c.column_name) THEN 1 ELSE 0 END AS pk,
+  CASE WHEN EXISTS (SELECT 1 FROM all_cons_columns cc JOIN all_constraints k ON k.owner = cc.owner AND k.constraint_name = cc.constraint_name
+     WHERE k.constraint_type = 'R' AND cc.owner = c.owner AND cc.table_name = c.table_name AND cc.column_name = c.column_name) THEN 1 ELSE 0 END AS fk,
+  CASE WHEN o.object_type = 'VIEW' THEN 'V' ELSE 'U' END AS kind
+FROM all_tab_columns c JOIN all_objects o ON o.owner = c.owner AND o.object_name = c.table_name AND o.object_type IN ('TABLE', 'VIEW')
+WHERE " + (one ? "c.owner = " + lit(onlySchema) + " AND c.table_name = " + lit(onlyTable) : "c.owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AND c.table_name NOT LIKE 'BIN$%'") + @"
+ORDER BY c.table_name, c.column_id";
+        } else {
+            sql = @"SELECT s.name AS sch, o.name AS tbl, c.name AS col, TYPE_NAME(c.user_type_id) AS typ, c.max_length AS len, c.precision AS prec, c.scale AS scale, CAST(c.is_nullable AS int) AS nul,
+  CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id WHERE i.is_primary_key = 1 AND ic.object_id = c.object_id AND ic.column_id = c.column_id) THEN 1 ELSE 0 END AS pk,
+  CASE WHEN EXISTS (SELECT 1 FROM sys.foreign_key_columns f WHERE f.parent_object_id = c.object_id AND f.parent_column_id = c.column_id) THEN 1 ELSE 0 END AS fk,
+  CASE WHEN o.type = 'V' THEN 'V' ELSE 'U' END AS kind
+FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id JOIN sys.columns c ON c.object_id = o.object_id
+WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0" + (one ? " AND s.name = " + lit(onlySchema) + " AND o.name = " + lit(onlyTable) : "") + @"
+ORDER BY s.name, o.name, c.column_id";
+        }
+        var raw = DgSql.Query(conn, sql, 60);
+        var t = new System.Data.DataTable();
+        foreach (var n in new[] { "sch", "tbl", "col", "typ", "kind" }) t.Columns.Add(n, typeof(string));
+        foreach (var n in new[] { "nul", "pk", "fk" }) t.Columns.Add(n, typeof(int));
+        foreach (System.Data.DataRow r in raw.Rows) {
+            t.Rows.Add(r["sch"].ToString(), r["tbl"].ToString(), r["col"].ToString(), TypeText(d, r["typ"].ToString(), Num(r["len"]), Num(r["prec"]), Num(r["scale"])), r["kind"].ToString(),
+                Num(r["nul"]), Num(r["pk"]), Num(r["fk"]));
+        }
+        return t;
+    }
+    static int Num(object o) { if (o == null || o is DBNull) return int.MinValue; try { return Convert.ToInt32(o, CultureInfo.InvariantCulture); } catch { return int.MinValue; } }
+    static string TypeText(string d, string t, int len, int prec, int scale) {
+        bool hasLen = len != int.MinValue, hasPrec = prec != int.MinValue;
+        if (d == "pg") {
+            if (t == "character varying") return "varchar" + (hasLen ? "(" + len + ")" : "");
+            if (t == "character") return "char" + (hasLen ? "(" + len + ")" : "");
+            if (t == "numeric" && hasPrec) return "numeric(" + prec + "," + (scale == int.MinValue ? 0 : scale) + ")";
+            if (t == "timestamp without time zone") return "timestamp";
+            if (t == "timestamp with time zone") return "timestamptz";
+            return t;
+        }
+        if (d == "oracle") {
+            string u = t.ToUpperInvariant();
+            if ((u == "VARCHAR2" || u == "NVARCHAR2" || u == "CHAR" || u == "NCHAR" || u == "RAW") && hasLen && len > 0) return t + "(" + len + ")";
+            if (u == "NUMBER" && hasPrec) return t + "(" + prec + (scale != int.MinValue && scale != 0 ? "," + scale : "") + ")";
+            return t;
+        }
+        if (t == "varchar" || t == "char" || t == "varbinary" || t == "binary") return t + "(" + (len < 0 ? "max" : len.ToString()) + ")";
+        if (t == "nvarchar" || t == "nchar") return t + "(" + (len < 0 ? "max" : (len / 2).ToString()) + ")";
+        if ((t == "decimal" || t == "numeric") && hasPrec) return t + "(" + prec + "," + scale + ")";
+        return t;
+    }
+
+    // foreign keys between tables: fkname, psch, ptbl (the table with the key), rsch, rtbl (the table it points to)
+    public static System.Data.DataTable Keys(string conn) {
+        string d = Dialect(conn), sql;
+        if (d == "pg") sql = @"SELECT DISTINCT tc.constraint_name AS fkname, tc.table_schema AS psch, tc.table_name AS ptbl, ccu.table_schema AS rsch, ccu.table_name AS rtbl
+FROM information_schema.table_constraints tc JOIN information_schema.constraint_column_usage ccu ON ccu.constraint_schema = tc.constraint_schema AND ccu.constraint_name = tc.constraint_name
+WHERE tc.constraint_type = 'FOREIGN KEY'";
+        else if (d == "oracle") sql = @"SELECT c.constraint_name AS fkname, c.owner AS psch, c.table_name AS ptbl, r.owner AS rsch, r.table_name AS rtbl
+FROM all_constraints c JOIN all_constraints r ON r.owner = c.r_owner AND r.constraint_name = c.r_constraint_name
+WHERE c.constraint_type = 'R' AND c.owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')";
+        else sql = DgSql.KeysSql;
+        return DgSql.Query(conn, sql, 60);
+    }
+
+    // the schema names resolve to when the SQL gives none
+    public static string DefaultSchema(string conn) {
+        var s = Parse(conn);
+        if (s.Dialect == "pg") return "public";
+        if (s.Dialect == "oracle") { if (s.Schema.Trim().Length > 0) return s.Schema.Trim().ToUpperInvariant(); try { return DgSql.Query(conn, "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual", 15).Rows[0][0].ToString(); } catch { return ""; } }
+        return "dbo";
+    }
+
+    // a row's values; a value a driver can't turn into a .NET value (Oracle NUMBER(38) beyond decimal, odd types) as text
+    public static void ReadRow(System.Data.Common.DbDataReader rd, object[] vals) {
+        try { rd.GetValues(vals); return; } catch { }
+        for (int i = 0; i < vals.Length; i++) {
+            try { vals[i] = rd.GetValue(i); continue; } catch { }
+            try { var v = rd.GetProviderSpecificValue(i); vals[i] = v == null ? (object)DBNull.Value : v.ToString(); continue; } catch { }
+            try { vals[i] = rd.GetString(i); continue; } catch { }
+            string tn = ""; try { tn = rd.GetDataTypeName(i); } catch { }
+            vals[i] = "(can't read " + tn + ")";
+        }
+    }
+
+    // a driver's error in a few clean lines (ODBC repeats itself and prefixes everything with [vendor][driver])
+    public static string ErrorText(Exception ex) {
+        ex = DgSqlRun.Inner(ex);
+        var lines = new List<string>();
+        var odbc = ex as System.Data.Odbc.OdbcException;
+        var raw = new List<string>();
+        if (odbc != null && odbc.Errors.Count > 0) foreach (System.Data.Odbc.OdbcError e in odbc.Errors) raw.Add(e.Message); else raw.Add(ex.Message);
+        foreach (var m in raw) foreach (var l0 in m.Replace("\r", "").Split('\n')) {
+            var l = Regex.Replace(l0, @"^(ERROR \[\w+\]\s*)?(\[[^\]]*\]\s*)+", "").Trim();
+            if (l.Length == 0 || l.IndexOf("SQLSetConnectAttr", StringComparison.OrdinalIgnoreCase) >= 0 || lines.Contains(l)) continue;
+            lines.Add(l);
+        }
+        return lines.Count > 0 ? string.Join("\n", lines.Take(4)) : ex.Message;
+    }
+
+    // the plan as text: PostgreSQL EXPLAIN, Oracle EXPLAIN PLAN / DBMS_XPLAN (the SQL Server plan tuner has its own code)
+    public static string PlanSql(string dialect, string statement, bool actual) {
+        if (dialect == "pg") return (actual ? "EXPLAIN (ANALYZE, BUFFERS) " : "EXPLAIN ") + statement;
+        if (dialect == "oracle") {
+            if (!actual) return "EXPLAIN PLAN FOR " + statement + ";\nSELECT plan_table_output AS plan FROM TABLE(DBMS_XPLAN.DISPLAY())";
+            var st = Regex.Replace(statement, @"^\s*SELECT\b", "SELECT /*+ gather_plan_statistics */", RegexOptions.IgnoreCase);
+            return st + ";\nSELECT plan_table_output AS plan FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'))";
+        }
+        return statement;
+    }
+}
+
 // ---- Live query diagram: reads a SELECT (CTEs, subqueries, joins, WHERE / GROUP / ORDER) and makes diagram text:
 //      the tables with their columns (from the database), links for the joins from key column to key column.
 public class DgSqlSchema {
     // "schema.table" (lower case) -> columns: name, type, "PK"/"", "FK"/""
     public Dictionary<string, List<string[]>> Tables = new Dictionary<string, List<string[]>>(StringComparer.OrdinalIgnoreCase);
+    public string DefaultSchema = "dbo";
     public static DgSqlSchema Load(string conn) {
         var s = new DgSqlSchema();
-        var t = DgSql.Query(conn, @"SELECT s.name AS sch, o.name AS tbl, c.name AS col, TYPE_NAME(c.user_type_id) AS typ,
-  CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id WHERE i.is_primary_key = 1 AND ic.object_id = c.object_id AND ic.column_id = c.column_id) THEN 'PK' ELSE '' END AS pk,
-  CASE WHEN EXISTS (SELECT 1 FROM sys.foreign_key_columns f WHERE f.parent_object_id = c.object_id AND f.parent_column_id = c.column_id) THEN 'FK' ELSE '' END AS fk
-FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id JOIN sys.columns c ON c.object_id = o.object_id
-WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 ORDER BY s.name, o.name, c.column_id", 30);
+        s.DefaultSchema = DgDb.DefaultSchema(conn);
+        var t = DgDb.Columns(conn, null, null);
         foreach (System.Data.DataRow r in t.Rows) {
             string k = r["sch"] + "." + r["tbl"];
             List<string[]> l; if (!s.Tables.TryGetValue(k, out l)) { l = new List<string[]>(); s.Tables[k] = l; }
-            l.Add(new[] { r["col"].ToString(), r["typ"].ToString(), r["pk"].ToString(), r["fk"].ToString() });
+            l.Add(new[] { r["col"].ToString(), r["typ"].ToString(), Convert.ToInt32(r["pk"]) == 1 ? "PK" : "", Convert.ToInt32(r["fk"]) == 1 ? "FK" : "" });
         }
         return s;
     }
@@ -24707,7 +25146,7 @@ WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 ORDER BY s.name, o.name, c.co
         var parts = name.Split('.').Where(p => p.Length > 0).ToList();
         if (parts.Count >= 2) { var k = parts[parts.Count - 2] + "." + parts[parts.Count - 1]; if (Tables.ContainsKey(k)) return k; }
         var last = parts.Count > 0 ? parts[parts.Count - 1] : name;
-        if (Tables.ContainsKey("dbo." + last)) return "dbo." + last;
+        if (Tables.ContainsKey(DefaultSchema + "." + last)) return DefaultSchema + "." + last;
         return Tables.Keys.FirstOrDefault(k => k.EndsWith("." + last, StringComparison.OrdinalIgnoreCase));
     }
 }
@@ -24755,8 +25194,8 @@ public static class DgSqlViz {
     static readonly HashSet<string> Reserved = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
         "SELECT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "APPLY", "ON", "AND", "OR", "NOT", "GROUP", "BY", "ORDER", "HAVING", "UNION", "ALL",
         "EXCEPT", "INTERSECT", "AS", "WITH", "TOP", "DISTINCT", "INTO", "VALUES", "INSERT", "UPDATE", "DELETE", "SET", "MERGE", "USING", "WHEN", "THEN", "ELSE", "END", "CASE",
-        "IN", "IS", "NULL", "LIKE", "BETWEEN", "EXISTS", "OPTION", "FOR", "OFFSET", "FETCH", "NEXT", "ROWS", "ROW", "ONLY", "PIVOT", "UNPIVOT", "OVER", "PARTITION", "GO", "ASC", "DESC", "NOLOCK", "WINDOW" };
-    static readonly HashSet<string> ClauseEnd = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "WHERE", "GROUP", "ORDER", "HAVING", "UNION", "EXCEPT", "INTERSECT", "OPTION", "FOR", "OFFSET", "WINDOW" };
+        "IN", "IS", "NULL", "LIKE", "BETWEEN", "EXISTS", "OPTION", "FOR", "OFFSET", "FETCH", "NEXT", "ROWS", "ROW", "ONLY", "PIVOT", "UNPIVOT", "OVER", "PARTITION", "GO", "ASC", "DESC", "NOLOCK", "WINDOW", "LIMIT", "RETURNING", "MINUS", "CONNECT", "START", "LATERAL", "ILIKE", "QUALIFY" };
+    static readonly HashSet<string> ClauseEnd = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "WHERE", "GROUP", "ORDER", "HAVING", "UNION", "EXCEPT", "INTERSECT", "OPTION", "FOR", "OFFSET", "WINDOW", "LIMIT", "MINUS", "CONNECT", "START", "RETURNING", "FETCH" };
 
     // a dotted name starting at i: returns the end (exclusive)
     static int NameAt(List<Tok> t, int i, int end, out string name) {
@@ -27665,6 +28104,7 @@ function New-DiagramFromData {
 # ======================================================================================
 # SQL client: SQL Server (Windows or SQL login) with nothing to install. Object browser, editor with colours,
 # runs in the background (Cancel), results in grids, export, history, saved queries, charts / ER diagrams.
+# PostgreSQL and Oracle too, through a driver found on this PC (ODBC, ODP.NET, Npgsql).
 # ======================================================================================
 $SqlDir = Join-Path $DataDir 'sql'
 $SqlUI = @{ Form = $null; Conns = (New-Object System.Collections.Generic.List[object]); Queries = (New-Object System.Collections.Generic.List[object]); History = (New-Object System.Collections.Generic.List[object]); Run = $null; Fl = @{} }
@@ -27690,31 +28130,45 @@ function Save-SqlData([string]$What) {
 function Protect-SqlPassword([string]$Pw) { if (-not $Pw) { return '' }; [Convert]::ToBase64String([PowerClipVault]::ProtectForUser([Text.Encoding]::UTF8.GetBytes($Pw))) }
 function Unprotect-SqlPassword([string]$Blob) { if (-not $Blob) { return '' }; try { [Text.Encoding]::UTF8.GetString([PowerClipVault]::UnprotectForUser([Convert]::FromBase64String($Blob))) } catch { '' } }
 
+$SqlDriverDir = Join-Path $DataDir 'drivers'
+$SqlTypes = [ordered]@{ mssql = 'SQL Server'; pg = 'PostgreSQL'; oracle = 'Oracle' }
+function Get-SqlDialect($Conn) { if ($Conn -and $Conn.Type) { [string]$Conn.Type } else { 'mssql' } }
 function Get-SqlConnString($Conn, [string]$Db = '') {
     if (-not $Conn) { return $null }
     $d = if ($Db) { $Db } else { [string]$Conn.Database }
+    $t = Get-SqlDialect $Conn
+    if ($t -ne 'mssql') { return [DgDb]::Build($t, [string]$Conn.Driver, [string]$Conn.Server, $d, [string]$Conn.User, (Unprotect-SqlPassword ([string]$Conn.Pw)), [bool]$Conn.Encrypt, [bool]$Conn.Trust, 15) }
     [DgSql]::Build([string]$Conn.Server, $d, [bool]$Conn.Windows, [string]$Conn.User, (Unprotect-SqlPassword ([string]$Conn.Pw)), [bool]$Conn.Encrypt, [bool]$Conn.Trust, 15)
 }
+# the database to connect to for listing the databases: SQL Server master, PostgreSQL the connection's own, Oracle any
+function Get-SqlListDb($Conn) { switch (Get-SqlDialect $Conn) { 'mssql' { 'master' } 'pg' { if ($Conn.Database) { [string]$Conn.Database } else { 'postgres' } } default { '' } } }
+function Get-SqlError($Err) { $e = $Err.Exception; while ($e.InnerException -and ($e -is [System.Management.Automation.MethodInvocationException] -or $e -is [System.Reflection.TargetInvocationException])) { $e = $e.InnerException }; $e.Message }
 
 # ---- the connection dialog
 function Edit-SqlConnection($Conn = $null) {
     $f = New-Object System.Windows.Forms.Form
     $f.Text = if ($Conn) { 'Edit connection' } else { 'New connection' }; $f.Icon = $IconActive; $f.StartPosition = 'CenterParent'
-    $f.Size = New-Object System.Drawing.Size((Px 520), (Px 620)); $f.FormBorderStyle = 'FixedDialog'; $f.MaximizeBox = $false; $f.MinimizeBox = $false
+    $f.Size = New-Object System.Drawing.Size((Px 560), (Px 720)); $f.FormBorderStyle = 'FixedDialog'; $f.MaximizeBox = $false; $f.MinimizeBox = $false
     $f.BackColor = $C.Bg; $f.ForeColor = $C.Fore; $f.Font = $FontMain
     $p = New-Object System.Windows.Forms.FlowLayoutPanel
     $p.Dock = 'Fill'; $p.FlowDirection = 'TopDown'; $p.WrapContents = $false; $p.AutoScroll = $true; $p.BackColor = $C.Bg; $p.Padding = New-Object System.Windows.Forms.Padding((Px 16), (Px 10), (Px 16), (Px 10))
     $f.Controls.Add($p)
-    $st = @{ Form = $f }
-    $box = { param($label, $value, [switch]$pw) New-TbLabel $p $label -Dim | Out-Null; $b = New-TbBox; $b.Width = Px 440; $b.Text = $value; if ($pw) { $b.UseSystemPasswordChar = $true }; $p.Controls.Add($b); $b }
+    $st = @{ Form = $f; Panel = $p }
+    $box = { param($label, $value, [switch]$pw) $l = New-TbLabel $p $label -Dim; $b = New-TbBox; $b.Width = Px 480; $b.Text = $value; if ($pw) { $b.UseSystemPasswordChar = $true }; $p.Controls.Add($b); $b.Tag = $l; $b }
     $st.Name = & $box 'Name' $(if ($Conn) { $Conn.Name } else { '' })
-    $st.Server = & $box 'Server   (localhost, .\SQLEXPRESS, (localdb)\MSSQLLocalDB, server.domain.com,1433)' $(if ($Conn) { $Conn.Server } else { 'localhost' })
-    New-TbLabel $p 'Sign in with' -Dim | Out-Null
+    New-TbLabel $p 'Database type' -Dim | Out-Null
+    $st.Type = New-TbCombo $p @($SqlTypes.Values) 220
+    $st.Type.SelectedIndex = [Math]::Max(0, @($SqlTypes.Keys).IndexOf((Get-SqlDialect $Conn)))
+    $st.DriverLabel = New-TbLabel $p 'Driver  (found on this PC)' -Dim
+    $st.Driver = New-TbCombo $p @() 430
+    $st.DriverInfo = New-TbLabel $p '' -Dim; $st.DriverInfo.MaximumSize = New-Object System.Drawing.Size((Px 480), 0)
+    $st.Server = & $box 'Server' $(if ($Conn) { $Conn.Server } else { 'localhost' })
+    $st.AuthLabel = New-TbLabel $p 'Sign in with' -Dim
     $st.Auth = New-TbCombo $p @('Windows account', 'SQL Server login') 220
-    $st.Auth.SelectedIndex = if ($Conn -and -not $Conn.Windows) { 1 } else { 0 }
+    $st.Auth.SelectedIndex = if ($Conn -and -not $Conn.Windows -and (Get-SqlDialect $Conn) -eq 'mssql') { 1 } else { 0 }
     $st.User = & $box 'User' $(if ($Conn) { $Conn.User } else { '' })
     $st.Pw = & $box 'Password  (kept protected for your Windows account)' $(if ($Conn) { Unprotect-SqlPassword $Conn.Pw } else { '' }) -pw
-    New-TbLabel $p 'Database' -Dim | Out-Null
+    $st.DbLabel = New-TbLabel $p 'Database' -Dim
     $dbrow = New-Object System.Windows.Forms.FlowLayoutPanel; $dbrow.AutoSize = $true; $dbrow.WrapContents = $false; $dbrow.BackColor = $C.Bg
     $st.Db = New-Object System.Windows.Forms.ComboBox; $st.Db.DropDownStyle = 'DropDown'; $st.Db.FlatStyle = 'Flat'; $st.Db.BackColor = $C.Bg; $st.Db.ForeColor = $C.Fore; $st.Db.Width = Px 300
     $st.Db.Text = if ($Conn) { $Conn.Database } else { 'master' }
@@ -27723,20 +28177,58 @@ function Edit-SqlConnection($Conn = $null) {
     $st.Encrypt = New-CheckBox $p 'Encrypt the connection' $(if ($Conn) { [bool]$Conn.Encrypt } else { $false })
     $st.Trust = New-CheckBox $p 'Trust the server certificate (self-signed)' $(if ($Conn) { [bool]$Conn.Trust } else { $true })
     $st.Confirm = New-CheckBox $p 'Ask before running statements that change data (INSERT, UPDATE, DELETE, DROP ...)' $(if ($Conn) { $Conn.Confirm -ne $false } else { $true })
-    foreach ($cb in $st.Encrypt, $st.Trust, $st.Confirm) { $cb.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0); $cb.MaximumSize = New-Object System.Drawing.Size((Px 440), 0) }
-    $st.Info = New-TbLabel $p '' -Dim; $st.Info.MaximumSize = New-Object System.Drawing.Size((Px 440), 0)
-    $st.Make = { param($s) [pscustomobject]@{ Name = $(if ($s.Name.Text.Trim()) { $s.Name.Text.Trim() } else { $s.Server.Text.Trim() }); Server = $s.Server.Text.Trim(); Database = $s.Db.Text.Trim(); Windows = ($s.Auth.SelectedIndex -eq 0)
-                                              User = $s.User.Text.Trim(); Pw = (Protect-SqlPassword $s.Pw.Text); Encrypt = $s.Encrypt.Checked; Trust = $s.Trust.Checked; Confirm = $s.Confirm.Checked } }
+    foreach ($cb in $st.Encrypt, $st.Trust, $st.Confirm) { $cb.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0); $cb.MaximumSize = New-Object System.Drawing.Size((Px 480), 0) }
+    $st.Info = New-TbLabel $p '' -Dim; $st.Info.MaximumSize = New-Object System.Drawing.Size((Px 480), 0)
+    $st.TypeKey = { param($s) @($SqlTypes.Keys)[[Math]::Max(0, $s.Type.SelectedIndex)] }
+    $st.DriverId = { param($s) $i = $s.Driver.SelectedIndex; if ($i -ge 0 -and $s.DriverIds -and $i -lt $s.DriverIds.Count) { $s.DriverIds[$i] } else { '' } }
+    # shows what the database type needs, and the drivers found for it
+    $st.Apply = {
+        param($s, [string]$Keep = '')
+        $t = & $s.TypeKey $s
+        $other = $t -ne 'mssql'
+        $s.DriverLabel.Visible = $other; $s.Driver.Visible = $other; $s.DriverInfo.Visible = $other
+        $s.AuthLabel.Visible = -not $other; $s.Auth.Visible = -not $other
+        $s.Encrypt.Visible = $t -ne 'oracle'; $s.Trust.Visible = $t -ne 'oracle'
+        $s.Encrypt.Text = if ($t -eq 'pg') { 'Use SSL (sslmode=require)' } else { 'Encrypt the connection' }
+        $s.Server.Tag.Text = switch ($t) { 'pg' { 'Server   (host, or host:port; the port is 5432 when left out)' } 'oracle' { 'Server   (host:port/service, e.g. dbhost:1521/ORCLPDB1, or a TNS alias)' } default { 'Server   (localhost, .\SQLEXPRESS, (localdb)\MSSQLLocalDB, server.domain.com,1433)' } }
+        $s.DbLabel.Text = switch ($t) { 'oracle' { 'Schema   (empty = your own)' } default { 'Database' } }
+        $s.Panel.PerformLayout()
+        if (-not $other) { return }
+        $list = @([DgDb]::Drivers($t, $SqlDriverDir))
+        $s.DriverIds = @($list | ForEach-Object { $_[0] })
+        $s.Driver.Items.Clear(); foreach ($x in $list) { [void]$s.Driver.Items.Add($x[1]) }
+        if ($list.Count) {
+            $k = [Math]::Max(0, [Array]::IndexOf($s.DriverIds, $Keep))
+            $s.Driver.SelectedIndex = $k
+            $s.DriverInfo.Text = ''
+        } else {
+            $s.DriverInfo.ForeColor = $C.Yellow
+            $s.DriverInfo.Text = if ($t -eq 'pg') { "No PostgreSQL driver found on this PC. Install the PostgreSQL ODBC driver (psqlODBC, 64-bit) from postgresql.org, or put Npgsql.dll (with the DLLs it needs) into $SqlDriverDir, then open this window again." } else { "No Oracle driver found on this PC. Install the Oracle Instant Client with its ODBC driver, or put Oracle.ManagedDataAccess.dll (ODP.NET managed, for .NET Framework) into $SqlDriverDir, then open this window again." }
+        }
+    }
+    $st.Type.add_SelectionChangeCommitted({
+        param($src, $e)
+        $s = $src.FindForm().Tag
+        $t = & $s.TypeKey $s
+        if (-not $s.Server.Text.Trim() -or $s.Server.Text -in 'localhost', 'localhost:5432', 'localhost:1521/FREEPDB1') { $s.Server.Text = switch ($t) { 'pg' { 'localhost:5432' } 'oracle' { 'localhost:1521/FREEPDB1' } default { 'localhost' } } }
+        if (-not $s.Db.Text.Trim() -or $s.Db.Text -in 'master', 'postgres') { $s.Db.Text = switch ($t) { 'pg' { 'postgres' } 'oracle' { '' } default { 'master' } } }
+        & $s.Apply $s
+    })
+    $st.Make = { param($s) $t = & $s.TypeKey $s
+        [pscustomobject]@{ Name = $(if ($s.Name.Text.Trim()) { $s.Name.Text.Trim() } else { $s.Server.Text.Trim() }); Type = $t; Driver = (& $s.DriverId $s); Server = $s.Server.Text.Trim(); Database = $s.Db.Text.Trim(); Windows = ($t -eq 'mssql' -and $s.Auth.SelectedIndex -eq 0)
+                           User = $s.User.Text.Trim(); Pw = (Protect-SqlPassword $s.Pw.Text); Encrypt = $s.Encrypt.Checked; Trust = $s.Trust.Checked; Confirm = $s.Confirm.Checked } }
     $f.Tag = $st
-    [void](New-Button 'Databases' 'Connect and list the databases' {
+    & $st.Apply $st $(if ($Conn) { [string]$Conn.Driver } else { '' })
+    [void](New-Button 'Databases' 'Connect and list the databases (Oracle: the schemas)' {
         $s = $this.FindForm().Tag; $c0 = & $s.Make $s
+        if ($c0.Type -ne 'mssql' -and -not $c0.Driver) { $s.Info.Text = 'Pick a driver first.'; $s.Info.ForeColor = $C.Red; return }
         $s.Form.Cursor = 'WaitCursor'
         try {
-            $t = [DgSql]::Query((Get-SqlConnString $c0 'master'), 'SELECT name FROM sys.databases WHERE HAS_DBACCESS(name) = 1 ORDER BY CASE WHEN database_id <= 4 THEN 1 ELSE 0 END, name', 15)
+            $t = [DgDb]::Databases((Get-SqlConnString $c0 (Get-SqlListDb $c0)))
             $cur = $s.Db.Text; $s.Db.Items.Clear(); foreach ($r in $t.Rows) { [void]$s.Db.Items.Add([string]$r[0]) }; $s.Db.Text = $cur
-            $s.Info.Text = "Connected: $($t.Rows.Count) databases."; $s.Info.ForeColor = $C.Green
+            $s.Info.Text = "Connected: $($t.Rows.Count) $(if ($c0.Type -eq 'oracle') { 'schemas' } else { 'databases' })."; $s.Info.ForeColor = $C.Green
             $s.Db.DroppedDown = $true
-        } catch { $s.Info.Text = $_.Exception.InnerException.Message; if (-not $s.Info.Text) { $s.Info.Text = $_.Exception.Message }; $s.Info.ForeColor = $C.Red } finally { $s.Form.Cursor = 'Default' }
+        } catch { $s.Info.Text = Get-SqlError $_; $s.Info.ForeColor = $C.Red } finally { $s.Form.Cursor = 'Default' }
     } $dbrow $Glyph.Refresh 2)
     $bar = New-Object System.Windows.Forms.FlowLayoutPanel; $bar.Dock = 'Bottom'; $bar.AutoSize = $true; $bar.BackColor = $C.Panel; $bar.Padding = New-Object System.Windows.Forms.Padding((Px 12), (Px 8), (Px 12), (Px 8)); $bar.FlowDirection = 'RightToLeft'
     $f.Controls.Add($bar)
@@ -27748,9 +28240,15 @@ function Edit-SqlConnection($Conn = $null) {
     } $bar $Glyph.Save 1)
     [void](New-Button 'Test' 'Try to connect' {
         $s = $this.FindForm().Tag; $c0 = & $s.Make $s
+        if ($c0.Type -ne 'mssql' -and -not $c0.Driver) { $s.Info.Text = 'Pick a driver first.'; $s.Info.ForeColor = $C.Red; return }
         $s.Form.Cursor = 'WaitCursor'
-        try { $t = [DgSql]::Query((Get-SqlConnString $c0), 'SELECT @@SERVERNAME, DB_NAME(), SUSER_SNAME(), CAST(SERVERPROPERTY(''ProductVersion'') AS varchar(40))', 15); $r = $t.Rows[0]; $s.Info.Text = "Connected to $($r[0]), database $($r[1]) as $($r[2]) (SQL Server $($r[3]))."; $s.Info.ForeColor = $C.Green }
-        catch { $m = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }; $s.Info.Text = $m; $s.Info.ForeColor = $C.Red } finally { $s.Form.Cursor = 'Default' }
+        $q = switch ($c0.Type) {
+            'pg' { 'SELECT inet_server_addr()::text, current_database(), current_user, version()' }
+            'oracle' { "SELECT SYS_CONTEXT('USERENV', 'SERVER_HOST'), SYS_CONTEXT('USERENV', 'DB_NAME') || ' / ' || SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA'), USER, SYS_CONTEXT('USERENV', 'DB_UNIQUE_NAME') FROM dual" }
+            default { 'SELECT @@SERVERNAME, DB_NAME(), SUSER_SNAME(), ''SQL Server '' + CAST(SERVERPROPERTY(''ProductVersion'') AS varchar(40))' }
+        }
+        try { $t = [DgSql]::Query((Get-SqlConnString $c0), $q, 15); $r = $t.Rows[0]; $s.Info.Text = "Connected to $($r[0]), database $($r[1]) as $($r[2]) ($(([string]$r[3]) -replace ',.*$', ''))."; $s.Info.ForeColor = $C.Green }
+        catch { $s.Info.Text = Get-SqlError $_; $s.Info.ForeColor = $C.Red } finally { $s.Form.Cursor = 'Default' }
     } $bar $Glyph.Play 2)
     Register-ThemedWindow $f
     $script:Modal = $true
@@ -27773,19 +28271,23 @@ function Update-SqlConnList([string]$Select = '') {
 }
 function Get-SqlConn { $i = $SqlUI.ConnBox.SelectedIndex; if ($i -ge 0 -and $i -lt $SqlUI.Conns.Count) { $SqlUI.Conns[$i] } else { $null } }
 
-# ---- object browser
+# ---- object browser (SQL Server, PostgreSQL: databases; Oracle: schemas)
 function Update-SqlTree {
     $tv = $SqlUI.Tree; $tv.Nodes.Clear()
     $c0 = Get-SqlConn
     if (-not $c0) { return }
-    $root = $tv.Nodes.Add([string]$c0.Server); $root.Tag = @{ Kind = 'server' }
+    $dl = Get-SqlDialect $c0
+    $root = $tv.Nodes.Add("$([string]$c0.Server)$(if ($dl -ne 'mssql') { "   ($($SqlTypes[$dl]))" })"); $root.Tag = @{ Kind = 'server' }
+    if ($dl -ne 'mssql' -and -not $c0.Driver) { $n = $root.Nodes.Add('No driver: edit the connection and pick one.'); $n.ForeColor = $C.Red; $root.Expand(); return }
     try {
-        $t = [DgSql]::Query((Get-SqlConnString $c0 'master'), 'SELECT name FROM sys.databases WHERE HAS_DBACCESS(name) = 1 ORDER BY CASE WHEN database_id <= 4 THEN 1 ELSE 0 END, name', 15)
+        $t = [DgDb]::Databases((Get-SqlConnString $c0 (Get-SqlListDb $c0)))
         foreach ($r in $t.Rows) { $n = $root.Nodes.Add([string]$r[0]); $n.Tag = @{ Kind = 'db'; Db = [string]$r[0] }; [void]$n.Nodes.Add('...') }
         $root.Expand()
-        $cur = @($root.Nodes | Where-Object { $_.Text -eq [string]$SqlUI.DbBox.Text }) | Select-Object -First 1
+        $want = if ($SqlUI.DbBox.Text) { [string]$SqlUI.DbBox.Text } else { '' }
+        $cur = @($root.Nodes | Where-Object { $_.Text -eq $want }) | Select-Object -First 1
+        if (-not $cur -and $dl -eq 'oracle' -and $root.Nodes.Count) { $cur = $root.Nodes[0] }       # your own schema comes first
         if ($cur) { $cur.Expand() }
-    } catch { $n = $root.Nodes.Add("Can't connect: $($_.Exception.InnerException.Message)"); $n.ForeColor = $C.Red }
+    } catch { $n = $root.Nodes.Add("Can't connect: $(Get-SqlError $_)"); $n.ForeColor = $C.Red }
 }
 function Expand-SqlNode($Node) {
     $tg = $Node.Tag
@@ -27798,29 +28300,43 @@ function Expand-SqlNode($Node) {
                 foreach ($k in @(@('Tables', 'U'), @('Views', 'V'), @('Procedures', 'P'), @('Functions', 'FN'))) { $n = $Node.Nodes.Add($k[0]); $n.Tag = @{ Kind = 'folder'; Db = $tg.Db; Type = $k[1] }; [void]$n.Nodes.Add('...') }
             }
             'folder' {
-                $types = if ($tg.Type -eq 'FN') { "'FN','IF','TF'" } else { "'$($tg.Type)'" }
-                $t = [DgSql]::Query((Get-SqlConnString $c0 $tg.Db), "SELECT s.name, o.name FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE o.type IN ($types) AND o.is_ms_shipped = 0 ORDER BY s.name, o.name", 15)
-                foreach ($r in $t.Rows) { $full = "$($r[0]).$($r[1])"; $n = $Node.Nodes.Add($full); $n.Tag = @{ Kind = 'object'; Db = $tg.Db; Name = $full; Type = $tg.Type }; if ($tg.Type -in 'U', 'V') { [void]$n.Nodes.Add('...') } }
+                $t = [DgDb]::Objects((Get-SqlConnString $c0 $tg.Db), $tg.Type)
+                foreach ($r in $t.Rows) { $full = "$($r[0]).$($r[1])"; $n = $Node.Nodes.Add($full); $n.Tag = @{ Kind = 'object'; Db = $tg.Db; Name = $full; Schema = [string]$r[0]; Object = [string]$r[1]; Type = $tg.Type }; if ($tg.Type -in 'U', 'V') { [void]$n.Nodes.Add('...') } }
                 if ($t.Rows.Count -eq 0) { $e = $Node.Nodes.Add('(none)'); $e.ForeColor = $C.Dim }
             }
             'object' {
-                $q = "SELECT c.name, TYPE_NAME(c.user_type_id), c.max_length, c.is_nullable, CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id WHERE i.is_primary_key = 1 AND ic.object_id = c.object_id AND ic.column_id = c.column_id) THEN 'PK' ELSE '' END, CASE WHEN EXISTS (SELECT 1 FROM sys.foreign_key_columns f WHERE f.parent_object_id = c.object_id AND f.parent_column_id = c.column_id) THEN 'FK' ELSE '' END FROM sys.columns c WHERE c.object_id = OBJECT_ID(@'" + ($tg.Name -replace "'", "''") + "') ORDER BY c.column_id"
-                $q = $q.Replace("@'", "'")
-                $t = [DgSql]::Query((Get-SqlConnString $c0 $tg.Db), $q, 15)
+                $t = [DgDb]::Columns((Get-SqlConnString $c0 $tg.Db), $tg.Schema, $tg.Object)
                 foreach ($r in $t.Rows) {
-                    $len = [int]$r[2]; $ty = [string]$r[1]
-                    if ($ty -match 'char|binary') { $ty += "($(if ($len -lt 0) { 'max' } elseif ($ty -match '^n') { $len / 2 } else { $len }))" }
-                    $keys = (@($r[4], $r[5]) | Where-Object { $_ }) -join ' '
-                    $n = $Node.Nodes.Add("$($r[0])   $ty$(if ($keys) { "  $keys" })$(if ([bool]$r[3]) { '' } else { '  not null' })"); $n.Tag = @{ Kind = 'column'; Name = [string]$r[0] }
+                    $keys = (@($(if ($r['pk'] -eq 1) { 'PK' }), $(if ($r['fk'] -eq 1) { 'FK' })) | Where-Object { $_ }) -join ' '
+                    $n = $Node.Nodes.Add("$($r['col'])   $($r['typ'])$(if ($keys) { "  $keys" })$(if ($r['nul'] -eq 0) { '  not null' })"); $n.Tag = @{ Kind = 'column'; Name = [string]$r['col'] }
                     if ($keys) { $n.ForeColor = $C.Accent }
                 }
             }
         }
-    } catch { $n = $Node.Nodes.Add($_.Exception.InnerException.Message); $n.ForeColor = $C.Red }
+    } catch { $n = $Node.Nodes.Add((Get-SqlError $_)); $n.ForeColor = $C.Red }
 }
 
 function Insert-SqlText([string]$Text) { $ed = $SqlUI.Editor; $ed.SelectedText = $Text; $ed.Focus() }
-function ConvertTo-SqlName([string]$Full) { (($Full -split '\.') | ForEach-Object { "[$_]" }) -join '.' }
+function ConvertTo-SqlName([string]$Full) { [DgDb]::QuoteName((Get-SqlDialect (Get-SqlConn)), $Full) }
+# the first rows of a table / view, and its definition, the way each database writes it
+function Get-SqlTopSql($Obj) {
+    $n = ConvertTo-SqlName $Obj.Name
+    switch (Get-SqlDialect (Get-SqlConn)) { 'pg' { "SELECT *`r`nFROM $n`r`nLIMIT 100;" } 'oracle' { "SELECT *`r`nFROM $n`r`nFETCH FIRST 100 ROWS ONLY" } default { "SELECT TOP 100 *`r`nFROM $n;" } }
+}
+function Get-SqlScriptSql($Obj) {
+    $s = $Obj.Schema -replace "'", "''"; $o = $Obj.Object -replace "'", "''"
+    switch (Get-SqlDialect (Get-SqlConn)) {
+        'pg' {
+            switch ($Obj.Type) {
+                'U' { "SELECT column_name, data_type, character_maximum_length, is_nullable, column_default`r`nFROM information_schema.columns WHERE table_schema = '$s' AND table_name = '$o'`r`nORDER BY ordinal_position;" }
+                'V' { "SELECT pg_get_viewdef('$(ConvertTo-SqlName $Obj.Name)'::regclass, true) AS definition;" }
+                default { "SELECT pg_get_functiondef(p.oid) AS definition`r`nFROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace`r`nWHERE n.nspname = '$s' AND p.proname = '$o';" }
+            }
+        }
+        'oracle' { "SELECT DBMS_METADATA.GET_DDL(object_type, object_name, owner) AS ddl`r`nFROM all_objects`r`nWHERE owner = '$s' AND object_name = '$o' AND object_type IN ('TABLE', 'VIEW', 'PROCEDURE', 'PACKAGE', 'FUNCTION')" }
+        default { if ($Obj.Type -eq 'U') { "SELECT c.name, TYPE_NAME(c.user_type_id) AS type, c.max_length, c.is_nullable, c.is_identity`r`nFROM sys.columns c WHERE c.object_id = OBJECT_ID('$($Obj.Name -replace "'", "''")')`r`nORDER BY c.column_id;" } else { "SELECT OBJECT_DEFINITION(OBJECT_ID('$($Obj.Name -replace "'", "''")')) AS definition;" } }
+    }
+}
 
 # ---- run
 function Start-SqlRun {
@@ -27830,11 +28346,12 @@ function Start-SqlRun {
     $ed = $SqlUI.Editor
     $sql = if ($ed.SelectionLength -gt 0) { $ed.SelectedText } else { $ed.Text }
     if (-not $sql.Trim()) { return }
-    $w = [DgSql]::Writes($sql)
+    $w = [DgSql]::Writes($sql, (Get-SqlDialect $c0))
     if ($w -and $c0.Confirm -ne $false) {
         if ([System.Windows.Forms.MessageBox]::Show($SqlUI.Form, "This changes data or objects ($w) on $($c0.Name) / $($SqlUI.DbBox.Text).`n`nRun it?", 'SQL client', 'YesNo', 'Warning') -ne 'Yes') { return }
     }
     $SqlUI.RunSql = $sql
+    $SqlUI.TextPlan = $false
     $SqlUI.Run = [DgSqlRun]::Start((Get-SqlConnString $c0 $SqlUI.DbBox.Text), $sql, [int]$SqlUI.MaxRows.Value, 0)
     $SqlUI.RunBtn.Enabled = $false; $SqlUI.CancelBtn.Enabled = $true
     Set-SqlStatus 'Running...' $C.Accent
@@ -27846,6 +28363,11 @@ function Complete-SqlRun {
     $r = $SqlUI.Run.Result
     $SqlUI.RunBtn.Enabled = $true; $SqlUI.CancelBtn.Enabled = $false
     Show-SqlResults $r
+    if ($SqlUI.TextPlan) {
+        $SqlUI.TextPlan = $false
+        $n = $r.Tables.Count
+        if ($n -gt 0 -and -not $r.Error) { Select-ApiTab $SqlUI.ResTabs "Result $n  ($($r.Tables[$n - 1].Rows.Count))"; Set-SqlStatus "The plan is in Result $n." $C.Green }
+    }
 }
 
 function Show-SqlResults($r, $Plan = $null) {
@@ -27900,7 +28422,7 @@ function New-SqlGrid($Parent) {
     $g.ReadOnly = $true; $g.AllowUserToAddRows = $false; $g.AllowUserToDeleteRows = $false
     $g.ClipboardCopyMode = 'EnableAlwaysIncludeHeaderText'
     $g.add_CellFormatting({ param($src, $e) if ($e.Value -is [DBNull]) { $e.CellStyle.ForeColor = $C.Dim } })
-    $g.add_DataBindingComplete({ param($src, $e) foreach ($col in $src.Columns) { $col.Width = [Math]::Min((Px 360), [Math]::Max([Math]::Max((Px 70), $col.GetPreferredWidth('AllCellsExceptHeader', $true) + (Px 12)), $col.GetPreferredWidth('ColumnHeader', $true))) } })
+    $g.add_DataBindingComplete({ param($src, $e) foreach ($col in $src.Columns) { $col.Width = [Math]::Min($(if ($src.Columns.Count -eq 1) { Px 1600 } else { Px 360 }), [Math]::Max([Math]::Max((Px 70), $col.GetPreferredWidth('AllCellsExceptHeader', $true) + (Px 12)), $col.GetPreferredWidth('ColumnHeader', $true))) } })
     $Parent.Controls.Add($g)
     $g
 }
@@ -27967,8 +28489,9 @@ function Start-SqlPlan([bool]$Actual) {
     $ed = $SqlUI.Editor
     $sql = if ($ed.SelectionLength -gt 0) { $ed.SelectedText } else { $ed.Text }
     if (-not $sql.Trim()) { return }
+    if ((Get-SqlDialect $c0) -ne 'mssql') { Start-SqlTextPlan $c0 $sql $Actual; return }
     if ($Actual) {
-        $w = [DgSql]::Writes($sql)
+        $w = [DgSql]::Writes($sql, (Get-SqlDialect $c0))
         if ($w -and $c0.Confirm -ne $false -and [System.Windows.Forms.MessageBox]::Show($SqlUI.Form, "Getting the actual plan runs the query, and it changes data or objects ($w).`n`nRun it?", 'SQL client', 'YesNo', 'Warning') -ne 'Yes') { return }
     }
     $SqlUI.RunSql = $sql
@@ -27977,6 +28500,27 @@ function Start-SqlPlan([bool]$Actual) {
     Set-SqlStatus $(if ($Actual) { 'Running with the plan...' } else { 'Asking for the plan (the query is not run)...' }) $C.Accent
     $SqlUI.Started = Get-Date
     $SqlUI.PlanTimer.Start()
+}
+
+# PostgreSQL EXPLAIN / Oracle DBMS_XPLAN of one statement (the selected one, or the one the cursor is in), shown as text
+function Start-SqlTextPlan($Conn, [string]$Sql, [bool]$Actual) {
+    $dl = Get-SqlDialect $Conn
+    $ed = $SqlUI.Editor
+    $sts = @([DgDb]::Statements($dl, $Sql))
+    if (-not $sts.Count) { return }
+    $one = $sts[0].Value
+    if ($sts.Count -gt 1 -and $ed.SelectionLength -eq 0) { $line = $ed.GetLineFromCharIndex($ed.SelectionStart); foreach ($kv in $sts) { if ($kv.Key -le $line) { $one = $kv.Value } } }
+    if ($Actual) {
+        $w = [DgSql]::Writes($one, $dl)
+        if ($w -and $Conn.Confirm -ne $false -and [System.Windows.Forms.MessageBox]::Show($SqlUI.Form, "Getting the actual plan runs the statement, and it changes data or objects ($w).`n`nRun it?", 'SQL client', 'YesNo', 'Warning') -ne 'Yes') { return }
+    }
+    $SqlUI.RunSql = $one
+    $SqlUI.TextPlan = $true
+    $SqlUI.Run = [DgSqlRun]::Start((Get-SqlConnString $Conn $SqlUI.DbBox.Text), [DgDb]::PlanSql($dl, $one, $Actual), [int]$SqlUI.MaxRows.Value, 0)
+    $SqlUI.RunBtn.Enabled = $false; $SqlUI.CancelBtn.Enabled = $true
+    Set-SqlStatus $(if ($Actual) { 'Running with the plan...' } else { 'Asking for the plan (the statement is not run)...' }) $C.Accent
+    $SqlUI.Started = Get-Date
+    $SqlUI.Timer.Start()
 }
 
 function Complete-SqlPlan {
@@ -28175,12 +28719,14 @@ function Remove-SqlQuery($Q, [switch]$NoPrompt) {
 }
 
 # ---- connections
+function Update-SqlDbLabel { if ($SqlUI.DbLabel) { $SqlUI.DbLabel.Text = if ((Get-SqlDialect (Get-SqlConn)) -eq 'oracle') { 'Schema' } else { 'Database' } } }
 function Select-SqlConn($Conn) {
     $i = $SqlUI.Conns.IndexOf($Conn)
     if ($i -lt 0) { return }
     $SqlUI.ConnBox.SelectedIndex = $i
     $SqlUI.ConnName = $Conn.Name
     $SqlUI.DbBox.Text = $Conn.Database
+    Update-SqlDbLabel
     Update-SqlTree
     if ($SqlUI.Fl.connections) { $SqlUI.Fl.connections.List.Invalidate() }
 }
@@ -28253,7 +28799,7 @@ function New-SqlFolderList([string]$Kind, $Parent) {
     $fl.OnRename = [scriptblock]::Create("param(`$row) if (`$row.IsFolder) { Rename-SqlFolder '$Kind' `$row.Path } elseif ('$Kind' -eq 'queries') { Rename-SqlQuery `$row.Item } else { Edit-SqlConnItem `$row.Item }")
     $fl.OnDelete = [scriptblock]::Create("param(`$row) if (`$row.IsFolder) { Remove-SqlFolder '$Kind' `$row.Path } elseif ('$Kind' -eq 'queries') { Remove-SqlQuery `$row.Item } else { Remove-SqlConnItem `$row.Item }")
     if ($Kind -eq 'connections') {
-        $fl.Meta = { param($it) "$($it.Server)  /  $($it.Database)$(if (-not $it.Windows) { "  /  $($it.User)" })" }
+        $fl.Meta = { param($it) $t = Get-SqlDialect $it; "$(if ($t -ne 'mssql') { "$($SqlTypes[$t])  -  " })$($it.Server)$(if ($it.Database) { "  /  $($it.Database)" })$(if (-not $it.Windows) { "  /  $($it.User)" })" }
         $fl.IsCurrent = { param($it) $it -eq (Get-SqlConn) }
         $fl.OnOpen = { param($it) if ($it -ne (Get-SqlConn)) { Select-SqlConn $it } }
         $fl.EmptyText = 'No connections yet. Right-click: New connection.'
@@ -28324,8 +28870,8 @@ function Show-SqlClient {
         $n = $SqlUI.Tree.SelectedNode; $tg = if ($n) { $n.Tag } else { $null }
         if ($tg -and $tg.Kind -eq 'object') {
             $SqlUI.MenuObj = $tg
-            if ($tg.Type -in 'U', 'V') { [void](Add-MenuItem $src 'SELECT TOP 100' { $o = $SqlUI.MenuObj; $SqlUI.DbBox.Text = $o.Db; $SqlUI.Editor.Text = "SELECT TOP 100 *`r`nFROM $(ConvertTo-SqlName $o.Name);"; Start-SqlRun } $Glyph.Play) }
-            [void](Add-MenuItem $src 'Script it (definition)' { $o = $SqlUI.MenuObj; $SqlUI.DbBox.Text = $o.Db; $SqlUI.Editor.Text = $(if ($o.Type -eq 'U') { "SELECT c.name, TYPE_NAME(c.user_type_id) AS type, c.max_length, c.is_nullable, c.is_identity`r`nFROM sys.columns c WHERE c.object_id = OBJECT_ID('$($o.Name)')`r`nORDER BY c.column_id;" } else { "SELECT OBJECT_DEFINITION(OBJECT_ID('$($o.Name)')) AS definition;" }); Start-SqlRun } $Glyph.Code)
+            if ($tg.Type -in 'U', 'V') { [void](Add-MenuItem $src 'First 100 rows' { $o = $SqlUI.MenuObj; $SqlUI.DbBox.Text = $o.Db; $SqlUI.Editor.Text = (Get-SqlTopSql $o); Start-SqlRun } $Glyph.Play) }
+            [void](Add-MenuItem $src 'Script it (definition)' { $o = $SqlUI.MenuObj; $SqlUI.DbBox.Text = $o.Db; $SqlUI.Editor.Text = (Get-SqlScriptSql $o); Start-SqlRun } $Glyph.Code)
             if ($tg.Type -eq 'U') { [void](Add-MenuItem $src 'ER diagram from here (with linked tables)' { $o = $SqlUI.MenuObj; $SqlUI.DbBox.Text = $o.Db; New-SqlErDiagram @($o.Name) } $Glyph.Apps) }
             [void](Add-MenuItem $src 'Insert the name' { Insert-SqlText (ConvertTo-SqlName $SqlUI.MenuObj.Name) } $Glyph.Paste)
         } elseif ($tg -and $tg.Kind -eq 'db') {
@@ -28357,10 +28903,10 @@ function Show-SqlClient {
     })
     [void](New-Button '' 'Edit the connection' { $c0 = Get-SqlConn; if ($c0) { Edit-SqlConnItem $c0 } else { Add-SqlConnection } } $top $Glyph.Edit 2)
     [void](New-Button '' 'Remove the connection' { $c0 = Get-SqlConn; if ($c0) { Remove-SqlConnItem $c0 } } $top $Glyph.Delete 2)
-    New-TbLabel $top 'Database' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding((Px 10), (Px 9), (Px 4), 0) }
+    $SqlUI.DbLabel = New-TbLabel $top 'Database' -Dim; $SqlUI.DbLabel.Margin = New-Object System.Windows.Forms.Padding((Px 10), (Px 9), (Px 4), 0)
     $SqlUI.DbBox = New-Object System.Windows.Forms.ComboBox; $SqlUI.DbBox.DropDownStyle = 'DropDown'; $SqlUI.DbBox.FlatStyle = 'Flat'; $SqlUI.DbBox.BackColor = $C.Bg; $SqlUI.DbBox.ForeColor = $C.Fore; $SqlUI.DbBox.Width = Px 180
     $SqlUI.DbBox.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 10), 0)
-    $SqlUI.DbBox.add_DropDown({ param($src, $e) $src.Items.Clear(); $c0 = Get-SqlConn; if ($c0) { try { foreach ($r in ([DgSql]::Query((Get-SqlConnString $c0 'master'), 'SELECT name FROM sys.databases WHERE HAS_DBACCESS(name) = 1 ORDER BY name', 10)).Rows) { [void]$src.Items.Add([string]$r[0]) } } catch { } } })
+    $SqlUI.DbBox.add_DropDown({ param($src, $e) $src.Items.Clear(); $c0 = Get-SqlConn; if ($c0) { try { foreach ($r in ([DgDb]::Databases((Get-SqlConnString $c0 (Get-SqlListDb $c0)))).Rows) { [void]$src.Items.Add([string]$r[0]) } } catch { } } })
     $top.Controls.Add($SqlUI.DbBox)
     $SqlUI.DbBox.add_TextChanged({ if ($SqlUI.LiveTimer) { $SqlUI.LiveTimer.Stop(); $SqlUI.LiveTimer.Start() } })
     $SqlUI.RunBtn = New-Button 'Run' 'Run the selection, or everything (F5 / Ctrl+Enter)' { Start-SqlRun } $top $Glyph.Play 1
@@ -28438,6 +28984,7 @@ function Show-SqlClient {
     $live.SplitterDistance = [int]($live.Width * 0.45)
     Update-SqlConnList
     $c0 = Get-SqlConn; if ($c0) { $SqlUI.DbBox.Text = $c0.Database }
+    Update-SqlDbLabel
     Update-SqlSideLists
     Set-SqlColors
     Update-SqlTree

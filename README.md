@@ -494,17 +494,24 @@ Diagrams from a few lines of text: architecture maps, flowcharts, org charts and
 
 ## SQL client
 
-A SQL Server client with nothing to install (it uses the SQL Server support built into .NET). Open it from the Toolbox (**Data** group) or the command palette.
+A database client for **SQL Server** (nothing to install: it uses the SQL Server support built into .NET), and for **PostgreSQL** and **Oracle** when a driver for them is already on the PC. Open it from the Toolbox (**Data** group) or the command palette.
 
-- **Connections**: the list at the top left, then **New connection...**.
-  - Server: `localhost`, `.\SQLEXPRESS`, `(localdb)\MSSQLLocalDB` or `server.company.com,1433`.
-  - Sign in with your **Windows account** or a **SQL Server login**. The password is kept protected for your Windows account.
+- **PostgreSQL / Oracle drivers**: DevTools installs nothing; it uses what it finds:
+  - an **ODBC driver**: psqlODBC ("PostgreSQL Unicode"), or Oracle's ("Oracle in ..."), 64-bit
+  - **ODP.NET** in an Oracle home (`Oracle.DataAccess` or `Oracle.ManagedDataAccess`), or a provider registered in .NET
+  - `Npgsql.dll` (with the DLLs it needs) or `Oracle.ManagedDataAccess.dll` put into `data\drivers\`
+  - When none is found, the connection window says so and what to install.
+
+- **Connections**: the list at the top left, then **New connection...**, and pick the **Database type** (and for PostgreSQL / Oracle the **driver** found on this PC).
+  - Server: `localhost`, `.\SQLEXPRESS`, `(localdb)\MSSQLLocalDB` or `server.company.com,1433`; PostgreSQL `host` or `host:port`; Oracle `host:port/service` (e.g. `dbhost:1521/ORCLPDB1`) or a TNS alias.
+  - Sign in with your **Windows account** or a **SQL Server login** (PostgreSQL / Oracle: user and password). The password is kept protected for your Windows account.
+  - For Oracle the **Schema** box takes the place of the database (empty = your own schema).
   - Database: the **Databases** button lists them.
   - Options: encrypt, trust the server certificate, and **ask before running statements that change data** (on by default).
   - **Test** shows the server, database, login and version.
-- **Objects**: databases > tables, views, procedures and functions > columns, with their types and PK / FK keys.
+- **Objects**: databases (Oracle: schemas) > tables, views, procedures and functions > columns, with their types and PK / FK keys.
   - Double-click a name to insert it.
-  - Right-click a table: **SELECT TOP 100**, its definition, or an **ER diagram from here** (with the tables linked to it). Right-click a database: **ER diagram of all tables**.
+  - Right-click a table: **First 100 rows** (`TOP` / `LIMIT` / `FETCH FIRST`), its definition, or an **ER diagram from here** (with the tables linked to it). Right-click a database: **ER diagram of all tables**.
 - **Live diagram** (beside the editor, the **Live diagram** button shows / hides it): the query under the cursor drawn as you write it, before anything runs.
   - Every table of the FROM / JOINs (CTEs and subqueries too) with its real columns, alias and PK / FK keys.
   - Joins as links from key column to key column, coloured by type (INNER, LEFT, RIGHT, FULL, CROSS / APPLY) and labelled with the ON condition.
@@ -514,7 +521,8 @@ A SQL Server client with nothing to install (it uses the SQL Server support buil
   - the plan drawn right to left like SSMS, each step with its share of the cost (red = expensive) and links as thick as their rows
   - **suggestions** in plain words, most important first: missing indexes with a ready `CREATE INDEX`, scans that filter rows, key lookups to cover, sorts and hash joins, implicit conversions, spills, estimates far from actual rows (`UPDATE STATISTICS`), missing statistics, joins without a condition, and from the SQL text: `SELECT *`, `LIKE '%...'`, functions on filtered columns, `NOT IN (SELECT ...)`, subqueries in the SELECT list
   - **Copy** or **Into the editor** for each fix (nothing is run for you), **Save .sqlplan** for SSMS / Azure Data Studio, **Open in Diagram studio**
-- **Editor** with SQL colours. **F5** or **Ctrl+Enter** runs the selection, or everything; `GO` lines separate batches (as in SSMS). **Cancel** (or Esc) stops a long query. **Max rows** caps what is shown per result.
+  - PostgreSQL / Oracle: **Plan** and **Run with plan** show the database's own plan as text for the statement under the cursor (`EXPLAIN` / `EXPLAIN (ANALYZE, BUFFERS)`, Oracle `EXPLAIN PLAN` / `DBMS_XPLAN`).
+- **Editor** with SQL colours. **F5** or **Ctrl+Enter** runs the selection, or everything; `GO` lines separate batches (as in SSMS). PostgreSQL / Oracle run one statement at a time (`;` between them; an Oracle PL/SQL block ends with a `/` line). **Cancel** (or Esc) stops a long query. **Max rows** caps what is shown per result.
 - **Results**: a tab per result set, plus **Messages** (rows affected, PRINT output, errors).
   - An error selects the line it happened on.
   - **Copy** (with headers, pastes into Excel), **CSV...**, **JSON...**.
