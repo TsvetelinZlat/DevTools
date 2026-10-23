@@ -512,6 +512,7 @@ A database client for **SQL Server** (nothing to install: it uses the SQL Server
   - Options: encrypt, trust the server certificate, and **ask before running statements that change data** (on by default).
   - **Test** shows the server, database, login and version.
 - **Objects**: databases (Oracle: schemas) > tables, views, procedures and functions > columns, with their types and PK / FK keys.
+  - **Filter** box above the tree: the tables, views, procedures and functions of the database selected at the top whose name has every word you type (`sales order`), with how many match in each folder; Esc clears it.
   - Double-click a name to insert it.
   - Right-click a table: **First 100 rows** (`TOP` / `LIMIT` / `FETCH FIRST`), its definition, or an **ER diagram from here** (with the tables linked to it). Right-click a database: **ER diagram of all tables**.
 - **Live diagram** (beside the editor, the **Live diagram** button shows / hides it): the query under the cursor drawn as you write it, before anything runs.
@@ -551,6 +552,8 @@ A database client for **SQL Server** (nothing to install: it uses the SQL Server
 - **Editor** with SQL colours. **Ctrl+Z** undoes typing a word at a time (a paste, an example or a suggestion all at once); **Ctrl+Y** or **Ctrl+Shift+Z** redoes. Pasting (Ctrl+V / Shift+Insert) puts in the text only, without the formatting of where it came from (a note, a web page, Word), and turns non-breaking spaces and curly quotes into plain ones so SQL Server takes them. **F5** or **Ctrl+Enter** runs the selection, or everything; `GO` lines separate batches (as in SSMS). PostgreSQL / Oracle run one statement at a time (`;` between them; an Oracle PL/SQL block ends with a `/` line). **Cancel** (or Esc) stops a long query. **Max rows** caps what is shown per result.
 - **Results**: a tab per result set, plus **Messages** (rows affected, PRINT output, errors).
   - An error selects the line it happened on.
+  - **Right-click** a result: **Copy** (with or without headers, Excel-ready), **Copy as** the value only, CSV / JSON / a Markdown table / `INSERT` statements of the selected rows, an `IN (...)` list or a `WHERE` condition of the selected cells, the column name, all column names, all values of a column; **Filter** to the rows with this value, hide the rows with it, NULL / not NULL (filters add up; **Clear the filters**; export and Chart this use what is shown); **Column**: sort, hide, show all, freeze up to here, fit widths; **View the value** in its own window (JSON / XML laid out); put the value, or the selection as `WHERE`, into the editor; Chart this, Diagram this, save as CSV / JSON.
+  - Selecting several cells shows **Count, Sum, Average, Min, Max** of them in the status line.
   - **Copy** (with headers, pastes into Excel), **CSV...**, **JSON...**.
   - **Chart this** / **Diagram this** send the result to the Diagram studio's Data tab, ready to become a chart, a link graph or a tree.
   - **ER diagram** draws the tables of the database with their columns, keys and the 1 : n links between them.

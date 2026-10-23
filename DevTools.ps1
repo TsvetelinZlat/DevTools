@@ -29651,6 +29651,7 @@ function Update-SqlTree {
         if (-not $cur -and $dl -eq 'oracle' -and $root.Nodes.Count) { $cur = $root.Nodes[0] }       # your own schema comes first
         if ($cur) { $cur.Expand() }
     } catch { $n = $root.Nodes.Add("Can't connect: $(Get-SqlError $_)"); $n.ForeColor = $C.Red }
+    if ($SqlUI.TreeFilter -and $SqlUI.TreeFilter.Text.Trim()) { Update-SqlTreeFilter }
 }
 function Expand-SqlNode($Node) {
     $tg = $Node.Tag
@@ -29663,9 +29664,9 @@ function Expand-SqlNode($Node) {
                 foreach ($k in @(@('Tables', 'U'), @('Views', 'V'), @('Procedures', 'P'), @('Functions', 'FN'))) { $n = $Node.Nodes.Add($k[0]); $n.Tag = @{ Kind = 'folder'; Db = $tg.Db; Type = $k[1] }; [void]$n.Nodes.Add('...') }
             }
             'folder' {
-                $t = [DgDb]::Objects((Get-SqlConnString $c0 $tg.Db), $tg.Type)
-                foreach ($r in $t.Rows) { $full = "$($r[0]).$($r[1])"; $n = $Node.Nodes.Add($full); $n.Tag = @{ Kind = 'object'; Db = $tg.Db; Name = $full; Schema = [string]$r[0]; Object = [string]$r[1]; Type = $tg.Type }; if ($tg.Type -in 'U', 'V') { [void]$n.Nodes.Add('...') } }
-                if ($t.Rows.Count -eq 0) { $e = $Node.Nodes.Add('(none)'); $e.ForeColor = $C.Dim }
+                $rows = Get-SqlObjectList $c0 $tg.Db $tg.Type
+                foreach ($r in $rows) { [void](Add-SqlObjectNode $Node $r[0] $r[1] $tg.Db $tg.Type) }
+                if ($rows.Count -eq 0) { $e = $Node.Nodes.Add('(none)'); $e.ForeColor = $C.Dim }
             }
             'object' {
                 $t = [DgDb]::Columns((Get-SqlConnString $c0 $tg.Db), $tg.Schema, $tg.Object)
@@ -29752,6 +29753,7 @@ function Show-SqlResults($r, $Plan = $null) {
     foreach ($k in @($tabs.Panels.Keys)) { $p = $tabs.Panels[$k]; foreach ($ctl in @($p.Controls)) { $ctl.Dispose() }; $tabs.Host.Controls.Remove($p); $tabs.Strip.Controls.Remove($tabs.Buttons[$k]); $tabs.Buttons[$k].Dispose(); $p.Dispose() }
     $tabs.Panels.Clear(); $tabs.Buttons.Clear()
     $SqlUI.Tables = @($r.Tables)
+    $SqlUI.GridState = @{}
     $i = 0; $first = ''
     foreach ($t in $r.Tables) {
         $i++
@@ -29799,6 +29801,7 @@ function New-SqlGrid($Parent) {
     $g.ReadOnly = $true; $g.AllowUserToAddRows = $false; $g.AllowUserToDeleteRows = $false
     $g.ClipboardCopyMode = 'EnableAlwaysIncludeHeaderText'
     $g.add_CellFormatting({ param($src, $e) if ($e.Value -is [DBNull]) { $e.CellStyle.ForeColor = $C.Dim } })
+    Register-SqlGridMenu $g
     $g.add_DataBindingComplete({ param($src, $e) foreach ($col in $src.Columns) { $col.Width = [Math]::Min($(if ($src.Columns.Count -eq 1) { Px 1600 } else { Px 360 }), [Math]::Max([Math]::Max((Px 70), $col.GetPreferredWidth('AllCellsExceptHeader', $true) + (Px 12)), $col.GetPreferredWidth('ColumnHeader', $true))) } })
     $Parent.Controls.Add($g)
     $g
@@ -30623,6 +30626,281 @@ function Register-PlainPaste($Ed) {
     })
 }
 
+# ---- the result grid's right-click menu: copy in many shapes, filter by a value, sort / hide columns, use a value,
+#      and totals of the selected cells in the status line
+if (-not $SqlUI.GridState) { $SqlUI.GridState = @{} }
+
+# what is selected: whole rows when -Rows (or when only one cell is selected and rows are asked for), else the selected block
+function Get-SqlGridPick($Grid, [switch]$Rows) {
+    $cells = @($Grid.SelectedCells)
+    $ri = @($cells | ForEach-Object { $_.RowIndex } | Where-Object { $_ -ge 0 } | Sort-Object -Unique)
+    $ci = @($cells | ForEach-Object { $_.ColumnIndex } | Sort-Object -Unique)
+    if ($Rows -or $ci.Count -eq 0) { $ci = @($Grid.Columns | Where-Object { $_.Visible } | ForEach-Object { $_.Index }) }
+    $cols = @($ci | ForEach-Object { $Grid.Columns[$_] } | Where-Object { $_.Visible } | Sort-Object DisplayIndex)
+    $t = New-Object System.Data.DataTable
+    foreach ($col in $cols) { [void]$t.Columns.Add($col.HeaderText, [object]) }
+    foreach ($r in $ri) {
+        $vals = foreach ($col in $cols) { $v = $Grid.Rows[$r].Cells[$col.Index].Value; if ($null -eq $v) { [DBNull]::Value } else { $v } }
+        [void]$t.Rows.Add([object[]]@($vals))
+    }
+    , $t
+}
+
+# a value as SQL: NULL, a number as it is, text quoted ('' doubled; N'' on SQL Server for non-ASCII)
+function Format-SqlLiteral($Value, [string]$Dialect) {
+    if ($null -eq $Value -or $Value -is [DBNull]) { return 'NULL' }
+    $s = [string]$Value
+    if ($s -match '^-?\d+(\.\d+)?$' -and -not ($s -match '^-?0\d')) { return $s }
+    $q = "'" + $s.Replace("'", "''") + "'"
+    if ($Dialect -eq 'mssql' -and ($s.ToCharArray() | Where-Object { [int]$_ -gt 127 })) { return 'N' + $q }
+    $q
+}
+
+# the table the last query read from (for INSERT statements), else a placeholder
+function Get-SqlResultTable {
+    $m = [regex]::Match([string]$SqlUI.RunSql, '(?is)\bFROM\s+((?:\[[^\]]+\]|"[^"]+"|[\w#@$]+)(?:\.(?:\[[^\]]+\]|"[^"]+"|[\w#@$]+))*)')
+    if ($m.Success -and $m.Groups[1].Value -notmatch '^\[?file:') { $m.Groups[1].Value } else { 'table_name' }
+}
+
+function Get-SqlGridText($Grid, [string]$As) {
+    $dl = Get-SqlDialect (Get-SqlConn)
+    $cell = $Grid.CurrentCell
+    $text = switch ($As) {
+        'cell' { if ($cell -and $null -ne $cell.Value -and $cell.Value -isnot [DBNull]) { [string]$cell.Value } else { '' } }
+        'tsv' { [DgSql]::ToCsv((Get-SqlGridPick $Grid), "`t") -replace '^[^\r\n]*\r\n', '' }
+        'tsvh' { [DgSql]::ToCsv((Get-SqlGridPick $Grid), "`t") }
+        'csv' { [DgSql]::ToCsv((Get-SqlGridPick $Grid -Rows), ',') }
+        'json' { [DgSql]::ToJson((Get-SqlGridPick $Grid -Rows)) }
+        'md' {
+            $t = Get-SqlGridPick $Grid -Rows
+            $cols = @($t.Columns | ForEach-Object { $_.ColumnName })
+            $md = @(('| ' + (($cols | ForEach-Object { $_.Replace('|', '\|') }) -join ' | ') + ' |'), ('|' + (($cols | ForEach-Object { ' --- ' }) -join '|') + '|'))
+            foreach ($r in $t.Rows) { $md += '| ' + (($r.ItemArray | ForEach-Object { if ($_ -is [DBNull]) { '' } else { ([string]$_).Replace('|', '\|').Replace("`r", ' ').Replace("`n", ' ') } }) -join ' | ') + ' |' }
+            $md -join "`r`n"
+        }
+        'insert' {
+            $t = Get-SqlGridPick $Grid -Rows
+            $tbl = Get-SqlResultTable
+            $names = (@($t.Columns | ForEach-Object { [DgDb]::QuoteName($dl, $_.ColumnName) }) -join ', ')
+            (@($t.Rows | ForEach-Object { "INSERT INTO $tbl ($names) VALUES ($((@($_.ItemArray | ForEach-Object { Format-SqlLiteral $_ $dl })) -join ', '));" })) -join "`r`n"
+        }
+        'in' {
+            $vals = @(@($Grid.SelectedCells) | Sort-Object RowIndex | ForEach-Object { $_.Value } | Where-Object { $null -ne $_ -and $_ -isnot [DBNull] } | ForEach-Object { [string]$_ } | Select-Object -Unique)
+            '(' + ((@($vals | ForEach-Object { Format-SqlLiteral $_ $dl })) -join ', ') + ')'
+        }
+        'where' {
+            $parts = @(@($Grid.SelectedCells) | Sort-Object ColumnIndex, RowIndex | ForEach-Object {
+                $n = [DgDb]::QuoteName($dl, $Grid.Columns[$_.ColumnIndex].HeaderText)
+                if ($null -eq $_.Value -or $_.Value -is [DBNull]) { "$n IS NULL" } else { "$n = $(Format-SqlLiteral $_.Value $dl)" } } | Select-Object -Unique)
+            $parts -join "`r`n  AND "
+        }
+        'name' { if ($cell) { $Grid.Columns[$cell.ColumnIndex].HeaderText } else { '' } }
+        'names' { (@($Grid.Columns | Where-Object { $_.Visible } | Sort-Object DisplayIndex | ForEach-Object { [DgDb]::QuoteName($dl, $_.HeaderText) })) -join ', ' }
+        'column' {
+            if (-not $cell) { '' } else {
+                $ix = $cell.ColumnIndex
+                (@($Grid.Rows | ForEach-Object { $v = $_.Cells[$ix].Value; if ($null -eq $v -or $v -is [DBNull]) { '' } else { [string]$v } })) -join "`r`n"
+            }
+        }
+    }
+    $text
+}
+function Copy-SqlGrid($Grid, [string]$As) {
+    $text = [string](Get-SqlGridText $Grid $As)
+    try { [System.Windows.Forms.Clipboard]::SetText($(if ($text.Length) { $text } else { ' ' })); Set-SqlStatus "Copied ($As)." $C.Green } catch { Set-SqlStatus "Couldn't copy: $($_.Exception.Message)" $C.Red }
+}
+
+# ---- filters: the grid shows the rows that pass; Export / Chart this use what is shown
+function Set-SqlGridFilter($Grid, [string]$Column, $Value, [string]$How) {
+    $st = $SqlUI.GridState[$Grid]
+    if (-not $st) { $st = @{ Full = $Grid.Tag; Filters = (New-Object System.Collections.Generic.List[object]) }; $SqlUI.GridState[$Grid] = $st }
+    if ($How -eq 'clear') { $st.Filters.Clear() } else { $st.Filters.Add(@{ Col = $Column; Value = $(if ($null -eq $Value -or $Value -is [DBNull]) { $null } else { [string]$Value }); How = $How }) }
+    $full = $st.Full
+    $t = $full.Clone()
+    $t.BeginLoadData()
+    foreach ($r in $full.Rows) {
+        $ok = $true
+        foreach ($fx in $st.Filters) {
+            $v = $r[$fx.Col]; $isNull = $v -is [DBNull] -or $null -eq $v; $s = if ($isNull) { $null } else { [string]$v }
+            $hit = switch ($fx.How) {
+                'only' { if ($null -eq $fx.Value) { $isNull } else { -not $isNull -and $s -ceq $fx.Value } }
+                'not' { if ($null -eq $fx.Value) { -not $isNull } else { $isNull -or $s -cne $fx.Value } }
+                'null' { $isNull }
+                'notnull' { -not $isNull }
+            }
+            if (-not $hit) { $ok = $false; break }
+        }
+        if ($ok) { [void]$t.LoadDataRow($r.ItemArray, $true) }
+    }
+    $t.EndLoadData()
+    $hidden = @($Grid.Columns | Where-Object { -not $_.Visible } | ForEach-Object { $_.Name })
+    $Grid.DataSource = $t; $Grid.Tag = $t
+    foreach ($h in $hidden) { if ($Grid.Columns[$h]) { $Grid.Columns[$h].Visible = $false } }
+    Set-SqlStatus $(if ($st.Filters.Count) { "Filtered: $($t.Rows.Count) of $($full.Rows.Count) rows  ($(@($st.Filters | ForEach-Object { "$($_.Col) $(switch ($_.How) { 'only' { '=' } 'not' { '<>' } 'null' { 'is NULL' } 'notnull' { 'is not NULL' } }) $(if ($_.How -in 'only', 'not') { if ($null -eq $_.Value) { 'NULL' } else { $_.Value } })" }) -join ', '))" } else { "All $($full.Rows.Count) rows." }) $C.Accent
+}
+
+# ---- a value in its own window (JSON / XML laid out), to read or copy
+function Show-SqlValue([string]$Text, [string]$Title) {
+    $shown = $Text
+    $tr = $Text.Trim()
+    try { if ($tr.StartsWith('{') -or $tr.StartsWith('[')) { $shown = [PowerClipFormat]::JsonSorted($tr) } elseif ($tr.StartsWith('<')) { $shown = [PowerClipFormat]::Xml($tr, $false) } } catch { $shown = $Text }
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = "Value  -  $Title"; $f.Icon = $IconActive; $f.StartPosition = 'CenterParent'
+    $f.Size = New-Object System.Drawing.Size((Px 760), (Px 520)); $f.BackColor = $C.Bg; $f.ForeColor = $C.Fore; $f.Font = $FontMain
+    $box = New-TbBox -Mono -Multi -ReadOnly; $box.Dock = 'Fill'; $box.WordWrap = $true; $box.ScrollBars = 'Vertical'; $box.Text = $shown.Replace("`r`n", "`n").Replace("`n", "`r`n")
+    $bar = New-Object System.Windows.Forms.FlowLayoutPanel; $bar.Dock = 'Bottom'; $bar.AutoSize = $true; $bar.BackColor = $C.Panel; $bar.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 6))
+    $f.Controls.Add($box); $f.Controls.Add($bar)
+    $bc = New-Button 'Copy' 'Copy the value' { [System.Windows.Forms.Clipboard]::SetText($this.Tag) } $bar $Glyph.Copy 1; $bc.Tag = $(if ($Text.Length) { $Text } else { ' ' })
+    [void](New-Button 'Close' '' { $this.FindForm().Close() } $bar '' 2)
+    $f.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Escape') { $src.Close() } }); $f.KeyPreview = $true
+    Register-ThemedWindow $f
+    [void]$f.Show($SqlUI.Form)
+}
+
+# ---- Count / Sum / Average / Min / Max of the selected cells (numbers), in the status line
+function Update-SqlSelectionTotals($Grid) {
+    $count0 = $Grid.SelectedCells.Count
+    if ($count0 -lt 2) { return }
+    if ($count0 -gt 50000) { Set-SqlStatus "$count0 cells selected (totals are worked out for up to 50,000 cells)." $C.Accent; return }
+    $cells = @($Grid.SelectedCells)
+    $n = 0; $sum = [decimal]0; $min = $null; $max = $null; $count = 0
+    foreach ($cl in $cells) {
+        $v = $cl.Value
+        if ($null -eq $v -or $v -is [DBNull]) { continue }
+        $count++
+        $d = [decimal]0
+        if ([decimal]::TryParse([string]$v, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) {
+            $n++; $sum += $d
+            if ($null -eq $min -or $d -lt $min) { $min = $d }
+            if ($null -eq $max -or $d -gt $max) { $max = $d }
+        }
+    }
+    $fmt = { param($x) ([decimal]$x).ToString('#,0.####', [Globalization.CultureInfo]::InvariantCulture) }
+    $msg = "$($cells.Count) cells, $count with a value"
+    if ($n) { $msg += "   |   Sum $(& $fmt $sum)   Average $(& $fmt ($sum / $n))   Min $(& $fmt $min)   Max $(& $fmt $max)   ($n numbers)" }
+    Set-SqlStatus $msg $C.Accent
+}
+
+function Register-SqlGridMenu($Grid) {
+    $Grid.add_CellMouseDown({
+        param($src, $e)
+        if ($e.Button -ne 'Right' -or $e.RowIndex -lt 0 -or $e.ColumnIndex -lt 0) { return }
+        $cl = $src.Rows[$e.RowIndex].Cells[$e.ColumnIndex]
+        if (-not $cl.Selected) { $src.ClearSelection(); $cl.Selected = $true }
+        $src.CurrentCell = $cl
+    })
+    $Grid.add_SelectionChanged({ param($src, $e) if (-not $SqlUI.GridQuiet) { Update-SqlSelectionTotals $src } })
+    $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $m.Tag = $Grid
+    $m.add_Opening({
+        param($src, $e)
+        $src.Items.Clear()
+        $g = $src.Tag; $SqlUI.MenuGrid = $g
+        $cl = $g.CurrentCell
+        if (-not $cl -or $g.Rows.Count -eq 0) { if (-not ($SqlUI.GridState[$g] -and $SqlUI.GridState[$g].Filters.Count)) { $e.Cancel = $true; return } }
+        $col = if ($cl) { $g.Columns[$cl.ColumnIndex].HeaderText } else { '' }
+        $val = if ($cl) { $cl.Value } else { $null }
+        $isNull = $null -eq $val -or $val -is [DBNull]
+        $show = if ($isNull) { 'NULL' } else { $sv = [string]$val -replace '\s+', ' '; if ($sv.Length -gt 30) { $sv.Substring(0, 30) + '...' } else { $sv } }
+        $SqlUI.MenuCol = $col; $SqlUI.MenuVal = $val
+        $sub = { param($title, $glyph) $it = New-Object System.Windows.Forms.ToolStripMenuItem($title, (New-GlyphImage $glyph)); $it.DropDown.Renderer = $MenuRenderer; [void]$src.Items.Add($it); $it }
+        $add = { param($menu, $title, $sb, $glyph, $keys) $it = $menu.DropDownItems.Add($title, (New-GlyphImage $glyph), $sb); if ($keys) { $it.ShortcutKeyDisplayString = $keys }; $it }
+        if ($cl) {
+            [void](Add-MenuItem $src 'Copy with headers' { Copy-SqlGrid $SqlUI.MenuGrid 'tsvh' } $Glyph.Copy 'Ctrl+C')
+            [void](Add-MenuItem $src 'Copy without headers' { Copy-SqlGrid $SqlUI.MenuGrid 'tsv' } $Glyph.Copy)
+            $cp = & $sub 'Copy as' $Glyph.Copy
+            [void](& $add $cp 'This value only' { Copy-SqlGrid $SqlUI.MenuGrid 'cell' } $Glyph.Copy)
+            [void](& $add $cp 'CSV (selected rows)' { Copy-SqlGrid $SqlUI.MenuGrid 'csv' } $Glyph.Text)
+            [void](& $add $cp 'JSON (selected rows)' { Copy-SqlGrid $SqlUI.MenuGrid 'json' } $Glyph.Code)
+            [void](& $add $cp 'Markdown table (selected rows)' { Copy-SqlGrid $SqlUI.MenuGrid 'md' } $Glyph.Text)
+            [void](& $add $cp 'INSERT statements (selected rows)' { Copy-SqlGrid $SqlUI.MenuGrid 'insert' } $Glyph.Code)
+            [void]$cp.DropDownItems.Add('-')
+            [void](& $add $cp 'IN (...) list of the selected values' { Copy-SqlGrid $SqlUI.MenuGrid 'in' } $Glyph.Code)
+            [void](& $add $cp 'WHERE condition (column = value)' { Copy-SqlGrid $SqlUI.MenuGrid 'where' } $Glyph.Code)
+            [void]$cp.DropDownItems.Add('-')
+            [void](& $add $cp "Column name ($col)" { Copy-SqlGrid $SqlUI.MenuGrid 'name' } $Glyph.Text)
+            [void](& $add $cp 'All column names' { Copy-SqlGrid $SqlUI.MenuGrid 'names' } $Glyph.Text)
+            [void](& $add $cp "All values of $col" { Copy-SqlGrid $SqlUI.MenuGrid 'column' } $Glyph.Text)
+            [void]$src.Items.Add('-')
+            $fl = & $sub 'Filter' $Glyph.Filter
+            [void](& $add $fl "Only rows where $col = $show" { Set-SqlGridFilter $SqlUI.MenuGrid $SqlUI.MenuCol $SqlUI.MenuVal 'only' } $Glyph.Search)
+            [void](& $add $fl "Hide rows where $col = $show" { Set-SqlGridFilter $SqlUI.MenuGrid $SqlUI.MenuCol $SqlUI.MenuVal 'not' } $Glyph.Search)
+            [void](& $add $fl "Only rows where $col is NULL" { Set-SqlGridFilter $SqlUI.MenuGrid $SqlUI.MenuCol $null 'null' } $Glyph.Search)
+            [void](& $add $fl "Only rows where $col has a value" { Set-SqlGridFilter $SqlUI.MenuGrid $SqlUI.MenuCol $null 'notnull' } $Glyph.Search)
+        }
+        if ($SqlUI.GridState[$g] -and $SqlUI.GridState[$g].Filters.Count) { [void](Add-MenuItem $src "Clear the filters ($($SqlUI.GridState[$g].Filters.Count))" { Set-SqlGridFilter $SqlUI.MenuGrid '' $null 'clear' } $Glyph.Refresh) }
+        if (-not $cl) { return }
+        $cm = & $sub 'Column' $Glyph.Apps
+        [void](& $add $cm 'Sort ascending' { $gg = $SqlUI.MenuGrid; $gg.Sort($gg.Columns[$gg.CurrentCell.ColumnIndex], 'Ascending') } ([string][char]0xE70E))
+        [void](& $add $cm 'Sort descending' { $gg = $SqlUI.MenuGrid; $gg.Sort($gg.Columns[$gg.CurrentCell.ColumnIndex], 'Descending') } ([string][char]0xE70D))
+        [void](& $add $cm "Hide $col" { $gg = $SqlUI.MenuGrid; $gg.Columns[$gg.CurrentCell.ColumnIndex].Visible = $false } $Glyph.View)
+        [void](& $add $cm 'Show all columns' { foreach ($cx in $SqlUI.MenuGrid.Columns) { $cx.Visible = $true } } $Glyph.View)
+        [void](& $add $cm 'Freeze columns up to here' { $gg = $SqlUI.MenuGrid; foreach ($cx in $gg.Columns) { $cx.Frozen = $false }; $gg.Columns[$gg.CurrentCell.ColumnIndex].Frozen = $true } $Glyph.Pin)
+        [void](& $add $cm 'Fit column widths' { $SqlUI.MenuGrid.AutoResizeColumns('AllCells') } $Glyph.Apps)
+        [void]$src.Items.Add('-')
+        [void](Add-MenuItem $src 'View the value...' { $v = $SqlUI.MenuVal; Show-SqlValue $(if ($null -eq $v -or $v -is [DBNull]) { 'NULL' } else { [string]$v }) $SqlUI.MenuCol } $Glyph.View)
+        [void](Add-MenuItem $src 'Put the value into the editor' { $v = $SqlUI.MenuVal; Insert-SqlText (Format-SqlLiteral $v (Get-SqlDialect (Get-SqlConn))) } $Glyph.Paste)
+        [void](Add-MenuItem $src 'Put the selection into the editor as WHERE' { Insert-SqlText ("WHERE " + (Get-SqlGridText $SqlUI.MenuGrid 'where')) } $Glyph.Paste)
+        [void]$src.Items.Add('-')
+        [void](Add-MenuItem $src 'Chart this' { Send-SqlToDiagram 0 } $Glyph.Apps)
+        [void](Add-MenuItem $src 'Diagram this' { Send-SqlToDiagram 1 } $Glyph.Apps)
+        [void](Add-MenuItem $src 'Save as CSV...' { Export-SqlResult 'csv' } $Glyph.Save)
+        [void](Add-MenuItem $src 'Save as JSON...' { Export-SqlResult 'json' } $Glyph.Save)
+    })
+    $Grid.ContextMenuStrip = $m
+}
+
+# ---- the object tree's filter: the tables / views / procedures / functions of the database selected at the top
+#      whose name has every word typed; object lists are read once per database (Refresh reads them again)
+function Get-SqlObjectList($Conn, [string]$Db, [string]$Type) {
+    if (-not $SqlUI.ObjCache) { $SqlUI.ObjCache = @{} }
+    $k = "$($Conn.Name)|$Db|$Type"
+    if (-not $SqlUI.ObjCache.ContainsKey($k)) {
+        $list = New-Object System.Collections.Generic.List[string[]]
+        $t = [DgDb]::Objects((Get-SqlConnString $Conn $Db), $Type)
+        foreach ($r in $t.Rows) { $list.Add([string[]]@([string]$r[0], [string]$r[1])) }
+        $SqlUI.ObjCache[$k] = $list
+    }
+    , $SqlUI.ObjCache[$k]
+}
+function Add-SqlObjectNode($Parent, [string]$Schema, [string]$Name, [string]$Db, [string]$Type) {
+    $full = "$Schema.$Name"
+    $n = $Parent.Nodes.Add($full); $n.Tag = @{ Kind = 'object'; Db = $Db; Name = $full; Schema = $Schema; Object = $Name; Type = $Type }
+    if ($Type -in 'U', 'V') { [void]$n.Nodes.Add('...') }
+    $n
+}
+function Update-SqlTreeFilter {
+    $tv = $SqlUI.Tree
+    if (-not $tv -or $tv.Nodes.Count -eq 0 -or -not $SqlUI.TreeFilter) { return }
+    $q = $SqlUI.TreeFilter.Text.Trim()
+    $root = $tv.Nodes[0]
+    $dbs = @($root.Nodes | Where-Object { $_.Tag -and $_.Tag.Kind -eq 'db' })
+    if (-not $dbs.Count) { return }
+    $dbNode = @($dbs | Where-Object { $_.Tag.Db -eq [string]$SqlUI.DbBox.Text }) | Select-Object -First 1
+    if (-not $dbNode) { $dbNode = $dbs[0] }                       # Oracle: your own schema is first
+    $c0 = Get-SqlConn
+    $words = @($q -split '\s+' | Where-Object { $_ })
+    $tv.BeginUpdate()
+    try {
+        $dbNode.Nodes.Clear()
+        $total = 0
+        foreach ($k in @(@('Tables', 'U'), @('Views', 'V'), @('Procedures', 'P'), @('Functions', 'FN'))) {
+            $fn = $dbNode.Nodes.Add($k[0]); $fn.Tag = @{ Kind = 'folder'; Db = $dbNode.Tag.Db; Type = $k[1] }
+            if (-not $words.Count) { [void]$fn.Nodes.Add('...'); continue }
+            try { $rows = Get-SqlObjectList $c0 $dbNode.Tag.Db $k[1] } catch { $x = $fn.Nodes.Add((Get-SqlError $_)); $x.ForeColor = $C.Red; continue }
+            $hits = @($rows | Where-Object { $nm = "$($_[0]).$($_[1])"; -not @($words | Where-Object { $nm.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -lt 0 }).Count })
+            $total += $hits.Count
+            $fn.Text = "$($k[0])  ($($hits.Count))"
+            foreach ($h in @($hits | Select-Object -First 500)) { [void](Add-SqlObjectNode $fn $h[0] $h[1] $dbNode.Tag.Db $k[1]) }
+            if ($hits.Count -gt 500) { $x = $fn.Nodes.Add("... $($hits.Count - 500) more: type more of the name"); $x.ForeColor = $C.Dim }
+            if ($hits.Count) { $fn.Expand() } else { $fn.ForeColor = $C.Dim }
+        }
+        $dbNode.Expand()
+        if ($words.Count) { $dbNode.EnsureVisible() }
+    } finally { $tv.EndUpdate() }
+    $SqlUI.TreeFilterInfo.Text = if ($words.Count) { "$total match$(if ($total -ne 1) { 'es' }) in $($dbNode.Tag.Db)" } else { '' }
+}
+
 function Show-SqlClient {
     Hide-Picker
     if (-not (Initialize-Diagrams)) { return }
@@ -30659,10 +30937,20 @@ function Show-SqlClient {
             [void](Add-MenuItem $src 'Use this database' { $SqlUI.DbBox.Text = $SqlUI.MenuObj.Db } $Glyph.Play)
             [void](Add-MenuItem $src 'ER diagram of all tables' { $SqlUI.DbBox.Text = $SqlUI.MenuObj.Db; New-SqlErDiagram } $Glyph.Apps)
         }
-        [void](Add-MenuItem $src 'Refresh' { Update-SqlTree } $Glyph.Refresh)
+        [void](Add-MenuItem $src 'Refresh' { $SqlUI.ObjCache = @{}; Update-SqlTree } $Glyph.Refresh)
     })
     $tv.ContextMenuStrip = $tm
     $pObj.Controls.Add($tv); $SqlUI.Tree = $tv
+    $tfp = New-Object System.Windows.Forms.Panel; $tfp.Dock = 'Top'; $tfp.Height = Px 38; $tfp.BackColor = $C.Bg; $tfp.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 6), (Px 6), (Px 4))
+    $tfb = New-Object System.Windows.Forms.TextBox; $tfb.Dock = 'Fill'; $tfb.BorderStyle = 'FixedSingle'; $tfb.BackColor = $C.Bg; $tfb.ForeColor = $C.Fore
+    $tfb.add_HandleCreated({ param($src, $e) [PowerClipHost]::SetCueBanner($src.Handle, 'Filter tables, views, procedures, functions...') })
+    $tfb.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Escape') { $src.Text = ''; $e.SuppressKeyPress = $true } })
+    $tfp.Controls.Add($tfb)
+    $tfi = New-Object System.Windows.Forms.Label; $tfi.Dock = 'Top'; $tfi.AutoSize = $false; $tfi.Height = $FontSmall.Height + (Px 4); $tfi.Font = $FontSmall; $tfi.ForeColor = $C.Dim; $tfi.BackColor = $C.Bg; $tfi.Padding = New-Object System.Windows.Forms.Padding((Px 8), 0, 0, 0)
+    $pObj.Controls.Add($tfi); $pObj.Controls.Add($tfp)
+    $SqlUI.TreeFilter = $tfb; $SqlUI.TreeFilterInfo = $tfi
+    $SqlUI.TreeFilterTimer = New-TbDebounce 300 { if ($SqlUI.Form) { Update-SqlTreeFilter } }
+    $tfb.add_TextChanged({ $SqlUI.TreeFilterTimer.Stop(); $SqlUI.TreeFilterTimer.Start() })
     $SqlUI.Fl = @{}
     [void](New-SqlFolderList 'connections' $pConn)
     [void](New-SqlFolderList 'queries' $pSaved)
@@ -30765,7 +31053,7 @@ function Show-SqlClient {
         elseif ($e.Control -and $e.KeyCode -eq 'M') { $e.SuppressKeyPress = $true; Start-SqlPlan $true }
         elseif ($e.KeyCode -eq 'Escape' -and $SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }
     })
-    $f.add_FormClosed({ if ($SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }; foreach ($k in 'Timer', 'ColorTimer', 'LiveTimer', 'PlanTimer', 'AcTimer') { if ($SqlUI[$k]) { $SqlUI[$k].Dispose(); $SqlUI[$k] = $null } }; $SqlUI.Form = $null; $SqlUI.SchemaKey = ''; $SqlUI.Fl = @{}; $SqlUI.Ac = $null })
+    $f.add_FormClosed({ if ($SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }; foreach ($k in 'Timer', 'ColorTimer', 'LiveTimer', 'PlanTimer', 'AcTimer', 'TreeFilterTimer') { if ($SqlUI[$k]) { $SqlUI[$k].Dispose(); $SqlUI[$k] = $null } }; $SqlUI.Form = $null; $SqlUI.SchemaKey = ''; $SqlUI.Fl = @{}; $SqlUI.Ac = $null })
     Register-ThemedWindow $f
     $f.Show()
     [PowerClipHost]::EnsureShown($f.Handle)
