@@ -25633,6 +25633,168 @@ public static class DgSqlViz {
     }
 }
 
+// ---- SQL autocomplete: what fits where the cursor is. Tables after FROM / JOIN, columns of the statement's tables,
+//      "alias." -> that table's columns, "schema." -> its tables, keywords and functions of the database.
+public class DgSqlSuggestion { public string Insert = "", Label = "", Kind = "", Detail = ""; public int Score; }
+
+public static class DgSqlComplete {
+    public static int Start, Length;          // the part of the text a pick replaces
+    public static string Prefix = "";
+
+    static readonly string[] KwCommon = { "SELECT", "FROM", "WHERE", "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL OUTER JOIN", "CROSS JOIN", "ON", "AND", "OR", "NOT", "IN", "EXISTS", "BETWEEN", "LIKE", "IS NULL", "IS NOT NULL",
+        "GROUP BY", "ORDER BY", "HAVING", "DISTINCT", "AS", "UNION", "UNION ALL", "CASE", "WHEN", "THEN", "ELSE", "END", "INSERT INTO", "VALUES", "UPDATE", "SET", "DELETE FROM", "WITH", "DESC", "ASC",
+        "CREATE TABLE", "ALTER TABLE", "DROP TABLE", "CREATE INDEX", "CREATE VIEW", "PRIMARY KEY", "FOREIGN KEY", "REFERENCES", "DEFAULT", "NULL", "OVER", "PARTITION BY" };
+    static readonly string[] KwMssql = { "TOP", "OFFSET", "FETCH NEXT", "ROWS ONLY", "CROSS APPLY", "OUTER APPLY", "WITH (NOLOCK)", "BEGIN TRAN", "COMMIT", "ROLLBACK", "DECLARE", "EXEC", "GO", "MERGE", "OUTPUT", "PIVOT", "IDENTITY" };
+    static readonly string[] KwPg = { "LIMIT", "OFFSET", "RETURNING", "ILIKE", "ON CONFLICT", "DO NOTHING", "LATERAL", "BEGIN", "COMMIT", "ROLLBACK", "EXPLAIN", "SERIAL", "INTERVAL" };
+    static readonly string[] KwOracle = { "FETCH FIRST", "ROWS ONLY", "MINUS", "CONNECT BY", "START WITH", "ROWNUM", "DUAL", "COMMIT", "ROLLBACK", "BEGIN", "DECLARE", "MERGE INTO", "SYSDATE" };
+    static readonly string[] FnCommon = { "COUNT(", "SUM(", "AVG(", "MIN(", "MAX(", "COALESCE(", "CAST(", "UPPER(", "LOWER(", "TRIM(", "ROUND(", "ABS(", "ROW_NUMBER() OVER (", "RANK() OVER (", "NULLIF(", "LAG(", "LEAD(" };
+    static readonly string[] FnMssql = { "ISNULL(", "GETDATE()", "SYSDATETIME()", "DATEADD(", "DATEDIFF(", "DATEPART(", "FORMAT(", "CONVERT(", "LEN(", "LEFT(", "RIGHT(", "SUBSTRING(", "CHARINDEX(", "REPLACE(", "STRING_AGG(", "IIF(", "TRY_CAST(", "TRY_CONVERT(", "NEWID()", "EOMONTH(" };
+    static readonly string[] FnPg = { "NOW()", "CURRENT_DATE", "DATE_TRUNC(", "EXTRACT(", "TO_CHAR(", "LENGTH(", "SUBSTRING(", "POSITION(", "REPLACE(", "STRING_AGG(", "ARRAY_AGG(", "JSONB_BUILD_OBJECT(", "GENERATE_SERIES(", "AGE(" };
+    static readonly string[] FnOracle = { "NVL(", "NVL2(", "SYSDATE", "SYSTIMESTAMP", "TO_DATE(", "TO_CHAR(", "TO_NUMBER(", "TRUNC(", "ADD_MONTHS(", "LENGTH(", "SUBSTR(", "INSTR(", "REPLACE(", "DECODE(", "LISTAGG(", "MONTHS_BETWEEN(" };
+    static readonly HashSet<string> NotAlias = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "WHERE", "ON", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "GROUP", "ORDER", "HAVING", "UNION", "SET", "VALUES", "SELECT", "WITH", "LIMIT", "FETCH", "OFFSET", "APPLY", "AS", "USING", "NATURAL", "PIVOT", "MINUS", "EXCEPT", "INTERSECT", "WINDOW", "FOR", "OPTION", "RETURNING", "CONNECT", "START" };
+
+    static bool NameChar(char c) { return char.IsLetterOrDigit(c) || c == '_' || c == '@' || c == '$' || c == '#'; }
+
+    // the statement the cursor is in: between the ';' / GO line / blank line before and after it
+    static void StatementAround(string text, int caret, out int a, out int b) {
+        a = 0; b = text.Length;
+        var stops = new Regex(@";|\n[ \t]*\r?\n|\n[ \t]*GO[ \t]*\r?\n", RegexOptions.IgnoreCase);
+        foreach (Match m in stops.Matches(text)) { if (m.Index + m.Length <= caret) a = m.Index + m.Length; else if (m.Index >= caret) { b = m.Index; break; } }
+    }
+
+    static string Unquote(string n) { return Regex.Replace(n ?? "", @"[\[\]""]", ""); }
+
+    // alias (and table name) -> the table name as written, for the FROM / JOIN / UPDATE / INTO parts of the statement
+    public static Dictionary<string, string> Aliases(string stmt) {
+        var r = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        const string part = @"(?:\[[^\]]+\]|""[^""]+""|[\w@$#]+)";
+        var rx = new Regex(@"\b(?:FROM|JOIN|UPDATE|INTO|APPLY)\s+(" + part + @"(?:\.(?:" + part + @")?)*)(?:\s+(?:AS\s+)?(" + part + @"))?", RegexOptions.IgnoreCase);
+        foreach (Match m in rx.Matches(stmt)) {
+            string name = Unquote(m.Groups[1].Value);
+            if (name.Length == 0 || name.StartsWith("(")) continue;
+            var last = name.Split('.').Last(); if (last.Contains("@")) last = last.Substring(0, last.IndexOf('@'));
+            if (last.Length > 0 && !r.ContainsKey(last)) r[last] = name;
+            if (m.Groups[2].Success) { string al = Unquote(m.Groups[2].Value); if (!NotAlias.Contains(al) && !r.ContainsKey(al)) r[al] = name; }
+        }
+        return r;
+    }
+
+    public static List<DgSqlSuggestion> Suggest(string text, int caret, DgSqlSchema schema, string dialect, bool forced) {
+        var list = new List<DgSqlSuggestion>();
+        text = text ?? ""; caret = Math.Max(0, Math.Min(caret, text.Length));
+        // the word being typed, and what is before its dot
+        int ws = caret; while (ws > 0 && NameChar(text[ws - 1])) ws--;
+        Prefix = text.Substring(ws, caret - ws); Start = ws; Length = caret - ws;
+        int we = caret; while (we < text.Length && NameChar(text[we])) we++;
+        Length = we - ws;                      // a pick replaces the whole word
+        string qual = "";
+        if (ws > 0 && text[ws - 1] == '.') {
+            int q = ws - 1;
+            while (q > 0 && (NameChar(text[q - 1]) || text[q - 1] == '.' || text[q - 1] == ']' || text[q - 1] == '[' || text[q - 1] == '"')) q--;
+            qual = Unquote(text.Substring(q, ws - 1 - q)).TrimEnd('.');
+        }
+        // inside a string or a comment: nothing
+        int ls = text.LastIndexOf('\n', Math.Max(0, ws - 1)) + 1;
+        string lineBefore = text.Substring(ls, ws - ls);
+        if (lineBefore.Contains("--") || lineBefore.Count(c => c == '\'') % 2 == 1) return list;
+        if (!forced && qual.Length == 0 && Prefix.Length < 1) return list;
+
+        int sa, sb; StatementAround(text, caret, out sa, out sb);
+        string stmt = text.Substring(sa, sb - sa);
+        var al = Aliases(stmt);
+        // the keyword before the word: FROM / JOIN / INTO / UPDATE -> a table goes here
+        string before = text.Substring(sa, Math.Max(0, ws - sa));
+        var km = Regex.Match(before, @"\b(SELECT|FROM|JOIN|INTO|UPDATE|WHERE|ON|BY|AND|OR|SET|HAVING|APPLY|TABLE|VALUES|WHEN|THEN|ELSE|CASE)\b(?![\s\S]*\b(SELECT|FROM|JOIN|INTO|UPDATE|WHERE|ON|BY|AND|OR|SET|HAVING|APPLY|TABLE|VALUES|WHEN|THEN|ELSE|CASE)\b)", RegexOptions.IgnoreCase);
+        string kw = km.Success ? km.Groups[1].Value.ToUpperInvariant() : "";
+        bool tableSpot = kw == "FROM" || kw == "JOIN" || kw == "INTO" || kw == "UPDATE" || kw == "APPLY" || kw == "TABLE";
+        if (tableSpot) {                        // right after FROM / JOIN, or after a comma in the FROM list; not where the alias goes
+            string after = before.Substring(km.Index + km.Length);
+            tableSpot = after.Trim().Length == 0 || after.TrimEnd().EndsWith(",");
+        }
+
+        Func<string, string, string, string, int, DgSqlSuggestion> add = (ins, label, kind, detail, rank) => {
+            int sc = Match(label, Prefix);
+            if (sc < 0) return null;
+            var s = new DgSqlSuggestion { Insert = ins, Label = label, Kind = kind, Detail = detail, Score = sc + rank };
+            list.Add(s); return s;
+        };
+
+        if (qual.Length > 0) {
+            // alias. / table. -> columns;  schema. -> its tables
+            string tname; string key = null;
+            if (al.TryGetValue(qual, out tname) && schema != null) key = schema.Resolve(tname);
+            bool isSchema = schema != null && schema.Tables.Keys.Any(k => k.StartsWith(qual + ".", StringComparison.OrdinalIgnoreCase));
+            if (key == null && schema != null && !isSchema) key = schema.Resolve(qual);      // table.column without an alias
+            List<string[]> cols;
+            if (key != null && schema.Tables.TryGetValue(key, out cols)) {
+                int i = 0;
+                foreach (var c in cols) add(Q(dialect, c[0]), c[0], "column", (c[1] + " " + c[2] + " " + c[3]).Trim(), 400 - Math.Min(i++, 300));     // in the table's order
+            } else if (schema != null) {
+                foreach (var k in schema.Tables.Keys) {
+                    if (!k.StartsWith(qual + ".", StringComparison.OrdinalIgnoreCase)) continue;
+                    string rest = k.Substring(qual.Length + 1);
+                    if (rest.Contains(".")) rest = rest.Substring(0, rest.IndexOf('.'));
+                    add(Q(dialect, rest), rest, k.Substring(qual.Length + 1).Contains(".") ? "schema" : "table", "", 300);
+                }
+            }
+            return Finish(list);
+        }
+
+        // tables
+        if (schema != null) {
+            foreach (var k in schema.Tables.Keys) {
+                if (k.IndexOf('@') >= 0) continue;
+                add(Q(dialect, k), k, "table", schema.Tables[k].Count + " columns", tableSpot ? 500 : 50);
+            }
+        }
+        // columns of the statement's tables, and the aliases
+        if (!tableSpot && schema != null) {
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in al) {
+                var key = schema.Resolve(kv.Value);
+                if (key == null || !seen.Add(kv.Key + "|" + key)) continue;
+                bool isAlias = !string.Equals(kv.Key, kv.Value.Split('.').Last(), StringComparison.OrdinalIgnoreCase);
+                if (isAlias) add(kv.Key, kv.Key, "alias", key, 350);
+                List<string[]> cols;
+                int ci = 0;
+                if (schema.Tables.TryGetValue(key, out cols)) foreach (var c in cols) add(Q(dialect, c[0]), c[0], "column", key.Split('.').Last() + "  " + c[1] + (c[2].Length > 0 ? " " + c[2] : ""), 450 - Math.Min(ci++, 100));
+            }
+        }
+        // keywords and functions
+        var kws = KwCommon.Concat(dialect == "pg" ? KwPg : dialect == "oracle" ? KwOracle : KwMssql);
+        int ki = 0;
+        foreach (var k in kws) add(k, k, "keyword", "", (tableSpot ? 0 : 200) - ki++);          // the common ones first
+        int fi = 0;
+        if (!tableSpot) foreach (var f in FnCommon.Concat(dialect == "pg" ? FnPg : dialect == "oracle" ? FnOracle : FnMssql)) add(f, f.TrimEnd('('), "function", "", 150 - fi++);
+        // a keyword already typed out in full is no suggestion
+        list.RemoveAll(x => x.Kind == "keyword" && string.Equals(x.Insert, Prefix, StringComparison.OrdinalIgnoreCase));
+        return Finish(list);
+    }
+
+    static List<DgSqlSuggestion> Finish(List<DgSqlSuggestion> list) {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        return list.OrderByDescending(x => x.Score).ThenBy(x => x.Label.Length).ThenBy(x => x.Label, StringComparer.OrdinalIgnoreCase)
+                   .Where(x => seen.Add(x.Kind + "|" + x.Insert)).Take(60).ToList();
+    }
+
+    // higher = better; -1 = no match. Start of the text > start of a word (after _ or .) > anywhere
+    static int Match(string label, string prefix) {
+        if (prefix.Length == 0) return 100;
+        if (label.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return 1000 - Math.Min(label.Length, 100);
+        int i = label.IndexOf(prefix, StringComparison.OrdinalIgnoreCase);
+        if (i > 0 && (label[i - 1] == '_' || label[i - 1] == '.' || label[i - 1] == ' ' || (char.IsUpper(label[i]) && char.IsLower(label[i - 1])))) return 700 - i;
+        if (i > 0 && prefix.Length >= 3) return 400 - i;
+        return -1;
+    }
+    // a name as typed: quoted only where it has to be (spaces, odd letters, Oracle lower case, PostgreSQL upper case)
+    static string Q(string dialect, string name) {
+        return string.Join(".", name.Split('.').Select(p => {
+            bool plain = dialect == "pg" ? Regex.IsMatch(p, @"^[a-z_][a-z0-9_$]*$") : dialect == "oracle" ? Regex.IsMatch(p, @"^[A-Z][A-Z0-9_$#]*$") : Regex.IsMatch(p, @"^[A-Za-z_@#][\w@$#]*$");
+            return plain ? p : DgDb.QuoteName(dialect, p);
+        }));
+    }
+}
+
 // ---- Query plan tuner: SQL Server's plan (estimated or actual) as a diagram, with suggestions and fixes.
 public class DgPlanOp {
     public int Id, Parent = -1, Depth;
@@ -28715,15 +28877,11 @@ function Add-SqlPlanTab($Plan) {
 function Update-SqlLive {
     if (-not $SqlUI.Form -or $SqlUI.LiveSplit.Panel2Collapsed) { return }
     $c0 = Get-SqlConn
-    $key = if ($c0) { "$($c0.Name)|$($SqlUI.DbBox.Text)" } else { '' }
-    if ($key -ne $SqlUI.SchemaKey) {
-        $SqlUI.SchemaKey = $key; $SqlUI.Schema = $null
-        if ($c0) { try { $SqlUI.Schema = [DgSqlSchema]::Load((Get-SqlConnString $c0 $SqlUI.DbBox.Text)) } catch { $SqlUI.LiveInfo.Text = "Columns not loaded: $($_.Exception.InnerException.Message)" } }
-    }
+    [void](Get-SqlSchema)
     $ed = $SqlUI.Editor
     $text = [DgSqlViz]::Build($ed.Text, $ed.SelectionStart, $SqlUI.Schema, $script:IsDark)
     $SqlUI.LiveText = $text
-    $SqlUI.LiveInfo.Text = [DgSqlViz]::Info
+    $SqlUI.LiveInfo.Text = if ($SqlUI.SchemaError -and -not $SqlUI.Schema) { "Columns not loaded: $($SqlUI.SchemaError)" } else { [DgSqlViz]::Info }
     $cv = $SqlUI.LiveCanvas
     if (-not $text) { $cv.SetDoc((New-Object DgDoc), $true); return }
     $d = [DgText]::Parse($text); [DgLayout]::Apply($d)
@@ -28967,6 +29125,109 @@ function Set-SqlColors {
     } finally { [PowerClipTheme]::Redraw($ed.Handle, $true); $ed.Invalidate(); $SqlUI.Coloring = $false }
 }
 
+# ---- autocomplete: suggestions under the cursor as you type; Up / Down choose, Tab puts it in, Esc closes, Ctrl+Space opens it
+# the columns of the current connection / database (shared with the live diagram; read again with Refresh columns)
+function Get-SqlSchema {
+    $c0 = Get-SqlConn
+    $key = if ($c0) { "$($c0.Name)|$($SqlUI.DbBox.Text)" } else { '' }
+    if ($key -ne $SqlUI.SchemaKey) {
+        $SqlUI.SchemaKey = $key; $SqlUI.Schema = $null; $SqlUI.SchemaError = ''
+        if ($c0) { try { $SqlUI.Schema = [DgSqlSchema]::Load((Get-SqlConnString $c0 $SqlUI.DbBox.Text)) } catch { $SqlUI.SchemaError = Get-SqlError $_ } }
+    }
+    $SqlUI.Schema
+}
+
+function New-SqlCompleteList($Form) {
+    $ac = New-Object System.Windows.Forms.ListBox
+    $ac.DrawMode = 'OwnerDrawFixed'; $ac.ItemHeight = $FontMain.Height + (Px 8); $ac.BorderStyle = 'FixedSingle'; $ac.IntegralHeight = $false
+    $ac.Visible = $false; $ac.TabStop = $false; $ac.Width = Px 460; $ac.BackColor = $C.Panel; $ac.ForeColor = $C.Fore; $ac.Font = $FontMain
+    $ac.add_DrawItem({
+        param($src, $e)
+        if ($e.Index -lt 0 -or -not $SqlUI.AcItems -or $e.Index -ge $SqlUI.AcItems.Count) { return }
+        $it = $SqlUI.AcItems[$e.Index]
+        $g = $e.Graphics; $r = $e.Bounds
+        $sel = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
+        $b = New-Object System.Drawing.SolidBrush $(if ($sel) { $C.Sel } else { $C.Panel }); $g.FillRectangle($b, $r); $b.Dispose()
+        $kc = switch ($it.Kind) { 'table' { $C.Accent } 'column' { $C.Green } 'alias' { $C.Purple } 'function' { $C.Orange } 'schema' { $C.Yellow } default { $C.Dim } }
+        $tag = switch ($it.Kind) { 'table' { 'T' } 'column' { 'C' } 'alias' { 'A' } 'function' { 'f' } 'schema' { 'S' } default { 'K' } }
+        $flags = [System.Windows.Forms.TextFormatFlags]'VerticalCenter, HorizontalCenter, NoPrefix, SingleLine, NoPadding'
+        [System.Windows.Forms.TextRenderer]::DrawText($g, $tag, $FontSmall, (New-Object System.Drawing.Rectangle(($r.X + (Px 6)), $r.Y, (Px 16), $r.Height)), $kc, $flags)
+        $dw = if ($it.Detail) { [Math]::Min([int]($r.Width * 0.45), [System.Windows.Forms.TextRenderer]::MeasureText($it.Detail, $FontSmall).Width + (Px 8)) } else { 0 }
+        [System.Windows.Forms.TextRenderer]::DrawText($g, $it.Label, $FontMain, (New-Object System.Drawing.Rectangle(($r.X + (Px 28)), $r.Y, ($r.Width - (Px 36) - $dw), $r.Height)), $C.Fore, $TextFlags)
+        if ($dw) { [System.Windows.Forms.TextRenderer]::DrawText($g, $it.Detail, $FontSmall, (New-Object System.Drawing.Rectangle(($r.Right - $dw - (Px 6)), $r.Y, $dw, $r.Height)), $C.Dim, $TextFlags) }
+    })
+    $ac.add_MouseDown({ param($src, $e) $i = $src.IndexFromPoint($e.Location); if ($i -ge 0) { $src.SelectedIndex = $i; Complete-SqlSuggestion } })
+    $Form.Controls.Add($ac)
+    $SqlUI.Ac = $ac
+    $SqlUI.AcTimer = New-TbDebounce 90 { if ($SqlUI.Form) { $SqlUI.AcTyped = $false; Update-SqlComplete } }
+}
+
+function Hide-SqlComplete { if ($SqlUI.Ac -and $SqlUI.Ac.Visible) { $SqlUI.Ac.Visible = $false } }
+
+function Update-SqlComplete([switch]$Forced) {
+    $ed = $SqlUI.Editor; $ac = $SqlUI.Ac
+    if (-not $ac -or $ed.SelectionLength -gt 0 -or $ed.TextLength -gt 200000) { Hide-SqlComplete; return }
+    $items = @([DgSqlComplete]::Suggest($ed.Text, $ed.SelectionStart, (Get-SqlSchema), (Get-SqlDialect (Get-SqlConn)), [bool]$Forced))
+    if (-not $items.Count -or ($items.Count -eq 1 -and $items[0].Insert -ceq [DgSqlComplete]::Prefix)) { Hide-SqlComplete; return }
+    $SqlUI.AcItems = $items; $SqlUI.AcStart = [DgSqlComplete]::Start; $SqlUI.AcLen = [DgSqlComplete]::Length
+    $ac.BeginUpdate(); $ac.Items.Clear(); for ($i = 0; $i -lt $items.Count; $i++) { [void]$ac.Items.Add($i) }; $ac.SelectedIndex = 0; $ac.EndUpdate()
+    # under the word (above it when there is no room below)
+    $at = $SqlUI.AcStart
+    if ($at -lt $ed.TextLength) { $p = $ed.GetPositionFromCharIndex($at) }
+    else { $p = $ed.GetPositionFromCharIndex([Math]::Max(0, $at - 1)); if ($at -gt 0) { $p.X += [System.Windows.Forms.TextRenderer]::MeasureText('x', $ed.Font, (New-Object System.Drawing.Size(100, 100)), [System.Windows.Forms.TextFormatFlags]::NoPadding).Width } }
+    $pt = $SqlUI.Form.PointToClient($ed.PointToScreen($p))
+    $h = [Math]::Min(9, $items.Count) * $ac.ItemHeight + 4
+    $cs = $SqlUI.Form.ClientSize
+    $y = $pt.Y + $ed.Font.Height + (Px 4)
+    if ($y + $h -gt $cs.Height - (Px 8)) { $y = [Math]::Max(0, $pt.Y - $h - (Px 2)) }
+    $x = [Math]::Max(0, [Math]::Min($pt.X - (Px 28), $cs.Width - $ac.Width - (Px 8)))
+    $ac.SetBounds($x, $y, $ac.Width, $h)
+    $ac.Visible = $true; $ac.BringToFront()
+}
+
+function Complete-SqlSuggestion {
+    $ac = $SqlUI.Ac; $ed = $SqlUI.Editor
+    $i = $ac.SelectedIndex
+    if ($i -lt 0 -or $i -ge $SqlUI.AcItems.Count) { Hide-SqlComplete; return }
+    $it = $SqlUI.AcItems[$i]
+    Hide-SqlComplete
+    $start = [Math]::Min($SqlUI.AcStart, $ed.TextLength)
+    $ed.Select($start, [Math]::Max(0, [Math]::Min($SqlUI.AcLen, $ed.TextLength - $start)))
+    $ed.SelectedText = $it.Insert
+    $ed.Focus()
+}
+
+# the editor's keys and events for the list
+function Register-SqlComplete($Ed) {
+    $Ed.add_KeyDown({
+        param($src, $e)
+        $ac = $SqlUI.Ac
+        if ($ac.Visible) {
+            switch ($e.KeyCode) {
+                'Down' { if ($ac.SelectedIndex -lt $ac.Items.Count - 1) { $ac.SelectedIndex++ }; $e.SuppressKeyPress = $true; $e.Handled = $true }
+                'Up' { if ($ac.SelectedIndex -gt 0) { $ac.SelectedIndex-- }; $e.SuppressKeyPress = $true; $e.Handled = $true }
+                'PageDown' { $ac.SelectedIndex = [Math]::Min($ac.Items.Count - 1, $ac.SelectedIndex + 8); $e.SuppressKeyPress = $true; $e.Handled = $true }
+                'PageUp' { $ac.SelectedIndex = [Math]::Max(0, $ac.SelectedIndex - 8); $e.SuppressKeyPress = $true; $e.Handled = $true }
+                'Tab' { if (-not $e.Shift -and -not $e.Control) { Complete-SqlSuggestion; $e.SuppressKeyPress = $true; $e.Handled = $true } }
+                'Escape' { Hide-SqlComplete; $e.SuppressKeyPress = $true; $e.Handled = $true }
+                { $_ -in 'Return', 'Left', 'Right', 'Home', 'End' } { Hide-SqlComplete }
+            }
+        } elseif ($e.Control -and $e.KeyCode -eq 'Space') { $e.SuppressKeyPress = $true; $e.Handled = $true; Update-SqlComplete -Forced }
+    })
+    # what was typed: a letter, digit, _ or . (re)opens the list; Backspace updates it while open; anything else closes it
+    $Ed.add_KeyPress({
+        param($src, $e)
+        $ch = $e.KeyChar
+        if ([char]::IsLetterOrDigit($ch) -or $ch -in '_', '.', '@', '$', '#') { $SqlUI.AcTyped = $true }
+        elseif ([int]$ch -eq 8) { $SqlUI.AcTyped = $SqlUI.Ac.Visible }
+        else { $SqlUI.AcTyped = $false; Hide-SqlComplete }
+    })
+    $Ed.add_TextChanged({ if (-not $SqlUI.Coloring -and $SqlUI.AcTyped) { $SqlUI.AcTimer.Stop(); $SqlUI.AcTimer.Start() } })
+    $Ed.add_MouseDown({ Hide-SqlComplete })
+    $Ed.add_VScroll({ Hide-SqlComplete })
+    $Ed.add_LostFocus({ if ($SqlUI.Form) { [void]$SqlUI.Form.BeginInvoke([Action]{ if ($SqlUI.Ac -and -not $SqlUI.Editor.Focused) { Hide-SqlComplete } }) } })
+}
+
 function Show-SqlClient {
     Hide-Picker
     if (-not (Initialize-Diagrams)) { return }
@@ -29056,8 +29317,9 @@ function Show-SqlClient {
     $live.Dock = 'Fill'; $live.Orientation = 'Vertical'; $live.SplitterWidth = 5; $live.BackColor = $C.Line; $live.Panel1.BackColor = $C.Bg; $live.Panel2.BackColor = $C.Bg
     $split.Panel1.Controls.Add($live); $SqlUI.LiveSplit = $live
     $ed = New-TbRtb; $ed.Dock = 'Fill'; $ed.AcceptsTab = $true; $ed.WordWrap = $false
-    $ed.Text = "-- F5 or Ctrl+Enter runs the selection, or everything. GO separates batches.`r`n-- The diagram on the right follows the statement under the cursor as you write it.`r`nSELECT TOP 100 name, create_date FROM sys.tables ORDER BY create_date DESC;"
+    $ed.Text = "-- F5 or Ctrl+Enter runs the selection, or everything. GO separates batches.`r`n-- Suggestions pop up as you type (Ctrl+Space opens them): Up / Down choose, Tab puts one in.`r`n-- The diagram on the right follows the statement under the cursor as you write it.`r`nSELECT TOP 100 name, create_date FROM sys.tables ORDER BY create_date DESC;"
     $live.Panel1.Controls.Add($ed); $SqlUI.Editor = $ed
+    Register-SqlComplete $ed
     $lcv = New-Object DgCanvas
     $lcv.Dock = 'Fill'; $lcv.UiScale = $Scale * $TextZoom; $lcv.Font = $FontMain; $lcv.Editable = $false; $lcv.Animate = $false
     $lcv.add_SelectionChanged({
@@ -29083,6 +29345,8 @@ function Show-SqlClient {
     $SqlUI.ResTabs = New-TabSet $resHost
 
     $f.Controls.Add($split); $f.Controls.Add($left); $f.Controls.Add($top)
+    New-SqlCompleteList $f
+    $f.add_Deactivate({ Hide-SqlComplete })
     $split.BringToFront()
 
     $SqlUI.ColorTimer = New-TbDebounce 450 { if ($SqlUI.Form) { Set-SqlColors } }
@@ -29100,7 +29364,7 @@ function Show-SqlClient {
         elseif ($e.Control -and $e.KeyCode -eq 'M') { $e.SuppressKeyPress = $true; Start-SqlPlan $true }
         elseif ($e.KeyCode -eq 'Escape' -and $SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }
     })
-    $f.add_FormClosed({ if ($SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }; foreach ($k in 'Timer', 'ColorTimer', 'LiveTimer', 'PlanTimer') { if ($SqlUI[$k]) { $SqlUI[$k].Dispose(); $SqlUI[$k] = $null } }; $SqlUI.Form = $null; $SqlUI.SchemaKey = ''; $SqlUI.Fl = @{} })
+    $f.add_FormClosed({ if ($SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }; foreach ($k in 'Timer', 'ColorTimer', 'LiveTimer', 'PlanTimer', 'AcTimer') { if ($SqlUI[$k]) { $SqlUI[$k].Dispose(); $SqlUI[$k] = $null } }; $SqlUI.Form = $null; $SqlUI.SchemaKey = ''; $SqlUI.Fl = @{}; $SqlUI.Ac = $null })
     Register-ThemedWindow $f
     $f.Show()
     [PowerClipHost]::EnsureShown($f.Handle)
