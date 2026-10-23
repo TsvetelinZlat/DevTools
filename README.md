@@ -100,6 +100,8 @@ Results that are copied land in the history like any other copy.
 
 Matching is forgiving: `thm drk` finds "Theme: dark", `cmp` finds Compare.
 
+**Favourites from the palette**: select a tool and press **Ctrl+D** (or right-click it > **Add to favourites**); again to remove it. Favourites have a star, come first when nothing is typed, and show on the picker's top bar, in the Toolbox and in the tray menu.
+
 ## Snippets
 
 Saved text you paste by name: tray menu **Snippets** or the palette (**Snippets** / **New snippet**). Type a snippet's name in the palette and press Enter to paste it into the app you were in. Placeholders are filled in when pasting:
@@ -137,7 +139,7 @@ An encrypted vault for passwords, API keys and tokens: the lock icon, **Ctrl+Shi
 
 Tools with an arrow open in their own window; the others open on the right. Type in **Search** to filter the list (Enter opens the first match). Ctrl+PageUp / PageDown switch pages.
 
-**Favourites**: right-click any tool > **Add to favourites** (a star). Favourites are listed first in the Toolbox, become icons on the picker's top bar and come first in the tray menu; right-click again (or the icon on the top bar) to remove one. The tray menu has the same groups as submenus, and the command palette shows each tool's group.
+**Favourites**: right-click any tool > **Add to favourites** (a star), or press **Ctrl+D** on it in the command palette. Favourites are listed first in the Toolbox, become icons on the picker's top bar and come first in the tray menu; right-click again (or the icon on the top bar) to remove one. The tray menu has the same groups as submenus, and the command palette shows each tool's group.
 
 - **JSON, YAML, CSV, XML**: converts any of the four into any other. Paste the input (its format is detected, or pick it) and press **JSON**, **Minified**, **Sorted keys**, **YAML**, **CSV**, **Tab-separated** or **XML**. Tab-separated data (copied from Excel or a database tool) is recognised too, and **Tab-separated** converts back to it. CSV: the first row names the columns, `address.city` columns become nested objects (and back), any separator (`,` `;` tab `|`). XML: attributes become `@name` keys, repeated elements become lists. The input is checked as you type.
   - **Tree**: browse the data. Click a value and **Path & loop code** shows its path and ready-to-copy code that loads *your* kind of text, reads that value and loops over its list, in JavaScript, Python, C#, PowerShell and a command-line tool:

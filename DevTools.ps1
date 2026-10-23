@@ -18349,7 +18349,9 @@ function Update-PaletteList {
         $score = [Math]::Max((Get-PaletteScore $it.Title $q), $(if ($it.Words -and $q) { (Get-PaletteScore $it.Words $q) - 200 } else { -1 }))
         if ($score -lt 0) { continue }
         if (-not $q -and $it.Kind -eq 'Clip') { continue }     # recent clips only when searching
-        [pscustomobject]@{ Item = $it; Raw = $score; Score = $score - 50 * $KindOrder[$it.Kind] }
+        $fav = if ($it.ToolId) { [Array]::IndexOf(@($script:Favorites), $it.ToolId) } else { -1 }
+        $bonus = if ($fav -ge 0) { if ($q) { 60 } else { 5000 - $fav } } else { 0 }     # favourites first (in their order) when nothing is typed
+        [pscustomobject]@{ Item = $it; Raw = $score; Score = $score - 50 * $KindOrder[$it.Kind] + $bonus }
     }
     # Letters-in-order matches only count when nothing contains the text as typed.
     if (@($scored | Where-Object { $_.Raw -ge 500 }).Count -gt 0) { $scored = @($scored | Where-Object { $_.Raw -ge 500 }) }
@@ -18360,6 +18362,26 @@ function Update-PaletteList {
     for ($i = 0; $i -lt $PalUI.View.Count; $i++) { [void]$l.Items.Add($i) }
     if ($PalUI.View.Count) { $l.SelectedIndex = 0 }
     $l.EndUpdate()
+}
+
+# Ctrl+D or right-click: star / unstar the tool of the selected row (it then shows in the picker's top bar, the Toolbox and the tray)
+function Switch-PaletteFavorite {
+    $i = $PalUI.List.SelectedIndex
+    if ($i -lt 0 -or $i -ge $PalUI.View.Count) { return }
+    $it = $PalUI.View[$i]
+    if (-not $it.ToolId) { Show-PaletteHint "Only tools can be favourites: $($it.Title) isn't one." $C.Yellow; return }
+    Switch-Favorite ([pscustomobject]@{ Id = $it.ToolId })
+    $on = @($script:Favorites) -contains $it.ToolId
+    Show-PaletteHint $(if ($on) { "$($it.Title) is a favourite now (picker top bar, Toolbox, tray)." } else { "$($it.Title) is no longer a favourite." }) $(if ($on) { $C.Green } else { $C.Dim })
+    $PalUI.List.Invalidate()
+}
+function Show-PaletteHint([string]$Text, $Color) {
+    $PalUI.Hint.Text = $Text; $PalUI.Hint.ForeColor = $Color
+    if (-not $PalUI.HintTimer) {
+        $PalUI.HintTimer = New-Object System.Windows.Forms.Timer; $PalUI.HintTimer.Interval = 3500
+        $PalUI.HintTimer.add_Tick({ $PalUI.HintTimer.Stop(); $PalUI.Hint.Text = $PalUI.HintText; $PalUI.Hint.ForeColor = $C.Dim })
+    }
+    $PalUI.HintTimer.Stop(); $PalUI.HintTimer.Start()
 }
 
 function Invoke-PaletteItem {
@@ -18430,14 +18452,37 @@ function New-PaletteForm {
             [System.Windows.Forms.TextRenderer]::DrawText($g, $subText, $FontSmall, (New-Object System.Drawing.Rectangle(($x + $tw + (Px 12)), $r.Y, ($avail - $tw - (Px 12)), $r.Height)), $C.Dim, $TextFlags)
         }
         if ($kind) { [System.Windows.Forms.TextRenderer]::DrawText($g, $kind, $FontSmall, (New-Object System.Drawing.Rectangle(($r.Right - $kw - (Px 12)), $r.Y, $kw, $r.Height)), $C.Dim, $TextFlags) }
+        if ($it.ToolId -and (@($script:Favorites) -contains $it.ToolId)) {
+            $sx = $x + $tw + (Px 6)
+            if ($FontIconSmall) { [System.Windows.Forms.TextRenderer]::DrawText($g, $Glyph.StarOn, $FontIconSmall, (New-Object System.Drawing.Rectangle($sx, $r.Y, (Px 18), $r.Height)), $C.Yellow, [System.Windows.Forms.TextFormatFlags]'VerticalCenter, HorizontalCenter, NoPrefix, SingleLine, NoPadding') }
+            else { [System.Windows.Forms.TextRenderer]::DrawText($g, $Star, $FontSmall, (New-Object System.Drawing.Rectangle($sx, $r.Y, (Px 18), $r.Height)), $C.Yellow, $TextFlags) }
+        }
     })
+    # right-click: run, or star / unstar the tool
+    $list.add_MouseDown({ param($src, $e) if ($e.Button -eq 'Right') { $i = $src.IndexFromPoint($e.Location); if ($i -ge 0) { $src.SelectedIndex = $i } } })
+    $pm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $pm.add_Opening({
+        param($src, $e)
+        $src.Items.Clear()
+        $i = $PalUI.List.SelectedIndex
+        if ($i -lt 0 -or $i -ge $PalUI.View.Count) { $e.Cancel = $true; return }
+        $it = $PalUI.View[$i]
+        [void](Add-MenuItem $src 'Run' { Invoke-PaletteItem } $Glyph.Play 'Enter')
+        if ($it.ToolId) {
+            $on = @($script:Favorites) -contains $it.ToolId
+            [void](Add-MenuItem $src $(if ($on) { 'Remove from favourites' } else { 'Add to favourites' }) { Switch-PaletteFavorite } $(if ($on) { $Glyph.StarOff } else { $Glyph.StarOn }) 'Ctrl+D')
+        }
+    })
+    $list.ContextMenuStrip = $pm
     $list.add_DoubleClick({ Invoke-PaletteItem })
     $inner.Controls.Add($list)
     $hint = New-Object System.Windows.Forms.Label
     $hint.Dock = 'Bottom'; $hint.Height = $FontSmall.Height + (Px 12); $hint.Font = $FontSmall; $hint.ForeColor = $C.Dim; $hint.BackColor = $C.Panel
     $hint.TextAlign = 'MiddleLeft'; $hint.Padding = New-Object System.Windows.Forms.Padding((Px 12), 0, 0, 0)
-    $hint.Text = "Enter run   $Dot   Up / Down choose   $Dot   Esc close   $Dot   tools, actions, snippets, notes, API requests and recent clips"
+    $PalUI.HintText = "Enter run   $Dot   Ctrl+D favourite   $Dot   Esc close   $Dot   tools, actions, snippets, notes, API requests and recent clips"
+    $hint.Text = $PalUI.HintText
     $inner.Controls.Add($hint)
+    $PalUI.Hint = $hint
     $boxWrap = New-Object System.Windows.Forms.Panel
     $boxWrap.Dock = 'Top'; $boxWrap.Height = $FontSearch.Height + (Px 30); $boxWrap.BackColor = $C.Bg
     $boxWrap.Padding = New-Object System.Windows.Forms.Padding((Px 18), (Px 14), (Px 14), (Px 6))
@@ -18456,6 +18501,7 @@ function New-PaletteForm {
         switch ($e.KeyCode) {
             'Escape' { $PalUI.Form.Hide(); $e.SuppressKeyPress = $true }
             'Return' { Invoke-PaletteItem; $e.SuppressKeyPress = $true }
+            'D'      { if ($e.Control) { Switch-PaletteFavorite; $e.SuppressKeyPress = $true } }
             'Down'   { if ($l.SelectedIndex -lt $l.Items.Count - 1) { $l.SelectedIndex++ }; $e.SuppressKeyPress = $true }
             'Up'     { if ($l.SelectedIndex -gt 0) { $l.SelectedIndex-- }; $e.SuppressKeyPress = $true }
             'PageDown' { $l.SelectedIndex = [Math]::Min($l.Items.Count - 1, $l.SelectedIndex + 8); $e.SuppressKeyPress = $true }
@@ -29081,7 +29127,9 @@ function Update-FavoriteButtons {
 function Set-PaletteGroups {
     foreach ($r in @(Get-ToolRows)) {
         $pcmd = if ($r.Cmd) { $r.Cmd } else { $script:PaletteCommands | Where-Object { $_.Title -eq $r.Title -and $_.Sub -eq 'Toolbox' } | Select-Object -First 1 }
-        if (-not $pcmd -or $pcmd.Grouped) { continue }
+        if (-not $pcmd) { continue }
+        if (-not $pcmd.ToolId) { $pcmd | Add-Member -NotePropertyName ToolId -NotePropertyValue $r.Id -Force }     # so the palette can star it
+        if ($pcmd.Grouped) { continue }
         $pcmd.Sub = if ($pcmd.Sub -and $pcmd.Sub -ne 'Toolbox') { "$($r.Group)  -  $($pcmd.Sub)" } else { $r.Group }
         $pcmd | Add-Member -NotePropertyName Grouped -NotePropertyValue $true -Force
     }
