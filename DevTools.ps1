@@ -21506,6 +21506,7 @@ public class DgEdge {
     public float Width, Density = 1f;
     public int Dash;                       // 0 solid, 1 dashed, 2 dotted
     public bool Animate, Both, ArrowStart, ArrowEnd = true, ArrowSet, ArrowAttr, Glow, GlowSet, Hidden;
+    public bool TwoWay { get { return Both || (ArrowStart && ArrowEnd); } }      // a <-> b or arrow both: each end sends to and receives from the other
     public int SrcLine = -1;
     public List<System.Drawing.PointF> Pts = new List<System.Drawing.PointF>();   // the route (after layout)
     public string PathD = "";                                                     // the route as SVG path data
@@ -23888,7 +23889,7 @@ public static class DgHtml {
             if (e.Pts.Count < 2) continue;
             var cat = d.FindCat(e.Cat);
             ls.Add("{\"id\":" + J(e.Id) + ",\"f\":" + J(e.From) + ",\"t\":" + J(e.To) + (cat != null ? ",\"c\":" + J(DgText.CssId(cat.Id)) : "") +
-                   (e.Animate ? ",\"a\":1" : "") + (e.Both ? ",\"b\":1" : "") + (e.Density != 1 ? ",\"n\":" + Nm(e.Density) : "") +
+                   (e.Animate ? ",\"a\":1" : "") + (e.Both ? ",\"b\":1" : "") + (e.TwoWay ? ",\"w\":1" : "") + (e.Density != 1 ? ",\"n\":" + Nm(e.Density) : "") +
                    ",\"p\":[" + string.Join(",", e.Pts.Select(p => Nm(p.X) + "," + Nm(p.Y))) + "]}");
         }
         sb.Append(string.Join(",", ls));
@@ -27892,8 +27893,9 @@ public static class DgAssets {
     if (!panel || !O.panel) return;
     if (!st.sel) { panel.hidden = true; return; }
     var n = D.nodes[st.sel];
-    var ins = uniq(D.links.filter(function (l) { return l.t === st.sel && l.f !== st.sel; }).map(function (l) { return title(l.f); }));
-    var out = uniq(D.links.filter(function (l) { return l.f === st.sel && l.t !== st.sel; }).map(function (l) { return title(l.t); }));
+    // a two-way link (l.w) counts in both directions
+    var ins = uniq(D.links.filter(function (l) { return l.f !== l.t && (l.t === st.sel || (l.w && l.f === st.sel)); }).map(function (l) { return title(l.t === st.sel ? l.f : l.t); }));
+    var out = uniq(D.links.filter(function (l) { return l.f !== l.t && (l.f === st.sel || (l.w && l.t === st.sel)); }).map(function (l) { return title(l.f === st.sel ? l.t : l.f); }));
     var col = n.c ? 'var(--c-' + n.c + ')' : 'var(--ink)', down = !!st.down[st.sel];
     panel.innerHTML =
       '<div class=""' + P + '-ph""><div><div class=""' + P + '-pk2"">' + (n.b ? '<span class=""' + P + '-chip"" style=""color:' + col + '"">' + esc(n.b) + '</span>' : '') +
@@ -29242,8 +29244,9 @@ function Show-DiagramDetails($P, $Node) {
     New-TbLabel $P $Node.Title -Title | Out-Null
     if ($Node.Desc) { New-TbLabel $P $Node.Desc | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0); $_.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, (Px 4)) } }
     if (@($Node.Tags).Count) { New-TbLabel $P ((@($Node.Tags) | ForEach-Object { "[$_]" }) -join '  ') -Dim | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0) } }
-    $ins = @($d.Edges | Where-Object { $_.To -eq $Node.Id -and $_.From -ne $Node.Id } | ForEach-Object { $d.Find($_.From).Title } | Select-Object -Unique)
-    $outs = @($d.Edges | Where-Object { $_.From -eq $Node.Id -and $_.To -ne $Node.Id } | ForEach-Object { $d.Find($_.To).Title } | Select-Object -Unique)
+    # a two-way link (a <-> b, arrow both) counts in both directions
+    $ins = @($d.Edges | Where-Object { $_.From -ne $_.To -and ($_.To -eq $Node.Id -or ($_.TwoWay -and $_.From -eq $Node.Id)) } | ForEach-Object { $d.Find($(if ($_.To -eq $Node.Id) { $_.From } else { $_.To })).Title } | Select-Object -Unique)
+    $outs = @($d.Edges | Where-Object { $_.From -ne $_.To -and ($_.From -eq $Node.Id -or ($_.TwoWay -and $_.To -eq $Node.Id)) } | ForEach-Object { $d.Find($(if ($_.From -eq $Node.Id) { $_.To } else { $_.From })).Title } | Select-Object -Unique)
     New-TbLabel $P 'Receives from' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding(0, (Px 10), 0, 0) }
     New-TbLabel $P $(if ($ins) { $ins -join ', ' } else { '-' }) | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0) }
     New-TbLabel $P 'Sends to' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0) }
