@@ -21480,6 +21480,7 @@ public class DgCategory { public string Id = "", Name = "", Light = "", Dark = "
 
 public class DgNode {
     public string Id = "", Label = "", Badge = "", Cat = "", Shape = "", Fill = "", Stroke = "", TextColor = "", Icon = "", Status = "", Metric = "", Url = "", Desc = "", Group = "";
+    public string Button = "";      // "Open website" (or its own text): a button by the box in the web page, when it has a url
     public List<string> Tags = new List<string>(), Lines = new List<string>(), Items = new List<string>();
     public int Lane = -1, SrcLine = -1, Order, Rank = -1;
     public float X, Y, W, H, FontSize, SetW, SetH;
@@ -21793,6 +21794,7 @@ public static class DgText {
             case "line": n.Lines.Add(Unq(v)); break;
             case "items": n.Items.Clear(); foreach (var t in Words(v)) n.Items.Add(t); break;
             case "url": case "link": n.Url = Unq(v); break;
+            case "button": n.Button = Unq(v).Length > 0 ? Unq(v) : "Open website"; break;
             case "metric": n.Metric = Unq(v); break;
             case "badge": n.Badge = Unq(v); break;
             case "status": n.Status = Unq(v).ToLowerInvariant(); break;
@@ -21911,7 +21913,7 @@ public static class DgText {
     static bool KnownKey(string k) {
         switch (k) {
             case "badge": case "lane": case "at": case "size": case "w": case "width": case "h": case "height": case "shape": case "fill": case "stroke": case "border": case "color": case "text":
-            case "icon": case "status": case "metric": case "url": case "link": case "font": case "lines": case "items": case "in": case "group": case "cat": case "category": case "flow":
+            case "icon": case "status": case "metric": case "url": case "link": case "button": case "font": case "lines": case "items": case "in": case "group": case "cat": case "category": case "flow":
             case "desc": case "tags": case "label": case "via": case "density": case "arrow": case "from": case "to": case "route": case "labelat": return true;
         }
         return false;
@@ -21941,6 +21943,7 @@ public static class DgText {
                 case "status": n.Status = v.ToLowerInvariant(); break;
                 case "metric": n.Metric = Unq(v); break;
                 case "url": case "link": n.Url = Unq(v); break;
+                case "button": n.Button = Unq(v).Length > 0 ? Unq(v) : "Open website"; break;
                 case "font": n.FontSize = F(v, 0); break;
                 case "lines": n.Lines.Clear(); foreach (var t in Words(v)) n.Lines.Add(t); break;
                 case "items": n.Items.Clear(); foreach (var t in Words(v)) n.Items.Add(t); break;
@@ -23779,6 +23782,7 @@ public static class DgHtml {
             if (n.Status.Length > 0) x.Append(",\"s\":" + J(n.Status));
             if (n.Metric.Length > 0) x.Append(",\"m\":" + J(n.Metric));
             if (n.Url.Length > 0) x.Append(",\"u\":" + J(n.Url));
+            if (n.Url.Length > 0 && n.Button.Length > 0) x.Append(",\"gb\":" + J(n.Button));
             if (n.Spark && DgLayout.IsCard(n)) x.Append(",\"sp\":[" + Nm(n.X + 14) + "," + Nm(n.Y + n.H - 14 - 28) + "," + Nm(n.W - 28) + ",26]");
             x.Append("}");
             parts.Add(x.ToString());
@@ -23820,9 +23824,9 @@ public static class DgHtml {
         else sb.Append("  <span></span>\n");
         if (o.Flows || o.ThemeSwitch || o.Zoom) {
             sb.Append("  <div class=\"dg-tools\">");
-            if (o.Flows) sb.Append("<button class=\"dg-pause\">Pause</button><div class=\"dg-seg dg-speed\"><button data-v=\"0.5\">0.5x</button><button data-v=\"1\" class=\"dg-act\">1x</button><button data-v=\"2\">2x</button><button data-v=\"4\">4x</button></div>");
-            if (o.ThemeSwitch) sb.Append("<div class=\"dg-seg dg-theme\"><button data-v=\"dark\">Dark</button><button data-v=\"light\">Light</button></div>");
-            if (o.Zoom) sb.Append("<button class=\"dg-zout\" title=\"Zoom out\">\u2212</button><span class=\"dg-zoom\">100%</span><button class=\"dg-zin\" title=\"Zoom in\">+</button><button class=\"dg-fit\">Fit</button>");
+            if (o.Flows) sb.Append("<button type=\"button\" class=\"dg-pause\">Pause</button><div class=\"dg-seg dg-speed\"><button type=\"button\" data-v=\"0.5\">0.5x</button><button type=\"button\" data-v=\"1\" class=\"dg-act\">1x</button><button type=\"button\" data-v=\"2\">2x</button><button type=\"button\" data-v=\"4\">4x</button></div>");
+            if (o.ThemeSwitch) sb.Append("<div class=\"dg-seg dg-theme\"><button type=\"button\" data-v=\"dark\">Dark</button><button type=\"button\" data-v=\"light\">Light</button></div>");
+            if (o.Zoom) sb.Append("<button type=\"button\" class=\"dg-zout\" title=\"Zoom out\">\u2212</button><span class=\"dg-zoom\">100%</span><button type=\"button\" class=\"dg-zin\" title=\"Zoom in\">+</button><button type=\"button\" class=\"dg-fit\">Fit</button>");
             sb.Append("</div>\n");
         }
         sb.Append("</div>\n");
@@ -27559,13 +27563,14 @@ public static class DgAssets {
   }
 
   // ---- pan / zoom / fit
-  function headH() { var h = q(cls('head')); return h && h.offsetParent ? Math.round(h.getBoundingClientRect().bottom - stage.getBoundingClientRect().top + 10) : 16; }
+  function headH() { var h = q(cls('bar')) || q(cls('head')); return h && h.offsetParent && h.getBoundingClientRect().height > 2 ? Math.round(h.getBoundingClientRect().bottom - stage.getBoundingClientRect().top + 10) : 16; }
   function footH() { var f = q(cls('foot')); return f && f.offsetParent ? Math.round(stage.getBoundingClientRect().bottom - f.getBoundingClientRect().top + 10) : 16; }
   function apply() {
     vp.setAttribute('transform', 'translate(' + view.x.toFixed(1) + ',' + view.y.toFixed(1) + ') scale(' + view.k.toFixed(4) + ')');
     stage.style.backgroundSize = (24 * view.k) + 'px ' + (24 * view.k) + 'px';
     stage.style.backgroundPosition = view.x + 'px ' + view.y + 'px';
     var z = q(cls('zoom')); if (z) z.textContent = Math.round(view.k * 100) + '%';
+    if (typeof placeGo === 'function') placeGo();
   }
   function fit(manual) {
     var w = stage.clientWidth, h = stage.clientHeight, b = D.bounds, top = headH(), bot = footH();
@@ -27586,9 +27591,32 @@ public static class DgAssets {
     if (e.ctrlKey || e.metaKey) zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * 0.0018));
     else { if (e.shiftKey) view.x -= e.deltaY || e.deltaX; else { view.x -= e.deltaX; view.y -= e.deltaY; } userMoved = true; apply(); }
   }
-  function onDown(e) { if (e.button !== 0) return; drag = { sx: e.clientX, sy: e.clientY, x0: view.x, y0: view.y, moved: false }; stage.style.cursor = 'grabbing'; }
+  // two fingers: pinch to zoom (and move); one finger / the mouse: pan
+  var touches = {}, pinch = null;
+  function pts() { return Object.keys(touches).map(function (k) { return touches[k]; }); }
+  function onDown(e) {
+    if (e.button !== 0) return;
+    touches[e.pointerId] = { x: e.clientX, y: e.clientY };
+    var p2 = pts();
+    if (p2.length === 2) {
+      var r = stage.getBoundingClientRect();
+      pinch = { d: Math.hypot(p2[0].x - p2[1].x, p2[0].y - p2[1].y) || 1, mx: (p2[0].x + p2[1].x) / 2 - r.left, my: (p2[0].y + p2[1].y) / 2 - r.top };
+      drag = null; justDragged = true; return;
+    }
+    drag = { sx: e.clientX, sy: e.clientY, x0: view.x, y0: view.y, moved: false }; stage.style.cursor = 'grabbing';
+  }
   function nodeAt(t) { var n = t && t.closest ? t.closest('[data-node]') : null; return n && root.contains(n) ? n.getAttribute('data-node') : null; }
   function onMove(e) {
+    if (touches[e.pointerId]) { touches[e.pointerId].x = e.clientX; touches[e.pointerId].y = e.clientY; }
+    if (pinch) {
+      var p2 = pts(); if (p2.length < 2) return;
+      var r = stage.getBoundingClientRect();
+      var d = Math.hypot(p2[0].x - p2[1].x, p2[0].y - p2[1].y) || 1, mx = (p2[0].x + p2[1].x) / 2 - r.left, my = (p2[0].y + p2[1].y) / 2 - r.top;
+      view.x += mx - pinch.mx; view.y += my - pinch.my;
+      zoomAt(mx, my, d / pinch.d);
+      pinch.d = d; pinch.mx = mx; pinch.my = my;
+      return;
+    }
     if (drag) {
       var dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
       if (Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true;
@@ -27597,7 +27625,7 @@ public static class DgAssets {
     }
     if (!stage.contains(e.target)) return;
     var id = nodeAt(e.target);
-    if (id !== st.hover) { st.hover = id; highlight(); }
+    if (id !== st.hover) { st.hover = id; highlight(); goSoon(id); }
     var tp = e.target.closest ? e.target.closest('[data-tip]') : null;
     if (tp && root.contains(tp) && !tp.classList.contains(P + '-off')) {
       if (!tipEl) { tipEl = document.createElement('div'); tipEl.className = P + '-tip'; root.appendChild(tipEl); }
@@ -27610,14 +27638,46 @@ public static class DgAssets {
     } else if (tipEl && tipEl.style.display !== 'none') { tipEl.style.display = 'none'; qa('.' + P + '-hov').forEach(function (h) { h.classList.remove(P + '-hov'); }); }
   }
   var tipEl = null;
-  function onUp() { if (!drag) return; justDragged = drag.moved; drag = null; stage.style.cursor = ''; }
+  function onUp(e) {
+    if (e && touches[e.pointerId]) delete touches[e.pointerId];
+    if (pinch) { if (pts().length < 2) pinch = null; drag = null; return; }
+    if (!drag) return; justDragged = drag.moved; drag = null; stage.style.cursor = '';
+  }
   function onClick(e) {
     if (justDragged) { justDragged = false; return; }
     var id = nodeAt(e.target);
-    if (id && !O.panel && D.nodes[id] && D.nodes[id].u) { window.open(D.nodes[id].u, '_blank', 'noopener'); return; }
+    if (id && !O.panel && D.nodes[id] && D.nodes[id].u && !D.nodes[id].gb) { window.open(D.nodes[id].u, '_blank', 'noopener'); return; }
     select(id);
+    showGo(id);                      // a tap shows the button too (touch screens have no hover)
   }
-  function onLeave() { st.hover = null; highlight(); }
+  function onLeave() { st.hover = null; highlight(); goSoon(null); }
+
+  // ---- ""Open website"" next to a box that asks for it (button on a box with a url)
+  var goEl = null, goId = null, goTimer = 0;
+  function goUrl(id) { var n = id && D.nodes[id], u = n && n.gb && n.u; return u && /^(https?:|mailto:|\/|\.|#)/i.test(u) ? u : null; }
+  function placeGo() {
+    if (!goEl || !goId || goEl.style.display === 'none') return;
+    var el = byNode[goId] && byNode[goId][0]; if (!el) return;
+    var b = el.getBoundingClientRect(), rr = root.getBoundingClientRect();
+    var x = Math.min(b.right - rr.left - goEl.offsetWidth, rr.width - goEl.offsetWidth - 6), y = b.top - rr.top - goEl.offsetHeight - 6;
+    if (y < 4) y = b.bottom - rr.top + 6;
+    goEl.style.left = Math.max(4, x) + 'px'; goEl.style.top = y + 'px';
+  }
+  function showGo(id) {
+    clearTimeout(goTimer);
+    var u = goUrl(id);
+    if (!u) { if (goEl) goEl.style.display = 'none'; goId = null; return; }
+    if (!goEl) {
+      goEl = document.createElement('a'); goEl.className = P + '-go'; goEl.target = '_blank'; goEl.rel = 'noopener';
+      goEl.addEventListener('mouseenter', function () { clearTimeout(goTimer); });
+      goEl.addEventListener('mouseleave', function () { goSoon(null); });
+      root.appendChild(goEl);
+    }
+    goId = id; goEl.href = u; goEl.title = u; goEl.textContent = D.nodes[id].gb + ' \u2197'; goEl.style.display = 'block'; placeGo();
+  }
+  // a moment's grace, so the pointer can move from the box onto the button
+  function goSoon(id) { clearTimeout(goTimer); if (id) { showGo(id); return; } goTimer = setTimeout(function () { if (!st.sel || !goUrl(st.sel) || !touchy) showGo(null); else showGo(st.sel); }, 350); }
+  var touchy = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
 
   // ---- highlight: hover / selection dims what is not related
   function related(id) { var r = {}; r[id] = 1; D.links.forEach(function (l) { if (l.f === id) r[l.t] = 1; if (l.t === id) r[l.f] = 1; }); return r; }
@@ -27740,7 +27800,7 @@ public static class DgAssets {
     var col = n.c ? 'var(--c-' + n.c + ')' : 'var(--ink)', down = !!st.down[st.sel];
     panel.innerHTML =
       '<div class=""' + P + '-ph""><div><div class=""' + P + '-pk2"">' + (n.b ? '<span class=""' + P + '-chip"" style=""color:' + col + '"">' + esc(n.b) + '</span>' : '') +
-      '<span class=""' + P + '-grp"">' + esc(n.g || (n.cn && n.cn !== n.b ? n.cn : '')) + '</span></div><div class=""' + P + '-pt"">' + esc(n.t) + '</div></div><button class=""' + P + '-x"" title=""Close"">\u2715</button></div>' +
+      '<span class=""' + P + '-grp"">' + esc(n.g || (n.cn && n.cn !== n.b ? n.cn : '')) + '</span></div><div class=""' + P + '-pt"">' + esc(n.t) + '</div></div><button type=""button"" class=""' + P + '-x"" title=""Close"">\u2715</button></div>' +
       (n.d ? '<p class=""' + P + '-pd"">' + esc(n.d) + '</p>' : '') +
       (n.tags && n.tags.length ? '<div class=""' + P + '-tags"">' + n.tags.map(function (t) { return '<span>' + esc(t) + '</span>'; }).join('') + '</div>' : '') +
       '<div class=""' + P + '-ps""><div class=""' + P + '-psh""><span>Last 40 seconds</span><span class=""' + P + '-pr""></span></div><svg width=""100%"" height=""56"" viewBox=""0 0 300 56"" preserveAspectRatio=""none""><path class=""' + P + '-psp"" style=""fill:none;stroke:' + col + ';stroke-width:1.8;stroke-linejoin:round"" vector-effect=""non-scaling-stroke""/></svg></div>' +
@@ -27748,7 +27808,7 @@ public static class DgAssets {
       '<div class=""' + P + '-pio""><div><span>Receives from</span>' + esc(ins.join(', ') || '-') + '</div><div><span>Sends to</span>' + esc(out.join(', ') || '-') + '</div></div>' +
       (n.u ? '<a class=""' + P + '-lnk"" href=""' + esc(n.u) + '"" target=""_blank"" rel=""noopener"">Open link \u2197</a>' : '') +
       '<div class=""' + P + '-pf""><span class=""' + P + '-st' + (down ? ' ' + P + '-bad' : '') + '""><i></i>' + (down ? 'Down' : 'Operational') + '</span>' +
-      (O.outage ? '<button class=""' + P + '-out"">' + (down ? 'End outage' : 'Simulate outage') + '</button>' : '') + '</div>';
+      (O.outage ? '<button type=""button"" class=""' + P + '-out"">' + (down ? 'End outage' : 'Simulate outage') + '</button>' : '') + '</div>';
     panel.hidden = false;
     panel.querySelector(cls('x')).onclick = function () { select(null); };
     var ob = panel.querySelector(cls('out'));
@@ -27771,7 +27831,7 @@ public static class DgAssets {
     if (D.chart) Object.keys(D.cats).forEach(function (c) { used[c] = 1; });
     Object.keys(D.cats).forEach(function (c) {
       if (!used[c]) return;
-      var b = document.createElement('button');
+      var b = document.createElement('button'); b.type = 'button';
       b.innerHTML = '<i style=""background:var(--c-' + c + ')""></i><span>' + esc(D.cats[c]) + '</span>';
       b.onclick = function () { if (st.hidden[c]) delete st.hidden[c]; else st.hidden[c] = 1; b.classList.toggle(P + '-offc', !!st.hidden[c]); highlight(); emit('flows', Object.keys(st.hidden)); };
       leg.appendChild(b);
@@ -27782,7 +27842,10 @@ public static class DgAssets {
   function on(sel, ev, f) { var el = q(sel); if (el) el.addEventListener(ev, f); }
   on(cls('pause'), 'click', function () { st.paused = !st.paused; this.textContent = st.paused ? 'Play' : 'Pause'; });
   qa(cls('speed') + ' button').forEach(function (b) { b.addEventListener('click', function () { st.speed = parseFloat(b.getAttribute('data-v')); qa(cls('speed') + ' button').forEach(function (x) { x.classList.toggle(P + '-act', x === b); }); }); });
-  qa(cls('theme') + ' button').forEach(function (b) { b.addEventListener('click', function () { setTheme(b.getAttribute('data-v')); }); });
+  var themeKey = 'devtools-diagram-theme:' + P + ':' + (D.title || '');
+  qa(cls('theme') + ' button').forEach(function (b) { b.addEventListener('click', function (e) { e.preventDefault(); var v = b.getAttribute('data-v'); setTheme(v); try { localStorage.setItem(themeKey, v); } catch (x) { } }); });
+  // the diagram's buttons never act on the page around it (a form there would be submitted and the page reloaded)
+  root.addEventListener('click', function (e) { var t = e.target; while (t && t !== root) { if (t.tagName === 'BUTTON') { e.preventDefault(); return; } t = t.parentNode; } });
   on(cls('zin'), 'click', function () { zoomAt(stage.clientWidth / 2, stage.clientHeight / 2, 1.2); });
   on(cls('zout'), 'click', function () { zoomAt(stage.clientWidth / 2, stage.clientHeight / 2, 1 / 1.2); });
   on(cls('fit'), 'click', function () { fit(true); });
@@ -27793,7 +27856,23 @@ public static class DgAssets {
   stage.addEventListener('pointerleave', onLeave);
   window.addEventListener('pointermove', onMove);
   window.addEventListener('pointerup', onUp);
-  var ro = window.ResizeObserver ? new ResizeObserver(function () { if (!userMoved) fit(); }) : null;
+  window.addEventListener('pointercancel', onUp);
+  // narrow layout from the diagram's own width (a widget in a narrow column too)
+  function narrow() {
+    var w = root.clientWidth, n = w > 0 && w < 640;
+    root.classList.toggle(P + '-narrow', n);
+    // on a narrow diagram the controls sit at the bottom (within thumb reach), above the legend; wide: back at the top
+    var tools = q(cls('tools')), bar = q(cls('bar')), foot = q(cls('foot'));
+    if (tools && bar && foot) {
+      if (n && tools.parentNode !== foot) foot.insertBefore(tools, foot.firstChild);
+      else if (!n && tools.parentNode !== bar) bar.appendChild(tools);
+    }
+  }
+  narrow();
+  var ro = window.ResizeObserver ? new ResizeObserver(function () { narrow(); if (!userMoved) fit(); }) : null;
+  if (!ro) window.addEventListener('resize', function () { narrow(); if (!userMoved) fit(); });
+  // the hint on touch screens
+  var hintEl = q(cls('hint')); if (hintEl && window.matchMedia && window.matchMedia('(pointer: coarse)').matches && !D.chart) hintEl.textContent = 'Drag to pan \u00b7 pinch to zoom' + (O.panel ? ' \u00b7 tap a component for details' : '');
   if (ro) ro.observe(stage);
 
   var api = {
@@ -27808,11 +27887,12 @@ public static class DgAssets {
     showFlow: function (c, show) { if (show === false) st.hidden[c] = 1; else delete st.hidden[c]; highlight(); },
     destroy: function () {
       alive = false; cancelAnimationFrame(raf); if (ro) ro.disconnect();
-      window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); window.removeEventListener('pointercancel', onUp);
       stage.removeEventListener('wheel', onWheel); stage.removeEventListener('pointerdown', onDown); stage.removeEventListener('click', onClick); stage.removeEventListener('pointerleave', onLeave);
     }
   };
-  setTheme(D.theme);
+  var savedTheme = null; try { savedTheme = localStorage.getItem(themeKey); } catch (x) { }
+  setTheme(savedTheme === 'dark' || savedTheme === 'light' ? savedTheme : D.theme);
   Object.keys(D.nodes).forEach(function (id) { if (D.nodes[id].s === 'down') st.down[id] = 1; });
   highlight();
   fit();
@@ -27868,6 +27948,8 @@ public static class DgAssets {
 .__P__-hint{font-size:11.5px;white-space:nowrap;color:var(--muted);padding:6px 10px;border-radius:6px;pointer-events:auto}
 .__P__-panel{position:absolute;top:84px;right:14px;width:330px;max-width:calc(100% - 28px);max-height:calc(100% - 150px);overflow-y:auto;display:flex;flex-direction:column;gap:14px;padding:20px;border-radius:12px;box-shadow:0 20px 50px rgba(0,0,0,.3);user-select:text}
 .__P__-panel[hidden]{display:none}
+.__P__-go{position:absolute;z-index:8;display:none;padding:5px 10px;border-radius:7px;background:var(--sel);color:var(--bg);font-family:var(--font);font-size:12px;font-weight:600;text-decoration:none;white-space:nowrap;box-shadow:0 6px 18px rgba(0,0,0,.25)}
+.__P__-go:hover{filter:brightness(1.1)}
 .__P__-ph{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
 .__P__-pk2{display:flex;align-items:center;gap:8px;margin-bottom:6px}
 .__P__-chip{font-family:var(--mono);font-size:10.5px;font-weight:600;padding:3px 7px;border-radius:4px;background:var(--chip)}
@@ -27891,7 +27973,27 @@ public static class DgAssets {
 .__P__-st{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ok)}
 .__P__-st i{width:8px;height:8px;border-radius:50%;background:currentColor}
 .__P__-out{height:30px;padding:0 12px;border-radius:6px;border:1px solid var(--bad);background:transparent;color:var(--bad);font-family:var(--font);font-size:12px;cursor:pointer}
-@media (max-width:640px){.__P__-panel{top:auto;bottom:60px;left:14px;width:auto}.__P__-hint{display:none}}
+/* narrow: under 640px wide (set by the script from the diagram's own width) */
+.__P__-narrow .__P__-bar{top:8px;left:8px;right:8px;gap:6px;flex-direction:column;align-items:stretch}
+.__P__-narrow .__P__-head{padding:7px 11px;gap:3px 12px;border-radius:9px;flex-wrap:nowrap;flex-direction:column;align-items:flex-start}
+.__P__-narrow .__P__-ttl{font-size:13.5px;max-width:100%}
+.__P__-narrow .__P__-ttl span:last-child{overflow:hidden;text-overflow:ellipsis}
+.__P__-narrow .__P__-stats{gap:10px;font-size:11px;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;max-width:100%}
+.__P__-narrow .__P__-tools{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;padding:5px;gap:4px;font-size:11.5px;align-self:flex-start;max-width:100%;border-radius:9px}
+.__P__-narrow .__P__-tools::-webkit-scrollbar,.__P__-narrow .__P__-stats::-webkit-scrollbar,.__P__-narrow .__P__-legend::-webkit-scrollbar{display:none}
+.__P__-narrow .__P__-tools button{height:32px;padding:0 9px;flex-shrink:0}
+.__P__-narrow .__P__-seg{flex-shrink:0}
+.__P__-narrow .__P__-seg button{height:28px;padding:0 8px}
+.__P__-narrow .__P__-zoom{min-width:38px;flex-shrink:0}
+.__P__-narrow .__P__-foot{left:8px;right:8px;bottom:8px;flex-direction:column;align-items:flex-start;gap:6px}
+.__P__-narrow .__P__-legend{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;max-width:100%;gap:6px}
+.__P__-narrow .__P__-legend button{height:30px;padding:0 11px;font-size:12px;flex-shrink:0}
+.__P__-narrow .__P__-hint{display:none}
+.__P__-narrow .__P__-panel{top:auto;bottom:8px;z-index:6;left:8px;right:8px;width:auto;max-width:none;max-height:58%;padding:14px 16px;gap:10px;border-radius:14px}
+.__P__-narrow .__P__-pt{font-size:16px}
+.__P__-narrow .__P__-pg b{font-size:14px}
+.__P__-narrow .__P__-tip{white-space:normal;max-width:70%}
+@media (max-width:640px){.__P__-panel{top:auto;bottom:8px;left:8px;right:8px;width:auto;max-width:none}.__P__-hint{display:none}}
 ";
 }
 '@
@@ -28941,6 +29043,8 @@ function Update-DiagramProps {
         Add-DgProp $p 'Description (shown when the shape is clicked)' (New-DgBox $node.Desc { param($v) Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'desc', $(if ($v.Trim()) { '"' + (($v -replace '"', "'") -replace "`r?`n", ' ') + '"' } else { $null }))) } -Multi -Height 64) | Out-Null
         Add-DgProp $p 'Tags (comma separated)' (New-DgBox (@($node.Tags) -join ', ') { param($v) $w = (@($v -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join '; '); Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'tags', $(if ($w) { $w } else { $null }))) }) | Out-Null
         Add-DgProp $p 'Link (opens when clicked in the web page)' (New-DgBox $node.Url { param($v) Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'url', $(if ($v) { '"' + $v + '"' } else { $null }))) }) | Out-Null
+        $gb = New-CheckBox $p 'Open website button on hover (web page)' ($node.Button.Length -gt 0); $gb.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, 0)
+        $gb.add_CheckedChanged({ param($src, $e) Set-DiagramNodeAttr $DgUI.PropId 'button' $(if ($src.Checked) { '' } else { $null }) })
         $row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.AutoSize = $true; $row.WrapContents = $true; $row.MaximumSize = New-Object System.Drawing.Size((Px (260 * $TextZoom)), 0); $row.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0)
         [void](New-DgColorButton $row 'Fill' $node.Fill { param($v) Set-DiagramNodeAttr $DgUI.PropId 'fill' $v })
         [void](New-DgColorButton $row 'Border' $node.Stroke { param($v) Set-DiagramNodeAttr $DgUI.PropId 'stroke' $v })
