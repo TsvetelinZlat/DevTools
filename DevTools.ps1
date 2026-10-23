@@ -29727,11 +29727,11 @@ function Add-SqlPlanTab($Plan) {
 function Update-SqlLive {
     if (-not $SqlUI.Form -or $SqlUI.LiveSplit.Panel2Collapsed) { return }
     $c0 = Get-SqlConn
-    [void](Get-SqlSchema)
+    $schema = Get-SqlSchema
     $ed = $SqlUI.Editor
-    $text = [DgSqlViz]::Build($ed.Text, $ed.SelectionStart, $SqlUI.Schema, $script:IsDark)
+    $text = [DgSqlViz]::Build($ed.Text, $ed.SelectionStart, $schema, $script:IsDark)
     $SqlUI.LiveText = $text
-    $SqlUI.LiveInfo.Text = if ($SqlUI.SchemaError -and -not $SqlUI.Schema) { "Columns not loaded: $($SqlUI.SchemaError)" } else { [DgSqlViz]::Info }
+    $SqlUI.LiveInfo.Text = if ($SqlUI.SchemaError -and -not $schema) { "Columns not loaded: $($SqlUI.SchemaError)" } else { [DgSqlViz]::Info }
     $cv = $SqlUI.LiveCanvas
     if (-not $text) { $cv.SetDoc((New-Object DgDoc), $true); return }
     $d = [DgText]::Parse($text); [DgLayout]::Apply($d)
@@ -29977,9 +29977,28 @@ function Set-SqlColors {
 
 # ---- autocomplete: suggestions under the cursor as you type; Up / Down choose, Tab puts it in, Esc closes, Ctrl+Space opens it
 # the columns of the current connection / database (shared with the live diagram; read again with Refresh columns)
+# the databases (Oracle: schemas) of the current connection, read once and kept (Refresh columns reads them again); $null when they can't be listed
+function Get-SqlDbNames {
+    $c0 = Get-SqlConn
+    if (-not $c0) { return $null }
+    $k = "$($c0.Name)|$($c0.Server)|$($c0.Driver)"
+    if (-not $SqlUI.DbNames) { $SqlUI.DbNames = @{} }
+    if (-not $SqlUI.DbNames.ContainsKey($k)) {
+        $set = $null
+        try { $set = New-Object 'System.Collections.Generic.List[string]'; foreach ($r in ([DgDb]::Databases((Get-SqlConnString $c0 (Get-SqlListDb $c0)))).Rows) { $set.Add([string]$r[0]) } } catch { $set = $null }
+        $SqlUI.DbNames[$k] = $set
+    }
+    , $SqlUI.DbNames[$k]
+}
 function Get-SqlSchema {
     $c0 = Get-SqlConn
-    $key = if ($c0) { "$($c0.Name)|$($SqlUI.DbBox.Text)" } else { '' }
+    $db = [string]$SqlUI.DbBox.Text
+    # a half-typed name in the Database box: don't connect to a database that isn't there (each try waits for the server)
+    if ($c0 -and $db.Trim()) {
+        $names = Get-SqlDbNames
+        if ($names -and -not ($names | Where-Object { $_ -eq $db.Trim() })) { $SqlUI.SchemaError = "no database called '$db' (pick one from the list)"; return $null }
+    }
+    $key = if ($c0) { "$($c0.Name)|$db" } else { '' }
     if ($key -ne $SqlUI.SchemaKey) {
         $SqlUI.SchemaKey = $key; $SqlUI.Schema = $null; $SqlUI.SchemaError = ''
         if ($c0) { try { $SqlUI.Schema = [DgSqlSchema]::Load((Get-SqlConnString $c0 $SqlUI.DbBox.Text)) } catch { $SqlUI.SchemaError = Get-SqlError $_ } }
@@ -30341,7 +30360,7 @@ function Show-SqlClient {
     $SqlUI.DbLabel = New-TbLabel $top 'Database' -Dim; $SqlUI.DbLabel.Margin = New-Object System.Windows.Forms.Padding((Px 10), (Px 9), (Px 4), 0)
     $SqlUI.DbBox = New-Object System.Windows.Forms.ComboBox; $SqlUI.DbBox.DropDownStyle = 'DropDown'; $SqlUI.DbBox.FlatStyle = 'Flat'; $SqlUI.DbBox.BackColor = $C.Bg; $SqlUI.DbBox.ForeColor = $C.Fore; $SqlUI.DbBox.Width = Px 180
     $SqlUI.DbBox.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 10), 0)
-    $SqlUI.DbBox.add_DropDown({ param($src, $e) $src.Items.Clear(); $c0 = Get-SqlConn; if ($c0) { try { foreach ($r in ([DgDb]::Databases((Get-SqlConnString $c0 (Get-SqlListDb $c0)))).Rows) { [void]$src.Items.Add([string]$r[0]) } } catch { } } })
+    $SqlUI.DbBox.add_DropDown({ param($src, $e) $t = $src.Text; $src.Items.Clear(); $names = Get-SqlDbNames; if ($names) { foreach ($n in $names) { [void]$src.Items.Add($n) } }; $src.Text = $t })
     $top.Controls.Add($SqlUI.DbBox)
     $SqlUI.DbBox.add_TextChanged({ if ($SqlUI.LiveTimer) { $SqlUI.LiveTimer.Stop(); $SqlUI.LiveTimer.Start() } })
     $SqlUI.RunBtn = New-Button 'Run' 'Run the selection, or everything (F5 / Ctrl+Enter)' { Start-SqlRun } $top $Glyph.Play 1
@@ -30380,7 +30399,7 @@ function Show-SqlClient {
     })
     $lbar = New-Object System.Windows.Forms.FlowLayoutPanel; $lbar.Dock = 'Top'; $lbar.AutoSize = $true; $lbar.WrapContents = $true; $lbar.BackColor = $C.Panel; $lbar.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 3), (Px 6), (Px 3))
     [void](New-Button 'Open in Diagram studio' 'Edit, style or export this diagram' { if ($SqlUI.LiveText) { Show-DiagramStudio; New-DiagramFromText 'Query' $SqlUI.LiveText } } $lbar $Glyph.Apps 2)
-    [void](New-Button 'Refresh columns' 'Read the tables and columns of the database again' { $SqlUI.SchemaKey = '-'; $SqlUI.SourcesSig = ''; Update-SqlLive } $lbar $Glyph.Refresh 2)
+    [void](New-Button 'Refresh columns' 'Read the tables and columns of the database again' { $SqlUI.SchemaKey = '-'; $SqlUI.SourcesSig = ''; $SqlUI.DbNames = @{}; Update-SqlLive } $lbar $Glyph.Refresh 2)
     $SqlUI.LiveInfo = New-TbLabel $lbar '' -Dim; $SqlUI.LiveInfo.Margin = New-Object System.Windows.Forms.Padding((Px 8), (Px 8), 0, 0)
     $live.Panel2.Controls.Add($lcv); $live.Panel2.Controls.Add($lbar)
     $SqlUI.LiveCanvas = $lcv
