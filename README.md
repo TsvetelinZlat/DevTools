@@ -485,7 +485,10 @@ Diagrams from a few lines of text: architecture maps, flowcharts, org charts and
     - hover highlight, draw-in animation, minified
     - a **prefix for every class and id**, so several diagrams can sit on the same page without clashing
   - Every output has a live code view with **Copy**, **Save** and **Open in browser** to see the result.
-- Diagrams are saved as you go under `data\diagrams\` (one `.dgm` text file each; **Saved** lists them, right-click to rename or delete).
+- Diagrams are saved as you go under `data\diagrams\` (one `.dgm` text file each). The **Saved** tab is a **folder tree** of real folders under it:
+  - **New folder** (inside the selected one, as deep as you like), **New diagram**, rename (F2), delete (Del; a folder asks first and says how many diagrams are in it), **Duplicate**, **Move to**, **Show in Explorer**.
+  - **Drag** diagrams and folders onto a folder to move them (onto empty space = the top). The open diagram follows when its folder moves or is renamed.
+  - New diagrams (**New**, **Examples**, the Data tab, the SQL client's Chart this / ER diagram) are saved in the folder selected in the tree; the line at the bottom shows which.
 
 ## SQL client
 

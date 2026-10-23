@@ -26220,7 +26220,23 @@ s5 -> t5 [a, dotted, label "a label"]
 
 function Get-DiagramFiles {
     if (-not (Test-Path -LiteralPath $DgDir)) { return @() }
-    @(Get-ChildItem -LiteralPath $DgDir -Filter '*.dgm' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    @(Get-ChildItem -LiteralPath $DgDir -Filter '*.dgm' -File -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+}
+# the folder new diagrams go into: the one selected in the Saved tree (or the folder of the selected diagram)
+function Get-DiagramTargetDir {
+    $d = $DgUI.TargetDir
+    if ($d -and (Test-Path -LiteralPath $d) -and (Test-DiagramInside $d)) { return $d }
+    $DgDir
+}
+function Test-DiagramInside([string]$Path) {
+    $root = [IO.Path]::GetFullPath($DgDir).TrimEnd('\') + '\'
+    ([IO.Path]::GetFullPath($Path).TrimEnd('\') + '\').StartsWith($root, [StringComparison]::OrdinalIgnoreCase)
+}
+function Get-DiagramRelative([string]$Path) {
+    $root = [IO.Path]::GetFullPath($DgDir).TrimEnd('\')
+    $full = [IO.Path]::GetFullPath($Path)
+    if ($full.Length -le $root.Length) { return '' }
+    $full.Substring($root.Length + 1)
 }
 
 # The text changed (typed, or an edit on the canvas): parse, lay out, draw.
@@ -26310,11 +26326,12 @@ function Save-DiagramFile {
         Write-JsonFile $DgUI.File $DgUI.Text
     } catch { Write-Log "diagram save failed: $_" }
 }
-function New-DiagramName([string]$Base) {
-    $Base = (($Base -replace '[\\/:*?"<>|]', ' ') -replace '\s+', ' ').Trim()
+function New-DiagramName([string]$Base, [string]$Dir = '', [string]$Ext = '.dgm') {
+    if (-not $Dir) { $Dir = $DgDir }
+    $Base = (($Base -replace '[\\/:*?"<>|]', ' ') -replace '\s+', ' ').Trim().TrimEnd('.')
     if (-not $Base) { $Base = 'Diagram' }
     $n = $Base; $i = 2
-    while (Test-Path -LiteralPath (Join-Path $DgDir "$n.dgm")) { $n = "$Base $i"; $i++ }
+    while (Test-Path -LiteralPath (Join-Path $Dir "$n$Ext")) { $n = "$Base $i"; $i++ }
     $n
 }
 function Open-DiagramFile([string]$Path) {
@@ -26327,19 +26344,165 @@ function Open-DiagramFile([string]$Path) {
 }
 function New-DiagramFromText([string]$Name, [string]$Text) {
     Save-DiagramFile
-    if (-not (Test-Path -LiteralPath $DgDir)) { [void](New-Item -ItemType Directory -Path $DgDir -Force) }
-    $DgUI.File = Join-Path $DgDir ((New-DiagramName $Name) + '.dgm')
+    $dir = Get-DiagramTargetDir
+    if (-not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+    $DgUI.File = Join-Path $dir ((New-DiagramName $Name $dir) + '.dgm')
     $DgUI.Undo.Clear(); $DgUI.Redo.Clear()
     Set-DiagramText $Text -Fit -NoUndo
     Save-DiagramFile
     Update-DiagramList
 }
+# ---- the Saved tab: a folder tree (real folders under data\diagrams)
 function Update-DiagramList {
-    $l = $DgUI.List
-    if (-not $l) { return }
-    $l.BeginUpdate(); $l.Items.Clear()
-    foreach ($f in Get-DiagramFiles) { [void]$l.Items.Add($f.BaseName); if ($f.FullName -eq $DgUI.File) { $l.SelectedIndex = $l.Items.Count - 1 } }
-    $l.EndUpdate()
+    $tv = $DgUI.List
+    if (-not $tv) { return }
+    if (-not (Test-Path -LiteralPath $DgDir)) { [void](New-Item -ItemType Directory -Path $DgDir -Force) }
+    # remember which folders are open
+    $open = $DgUI.OpenFolders
+    $tv.BeginUpdate()
+    try {
+        $tv.Nodes.Clear()
+        $sel = $null
+        $add = $null
+        $add = {
+            param($nodes, [string]$dir)
+            foreach ($d in @(Get-ChildItem -LiteralPath $dir -Directory -ErrorAction SilentlyContinue | Sort-Object Name)) {
+                $n = $nodes.Add($d.Name); $n.Tag = @{ Kind = 'folder'; Path = $d.FullName }; $n.ImageKey = 'folder'; $n.SelectedImageKey = 'folder'
+                & $add $n.Nodes $d.FullName
+                if ($open.Contains($d.FullName)) { $n.Expand() }
+            }
+            foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter '*.dgm' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+                $n = $nodes.Add($f.BaseName); $n.Tag = @{ Kind = 'file'; Path = $f.FullName }; $n.ForeColor = $C.Fore; $n.ImageKey = 'file'; $n.SelectedImageKey = 'file'
+                if ($f.FullName -eq $DgUI.File) { $script:DgSelNode = $n }
+            }
+        }
+        $script:DgSelNode = $null
+        & $add $tv.Nodes $DgDir
+        foreach ($n in @($tv.Nodes)) { }
+        if ($script:DgSelNode) { $p = $script:DgSelNode.Parent; while ($p) { $p.Expand(); $p = $p.Parent }; $DgUI.TreeQuiet = $true; $tv.SelectedNode = $script:DgSelNode; $DgUI.TreeQuiet = $false }
+        if ($tv.Nodes.Count -eq 0) { $e = $tv.Nodes.Add('(no diagrams yet)'); $e.ForeColor = $C.Dim }
+    } finally { $tv.EndUpdate() }
+    $DgUI.FolderLabel.Text = "New diagrams go into:  \" + (Get-DiagramRelative (Get-DiagramTargetDir))
+}
+
+function New-DiagramNamed {
+    $dir = Get-DiagramTargetDir
+    $rel = Get-DiagramRelative $dir
+    $n = Read-TextDialog 'New diagram' "Name  (saved in \$rel)" 'Diagram' $DgUI.Form
+    if (-not $n) { return }
+    New-DiagramFromText $n "title $n`r`ntheme midnight dark`r`n`r`na: Start`r`nb: Next step`r`na -> b"
+    Select-ApiTab $DgUI.Tabs 'Text'
+}
+
+function Get-DiagramNodeDir($Node) {
+    if (-not $Node -or -not $Node.Tag) { return $DgDir }
+    if ($Node.Tag.Kind -eq 'folder') { $Node.Tag.Path } else { Split-Path -Parent $Node.Tag.Path }
+}
+
+function New-DiagramFolder($Parent = $null, [string]$Name = '') {
+    $dir = if ($Parent) { $Parent } else { Get-DiagramTargetDir }
+    $n = if ($Name) { $Name } else { Read-TextDialog 'New folder' "Folder name  (inside \$(Get-DiagramRelative $dir))" '' $DgUI.Form }
+    if (-not $n) { return }
+    $n = (($n -replace '[\\/:*?"<>|]', ' ') -replace '\s+', ' ').Trim().TrimEnd('.')
+    if (-not $n) { return }
+    $path = Join-Path $dir $n
+    if (Test-Path -LiteralPath $path) { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, "There is already a ""$n"" there.", 'Diagram studio'); return }
+    [void](New-Item -ItemType Directory -Path $path -Force)
+    [void]$DgUI.OpenFolders.Add($dir); [void]$DgUI.OpenFolders.Add($path)
+    $DgUI.TargetDir = $path
+    Update-DiagramList
+}
+
+# moves a diagram or a folder into another folder (keeps the open diagram open)
+function Move-DiagramItem([string]$Path, [string]$ToDir) {
+    if (-not (Test-Path -LiteralPath $Path) -or -not (Test-DiagramInside $ToDir)) { return }
+    $isDir = Test-Path -LiteralPath $Path -PathType Container
+    if ($isDir -and ([IO.Path]::GetFullPath($ToDir).TrimEnd('\') + '\').StartsWith(([IO.Path]::GetFullPath($Path).TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)) { return }   # not into itself
+    if ((Split-Path -Parent $Path) -eq $ToDir) { return }
+    $name = Split-Path -Leaf $Path
+    $dest = Join-Path $ToDir $name
+    if (Test-Path -LiteralPath $dest) {
+        if ($isDir) { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, "There is already a folder ""$name"" there.", 'Diagram studio'); return }
+        $dest = Join-Path $ToDir ((New-DiagramName ([IO.Path]::GetFileNameWithoutExtension($name)) $ToDir) + '.dgm')
+    }
+    Save-DiagramFile
+    try { Move-Item -LiteralPath $Path -Destination $dest -ErrorAction Stop } catch { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, "Couldn't move it: $($_.Exception.Message)", 'Diagram studio'); return }
+    if ($DgUI.File) {
+        if ($DgUI.File -eq $Path) { $DgUI.File = $dest }
+        elseif ($isDir -and $DgUI.File.StartsWith($Path + '\', [StringComparison]::OrdinalIgnoreCase)) { $DgUI.File = $dest + $DgUI.File.Substring($Path.Length) }
+    }
+    if ($isDir) { foreach ($o in @($DgUI.OpenFolders)) { if ($o -eq $Path -or $o.StartsWith($Path + '\', [StringComparison]::OrdinalIgnoreCase)) { [void]$DgUI.OpenFolders.Remove($o); [void]$DgUI.OpenFolders.Add($dest + $o.Substring($Path.Length)) } } }
+    [void]$DgUI.OpenFolders.Add($ToDir)
+    Update-DiagramTitle
+    Update-DiagramList
+}
+
+function Rename-DiagramItem($Node, [string]$NewName = '') {
+    if (-not $Node -or -not $Node.Tag) { return }
+    $tg = $Node.Tag
+    $old = if ($tg.Kind -eq 'file') { [IO.Path]::GetFileNameWithoutExtension($tg.Path) } else { Split-Path -Leaf $tg.Path }
+    $n = if ($NewName) { $NewName } else { Read-TextDialog $(if ($tg.Kind -eq 'file') { 'Rename diagram' } else { 'Rename folder' }) 'New name' $old $DgUI.Form }
+    if (-not $n -or $n -eq $old) { return }
+    $n = (($n -replace '[\\/:*?"<>|]', ' ') -replace '\s+', ' ').Trim().TrimEnd('.')
+    if (-not $n) { return }
+    $dir = Split-Path -Parent $tg.Path
+    Save-DiagramFile
+    if ($tg.Kind -eq 'file') {
+        $new = Join-Path $dir ((New-DiagramName $n $dir) + '.dgm')
+        Move-Item -LiteralPath $tg.Path -Destination $new
+        if ($DgUI.File -eq $tg.Path) { $DgUI.File = $new }
+    } else {
+        $new = Join-Path $dir $n
+        if (Test-Path -LiteralPath $new) { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, "There is already a ""$n"" there.", 'Diagram studio'); return }
+        Move-Item -LiteralPath $tg.Path -Destination $new
+        if ($DgUI.File -and $DgUI.File.StartsWith($tg.Path + '\', [StringComparison]::OrdinalIgnoreCase)) { $DgUI.File = $new + $DgUI.File.Substring($tg.Path.Length) }
+        if ($DgUI.TargetDir -and $DgUI.TargetDir.StartsWith($tg.Path, [StringComparison]::OrdinalIgnoreCase)) { $DgUI.TargetDir = $new + $DgUI.TargetDir.Substring($tg.Path.Length) }
+        if ($DgUI.OpenFolders.Remove($tg.Path)) { [void]$DgUI.OpenFolders.Add($new) }
+    }
+    Update-DiagramTitle
+    Update-DiagramList
+}
+
+function Remove-DiagramItem($Node) {
+    if (-not $Node -or -not $Node.Tag) { return }
+    $tg = $Node.Tag
+    if ($tg.Kind -eq 'file') {
+        if ([System.Windows.Forms.MessageBox]::Show($DgUI.Form, "Delete the diagram ""$($Node.Text)""?", 'Diagram studio', 'YesNo', 'Question') -ne 'Yes') { return }
+        if ($DgUI.File -eq $tg.Path) { $DgUI.File = ''; Update-DiagramTitle }
+        Remove-Item -LiteralPath $tg.Path -Force
+    } else {
+        $count = @(Get-ChildItem -LiteralPath $tg.Path -Filter '*.dgm' -File -Recurse -ErrorAction SilentlyContinue).Count
+        $msg = if ($count) { "Delete the folder ""$($Node.Text)"" and the $count diagram(s) in it?" } else { "Delete the empty folder ""$($Node.Text)""?" }
+        if ([System.Windows.Forms.MessageBox]::Show($DgUI.Form, $msg, 'Diagram studio', 'YesNo', 'Warning') -ne 'Yes') { return }
+        if ($DgUI.File -and $DgUI.File.StartsWith($tg.Path + '\', [StringComparison]::OrdinalIgnoreCase)) { $DgUI.File = ''; Update-DiagramTitle }
+        Remove-Item -LiteralPath $tg.Path -Recurse -Force
+        if ($DgUI.TargetDir -and $DgUI.TargetDir.StartsWith($tg.Path, [StringComparison]::OrdinalIgnoreCase)) { $DgUI.TargetDir = '' }
+    }
+    Update-DiagramList
+}
+
+function Copy-DiagramItem($Node) {
+    if (-not $Node -or $Node.Tag.Kind -ne 'file') { return }
+    Save-DiagramFile
+    $dir = Split-Path -Parent $Node.Tag.Path
+    $new = Join-Path $dir ((New-DiagramName ([IO.Path]::GetFileNameWithoutExtension($Node.Tag.Path) + ' copy') $dir) + '.dgm')
+    Copy-Item -LiteralPath $Node.Tag.Path -Destination $new
+    Open-DiagramFile $new
+}
+
+# "Move to..." menu: every folder
+function Add-DiagramMoveMenu($Menu, [string]$Path) {
+    $mv = New-Object System.Windows.Forms.ToolStripMenuItem('Move to', (New-GlyphImage $Glyph.Folder))
+    $dirs = @($DgDir) + @(Get-ChildItem -LiteralPath $DgDir -Directory -Recurse -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object FullName)
+    foreach ($d in $dirs) {
+        if ($d -eq (Split-Path -Parent $Path)) { continue }
+        if (([IO.Path]::GetFullPath($d) + '\').StartsWith([IO.Path]::GetFullPath($Path) + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
+        $rel = Get-DiagramRelative $d
+        $it = New-Object System.Windows.Forms.ToolStripMenuItem($(if ($rel) { $rel } else { '(top)' }), $null, { param($s2, $e2) Move-DiagramItem $s2.Tag.Path $s2.Tag.To })
+        $it.Tag = @{ Path = $Path; To = $d }
+        [void]$mv.DropDownItems.Add($it)
+    }
+    if ($mv.DropDownItems.Count) { [void]$Menu.Items.Add($mv) }
 }
 
 # ---- edits from the canvas and the properties panel (all go through the text)
@@ -26792,37 +26955,87 @@ function Show-DiagramStudio([string]$Text = '') {
     $help.Dock = 'Bottom'; $help.Text = 'Syntax help'; $help.LinkColor = $C.Accent; $help.BackColor = $C.Bg; $help.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 2), 0, (Px 4)); $help.AutoSize = $false; $help.Height = $FontMain.Height + (Px 8)
     $help.add_LinkClicked({ Show-DiagramHelp })
     $pText.Controls.Add($ed); $pText.Controls.Add($warn); $pText.Controls.Add($help)
-    $list = New-Object System.Windows.Forms.ListBox
-    $list.Dock = 'Fill'; $list.BorderStyle = 'None'; $list.BackColor = $C.Bg; $list.ForeColor = $C.Fore; $list.IntegralHeight = $false; $list.ItemHeight = $FontMain.Height + (Px 10)
-    $list.add_DoubleClick({ param($src, $e) if ($src.SelectedItem) { Open-DiagramFile (Join-Path $DgDir "$($src.SelectedItem).dgm"); Select-ApiTab $DgUI.Tabs 'Text' } })
+    $sbar = New-Object System.Windows.Forms.FlowLayoutPanel
+    $sbar.Dock = 'Top'; $sbar.AutoSize = $true; $sbar.WrapContents = $true; $sbar.BackColor = $C.Bg; $sbar.Padding = New-Object System.Windows.Forms.Padding((Px 4), (Px 4), (Px 4), (Px 2))
+    [void](New-Button 'New folder' 'A folder inside the selected one' { New-DiagramFolder } $sbar $Glyph.Folder 2)
+    [void](New-Button 'New diagram' 'A new diagram in the selected folder' { New-DiagramNamed } $sbar $Glyph.Add 2)
+    [void](New-Button '' 'Open the diagrams folder in Explorer' { Start-Process explorer.exe (Get-DiagramTargetDir) } $sbar $Glyph.Open 2)
+    $DgUI.FolderLabel = New-Object System.Windows.Forms.Label
+    $DgUI.FolderLabel.Dock = 'Bottom'; $DgUI.FolderLabel.AutoSize = $false; $DgUI.FolderLabel.Height = $FontSmall.Height + (Px 10); $DgUI.FolderLabel.ForeColor = $C.Dim; $DgUI.FolderLabel.BackColor = $C.Bg; $DgUI.FolderLabel.Font = $FontSmall
+    $DgUI.FolderLabel.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 3), 0, 0)
+    $tv = New-Object System.Windows.Forms.TreeView
+    $tv.Dock = 'Fill'; $tv.BorderStyle = 'None'; $tv.BackColor = $C.Bg; $tv.ForeColor = $C.Fore; $tv.ItemHeight = $FontMain.Height + (Px 10); $tv.HideSelection = $false
+    $tv.ShowLines = $false; $tv.FullRowSelect = $true; $tv.AllowDrop = $true; $tv.LabelEdit = $false
+    $DgUI.OpenFolders = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $il = New-Object System.Windows.Forms.ImageList; $il.ColorDepth = 'Depth32Bit'; $il.ImageSize = New-Object System.Drawing.Size((Px 16), (Px 16))
+    $gf = New-GlyphImage $Glyph.Folder $C.Orange; $gd = New-GlyphImage $Glyph.Apps $C.Accent
+    if ($gf -and $gd) { $il.Images.Add('folder', $gf); $il.Images.Add('file', $gd); $tv.ImageList = $il }
+    $tv.add_AfterExpand({ param($src, $e) if ($e.Node.Tag) { [void]$DgUI.OpenFolders.Add($e.Node.Tag.Path) } })
+    $tv.add_AfterCollapse({ param($src, $e) if ($e.Node.Tag) { [void]$DgUI.OpenFolders.Remove($e.Node.Tag.Path) } })
+    $tv.add_AfterSelect({
+        param($src, $e)
+        if ($DgUI.TreeQuiet) { return }
+        $DgUI.TargetDir = Get-DiagramNodeDir $e.Node
+        $DgUI.FolderLabel.Text = "New diagrams go into:  \" + (Get-DiagramRelative (Get-DiagramTargetDir))
+    })
+    $tv.add_NodeMouseClick({ param($src, $e) if ($e.Button -eq 'Right') { $src.SelectedNode = $e.Node } })
+    $tv.add_NodeMouseDoubleClick({ param($src, $e) if ($e.Node.Tag -and $e.Node.Tag.Kind -eq 'file') { Open-DiagramFile $e.Node.Tag.Path; Select-ApiTab $DgUI.Tabs 'Text' } })
+    $tv.add_KeyDown({
+        param($src, $e)
+        $n = $src.SelectedNode
+        if ($e.KeyCode -eq 'Return' -and $n -and $n.Tag -and $n.Tag.Kind -eq 'file') { $e.SuppressKeyPress = $true; Open-DiagramFile $n.Tag.Path; Select-ApiTab $DgUI.Tabs 'Text' }
+        elseif ($e.KeyCode -eq 'F2' -and $n) { $e.SuppressKeyPress = $true; Rename-DiagramItem $n }
+        elseif ($e.KeyCode -eq 'Delete' -and $n) { $e.SuppressKeyPress = $true; Remove-DiagramItem $n }
+    })
+    # drag diagrams and folders onto a folder (or empty space = the top)
+    $tv.add_ItemDrag({ param($src, $e) if ($e.Item.Tag) { [void]$src.DoDragDrop($e.Item, [System.Windows.Forms.DragDropEffects]::Move) } })
+    $tv.add_DragOver({
+        param($src, $e)
+        if (-not $e.Data.GetDataPresent([System.Windows.Forms.TreeNode])) { $e.Effect = 'None'; return }
+        $pt = $src.PointToClient((New-Object System.Drawing.Point($e.X, $e.Y)))
+        $target = $src.GetNodeAt($pt)
+        $e.Effect = 'Move'
+        if ($target) { $src.SelectedNode = $target }
+    })
+    $tv.add_DragDrop({
+        param($src, $e)
+        $node = $e.Data.GetData([System.Windows.Forms.TreeNode])
+        if (-not $node -or -not $node.Tag) { return }
+        $pt = $src.PointToClient((New-Object System.Drawing.Point($e.X, $e.Y)))
+        $target = $src.GetNodeAt($pt)
+        $to = if ($target -and $target.Tag) { Get-DiagramNodeDir $target } else { $DgDir }
+        Move-DiagramItem $node.Tag.Path $to
+    })
     $lm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
-    [void](Add-MenuItem $lm 'Open' { $s = $DgUI.List.SelectedItem; if ($s) { Open-DiagramFile (Join-Path $DgDir "$s.dgm"); Select-ApiTab $DgUI.Tabs 'Text' } } $Glyph.Open)
-    [void](Add-MenuItem $lm 'Rename...' {
-        $s = $DgUI.List.SelectedItem; if (-not $s) { return }
-        $n = Read-TextDialog 'Rename diagram' 'New name' $s $DgUI.Form
-        if (-not $n -or $n -eq $s) { return }
-        $new = Join-Path $DgDir ((New-DiagramName $n) + '.dgm')
-        Move-Item -LiteralPath (Join-Path $DgDir "$s.dgm") -Destination $new
-        if ($DgUI.File -eq (Join-Path $DgDir "$s.dgm")) { $DgUI.File = $new; Update-DiagramTitle }
-        Update-DiagramList
-    } $Glyph.Edit)
-    [void](Add-MenuItem $lm 'Delete' {
-        $s = $DgUI.List.SelectedItem; if (-not $s) { return }
-        if ([System.Windows.Forms.MessageBox]::Show($DgUI.Form, "Delete the diagram ""$s""?", 'Diagram studio', 'YesNo', 'Question') -ne 'Yes') { return }
-        $p = Join-Path $DgDir "$s.dgm"
-        if ($DgUI.File -eq $p) { $DgUI.File = ''; Update-DiagramTitle }
-        Remove-Item -LiteralPath $p -Force
-        Update-DiagramList
-    } $Glyph.Delete)
-    $list.ContextMenuStrip = $lm
-    $pSaved.Controls.Add($list)
+    $lm.add_Opening({
+        param($src, $e)
+        $src.Items.Clear()
+        $n = $DgUI.List.SelectedNode; $tg = if ($n) { $n.Tag } else { $null }
+        if ($tg -and $tg.Kind -eq 'file') {
+            [void](Add-MenuItem $src 'Open' { Open-DiagramFile $DgUI.List.SelectedNode.Tag.Path; Select-ApiTab $DgUI.Tabs 'Text' } $Glyph.Open 'Enter')
+            [void](Add-MenuItem $src 'Duplicate' { Copy-DiagramItem $DgUI.List.SelectedNode } $Glyph.Copy)
+        }
+        [void](Add-MenuItem $src 'New diagram here' { $DgUI.TargetDir = Get-DiagramNodeDir $DgUI.List.SelectedNode; New-DiagramNamed } $Glyph.Add)
+        [void](Add-MenuItem $src 'New folder here' { New-DiagramFolder (Get-DiagramNodeDir $DgUI.List.SelectedNode) } $Glyph.Folder)
+        if ($tg) {
+            [void]$src.Items.Add('-')
+            [void](Add-MenuItem $src 'Rename...' { Rename-DiagramItem $DgUI.List.SelectedNode } $Glyph.Edit 'F2')
+            Add-DiagramMoveMenu $src $tg.Path
+            [void](Add-MenuItem $src 'Delete' { Remove-DiagramItem $DgUI.List.SelectedNode } $Glyph.Delete 'Del')
+        }
+        [void]$src.Items.Add('-')
+        [void](Add-MenuItem $src 'Show in Explorer' { $n = $DgUI.List.SelectedNode; if ($n -and $n.Tag -and $n.Tag.Kind -eq 'file') { Start-Process explorer.exe "/select,`"$($n.Tag.Path)`"" } else { Start-Process explorer.exe (Get-DiagramNodeDir $n) } } $Glyph.Open)
+    })
+    $tv.ContextMenuStrip = $lm
+    $pSaved.Controls.Add($tv); $pSaved.Controls.Add($DgUI.FolderLabel); $pSaved.Controls.Add($sbar)
+    $list = $tv
     $DgUI.List = $list; $DgUI.Tabs = $tabs
     Select-ApiTab $tabs 'Text'
 
     # top: commands
     $top = New-Object System.Windows.Forms.FlowLayoutPanel
     $top.Dock = 'Top'; $top.AutoSize = $true; $top.WrapContents = $true; $top.BackColor = $C.Panel; $top.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 6))
-    [void](New-Button 'New' 'A new, empty diagram' { New-DiagramFromText 'Diagram' "title My diagram`r`ntheme midnight dark`r`n`r`na: Start`r`nb: Next step`r`na -> b" } $top $Glyph.Add 2)
+    [void](New-Button 'New' 'A new, empty diagram (in the folder selected in Saved)' { New-DiagramNamed } $top $Glyph.Add 2)
     $exb = New-Button 'Examples' 'Start from an example' { Show-DiagramExamplesMenu $this } $top $Glyph.Apps 2
     [void](New-Button '' 'Undo (Ctrl+Z)' { Undo-Diagram } $top ([string][char]0xE7A7) 2)
     [void](New-Button '' 'Redo (Ctrl+Y)' { Redo-Diagram } $top ([string][char]0xE7A6) 2)
