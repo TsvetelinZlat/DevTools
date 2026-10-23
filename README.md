@@ -482,7 +482,8 @@ Diagrams from a few lines of text: architecture maps, flowcharts, org charts and
   - **Embeddable widget**: the same as a block to paste into any existing page (its own height); give each diagram its own prefix and several can share a page.
   - **React component**: a `.jsx` file with `theme` and `onSelect` props.
   - The page's buttons never act on the page around it (they are `type="button"`, so a widget inside a `<form>`, as in SharePoint or ASP.NET pages, no longer reloads the page), and the **Dark / Light** you pick is remembered for that diagram in the browser.
-  - **Small screens** (the diagram's own width, so a widget in a narrow column too): a compact header, the controls in one row at the bottom (within thumb reach), legend chips in one row you can swipe, the details as a bottom sheet, and **pinch to zoom**.
+  - The controls (Pause, speed, Dark / Light, zoom, Fit) sit in the bottom row next to the legend, the title and live totals at the top.
+  - **Small screens** (the diagram's own width, so a widget in a narrow column too): a compact header, the controls in one row above the legend (swipe it sideways if it doesn't fit), legend chips in one row you can swipe, the details as a bottom sheet, and **pinch to zoom**.
   - **Open website button**: tick it in a shape's properties (or write `button`, or `button "Open docs"`, next to its `url`) and pointing at that shape in the web page shows a button that opens its link in a new tab; on a touch screen tapping the shape shows it.
   - Every export is **plain ASCII** (characters like `– → é` are written as `&#x2013;` in the markup and `\u2013` in scripts), so it shows the same in any page whatever its encoding, and it **needs no internet**: the system fonts are used (Segoe UI / Cascadia Mono / Consolas, with standard fallbacks). Tick **Load the font from Google Fonts** only if you set a `font` and want it downloaded.
   - **SVG code**, with a live preview of the code and options:

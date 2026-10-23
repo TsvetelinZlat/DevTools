@@ -23822,15 +23822,17 @@ public static class DgHtml {
         sb.Append("<div class=\"dg-bar\">\n");
         if (o.Header) sb.Append("  <div class=\"dg-head\"><div class=\"dg-ttl\"><span class=\"dg-live\"></span><span>" + DgSvgPainter.Esc(string.IsNullOrEmpty(d.Title) ? "Diagram" : d.Title) + "</span></div>" + (o.Flows ? "<div class=\"dg-stats\"></div>" : "") + "</div>\n");
         else sb.Append("  <span></span>\n");
-        if (o.Flows || o.ThemeSwitch || o.Zoom) {
-            sb.Append("  <div class=\"dg-tools\">");
-            if (o.Flows) sb.Append("<button type=\"button\" class=\"dg-pause\">Pause</button><div class=\"dg-seg dg-speed\"><button type=\"button\" data-v=\"0.5\">0.5x</button><button type=\"button\" data-v=\"1\" class=\"dg-act\">1x</button><button type=\"button\" data-v=\"2\">2x</button><button type=\"button\" data-v=\"4\">4x</button></div>");
-            if (o.ThemeSwitch) sb.Append("<div class=\"dg-seg dg-theme\"><button type=\"button\" data-v=\"dark\">Dark</button><button type=\"button\" data-v=\"light\">Light</button></div>");
-            if (o.Zoom) sb.Append("<button type=\"button\" class=\"dg-zout\" title=\"Zoom out\">\u2212</button><span class=\"dg-zoom\">100%</span><button type=\"button\" class=\"dg-zin\" title=\"Zoom in\">+</button><button type=\"button\" class=\"dg-fit\">Fit</button>");
-            sb.Append("</div>\n");
-        }
         sb.Append("</div>\n");
-        sb.Append("<div class=\"dg-foot\">" + (o.Legend ? "<div class=\"dg-legend\"></div>" : "<span></span>") +
+        // the controls sit in the bottom row, before the legend
+        var tools = new StringBuilder();
+        if (o.Flows || o.ThemeSwitch || o.Zoom) {
+            tools.Append("<div class=\"dg-tools\">");
+            if (o.Flows) tools.Append("<button type=\"button\" class=\"dg-pause\">Pause</button><div class=\"dg-seg dg-speed\"><button type=\"button\" data-v=\"0.5\">0.5x</button><button type=\"button\" data-v=\"1\" class=\"dg-act\">1x</button><button type=\"button\" data-v=\"2\">2x</button><button type=\"button\" data-v=\"4\">4x</button></div>");
+            if (o.ThemeSwitch) tools.Append("<div class=\"dg-seg dg-theme\"><button type=\"button\" data-v=\"dark\">Dark</button><button type=\"button\" data-v=\"light\">Light</button></div>");
+            if (o.Zoom) tools.Append("<button type=\"button\" class=\"dg-zout\" title=\"Zoom out\">\u2212</button><span class=\"dg-zoom\">100%</span><button type=\"button\" class=\"dg-zin\" title=\"Zoom in\">+</button><button type=\"button\" class=\"dg-fit\">Fit</button>");
+            tools.Append("</div>");
+        }
+        sb.Append("<div class=\"dg-foot\">" + tools + (o.Legend ? "<div class=\"dg-legend\"></div>" : "<span></span>") +
                   (o.Hint ? "<span class=\"dg-hint\">" + (d.Chart != null ? "Point at a bar or a dot for its value \u00B7 click the legend to hide a series" : "Drag to pan \u00B7 Ctrl + wheel to zoom" + (o.Panel ? " \u00B7 Click a component for details" : "")) + "</span>" : "") + "</div>\n");
         if (o.Panel) sb.Append("<aside class=\"dg-panel\" hidden></aside>\n");
         sb.Append("</div>\n");
@@ -27861,12 +27863,6 @@ public static class DgAssets {
   function narrow() {
     var w = root.clientWidth, n = w > 0 && w < 640;
     root.classList.toggle(P + '-narrow', n);
-    // on a narrow diagram the controls sit at the bottom (within thumb reach), above the legend; wide: back at the top
-    var tools = q(cls('tools')), bar = q(cls('bar')), foot = q(cls('foot'));
-    if (tools && bar && foot) {
-      if (n && tools.parentNode !== foot) foot.insertBefore(tools, foot.firstChild);
-      else if (!n && tools.parentNode !== bar) bar.appendChild(tools);
-    }
   }
   narrow();
   var ro = window.ResizeObserver ? new ResizeObserver(function () { narrow(); if (!userMoved) fit(); }) : null;
@@ -27939,7 +27935,8 @@ public static class DgAssets {
 .__P__-seg button{height:26px;border:none;background:transparent;color:var(--muted);padding:0 9px}
 .__P__-seg button.__P__-act{background:var(--sel);color:var(--bg)}
 .__P__-zoom{min-width:44px;text-align:center}
-.__P__-foot{position:absolute;left:14px;right:14px;bottom:14px;display:flex;justify-content:space-between;align-items:flex-end;gap:10px;flex-wrap:wrap;pointer-events:none}
+.__P__-foot{position:absolute;left:14px;right:14px;bottom:14px;display:flex;justify-content:flex-start;align-items:flex-end;gap:10px;flex-wrap:wrap;pointer-events:none}
+.__P__-foot .__P__-hint{margin-left:auto}
 .__P__-legend{display:flex;gap:8px;flex-wrap:wrap;pointer-events:auto}
 .__P__-legend button{display:flex;align-items:center;gap:8px;height:32px;padding:0 14px;border-radius:16px;color:var(--ink);font-family:var(--font);font-size:12.5px;cursor:pointer;white-space:nowrap}
 .__P__-legend i{width:9px;height:9px;border-radius:50%;display:inline-block}
