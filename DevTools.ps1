@@ -21480,7 +21480,8 @@ public class DgCategory { public string Id = "", Name = "", Light = "", Dark = "
 
 public class DgNode {
     public string Id = "", Label = "", Badge = "", Cat = "", Shape = "", Fill = "", Stroke = "", TextColor = "", Icon = "", Status = "", Metric = "", Url = "", Desc = "", Group = "";
-    public string Button = "";      // "Open website" (or its own text): a button by the box in the web page, when it has a url
+    public string LinkText = "";    // the text on the link's button (details panel and hover button); empty: "Open webpage"
+    public string Button = "";      // "Open webpage" (or its own text): a button by the box in the web page, when it has a url
     public List<string> Tags = new List<string>(), Lines = new List<string>(), Items = new List<string>();
     public int Lane = -1, SrcLine = -1, Order, Rank = -1;
     public float X, Y, W, H, FontSize, SetW, SetH;
@@ -21876,7 +21877,8 @@ public static class DgText {
             case "line": n.Lines.Add(Unq(v)); break;
             case "items": n.Items.Clear(); foreach (var t in Words(v)) n.Items.Add(t); break;
             case "url": case "link": n.Url = Unq(v); break;
-            case "button": n.Button = Unq(v).Length > 0 ? Unq(v) : "Open website"; break;
+            case "button": n.Button = Unq(v).Length > 0 ? Unq(v) : "Open webpage"; break;
+            case "linktext": case "buttontext": n.LinkText = Unq(v); break;
             case "metric": n.Metric = Unq(v); break;
             case "badge": n.Badge = Unq(v); break;
             case "status": n.Status = Unq(v).ToLowerInvariant(); break;
@@ -21998,7 +22000,7 @@ public static class DgText {
     static bool KnownKey(string k) {
         switch (k) {
             case "badge": case "lane": case "at": case "size": case "w": case "width": case "h": case "height": case "shape": case "fill": case "stroke": case "border": case "color": case "text":
-            case "icon": case "status": case "metric": case "url": case "link": case "button": case "font": case "lines": case "items": case "in": case "group": case "cat": case "category": case "flow":
+            case "icon": case "status": case "metric": case "url": case "link": case "button": case "linktext": case "buttontext": case "font": case "lines": case "items": case "in": case "group": case "cat": case "category": case "flow":
             case "desc": case "tags": case "label": case "via": case "density": case "arrow": case "from": case "to": case "route": case "labelat": return true;
         }
         return false;
@@ -22028,7 +22030,8 @@ public static class DgText {
                 case "status": n.Status = v.ToLowerInvariant(); break;
                 case "metric": n.Metric = Unq(v); break;
                 case "url": case "link": n.Url = Unq(v); break;
-                case "button": n.Button = Unq(v).Length > 0 ? Unq(v) : "Open website"; break;
+                case "button": n.Button = Unq(v).Length > 0 ? Unq(v) : "Open webpage"; break;
+                case "linktext": case "buttontext": n.LinkText = Unq(v); break;
                 case "font": n.FontSize = F(v, 0); break;
                 case "lines": n.Lines.Clear(); foreach (var t in Words(v)) n.Lines.Add(t); break;
                 case "items": n.Items.Clear(); foreach (var t in Words(v)) n.Items.Add(t); break;
@@ -23873,6 +23876,7 @@ public static class DgHtml {
             if (n.Metric.Length > 0) x.Append(",\"m\":" + J(n.Metric));
             if (n.Url.Length > 0) x.Append(",\"u\":" + J(n.Url));
             if (n.Url.Length > 0 && n.Button.Length > 0) x.Append(",\"gb\":" + J(n.Button));
+            if (n.Url.Length > 0 && n.LinkText.Length > 0) x.Append(",\"bt\":" + J(n.LinkText));
             if (n.Spark && DgLayout.IsCard(n)) x.Append(",\"sp\":[" + Nm(n.X + 14) + "," + Nm(n.Y + n.H - 14 - 28) + "," + Nm(n.W - 28) + ",26]");
             x.Append("}");
             parts.Add(x.ToString());
@@ -27766,7 +27770,7 @@ public static class DgAssets {
       goEl.addEventListener('mouseleave', function () { goSoon(null); });
       root.appendChild(goEl);
     }
-    goId = id; goEl.href = u; goEl.title = u; goEl.textContent = D.nodes[id].gb + ' \u2197'; goEl.style.display = 'block'; placeGo();
+    goId = id; goEl.href = u; goEl.title = u; goEl.textContent = (D.nodes[id].bt || D.nodes[id].gb) + ' \u2197'; goEl.style.display = 'block'; placeGo();
   }
   // a moment's grace, so the pointer can move from the box onto the button
   function goSoon(id) { clearTimeout(goTimer); if (id) { showGo(id); return; } goTimer = setTimeout(function () { if (!st.sel || !goUrl(st.sel) || !touchy) showGo(null); else showGo(st.sel); }, 350); }
@@ -27899,7 +27903,7 @@ public static class DgAssets {
       '<div class=""' + P + '-ps""><div class=""' + P + '-psh""><span>Last 40 seconds</span><span class=""' + P + '-pr""></span></div><svg width=""100%"" height=""56"" viewBox=""0 0 300 56"" preserveAspectRatio=""none""><path class=""' + P + '-psp"" style=""fill:none;stroke:' + col + ';stroke-width:1.8;stroke-linejoin:round"" vector-effect=""non-scaling-stroke""/></svg></div>' +
       '<div class=""' + P + '-pg""><div><span>Packets observed</span><b class=""' + P + '-po"">0</b></div><div><span>Dropped here</span><b class=""' + P + '-pdr"">0</b></div></div>' +
       '<div class=""' + P + '-pio""><div><span>Receives from</span>' + esc(ins.join(', ') || '-') + '</div><div><span>Sends to</span>' + esc(out.join(', ') || '-') + '</div></div>' +
-      (n.u ? '<a class=""' + P + '-lnk"" href=""' + esc(n.u) + '"" target=""_blank"" rel=""noopener"">Open link \u2197</a>' : '') +
+      (n.u ? '<a class=""' + P + '-lnk"" href=""' + esc(n.u) + '"" target=""_blank"" rel=""noopener"" title=""' + esc(n.u) + '"">' + esc(n.bt || n.gb || 'Open webpage') + ' \u2197</a>' : '') +
       '<div class=""' + P + '-pf""><span class=""' + P + '-st' + (down ? ' ' + P + '-bad' : '') + '""><i></i>' + (down ? 'Down' : 'Operational') + '</span>' +
       (O.outage ? '<button type=""button"" class=""' + P + '-out"">' + (down ? 'End outage' : 'Simulate outage') + '</button>' : '') + '</div>';
     panel.hidden = false;
@@ -28057,7 +28061,8 @@ public static class DgAssets {
 .__P__-pg b{font-family:var(--mono);font-size:16px;font-weight:500}
 .__P__-pio{display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:12px;line-height:1.5}
 .__P__-pio div{display:flex;flex-direction:column;gap:4px}
-.__P__-lnk{color:var(--sel);font-size:12.5px}
+.__P__-lnk{display:inline-block;margin-top:12px;padding:7px 14px;border-radius:8px;background:var(--sel);color:var(--card);font-size:12.5px;font-weight:600;text-decoration:none;box-shadow:0 4px 12px rgba(0,0,0,.18)}
+.__P__-lnk:hover{filter:brightness(1.1)}
 .__P__-pf{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-top:14px;border-top:1px solid var(--btnLine)}
 .__P__-st{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ok)}
 .__P__-st i{width:8px;height:8px;border-radius:50%;background:currentColor}
@@ -29131,8 +29136,9 @@ function Update-DiagramProps {
         Add-DgProp $p 'Items inside (one per line; link to them as id.1, id.2 ...)' (New-DgBox (@($node.Items) -join "`r`n") { param($v) $w = Format-DiagramWords ($v -split "`r?`n"); Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'items', $(if ($w) { $w } else { $null }))) } -Multi -Height 54) | Out-Null
         Add-DgProp $p 'Description (shown when the shape is clicked)' (New-DgBox $node.Desc { param($v) Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'desc', $(if ($v.Trim()) { '"' + (($v -replace '"', "'") -replace "`r?`n", ' ') + '"' } else { $null }))) } -Multi -Height 64) | Out-Null
         Add-DgProp $p 'Tags (comma separated)' (New-DgBox (@($node.Tags) -join ', ') { param($v) $w = (@($v -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join '; '); Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'tags', $(if ($w) { $w } else { $null }))) }) | Out-Null
+        Add-DgProp $p 'Button text (empty: Open webpage)' (New-DgBox $node.LinkText { param($v) Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'linktext', $(if ($v) { '"' + ($v -replace '"', "'") + '"' } else { $null }))) }) | Out-Null
         Add-DgProp $p 'Link (opens when clicked in the web page)' (New-DgBox $node.Url { param($v) Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'url', $(if ($v) { '"' + $v + '"' } else { $null }))) }) | Out-Null
-        $gb = New-CheckBox $p 'Open website button on hover (web page)' ($node.Button.Length -gt 0); $gb.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, 0)
+        $gb = New-CheckBox $p 'Open webpage button on hover (web page)' ($node.Button.Length -gt 0); $gb.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, 0)
         $gb.add_CheckedChanged({ param($src, $e) Set-DiagramNodeAttr $DgUI.PropId 'button' $(if ($src.Checked) { '' } else { $null }) })
         $row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.AutoSize = $true; $row.WrapContents = $true; $row.MaximumSize = New-Object System.Drawing.Size((Px (260 * $TextZoom)), 0); $row.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0)
         [void](New-DgColorButton $row 'Fill' $node.Fill { param($v) Set-DiagramNodeAttr $DgUI.PropId 'fill' $v })
