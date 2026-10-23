@@ -29250,6 +29250,7 @@ function Show-DiagramStudio([string]$Text = '') {
     [void](New-Button 'New' 'A new, empty diagram (in the folder selected in Saved)' { New-DiagramNamed } $top $Glyph.Add 2)
     $exb = New-Button 'Examples' 'Start from an example' { Show-DiagramExamplesMenu $this } $top $Glyph.Apps 2
     [void](New-Button 'Import...' 'Open a diagram from a file (or drop it on this window): .dgm / .txt, Mermaid, draw.io, Graphviz DOT, CSV / Excel, or an SVG / HTML / PNG exported by DevTools' { Open-DiagramImport } $top $Glyph.Open 2)
+    $exp = New-Button 'Export' 'Picture, PNG, SVG, an interactive web page, a widget or a React component' { Show-DiagramExportMenu $this } $top $Glyph.Save 1
     [void](New-Button '' 'Undo (Ctrl+Z)' { Undo-Diagram } $top ([string][char]0xE7A7) 2)
     [void](New-Button '' 'Redo (Ctrl+Y)' { Redo-Diagram } $top ([string][char]0xE7A6) 2)
     $DgUI.ModeBtn = New-Button 'Edit' 'Edit: drag, link and style shapes.  Preview: click shapes for details and try outages, as in the web page.' {
@@ -29270,7 +29271,6 @@ function Show-DiagramStudio([string]$Text = '') {
         foreach ($n in $DgUI.Doc.Nodes) { if ($n.HasPos) { $t = [DgText]::SetNodeAttr($t, $n.Id, 'at', $null) } }
         Set-DiagramText $t -Fit
     } $top $Glyph.Refresh 2)
-    $exp = New-Button 'Export' 'Picture, PNG, SVG, an interactive web page, a widget or a React component' { Show-DiagramExportMenu $this } $top $Glyph.Save 1
 
     # middle: canvas
     $cv = New-Object DgCanvas
