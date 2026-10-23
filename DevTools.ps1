@@ -24952,6 +24952,14 @@ public static class DgDb {
         } catch { c.Dispose(); throw; }
         return c;
     }
+    // the same SQL Server connection in another database (Db.schema.table in a query)
+    public static string WithDatabase(string conn, string db) {
+        var s = Parse(conn);
+        if (s.Kind != "sqlclient") return conn;
+        var b = new System.Data.SqlClient.SqlConnectionStringBuilder(s.ConnStr);
+        b.InitialCatalog = db;
+        return b.ConnectionString;
+    }
     static string QuoteOracle(string n) { return Regex.IsMatch(n, @"^[A-Za-z][A-Za-z0-9_$#]*$") ? n.ToUpperInvariant() : "\"" + n.Replace("\"", "") + "\""; }
 
     // a name as the editor should write it: [dbo].[T] / "Mixed"."Case" / plain when it needs no quotes
@@ -25043,7 +25051,9 @@ public static class DgDb {
     }
 
     // columns of every table and view (or of one): sch, tbl, col, typ (with its size), nul (1/0), pk (1/0), fk (1/0), kind (U / V)
-    public static System.Data.DataTable Columns(string conn, string onlySchema, string onlyTable) {
+    public static System.Data.DataTable Columns(string conn, string onlySchema, string onlyTable) { return Columns(conn, onlySchema, onlyTable, null); }
+    // link: an Oracle db link the dictionary views are read through (OWNER empty = the link's own user)
+    public static System.Data.DataTable Columns(string conn, string onlySchema, string onlyTable, string link) {
         string d = Dialect(conn), sql;
         Func<string, string> lit = v => "'" + (v ?? "").Replace("'", "''") + "'";
         bool one = !string.IsNullOrEmpty(onlyTable);
@@ -25067,8 +25077,12 @@ ORDER BY c.table_schema, c.table_name, c.ordinal_position";
      WHERE k.constraint_type = 'R' AND cc.owner = c.owner AND cc.table_name = c.table_name AND cc.column_name = c.column_name) THEN 1 ELSE 0 END AS fk,
   CASE WHEN o.object_type = 'VIEW' THEN 'V' ELSE 'U' END AS kind
 FROM all_tab_columns c JOIN all_objects o ON o.owner = c.owner AND o.object_name = c.table_name AND o.object_type IN ('TABLE', 'VIEW')
-WHERE " + (one ? "c.owner = " + lit(onlySchema) + " AND c.table_name = " + lit(onlyTable) : "c.owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AND c.table_name NOT LIKE 'BIN$%'") + @"
+WHERE " + (one ? "c.owner = " + (string.IsNullOrEmpty(onlySchema) && !string.IsNullOrEmpty(link) ? "(SELECT USER FROM dual)" : lit(onlySchema)) + " AND c.table_name = " + lit(onlyTable) : "c.owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AND c.table_name NOT LIKE 'BIN$%'") + @"
 ORDER BY c.table_name, c.column_id";
+            if (!string.IsNullOrEmpty(link)) {
+                if (!Regex.IsMatch(link, @"^[A-Za-z][\w$#.]*$")) throw new Exception("Not a db link name: " + link);
+                sql = Regex.Replace(sql, @"\b(all_tab_columns|all_objects|all_cons_columns|all_constraints|dual)\b", "$1@" + link);
+            }
         } else {
             sql = @"SELECT s.name AS sch, o.name AS tbl, c.name AS col, TYPE_NAME(c.user_type_id) AS typ, c.max_length AS len, c.precision AS prec, c.scale AS scale, CAST(c.is_nullable AS int) AS nul,
   CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id WHERE i.is_primary_key = 1 AND ic.object_id = c.object_id AND ic.column_id = c.column_id) THEN 1 ELSE 0 END AS pk,
@@ -25176,24 +25190,84 @@ WHERE c.constraint_type = 'R' AND c.owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHE
 public class DgSqlSchema {
     // "schema.table" (lower case) -> columns: name, type, "PK"/"", "FK"/""
     public Dictionary<string, List<string[]>> Tables = new Dictionary<string, List<string[]>>(StringComparer.OrdinalIgnoreCase);
-    public string DefaultSchema = "dbo";
+    public string DefaultSchema = "dbo", Dialect = "mssql", CurrentDb = "", Conn = "";
+    // what was read on demand (another database, schema or db link) and why something couldn't be
+    readonly HashSet<string> tried = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, string> failed = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     public static DgSqlSchema Load(string conn) {
         var s = new DgSqlSchema();
+        s.Conn = conn; s.Dialect = DgDb.Dialect(conn);
         s.DefaultSchema = DgDb.DefaultSchema(conn);
-        var t = DgDb.Columns(conn, null, null);
-        foreach (System.Data.DataRow r in t.Rows) {
-            string k = r["sch"] + "." + r["tbl"];
-            List<string[]> l; if (!s.Tables.TryGetValue(k, out l)) { l = new List<string[]>(); s.Tables[k] = l; }
-            l.Add(new[] { r["col"].ToString(), r["typ"].ToString(), Convert.ToInt32(r["pk"]) == 1 ? "PK" : "", Convert.ToInt32(r["fk"]) == 1 ? "FK" : "" });
-        }
+        if (s.Dialect == "mssql") { try { s.CurrentDb = DgSql.Query(conn, "SELECT DB_NAME()", 15).Rows[0][0].ToString(); } catch { } }
+        s.Add(DgDb.Columns(conn, null, null), null);
         return s;
     }
+    // rows of DgDb.Columns; key = null: "schema.table", else every row goes under that key
+    void Add(System.Data.DataTable t, string key) {
+        foreach (System.Data.DataRow r in t.Rows) {
+            string k = key ?? (r["sch"] + "." + r["tbl"]);
+            List<string[]> l; if (!Tables.TryGetValue(k, out l)) { l = new List<string[]>(); Tables[k] = l; }
+            l.Add(new[] { r["col"].ToString(), r["typ"].ToString(), Convert.ToInt32(r["pk"]) == 1 ? "PK" : "", Convert.ToInt32(r["fk"]) == 1 ? "FK" : "" });
+        }
+    }
+    // reads one table once; 'scope' is the database / schema / link: when it can't be reached, it isn't tried again
+    void Fetch(string scope, string tableKey, Func<System.Data.DataTable> read, string key) {
+        if (failed.ContainsKey(scope) || !tried.Add(tableKey)) return;
+        try { Add(read(), key); }
+        catch (Exception ex) { var m = DgDb.ErrorText(ex).Split('\n')[0].Trim(); failed[scope] = m.Length > 90 ? m.Substring(0, 90) + "..." : m; }
+    }
+
+    // the key of a table in Tables (reading it first when it is in another database, schema or db link), or null
     public string Resolve(string name) {
-        var parts = name.Split('.').Where(p => p.Length > 0).ToList();
-        if (parts.Count >= 2) { var k = parts[parts.Count - 2] + "." + parts[parts.Count - 1]; if (Tables.ContainsKey(k)) return k; }
-        var last = parts.Count > 0 ? parts[parts.Count - 1] : name;
-        if (Tables.ContainsKey(DefaultSchema + "." + last)) return DefaultSchema + "." + last;
-        return Tables.Keys.FirstOrDefault(k => k.EndsWith("." + last, StringComparison.OrdinalIgnoreCase));
+        string link = "";
+        int at = name.IndexOf('@');
+        if (at > 0) { link = name.Substring(at + 1).Trim(); name = name.Substring(0, at); }
+        var raw = name.Split('.').Select(p => p.Trim()).ToList();
+        if (Dialect == "mssql" && raw.Count == 3 && raw[1].Length == 0) raw[1] = "dbo";        // db..table
+        var parts = raw.Where(p => p.Length > 0).ToList();
+        if (parts.Count == 0) return null;
+        if (link.Length > 0) {                                                                  // Oracle: TABLE@LINK, OWNER.TABLE@LINK
+            if (Dialect != "oracle" || !Regex.IsMatch(link, @"^[A-Za-z][\w$#.]*$") || parts.Count > 2) return null;
+            string key = string.Join(".", parts).ToUpperInvariant() + "@" + link.ToUpperInvariant();
+            string owner = parts.Count == 2 ? parts[0] : "", table = parts[parts.Count - 1];
+            Fetch("link:" + link, key, () => DgDb.Columns(Conn, owner, table, link), key);
+            return Tables.ContainsKey(key) ? key : null;
+        }
+        if (Dialect == "mssql" && parts.Count >= 3) {
+            if (parts.Count > 3) return null;                                                   // a linked server: not read
+            string db = parts[0];
+            if (!string.Equals(db, CurrentDb, StringComparison.OrdinalIgnoreCase)) {          // Db.schema.table in another database
+                string key = db + "." + parts[1] + "." + parts[2];
+                Fetch("db:" + db, key, () => DgDb.Columns(DgDb.WithDatabase(Conn, db), parts[1], parts[2]), key);
+                return Tables.ContainsKey(key) ? key : null;
+            }
+            parts = parts.Skip(1).ToList();
+        }
+        if (parts.Count >= 2) {
+            var k = parts[parts.Count - 2] + "." + parts[parts.Count - 1];
+            if (Tables.ContainsKey(k)) return Real(k);
+            if (Dialect == "oracle" && !string.Equals(parts[parts.Count - 2], DefaultSchema, StringComparison.OrdinalIgnoreCase)) {   // OWNER.TABLE in another schema
+                string owner = parts[parts.Count - 2], table = parts[parts.Count - 1];
+                Fetch("owner:" + owner, k, () => DgDb.Columns(Conn, owner.ToUpperInvariant(), table.ToUpperInvariant()), null);
+                if (Tables.ContainsKey(k)) return Real(k);
+            }
+            return null;                                                                        // a schema was named: no guessing
+        }
+        var last = parts[0];
+        if (Tables.ContainsKey(DefaultSchema + "." + last)) return Real(DefaultSchema + "." + last);
+        return Tables.Keys.FirstOrDefault(k => k.IndexOf('@') < 0 && k.Split('.').Length == 2 && k.EndsWith("." + last, StringComparison.OrdinalIgnoreCase));
+    }
+    string Real(string k) { return Tables.Keys.FirstOrDefault(x => string.Equals(x, k, StringComparison.OrdinalIgnoreCase)) ?? k; }     // as the database spells it
+    // why a name wasn't found ("not found", or the database / schema / link that couldn't be read)
+    public string Why(string name) {
+        int at = name.IndexOf('@');
+        if (at > 0) { string m; if (failed.TryGetValue("link:" + name.Substring(at + 1).Trim(), out m)) return "link not readable: " + m; return "not found"; }
+        var parts = name.Split('.').Where(p => p.Trim().Length > 0).ToList();
+        string f;
+        if (Dialect == "mssql" && parts.Count == 3 && failed.TryGetValue("db:" + parts[0], out f)) return "no access to " + parts[0] + ": " + f;
+        if (Dialect == "mssql" && parts.Count > 3) return "linked server, not read";
+        if (Dialect == "oracle" && parts.Count == 2 && failed.TryGetValue("owner:" + parts[0], out f)) return "can't read " + parts[0] + ": " + f;
+        return "not found";
     }
 }
 
@@ -25247,7 +25321,11 @@ public static class DgSqlViz {
     static int NameAt(List<Tok> t, int i, int end, out string name) {
         name = ""; if (i >= end || !(IsName(t[i]) || t[i].Kind == 0)) return i;
         var sb = new StringBuilder(t[i].T); int j = i + 1;
-        while (j + 1 < end && t[j].T == "." && (t[j + 1].Kind == 0 || t[j + 1].Kind == 4)) { sb.Append('.').Append(t[j + 1].T); j += 2; }
+        while (j + 1 < end && t[j].T == ".") {
+            if (t[j + 1].Kind == 0 || t[j + 1].Kind == 4) { sb.Append('.').Append(t[j + 1].T); j += 2; }
+            else if (t[j + 1].T == "." && j + 2 < end && (t[j + 2].Kind == 0 || t[j + 2].Kind == 4)) { sb.Append("..").Append(t[j + 2].T); j += 3; }     // db..table
+            else break;
+        }
         name = sb.ToString(); return j;
     }
     static int Close(List<Tok> t, int open, int end) { int d = 0; for (int i = open; i < end; i++) { if (t[i].T == "(") d++; else if (t[i].T == ")") { d--; if (d == 0) return i; } } return end - 1; }
@@ -25485,7 +25563,7 @@ public static class DgSqlViz {
             } else foreach (var m in s.Marks.Keys) lines.Add(Col(m, "", s, "", ""));
             foreach (var f in s.Filters.Take(4)) lines.Add(Q("? " + Cut(f, 46)));
             rowsOf[s.Id] = lines.Select(l => Regex.Match(l, "^\"([^ \"]*)").Groups[1].Value).ToList();
-            string title = s.Derived ? s.Name + (s.Join == "CTE" ? "  (CTE)" : "") : (s.Key.Length > 0 ? s.Key : s.Name + "  (not found)");
+            string title = s.Derived ? s.Name + (s.Join == "CTE" ? "  (CTE)" : "") : (s.Key.Length > 0 ? s.Key : s.Name + "  (" + (schema != null ? schema.Why(s.Name) : "not found").Replace("\"", "'").Replace("[", "(").Replace("]", ")") + ")");
             string badge = s.Alias.Length > 0 && !string.Equals(s.Alias, s.Name.Split('.').Last(), StringComparison.OrdinalIgnoreCase) ? s.Alias : "";
             sb.Append(s.Id + ": " + title.Replace("\n", " ") + " [shape table" + (badge.Length > 0 ? ", badge " + badge : "") + (s.Derived ? ", cat derived" : "") + ", lines " + string.Join(" ", lines) + "]\r\n");
             Map[s.Id] = new[] { s.Pos, s.Len };
