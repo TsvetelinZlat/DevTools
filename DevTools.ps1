@@ -26871,6 +26871,402 @@ public class DgFedRun {
     }
 }
 
+// ---- Importing diagrams: DevTools' own exports (they carry the diagram text), draw.io / diagrams.net and Graphviz DOT.
+public class DgImported { public string Name = "", Text = ""; }
+
+public static class DgImport {
+    // ---- the diagram text inside an export: "devtools-diagram:<base64 of the text>:end" in a comment / PNG text chunk
+    public static string Marker(string text) { return "devtools-diagram:" + Convert.ToBase64String(Encoding.UTF8.GetBytes(text ?? "")) + ":end"; }
+    public static string FindSource(string content) {
+        var m = Regex.Match(content ?? "", @"devtools-diagram:([A-Za-z0-9+/=]+):end");
+        if (!m.Success) return null;
+        try { return Encoding.UTF8.GetString(Convert.FromBase64String(m.Groups[1].Value)); } catch { return null; }
+    }
+
+    // ---- PNG text chunks (tEXt / zTXt / iTXt): DevTools puts its text in one, draw.io its diagram ("mxfile")
+    static uint Crc(byte[] b, int off, int len) {
+        uint c = 0xFFFFFFFF;
+        for (int i = off; i < off + len; i++) { c ^= b[i]; for (int k = 0; k < 8; k++) c = (c & 1) != 0 ? 0xEDB88320 ^ (c >> 1) : c >> 1; }
+        return c ^ 0xFFFFFFFF;
+    }
+    static uint BE(byte[] b, int i) { return (uint)(b[i] << 24 | b[i + 1] << 16 | b[i + 2] << 8 | b[i + 3]); }
+    public static void PngAddText(string path, string key, string value) {
+        var b = System.IO.File.ReadAllBytes(path);
+        if (b.Length < 12 || b[1] != 'P' || b[2] != 'N' || b[3] != 'G') return;
+        int i = 8, iend = -1;
+        while (i + 8 <= b.Length) { uint len = BE(b, i); string type = Encoding.ASCII.GetString(b, i + 4, 4); if (type == "IEND") { iend = i; break; } i += 12 + (int)len; }
+        if (iend < 0) return;
+        var data = Encoding.ASCII.GetBytes(key + "\0" + value);
+        var chunk = new byte[12 + data.Length];
+        chunk[0] = (byte)(data.Length >> 24); chunk[1] = (byte)(data.Length >> 16); chunk[2] = (byte)(data.Length >> 8); chunk[3] = (byte)data.Length;
+        Encoding.ASCII.GetBytes("tEXt").CopyTo(chunk, 4); data.CopyTo(chunk, 8);
+        uint crc = Crc(chunk, 4, 4 + data.Length);
+        chunk[8 + data.Length] = (byte)(crc >> 24); chunk[9 + data.Length] = (byte)(crc >> 16); chunk[10 + data.Length] = (byte)(crc >> 8); chunk[11 + data.Length] = (byte)crc;
+        var outB = new byte[b.Length + chunk.Length];
+        Array.Copy(b, 0, outB, 0, iend); chunk.CopyTo(outB, iend); Array.Copy(b, iend, outB, iend + chunk.Length, b.Length - iend);
+        System.IO.File.WriteAllBytes(path, outB);
+    }
+    public static string PngText(string path, string key) {
+        var b = System.IO.File.ReadAllBytes(path);
+        if (b.Length < 12 || b[1] != 'P' || b[2] != 'N' || b[3] != 'G') return null;
+        int i = 8;
+        while (i + 12 <= b.Length) {
+            int len = (int)BE(b, i); string type = Encoding.ASCII.GetString(b, i + 4, 4);
+            if (len < 0 || i + 12 + len > b.Length) break;
+            if (type == "tEXt" || type == "zTXt" || type == "iTXt") {
+                int z = Array.IndexOf(b, (byte)0, i + 8, len);
+                if (z > 0 && Encoding.ASCII.GetString(b, i + 8, z - i - 8) == key) {
+                    int start = z + 1, end = i + 8 + len;
+                    if (type == "tEXt") return Encoding.GetEncoding(28591).GetString(b, start, end - start);
+                    if (type == "zTXt") return Inflate(b, start + 1 + 2, end - start - 1 - 2, 28591);
+                    // iTXt: compression flag, method, language\0, translated keyword\0, text
+                    bool comp = b[start] == 1; int p = start + 2;
+                    p = Array.IndexOf(b, (byte)0, p, end - p) + 1; p = Array.IndexOf(b, (byte)0, p, end - p) + 1;
+                    return comp ? Inflate(b, p + 2, end - p - 2, 65001) : Encoding.UTF8.GetString(b, p, end - p);
+                }
+            }
+            if (type == "IEND") break;
+            i += 12 + len;
+        }
+        return null;
+    }
+    static string Inflate(byte[] b, int off, int len, int codePage) {
+        using (var ms = new System.IO.MemoryStream(b, off, len))
+        using (var ds = new System.IO.Compression.DeflateStream(ms, System.IO.Compression.CompressionMode.Decompress))
+        using (var outS = new System.IO.MemoryStream()) { ds.CopyTo(outS); return Encoding.GetEncoding(codePage).GetString(outS.ToArray()); }
+    }
+
+    // ---- draw.io / diagrams.net: .drawio, its uncompressed or compressed pages, an SVG or PNG with the diagram inside
+    public static bool IsDrawio(string content) { return content != null && (content.Contains("<mxfile") || content.Contains("<mxGraphModel") || content.Contains("&lt;mxfile") || content.Contains("&lt;mxGraphModel")); }
+    public static List<DgImported> FromDrawio(string content) {
+        var r = new List<DgImported>();
+        content = content ?? "";
+        // an SVG export holds the file in content="..."; a PNG export (already read) holds it URL-encoded
+        var cm = Regex.Match(content, @"\scontent=""([^""]*)""");
+        if (!content.TrimStart().StartsWith("<mxfile") && cm.Success && System.Net.WebUtility.HtmlDecode(cm.Groups[1].Value).Contains("<mx")) content = System.Net.WebUtility.HtmlDecode(cm.Groups[1].Value);
+        if (content.TrimStart().StartsWith("%3C")) content = Uri.UnescapeDataString(content);
+        var x = System.Xml.Linq.XDocument.Parse(content.Trim());
+        var root = x.Root;
+        if (root.Name.LocalName == "mxGraphModel") { r.Add(new DgImported { Name = "", Text = Drawio(root, "") }); return r; }
+        foreach (var dia in root.Elements().Where(e => e.Name.LocalName == "diagram")) {
+            string name = (string)dia.Attribute("name") ?? "";
+            var model = dia.Elements().FirstOrDefault(e => e.Name.LocalName == "mxGraphModel");
+            if (model == null) {
+                string raw = dia.Value.Trim();
+                if (raw.Length == 0) continue;
+                string xml;
+                if (raw.StartsWith("<")) xml = raw;
+                else {
+                    var bytes = Convert.FromBase64String(raw);
+                    using (var ms = new System.IO.MemoryStream(bytes)) using (var ds = new System.IO.Compression.DeflateStream(ms, System.IO.Compression.CompressionMode.Decompress)) using (var sr = new System.IO.StreamReader(ds, Encoding.UTF8)) xml = sr.ReadToEnd();
+                    xml = Uri.UnescapeDataString(xml);
+                }
+                model = System.Xml.Linq.XElement.Parse(xml);
+            }
+            r.Add(new DgImported { Name = name, Text = Drawio(model, name) });
+        }
+        return r;
+    }
+    static Dictionary<string, string> Style(string s) {
+        var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in (s ?? "").Split(';')) {
+            if (p.Trim().Length == 0) continue;
+            int e = p.IndexOf('=');
+            if (e < 0) { if (!d.ContainsKey("_kind")) d["_kind"] = p.Trim(); d[p.Trim()] = "1"; } else d[p.Substring(0, e).Trim()] = p.Substring(e + 1).Trim();
+        }
+        return d;
+    }
+    // a draw.io label (HTML) as plain lines
+    static List<string> LabelLines(string v) {
+        v = v ?? "";
+        v = Regex.Replace(v, @"<\s*br\s*/?\s*>|</\s*(div|p|li|tr|h\d)\s*>", "\n", RegexOptions.IgnoreCase);
+        v = Regex.Replace(v, @"<[^>]+>", "");
+        v = System.Net.WebUtility.HtmlDecode(v).Replace('\u00A0', ' ');
+        return v.Split('\n').Select(t => Regex.Replace(t, @"\s+", " ").Trim()).Where(t => t.Length > 0).ToList();
+    }
+    static string Hex(string c) { if (string.IsNullOrEmpty(c) || c == "none" || c == "default") return ""; return Regex.IsMatch(c, @"^#[0-9a-fA-F]{3,8}$") ? c : ""; }
+    static string Q(string s) { return "\"" + (s ?? "").Replace("\"", "'") + "\""; }
+    // a label as a node line takes it: quoted, without brackets or arrows that would make the line a link
+    static string Lbl(string s) { s = (s ?? "").Replace("[", "(").Replace("]", ")").Replace("->", "\u2192").Replace("<-", "\u2190").Replace("--", "\u2013").Replace("==", "= ="); return s.Trim().Length == 0 ? "\" \"" : Q(s); }
+    static string F(double v) { return Math.Round(v).ToString(CultureInfo.InvariantCulture); }
+    class Cell { public string Id = "", Parent = "", Value = "", Src = "", Dst = ""; public Dictionary<string, string> St; public bool Vertex, Edge; public double X, Y, W, H, AX, AY; public bool Placed; }
+
+    static string Drawio(System.Xml.Linq.XElement model, string name) {
+        var cells = new Dictionary<string, Cell>();
+        var order = new List<Cell>();
+        var rootEl = model.Elements().FirstOrDefault(e => e.Name.LocalName == "root") ?? model;
+        foreach (var el in rootEl.Elements()) {
+            // a cell, or an <object> / <UserObject> wrapping one (its label is in the label attribute)
+            var cellEl = el.Name.LocalName == "mxCell" ? el : el.Elements().FirstOrDefault(e => e.Name.LocalName == "mxCell");
+            if (cellEl == null) continue;
+            var c = new Cell { Id = (string)el.Attribute("id") ?? (string)cellEl.Attribute("id") ?? "", Parent = (string)cellEl.Attribute("parent") ?? "",
+                               Value = (string)el.Attribute("label") ?? (string)cellEl.Attribute("value") ?? "", St = Style((string)cellEl.Attribute("style")),
+                               Vertex = (string)cellEl.Attribute("vertex") == "1", Edge = (string)cellEl.Attribute("edge") == "1", Src = (string)cellEl.Attribute("source") ?? "", Dst = (string)cellEl.Attribute("target") ?? "" };
+            var g = cellEl.Elements().FirstOrDefault(e => e.Name.LocalName == "mxGeometry");
+            Func<string, double> num = a => { double v; return g != null && double.TryParse((string)g.Attribute(a), NumberStyles.Float, CultureInfo.InvariantCulture, out v) ? v : 0; };
+            c.X = num("x"); c.Y = num("y"); c.W = num("width"); c.H = num("height");
+            if (c.Id.Length == 0) continue;
+            cells[c.Id] = c; order.Add(c);
+        }
+        // absolute positions (a shape inside a container is placed relative to it)
+        Func<Cell, int, bool> place = null;
+        place = (c, depth) => {
+            if (c.Placed || depth > 50) return true;
+            Cell p; if (cells.TryGetValue(c.Parent, out p) && p.Vertex) { place(p, depth + 1); c.AX = p.AX + c.X; c.AY = p.AY + c.Y; } else { c.AX = c.X; c.AY = c.Y; }
+            c.Placed = true; return true;
+        };
+        foreach (var c in order) { Cell pe; if (c.Vertex && cells.TryGetValue(c.Parent, out pe) && pe.Edge) c.Vertex = false; }      // a link's label
+        foreach (var c in order) if (c.Vertex) place(c, 0);
+        Func<Cell, bool> isGroup = c => c.St.ContainsKey("swimlane") || c.St.ContainsKey("group") || (c.St.ContainsKey("container") && c.St["container"] == "1") || c.St.ContainsKey("shape") && c.St["shape"].StartsWith("mxgraph.") && c.St["shape"].Contains("group");
+        var ids = new Dictionary<string, string>();
+        int n = 0, gN = 0;
+        foreach (var c in order) if (c.Vertex) ids[c.Id] = isGroup(c) ? "g" + (++gN) : "n" + (++n);
+        var sb = new StringBuilder();
+        sb.Append("title " + (name.Length > 0 ? name : "Imported from draw.io") + "\r\ntheme corporate light\r\nhide legend, header\r\n");
+        bool ortho = order.Any(c => c.Edge && c.St.ContainsKey("edgeStyle") && c.St["edgeStyle"].ToLowerInvariant().Contains("orthogonal"));
+        sb.Append("route " + (ortho ? "ortho" : "straight") + "\r\n\r\n");
+        Func<Cell, string> groupOf = null;
+        groupOf = c => { Cell p; int guard = 0; var cur = c; while (guard++ < 50 && cells.TryGetValue(cur.Parent, out p)) { if (p.Vertex && isGroup(p)) return ids[p.Id]; cur = p; } return ""; };
+        // groups first
+        foreach (var c in order.Where(c => c.Vertex && isGroup(c))) {
+            var title = LabelLines(c.Value);
+            var members = order.Where(m => m.Vertex && !isGroup(m) && groupOf(m) == ids[c.Id]).Select(m => ids[m.Id]).ToList();
+            if (members.Count == 0) continue;
+            sb.Append("group " + ids[c.Id] + " " + Q(title.Count > 0 ? title[0] : "Group") + " [" + (c.St.ContainsKey("dashed") && c.St["dashed"] == "1" ? "dashed" : "solid") + (Hex(Get(c.St, "fillColor")).Length > 0 ? ", fill " + Hex(Get(c.St, "fillColor")) : "") + "] { " + string.Join(", ", members) + " }\r\n");
+        }
+        int skipped = 0;
+        foreach (var c in order.Where(c => c.Vertex && !isGroup(c))) {
+            var lines = LabelLines(c.Value);
+            string kind = Get(c.St, "_kind").ToLowerInvariant(), shp = Get(c.St, "shape").ToLowerInvariant();
+            string shape;
+            if (kind == "text" || kind == "edgelabel") shape = "text";
+            else if (kind == "ellipse" || shp == "ellipse" || kind.Contains("ellipse")) shape = Math.Abs(c.W - c.H) < 4 ? "circle" : "pill";
+            else if (kind == "rhombus" || shp == "rhombus") shape = "diamond";
+            else if (shp.Contains("cylinder") || shp.Contains("datastore") || shp == "database" || kind.Contains("cylinder")) shape = "cylinder";
+            else if (shp == "hexagon" || kind == "hexagon") shape = "hexagon";
+            else if (shp == "parallelogram" || kind == "parallelogram") shape = "parallelogram";
+            else if (shp == "document" || kind == "document") shape = "doc";
+            else if (shp == "note" || kind == "note") shape = "note";
+            else if (shp.Contains("actor") || kind.Contains("actor")) shape = "actor";
+            else if (Get(c.St, "rounded") == "1") shape = Get(c.St, "arcSize").Length > 0 && Get(c.St, "arcSize") == "50" ? "pill" : "rounded";
+            else shape = "rect";
+            if (kind == "image" || shp == "image") shape = "rect";
+            var attrs = new List<string> { "shape " + shape, "at " + F(c.AX) + " " + F(c.AY), "w " + F(c.W), "h " + F(c.H) };
+            string fill = Hex(Get(c.St, "fillColor")), stroke = Hex(Get(c.St, "strokeColor")), fc = Hex(Get(c.St, "fontColor"));
+            if (fill.Length > 0) attrs.Add("fill " + fill);
+            if (stroke.Length > 0) attrs.Add("stroke " + stroke);
+            if (fc.Length > 0) attrs.Add("color " + fc);
+            if (Get(c.St, "dashed") == "1") attrs.Add("dashed");
+            if (Get(c.St, "fontStyle") == "1") attrs.Add("bold");
+            if (lines.Count > 1) attrs.Add("lines " + string.Join(" ", lines.Skip(1).Take(8).Select(Q)));
+            string label = lines.Count > 0 ? lines[0] : "";
+            sb.Append(ids[c.Id] + ": " + Lbl(label) + " [" + string.Join(", ", attrs) + "]\r\n");
+        }
+        sb.Append("\r\n");
+        foreach (var c in order.Where(c => c.Edge)) {
+            string a, b;
+            if (!ids.TryGetValue(c.Src, out a) || !ids.TryGetValue(c.Dst, out b) || a.StartsWith("g") || b.StartsWith("g")) { skipped++; continue; }
+            var attrs = new List<string>();
+            var lines = LabelLines(c.Value);
+            // edge labels can also be child cells of the edge
+            if (lines.Count == 0) { var lc = order.FirstOrDefault(k => k.Parent == c.Id && LabelLines(k.Value).Count > 0); if (lc != null) lines = LabelLines(lc.Value); }
+            if (lines.Count > 0) attrs.Add("label " + Q(string.Join(" ", lines)));
+            if (Get(c.St, "dashed") == "1") attrs.Add(Get(c.St, "dashPattern").Length > 0 && Get(c.St, "dashPattern").StartsWith("1 ") ? "dotted" : "dashed");
+            bool end = Get(c.St, "endArrow") != "none", start = Get(c.St, "startArrow").Length > 0 && Get(c.St, "startArrow") != "none";
+            if (!end || start) attrs.Add("arrow " + (end && start ? "both" : start ? "start" : "none"));
+            string sc = Hex(Get(c.St, "strokeColor")); if (sc.Length > 0) attrs.Add("color " + sc);
+            sb.Append(a + " -> " + b + (attrs.Count > 0 ? " [" + string.Join(", ", attrs) + "]" : "") + "\r\n");
+        }
+        if (skipped > 0) sb.Append("% " + skipped + " link(s) to a container or to nothing were left out\r\n");
+        return sb.ToString();
+    }
+    static string Get(Dictionary<string, string> d, string k) { string v; return d.TryGetValue(k, out v) ? v : ""; }
+
+    // ---- Graphviz DOT
+    class DTok { public string T; public bool Id; }
+    static List<DTok> DotLex(string s) {
+        var r = new List<DTok>(); int i = 0, n = s.Length;
+        while (i < n) {
+            char c = s[i];
+            if (char.IsWhiteSpace(c)) { i++; continue; }
+            if (c == '/' && i + 1 < n && s[i + 1] == '/') { while (i < n && s[i] != '\n') i++; continue; }
+            if (c == '#' && (i == 0 || s[i - 1] == '\n')) { while (i < n && s[i] != '\n') i++; continue; }
+            if (c == '/' && i + 1 < n && s[i + 1] == '*') { int e = s.IndexOf("*/", i + 2); i = e < 0 ? n : e + 2; continue; }
+            if (c == '"') { var sb = new StringBuilder(); i++; while (i < n && s[i] != '"') { if (s[i] == '\\' && i + 1 < n) { char nx = s[i + 1]; if (nx == 'n' || nx == 'l' || nx == 'r') sb.Append('\n'); else sb.Append(nx); i += 2; continue; } sb.Append(s[i]); i++; } i++;
+                // "a" + "b" concatenation
+                r.Add(new DTok { T = sb.ToString(), Id = true }); continue; }
+            if (c == '<') { int d = 0, st = i; while (i < n) { if (s[i] == '<') d++; else if (s[i] == '>') { d--; if (d == 0) { i++; break; } } i++; } r.Add(new DTok { T = Regex.Replace(Regex.Replace(s.Substring(st + 1, Math.Max(0, i - st - 2)), @"<\s*br\s*/?\s*>", "\n", RegexOptions.IgnoreCase), @"<[^>]+>", ""), Id = true }); continue; }
+            if (c == '-' && i + 1 < n && (s[i + 1] == '>' || s[i + 1] == '-')) { r.Add(new DTok { T = s.Substring(i, 2) }); i += 2; continue; }
+            if (char.IsLetterOrDigit(c) || c == '_' || c == '.' || c == '-' || c > 127) { int st = i; while (i < n && (char.IsLetterOrDigit(s[i]) || s[i] == '_' || s[i] == '.' || s[i] > 127 || (s[i] == '-' && !(i + 1 < n && (s[i + 1] == '>' || s[i + 1] == '-'))))) i++; r.Add(new DTok { T = s.Substring(st, i - st), Id = true }); continue; }
+            r.Add(new DTok { T = c.ToString() }); i++;
+        }
+        return r;
+    }
+    class DNode { public string Id = "", Key = ""; public Dictionary<string, string> A = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); public string Group = ""; }
+    public static string FromDot(string dot) {
+        var t = DotLex(dot ?? "");
+        int p = 0;
+        Func<string, bool> isT = s => p < t.Count && !t[p].Id && t[p].T == s;
+        var nodes = new Dictionary<string, DNode>(); var order = new List<DNode>();
+        var edges = new List<KeyValuePair<string[], Dictionary<string, string>>>();
+        var groups = new List<string[]>();     // id, title
+        var graphA = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        bool directed = true;
+        if (p < t.Count && t[p].Id && t[p].T.ToLowerInvariant() == "strict") p++;
+        if (p < t.Count && t[p].Id) { directed = t[p].T.ToLowerInvariant() == "digraph"; p++; }
+        if (p < t.Count && t[p].Id) p++;                                       // the graph's name
+        if (isT("{")) p++;
+        Func<Dictionary<string, string>> attrList = () => {
+            var a = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            while (isT("[")) {
+                p++;
+                while (p < t.Count && !isT("]")) {
+                    if (isT(",") || isT(";")) { p++; continue; }
+                    string k = t[p].T; p++;
+                    if (isT("=")) { p++; if (p < t.Count) { a[k] = t[p].T; p++; } } else a[k] = "true";
+                }
+                p++;
+            }
+            return a;
+        };
+        int gCount = 0;
+        Func<Dictionary<string, string>, string, DNode> node = null;
+        List<string> collect = null;                      // the nodes named inside the { ... } being read
+        Action<string, Dictionary<string, string>, Dictionary<string, string>> stmts = null;
+        node = (a, key) => {
+            DNode d;
+            if (!nodes.TryGetValue(key, out d)) { d = new DNode { Key = key, Id = "n" + (nodes.Count + 1) }; nodes[key] = d; order.Add(d); foreach (var kv in a) d.A[kv.Key] = kv.Value; }
+            return d;
+        };
+        // a statement list; group = the cluster being read; nodeDefaults = node [..] in force
+        stmts = (group, nodeDef, edgeDef) => {
+            while (p < t.Count && !isT("}")) {
+                if (isT(";") || isT(",")) { p++; continue; }
+                // the endpoints of a statement: a node, or { ... } / subgraph x { ... }
+                Func<List<string>> endpoint = null;
+                endpoint = () => {
+                    var keys = new List<string>();
+                    if (p < t.Count && t[p].Id && t[p].T.ToLowerInvariant() == "subgraph" || isT("{")) {
+                        string gid = "";
+                        if (t[p].Id && t[p].T.ToLowerInvariant() == "subgraph") { p++; if (p < t.Count && t[p].Id) { gid = t[p].T; p++; } }
+                        if (!isT("{")) return keys;
+                        p++;
+                        var saved = collect; collect = new List<string>();
+                        bool cluster = gid.StartsWith("cluster", StringComparison.OrdinalIgnoreCase);
+                        string gname = cluster ? "g" + (++gCount) : group;
+                        int gi = groups.Count;
+                        if (cluster) groups.Add(new[] { gname, gid.Substring(7).Trim('_', ' ') });
+                        var nd = new Dictionary<string, string>(nodeDef, StringComparer.OrdinalIgnoreCase);
+                        // the cluster's label is a statement inside it
+                        stmts(gname, nd, edgeDef);
+                        if (isT("}")) p++;
+                        foreach (var k0 in collect.Distinct()) keys.Add(k0);
+                        if (saved != null) saved.AddRange(collect);
+                        collect = saved;
+                        if (cluster && graphLabel.ContainsKey(gname)) groups[gi][1] = graphLabel[gname];
+                        return keys;
+                    }
+                    if (p < t.Count && t[p].Id) {
+                        string k = t[p].T; p++;
+                        if (isT(":")) { p++; if (p < t.Count && t[p].Id) p++; if (isT(":")) { p++; p++; } }      // ports
+                        var d = node(nodeDef, k);
+                        if (group.Length > 0 && d.Group.Length == 0) d.Group = group;
+                        if (collect != null) collect.Add(k);
+                        keys.Add(k);
+                    } else p++;
+                    return keys;
+                };
+                if (p < t.Count && t[p].Id) {
+                    string w = t[p].T.ToLowerInvariant();
+                    if ((w == "graph" || w == "node" || w == "edge") && p + 1 < t.Count && !t[p + 1].Id && t[p + 1].T == "[") {
+                        p++; var a = attrList();
+                        if (w == "node") foreach (var kv in a) nodeDef[kv.Key] = kv.Value;
+                        else if (w == "edge") foreach (var kv in a) edgeDef[kv.Key] = kv.Value;
+                        else foreach (var kv in a) { if (group.Length > 0 && kv.Key == "label") graphLabel[group] = kv.Value; else graphA[kv.Key] = kv.Value; }
+                        continue;
+                    }
+                    if (p + 1 < t.Count && !t[p + 1].Id && t[p + 1].T == "=") {            // name = value
+                        string k = t[p].T; p += 2; string v = p < t.Count ? t[p].T : ""; p++;
+                        if (group.Length > 0 && k == "label") graphLabel[group] = v; else graphA[k] = v;
+                        continue;
+                    }
+                }
+                var first = endpoint();
+                if (isT("->") || isT("--")) {
+                    var chain = new List<List<string>> { first };
+                    while (isT("->") || isT("--")) { p++; chain.Add(endpoint()); }
+                    var ea = new Dictionary<string, string>(edgeDef, StringComparer.OrdinalIgnoreCase);
+                    foreach (var kv in attrList()) ea[kv.Key] = kv.Value;
+                    for (int k = 0; k + 1 < chain.Count; k++) foreach (var a0 in chain[k]) foreach (var b0 in chain[k + 1]) edges.Add(new KeyValuePair<string[], Dictionary<string, string>>(new[] { a0, b0 }, ea));
+                } else if (isT("[")) {
+                    var a = attrList();
+                    foreach (var k in first) { var d = nodes[k]; foreach (var kv in a) d.A[kv.Key] = kv.Value; }
+                }
+            }
+        };
+        graphLabel = new Dictionary<string, string>();
+        stmts("", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
+        // the diagram text
+        var sb = new StringBuilder();
+        string gTitle; graphA.TryGetValue("label", out gTitle);
+        string rank; graphA.TryGetValue("rankdir", out rank);
+        sb.Append("title " + (string.IsNullOrEmpty(gTitle) ? "Imported from Graphviz" : gTitle.Replace("\n", " ")) + "\r\ntheme corporate light\r\nhide legend, header\r\n");
+        sb.Append("direction " + (rank != null && (rank.ToUpperInvariant() == "LR" || rank.ToUpperInvariant() == "RL") ? "LR" : "TD") + "\r\nroute " + (graphA.ContainsKey("splines") && graphA["splines"] == "ortho" ? "ortho" : "curve") + "\r\n\r\n");
+        foreach (var g in groups) {
+            var members = order.Where(d => d.Group == g[0]).Select(d => d.Id).ToList();
+            if (members.Count > 0) sb.Append("group " + g[0] + " " + Q(g[1].Length > 0 ? g[1] : g[0]) + " [dashed] { " + string.Join(", ", members) + " }\r\n");
+        }
+        foreach (var d in order) {
+            string label = d.A.ContainsKey("label") ? d.A["label"] : d.Key;
+            string shp = d.A.ContainsKey("shape") ? d.A["shape"].ToLowerInvariant() : "ellipse";
+            var lines = new List<string>();
+            if (shp == "record" || shp == "mrecord") {
+                var parts = Regex.Split(label.Trim('{', '}', ' '), @"\s*\|\s*").Select(x => Regex.Replace(x, @"<[^>]*>", "").Trim('{', '}', ' ')).Where(x => x.Length > 0).ToList();
+                label = parts.Count > 0 ? parts[0] : d.Key; lines = parts.Skip(1).ToList();
+            } else {
+                var ls = label.Split('\n').Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+                label = ls.Count > 0 ? ls[0] : ""; lines = ls.Skip(1).ToList();
+            }
+            string shape = shp == "box" || shp == "rect" || shp == "rectangle" || shp == "square" ? (d.A.ContainsKey("style") && d.A["style"].Contains("rounded") ? "rounded" : "rect")
+                         : shp == "circle" || shp == "doublecircle" || shp == "point" ? "circle" : shp == "ellipse" || shp == "oval" ? "pill"
+                         : shp == "diamond" ? "diamond" : shp == "cylinder" ? "cylinder" : shp == "note" ? "note" : shp == "hexagon" ? "hexagon"
+                         : shp == "parallelogram" ? "parallelogram" : shp == "folder" || shp == "tab" || shp == "component" ? "card"
+                         : shp == "plaintext" || shp == "plain" || shp == "none" || shp == "underline" ? "text" : shp == "record" || shp == "mrecord" ? "table" : "rounded";
+            var attrs = new List<string> { "shape " + shape };
+            string fill = DotColor(d.A.ContainsKey("fillcolor") ? d.A["fillcolor"] : (d.A.ContainsKey("style") && d.A["style"].Contains("filled") && d.A.ContainsKey("color") ? d.A["color"] : ""));
+            string stroke = DotColor(d.A.ContainsKey("color") ? d.A["color"] : ""), fc = DotColor(d.A.ContainsKey("fontcolor") ? d.A["fontcolor"] : "");
+            if (fill.Length > 0) attrs.Add("fill " + fill);
+            if (stroke.Length > 0) attrs.Add("stroke " + stroke);
+            if (fc.Length > 0) attrs.Add("color " + fc);
+            if (d.A.ContainsKey("style") && (d.A["style"].Contains("dashed") || d.A["style"].Contains("dotted"))) attrs.Add("dashed");
+            if (lines.Count > 0) attrs.Add("lines " + string.Join(" ", lines.Take(12).Select(Q)));
+            sb.Append(d.Id + ": " + Lbl(label) + " [" + string.Join(", ", attrs) + "]\r\n");
+        }
+        sb.Append("\r\n");
+        foreach (var e in edges) {
+            var a = e.Value; var attrs = new List<string>();
+            if (a.ContainsKey("label") && a["label"].Length > 0) attrs.Add("label " + Q(a["label"].Replace("\n", " ")));
+            if (a.ContainsKey("style") && a["style"].Contains("dotted")) attrs.Add("dotted"); else if (a.ContainsKey("style") && a["style"].Contains("dashed")) attrs.Add("dashed");
+            string dir = a.ContainsKey("dir") ? a["dir"].ToLowerInvariant() : (directed ? "forward" : "none");
+            if (dir != "forward") attrs.Add("arrow " + (dir == "both" ? "both" : dir == "back" ? "start" : "none"));
+            string col = DotColor(a.ContainsKey("color") ? a["color"] : ""); if (col.Length > 0) attrs.Add("color " + col);
+            sb.Append(nodes[e.Key[0]].Id + " -> " + nodes[e.Key[1]].Id + (attrs.Count > 0 ? " [" + string.Join(", ", attrs) + "]" : "") + "\r\n");
+        }
+        return sb.ToString();
+    }
+    static Dictionary<string, string> graphLabel = new Dictionary<string, string>();
+    // a Graphviz colour (#rrggbb, a name like "lightblue", or "0.6 0.3 0.9" HSV) as #rrggbb
+    static string DotColor(string c) {
+        if (string.IsNullOrEmpty(c)) return "";
+        c = c.Split(':')[0].Trim();
+        if (Regex.IsMatch(c, @"^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$")) return c.Substring(0, 7);
+        var col = System.Drawing.Color.FromName(c.Replace(" ", ""));
+        if (col.IsKnownColor || col.A > 0 && (col.R | col.G | col.B) != 0) return "#" + col.R.ToString("x2") + col.G.ToString("x2") + col.B.ToString("x2");
+        return "";
+    }
+    public static bool IsDot(string s) { return Regex.IsMatch(s ?? "", @"^\s*(?://[^\n]*\n\s*|/\*[\s\S]*?\*/\s*)*(strict\s+)?(di)?graph\b[^{]*\{", RegexOptions.IgnoreCase); }
+}
+
 // ---- Query plan tuner: SQL Server's plan (estimated or actual) as a diagram, with suggestions and fixes.
 public class DgPlanOp {
     public int Id, Parent = -1, Depth;
@@ -28640,6 +29036,7 @@ function Save-DiagramPng([float]$Scale) {
     try { if ($d.ShowDialog($DgUI.Form) -ne 'OK') { return }; $path = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
     $bmp = $DgUI.Canvas.RenderBitmap($Scale, (-not $DgUI.Transparent), $DgUI.Canvas.Dark)
     try { $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png) } finally { $bmp.Dispose() }
+    try { [DgImport]::PngAddText($path, 'devtools-diagram', [DgImport]::Marker($DgUI.Text)) } catch { }      # so Import gets the diagram back from the picture
 }
 
 function Show-DiagramCode([string]$Kind = 'page') {
@@ -28700,13 +29097,13 @@ function Show-DiagramCode([string]$Kind = 'page') {
             $o.Hover = $s.Hover.Checked; $o.DrawIn = $s.Draw.Checked; $o.Pretty = -not $s.Min.Checked; $o.Prefix = $s.Prefix.Text
             $o.Mode = $mode
             if (-not $o.Vars -and $o.Mode -eq 'auto') { $o.Mode = if ($DgUI.Canvas.Dark) { 'dark' } else { 'light' } }
-            return [DgSvg]::Document($DgUI.Doc, $DgUI.Canvas.Theme, $o)
+            return (Add-DiagramSource ([DgSvg]::Document($DgUI.Doc, $DgUI.Canvas.Theme, $o)) 'svg')
         }
         $o = New-Object DgHtmlOptions
         $o.Kind = $kind; $o.Prefix = $s.Prefix.Text; $o.Mode = $mode
         if ($kind -ne 'page') { $o.Height = $s.Height.Text.Trim() }
         foreach ($k in $s.Feat.Keys) { $o.$k = $s.Feat[$k].Checked }
-        [DgHtml]::Build($DgUI.Doc, $DgUI.Canvas.Theme, $o)
+        Add-DiagramSource ([DgHtml]::Build($DgUI.Doc, $DgUI.Canvas.Theme, $o)) $kind
     }
     $st.Refresh = {
         param($s)
@@ -28852,6 +29249,7 @@ function Show-DiagramStudio([string]$Text = '') {
     $top.Dock = 'Top'; $top.AutoSize = $true; $top.WrapContents = $true; $top.BackColor = $C.Panel; $top.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 6))
     [void](New-Button 'New' 'A new, empty diagram (in the folder selected in Saved)' { New-DiagramNamed } $top $Glyph.Add 2)
     $exb = New-Button 'Examples' 'Start from an example' { Show-DiagramExamplesMenu $this } $top $Glyph.Apps 2
+    [void](New-Button 'Import...' 'Open a diagram from a file (or drop it on this window): .dgm / .txt, Mermaid, draw.io, Graphviz DOT, CSV / Excel, or an SVG / HTML / PNG exported by DevTools' { Open-DiagramImport } $top $Glyph.Open 2)
     [void](New-Button '' 'Undo (Ctrl+Z)' { Undo-Diagram } $top ([string][char]0xE7A7) 2)
     [void](New-Button '' 'Redo (Ctrl+Y)' { Redo-Diagram } $top ([string][char]0xE7A6) 2)
     $DgUI.ModeBtn = New-Button 'Edit' 'Edit: drag, link and style shapes.  Preview: click shapes for details and try outages, as in the web page.' {
@@ -28954,6 +29352,7 @@ function Show-DiagramStudio([string]$Text = '') {
         elseif ($e.Control -and $e.KeyCode -eq 'Y') { $e.SuppressKeyPress = $true; Redo-Diagram }
         elseif ($e.Control -and $e.KeyCode -eq 'S') { $e.SuppressKeyPress = $true; Save-DiagramFile }
     })
+    Register-DiagramDrop $f
     $f.add_FormClosing({ $DgUI.TypeTimer.Stop(); $t = $DgUI.Editor.Text; if ($t -cne $DgUI.Text) { $DgUI.Text = $t }; Save-DiagramFile })
     $f.add_FormClosed({ foreach ($k in 'TypeTimer', 'ColorTimer', 'SaveTimer') { if ($DgUI[$k]) { $DgUI[$k].Dispose(); $DgUI[$k] = $null } }; $DgUI.Form = $null; $DgUI.Canvas = $null; $DgUI.Props = $null; $DgUI.List = $null; $DgUI.Folders = $null; $DgUI.ModeSet = $false })
     Register-ThemedWindow $f
@@ -29462,6 +29861,72 @@ function New-DiagramFromData {
     }
     New-DiagramFromText $title $sb.ToString()
     Select-ApiTab $DgUI.Tabs 'Text'
+}
+
+# ---- importing diagrams: Import... or a file dropped on the window. .dgm / .txt / Mermaid (.mmd, a ```mermaid block in .md),
+#      draw.io (.drawio / .xml, its SVG and PNG exports), Graphviz (.dot / .gv), CSV / Excel (into the Data tab), and the
+#      SVG / HTML / React / PNG exports of DevTools (they carry the diagram text, so it comes back as it was)
+function Add-DiagramSource([string]$Code, [string]$Kind) {
+    $mk = [DgImport]::Marker($DgUI.Text)
+    switch ($Kind) {
+        'react' { return $Code.TrimEnd() + "`n/* $mk */`n" }
+        'svg' { $i = $Code.LastIndexOf('</svg>'); if ($i -ge 0) { return $Code.Substring(0, $i) + "<!-- $mk -->" + $Code.Substring($i) }; return $Code + "`n<!-- $mk -->" }
+        default { $i = $Code.LastIndexOf('</body>'); if ($i -ge 0) { return $Code.Substring(0, $i) + "<!-- $mk -->`n" + $Code.Substring($i) }; return $Code.TrimEnd() + "`n<!-- $mk -->`n" }
+    }
+}
+
+function Get-DrawioPages([string]$Content, [string]$Name) {
+    $pages = @([DgImport]::FromDrawio($Content))
+    foreach ($pg in $pages) { @{ Name = $(if ($pages.Count -gt 1 -and $pg.Name) { "$Name - $($pg.Name)" } else { $Name }); Text = $pg.Text } }
+}
+
+function Import-DiagramFile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    $name = [IO.Path]::GetFileNameWithoutExtension($Path)
+    $ext = [IO.Path]::GetExtension($Path).ToLowerInvariant()
+    if ($ext -in '.csv', '.tsv', '.xlsx', '.xlsm') { Select-ApiTab $DgUI.Tabs 'Data'; Import-DiagramDataFile $Path; return }
+    $pages = @(); $why = ''
+    try {
+        if ($ext -in '.png') {
+            $t = [DgImport]::FindSource([DgImport]::PngText($Path, 'devtools-diagram'))
+            if ($t) { $pages = @(@{ Name = $name; Text = $t }) }
+            else { $mx = [DgImport]::PngText($Path, 'mxfile'); if ($mx) { $pages = @(Get-DrawioPages $mx $name) } else { $why = 'This picture has no diagram inside it. PNGs exported by DevTools (from now on) or by draw.io with "Include a copy of my diagram" do.' } }
+        } else {
+            $raw = [IO.File]::ReadAllText($Path)
+            $src = [DgImport]::FindSource($raw)
+            if ($src) { $pages = @(@{ Name = $name; Text = $src }) }
+            elseif ([DgImport]::IsDrawio($raw)) { $pages = @(Get-DrawioPages $raw $name) }
+            elseif ($ext -in '.dot', '.gv' -or [DgImport]::IsDot($raw)) { $pages = @(@{ Name = $name; Text = [DgImport]::FromDot($raw) }) }
+            elseif ($ext -eq '.md') {
+                $m = [regex]::Match($raw, '(?ms)^\s*```\s*mermaid\s*\r?\n(.*?)^\s*```')
+                if ($m.Success) { $pages = @(@{ Name = $name; Text = $m.Groups[1].Value }) } else { $why = 'There is no ```mermaid block in this Markdown file.' }
+            }
+            elseif ($ext -in '.svg', '.html', '.htm', '.jsx', '.tsx', '.js') { $why = 'This file has no diagram text inside it. SVG / HTML / React files exported by DevTools from now on carry it, and so do SVGs exported by draw.io.' }
+            else { $pages = @(@{ Name = $name; Text = $raw }) }                    # .dgm, .txt, .mmd, .mermaid: diagram text or Mermaid as it is
+        }
+    } catch { $e0 = $_.Exception; while ($e0.InnerException) { $e0 = $e0.InnerException }; $why = "Couldn't read $(Split-Path -Leaf $Path): $($e0.Message)" }
+    if (-not $pages.Count) { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, $why, 'Diagram studio'); return }
+    foreach ($pg in $pages) { New-DiagramFromText $pg.Name ($pg.Text -replace '^title Imported from (Graphviz|draw\.io)', "title $($pg.Name)") }     # untitled: the file's name
+    Select-ApiTab $DgUI.Tabs 'Text'
+    if ($pages.Count -gt 1) { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, "$(Split-Path -Leaf $Path) has $($pages.Count) pages: each is now its own diagram in Saved.", 'Diagram studio') }
+}
+
+function Open-DiagramImport {
+    $d = New-Object System.Windows.Forms.OpenFileDialog
+    $d.Title = 'Import a diagram'; $d.Multiselect = $true
+    $d.Filter = 'Diagrams|*.dgm;*.txt;*.mmd;*.mermaid;*.md;*.drawio;*.dio;*.xml;*.dot;*.gv;*.svg;*.html;*.htm;*.jsx;*.png;*.csv;*.tsv;*.xlsx|DevTools diagram text|*.dgm;*.txt|Mermaid|*.mmd;*.mermaid;*.md|draw.io / diagrams.net|*.drawio;*.dio;*.xml;*.svg;*.png|Graphviz|*.dot;*.gv|Exports from DevTools|*.svg;*.html;*.htm;*.jsx;*.png|Data (CSV / Excel)|*.csv;*.tsv;*.xlsx|All files|*.*'
+    $script:Modal = $true
+    try { if ($d.ShowDialog($DgUI.Form) -ne 'OK') { return }; $files = @($d.FileNames) } finally { $script:Modal = $false; $d.Dispose() }
+    foreach ($p in $files) { Import-DiagramFile $p }
+}
+
+# files dropped anywhere on the window are imported
+function Register-DiagramDrop($Control) {
+    $Control.AllowDrop = $true
+    $Control.add_DragEnter({ param($src, $e) if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { $e.Effect = 'Copy' } })
+    # (imported after the drop returns, so Explorer isn't kept waiting)
+    $Control.add_DragDrop({ param($src, $e) $DgUI.DropFiles = @($e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)); if ($DgUI.DropFiles.Count) { [void]$DgUI.Form.BeginInvoke([Action]{ $files = $DgUI.DropFiles; $DgUI.DropFiles = $null; foreach ($p in $files) { Import-DiagramFile $p } }) } })
+    foreach ($ch in $Control.Controls) { if ($ch -isnot [System.Windows.Forms.TextBox]) { Register-DiagramDrop $ch } }
 }
 
 # ======================================================================================

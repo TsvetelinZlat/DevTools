@@ -487,6 +487,12 @@ Diagrams from a few lines of text: architecture maps, flowcharts, org charts and
     - hover highlight, draw-in animation, minified
     - a **prefix for every class and id**, so several diagrams can sit on the same page without clashing
   - Every output has a live code view with **Copy**, **Save** and **Open in browser** to see the result.
+- **Import...** (top bar), or drop files on the window: each file becomes a diagram in the folder selected in Saved.
+  - **DevTools' own exports come back as they were**: every SVG, HTML page, widget, React component and PNG it exports carries the diagram text inside it (a hidden comment / PNG text), so importing one gives back the editable diagram with its positions and styles.
+  - `.dgm` / `.txt` (diagram text), **Mermaid** (`.mmd`, or the first ```` ```mermaid ```` block of a `.md` file).
+  - **draw.io / diagrams.net**: `.drawio` / `.xml` files (compressed or not; every page becomes its own diagram), and draw.io's SVG and PNG exports that include the diagram. Shapes (rectangles, rounded, ellipses, diamonds, cylinders, actors, notes, text ...), labels, positions and sizes, fill / line / text colours, dashed and two-way links and containers (as frames) are kept.
+  - **Graphviz DOT** (`.dot` / `.gv`): nodes with their shapes, labels and colours, records as tables, `cluster` subgraphs as frames, edge chains and `{ a b }` groups, labels, dashed / dotted, `dir`, `rankdir`.
+  - **CSV / TSV / Excel** go to the **Data** tab.
 - Diagrams are saved as you go under `data\diagrams\` (one `.dgm` text file each). The **Saved** tab shows them in **folders, like Notes** (real folders under it):
   - Click a folder to open or close it (the number is how many diagrams are inside); click a diagram to open it. **Search** filters the list.
   - **New diagram** and **Folder** at the top, or right-click: on a folder **New diagram here...**, **New folder inside...**, **Rename folder...**, **Move to**, **Delete folder...**; on a diagram **Open**, **Duplicate**, **Rename...**, **Move to**, **Delete**, **Show in Explorer**. F2 renames, Del deletes.
