@@ -28812,6 +28812,7 @@ function Show-DiagramStudio([string]$Text = '') {
     $pSaved = Add-ApiTab $tabs 'Saved'
     $ed = New-TbRtb; $ed.Dock = 'Fill'; $ed.AcceptsTab = $true; $ed.WordWrap = $false
     $DgUI.Editor = $ed
+    Register-PlainPaste $ed
     $warn = New-Object System.Windows.Forms.Label
     $warn.Dock = 'Bottom'; $warn.AutoSize = $false; $warn.Height = Px 46; $warn.ForeColor = $C.Dim; $warn.BackColor = $C.Bg; $warn.Font = $FontSmall; $warn.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 4), (Px 6), 0)
     $DgUI.Warn = $warn
@@ -30211,6 +30212,7 @@ function Set-SqlColors {
     [PowerClipTheme]::Redraw($ed.Handle, $false)
     try {
         $ed.SelectAll(); $ed.SelectionColor = $C.Fore
+        $ed.SelectionFont = $ed.Font; $ed.SelectionBackColor = $ed.BackColor; $ed.SelectionBullet = $false; $ed.SelectionIndent = 0; $ed.SelectionHangingIndent = 0; $ed.SelectionRightIndent = 0     # whatever came in with the text
         $col = @{ 1 = $C.Accent; 2 = $C.Orange; 3 = $C.Dim; 4 = $C.Purple; 5 = $C.Green }
         foreach ($tk in [DevCode]::Tokens($ed.Text, 'sql')) { $cc = $col[[int]$tk[2]]; if ($null -eq $cc) { continue }; $ed.Select($tk[0], $tk[1]); $ed.SelectionColor = $cc }
     } finally {
@@ -30598,6 +30600,29 @@ function Undo-SqlEdit([switch]$Redo) {
     $ed.ScrollToCaret()
 }
 
+# ---- pasting into the code editors (SQL client, Diagram studio): text only. Ctrl+V of a RichTextBox also brings the
+#      formatting of where it came from (a note's font, size, colours, bullets), and text from notes / documents can hold
+#      characters SQL doesn't take as spaces or quotes (non-breaking space, zero-width space, curly quotes).
+function ConvertTo-PlainCode([string]$Text) {
+    $Text.Replace([string][char]0x00A0, ' ').Replace([string][char]0x202F, ' ').Replace([string][char]0x200B, '').Replace([string][char]0xFEFF, '').Replace([string][char]0x2018, "'").Replace([string][char]0x2019, "'").Replace([string][char]0x201C, '"').Replace([string][char]0x201D, '"').Replace("`r`n", "`n").Replace("`r", "`n")
+}
+function Invoke-PlainPaste($Ed, [string]$Text) {
+    if ($null -eq $Text) { return }
+    $Ed.SelectedText = ConvertTo-PlainCode $Text
+    $Ed.ScrollToCaret()
+}
+function Register-PlainPaste($Ed) {
+    $Ed.add_KeyDown({
+        param($src, $e)
+        if (($e.Control -and -not $e.Alt -and -not $e.Shift -and $e.KeyCode -eq 'V') -or ($e.Shift -and -not $e.Control -and $e.KeyCode -eq 'Insert')) {
+            $e.SuppressKeyPress = $true; $e.Handled = $true
+            $t = $null
+            try { if ([System.Windows.Forms.Clipboard]::ContainsText()) { $t = [System.Windows.Forms.Clipboard]::GetText() } } catch { }
+            Invoke-PlainPaste $src $t
+        }
+    })
+}
+
 function Show-SqlClient {
     Hide-Picker
     if (-not (Initialize-Diagrams)) { return }
@@ -30692,6 +30717,7 @@ function Show-SqlClient {
     $live.Panel1.Controls.Add($ed); $SqlUI.Editor = $ed
     Register-SqlComplete $ed
     Register-SqlUndo $ed
+    Register-PlainPaste $ed
     $lcv = New-Object DgCanvas
     $lcv.Dock = 'Fill'; $lcv.UiScale = $Scale * $TextZoom; $lcv.Font = $FontMain; $lcv.Editable = $false; $lcv.Draggable = $true; $lcv.Animate = $false
     $SqlUI.LivePos = @{}

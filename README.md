@@ -548,7 +548,7 @@ A database client for **SQL Server** (nothing to install: it uses the SQL Server
   - **Other databases and schemas**: SQL Server `Db.schema.table`; Oracle `OWNER.TABLE` and `TABLE@LINK`
   - **Per database**: SQL Server top / paging / dates; PostgreSQL `LIMIT` / `ILIKE` / `date_trunc`; Oracle `FETCH FIRST` / `NVL` / a PL/SQL block
   - **Tips**: the keys for plans, the live diagram and suggestions
-- **Editor** with SQL colours. **Ctrl+Z** undoes typing a word at a time (a paste, an example or a suggestion all at once); **Ctrl+Y** or **Ctrl+Shift+Z** redoes. **F5** or **Ctrl+Enter** runs the selection, or everything; `GO` lines separate batches (as in SSMS). PostgreSQL / Oracle run one statement at a time (`;` between them; an Oracle PL/SQL block ends with a `/` line). **Cancel** (or Esc) stops a long query. **Max rows** caps what is shown per result.
+- **Editor** with SQL colours. **Ctrl+Z** undoes typing a word at a time (a paste, an example or a suggestion all at once); **Ctrl+Y** or **Ctrl+Shift+Z** redoes. Pasting (Ctrl+V / Shift+Insert) puts in the text only, without the formatting of where it came from (a note, a web page, Word), and turns non-breaking spaces and curly quotes into plain ones so SQL Server takes them. **F5** or **Ctrl+Enter** runs the selection, or everything; `GO` lines separate batches (as in SSMS). PostgreSQL / Oracle run one statement at a time (`;` between them; an Oracle PL/SQL block ends with a `/` line). **Cancel** (or Esc) stops a long query. **Max rows** caps what is shown per result.
 - **Results**: a tab per result set, plus **Messages** (rows affected, PRINT output, errors).
   - An error selects the line it happened on.
   - **Copy** (with headers, pastes into Excel), **CSV...**, **JSON...**.
