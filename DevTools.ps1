@@ -24657,7 +24657,7 @@ public class DgSqlRun {
             vals[i] = b.IsNull ? (object)DBNull.Value : b.Value;
         }
     }
-    static object Show(object v) {
+    public static object Show(object v) {
         if (v == null || v is DBNull) return DBNull.Value;
         if (v is byte[]) { var b = (byte[])v; var sb = new StringBuilder("0x"); for (int i = 0; i < Math.Min(b.Length, 64); i++) sb.Append(b[i].ToString("X2")); if (b.Length > 64) sb.Append("..."); return sb.ToString(); }
         if (v is DateTime) { var d = (DateTime)v; return d.TimeOfDay.Ticks == 0 ? d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) : d.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture); }
@@ -25191,6 +25191,16 @@ public class DgSqlSchema {
     // "schema.table" (lower case) -> columns: name, type, "PK"/"", "FK"/""
     public Dictionary<string, List<string[]>> Tables = new Dictionary<string, List<string[]>>(StringComparer.OrdinalIgnoreCase);
     public string DefaultSchema = "dbo", Dialect = "mssql", CurrentDb = "", Conn = "";
+    // saved connections by name, for [Name].schema.table (joins across connections); their columns are read when named
+    public Dictionary<string, string> Sources = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, DgSqlSchema> others = new Dictionary<string, DgSqlSchema>(StringComparer.OrdinalIgnoreCase);
+    public DgSqlSchema Other(string name) {
+        DgSqlSchema o; string conn;
+        if (others.TryGetValue(name, out o)) return o;
+        if (!Sources.TryGetValue(name, out conn) || failed.ContainsKey("src:" + name)) return null;
+        try { o = Load(conn); others[name] = o; return o; }
+        catch (Exception ex) { var m = DgDb.ErrorText(ex).Split('\n')[0].Trim(); failed["src:" + name] = m.Length > 90 ? m.Substring(0, 90) + "..." : m; return null; }
+    }
     // what was read on demand (another database, schema or db link) and why something couldn't be
     readonly HashSet<string> tried = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, string> failed = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -25219,6 +25229,29 @@ public class DgSqlSchema {
 
     // the key of a table in Tables (reading it first when it is in another database, schema or db link), or null
     public string Resolve(string name) {
+        // a file: file:C:\data\x.csv, file:C:\data\x.xlsx.Sheet1
+        if (name.StartsWith("file:", StringComparison.OrdinalIgnoreCase)) {
+            string path = name.Substring(5).Trim(), sheet = "";
+            if (!System.IO.File.Exists(path)) { int d = path.LastIndexOf('.'); if (d > 0 && System.IO.File.Exists(path.Substring(0, d))) { sheet = path.Substring(d + 1); path = path.Substring(0, d); } }
+            string key = System.IO.Path.GetFileName(path) + (sheet.Length > 0 ? " / " + sheet : "");
+            if (!Tables.ContainsKey(key) && !failed.ContainsKey("file:" + path)) {
+                try { Tables[key] = DgFedRun.FileColumns(path, sheet).Select(c => new[] { c[0], c[1], "", "" }).ToList(); }
+                catch (Exception ex) { failed["file:" + path] = ex.Message; }
+            }
+            return Tables.ContainsKey(key) ? key : null;
+        }
+        // another saved connection: Name.schema.table
+        int dot0 = name.IndexOf('.');
+        if (dot0 > 0 && Sources.Count > 0 && Sources.ContainsKey(name.Substring(0, dot0).Trim())) {
+            string src = name.Substring(0, dot0).Trim();
+            var o = Other(src);
+            if (o == null) return null;
+            var k2 = o.Resolve(name.Substring(dot0 + 1));
+            if (k2 == null) return null;
+            string key = src + ": " + k2;
+            Tables[key] = o.Tables[k2];
+            return key;
+        }
         string link = "";
         int at = name.IndexOf('@');
         if (at > 0) { link = name.Substring(at + 1).Trim(); name = name.Substring(0, at); }
@@ -25260,6 +25293,10 @@ public class DgSqlSchema {
     string Real(string k) { return Tables.Keys.FirstOrDefault(x => string.Equals(x, k, StringComparison.OrdinalIgnoreCase)) ?? k; }     // as the database spells it
     // why a name wasn't found ("not found", or the database / schema / link that couldn't be read)
     public string Why(string name) {
+        string f0;
+        if (name.StartsWith("file:", StringComparison.OrdinalIgnoreCase)) { var hit = failed.Keys.FirstOrDefault(k => k.StartsWith("file:") && name.Substring(5).Trim().StartsWith(k.Substring(5), StringComparison.OrdinalIgnoreCase)); return hit != null ? "can't read the file: " + failed[hit] : "not found"; }
+        int d0 = name.IndexOf('.');
+        if (d0 > 0 && failed.TryGetValue("src:" + name.Substring(0, d0).Trim(), out f0)) return "can't reach " + name.Substring(0, d0) + ": " + f0;
         int at = name.IndexOf('@');
         if (at > 0) { string m; if (failed.TryGetValue("link:" + name.Substring(at + 1).Trim(), out m)) return "link not readable: " + m; return "not found"; }
         var parts = name.Split('.').Where(p => p.Trim().Length > 0).ToList();
@@ -25682,6 +25719,18 @@ public static class DgSqlComplete {
     public static List<DgSqlSuggestion> Suggest(string text, int caret, DgSqlSchema schema, string dialect, bool forced) {
         var list = new List<DgSqlSuggestion>();
         text = text ?? ""; caret = Math.Max(0, Math.Min(caret, text.Length));
+        // inside [ ... : the saved connections (joins across connections) and file:
+        if (schema != null && schema.Sources.Count > 0) {
+            int open = text.LastIndexOf('[', Math.Max(0, caret - 1));
+            if (open >= 0 && caret > open && text.IndexOf(']', open, caret - open) < 0 && text.IndexOf('\n', open, caret - open) < 0) {
+                Prefix = text.Substring(open + 1, caret - open - 1); Start = open + 1; Length = Prefix.Length;
+                if (Prefix.StartsWith("file:", StringComparison.OrdinalIgnoreCase)) return list;
+                bool closed = caret < text.Length && text[caret] == ']';
+                foreach (var k in schema.Sources.Keys) { int sc = Match(k, Prefix); if (sc >= 0) list.Add(new DgSqlSuggestion { Insert = k + (closed ? "" : "]."), Label = k, Kind = "connection", Detail = DgDb.Dialect(schema.Sources[k]), Score = sc + 500 }); }
+                if (Match("file:", Prefix) >= 0) list.Add(new DgSqlSuggestion { Insert = "file:", Label = "file:", Kind = "keyword", Detail = "a CSV / Excel file: [file:C:\\path\\data.xlsx].Sheet1", Score = 100 });
+                return Finish(list);
+            }
+        }
         // the word being typed, and what is before its dot
         int ws = caret; while (ws > 0 && NameChar(text[ws - 1])) ws--;
         Prefix = text.Substring(ws, caret - ws); Start = ws; Length = caret - ws;
@@ -25722,6 +25771,11 @@ public static class DgSqlComplete {
         if (qual.Length > 0) {
             // alias. / table. -> columns;  schema. -> its tables
             string tname; string key = null;
+            if (schema != null && schema.Sources.ContainsKey(qual)) {        // [Name]. -> the tables of that connection
+                var o = schema.Other(qual);
+                if (o != null) foreach (var k in o.Tables.Keys) if (k.IndexOf('@') < 0 && k.Split('.').Length == 2) add(Q(DgDb.Dialect(schema.Sources[qual]), k), k, "table", o.Tables[k].Count + " columns", 300);
+                return Finish(list);
+            }
             if (al.TryGetValue(qual, out tname) && schema != null) key = schema.Resolve(tname);
             bool isSchema = schema != null && schema.Tables.Keys.Any(k => k.StartsWith(qual + ".", StringComparison.OrdinalIgnoreCase));
             if (key == null && schema != null && !isSchema) key = schema.Resolve(qual);      // table.column without an alias
@@ -25792,6 +25846,788 @@ public static class DgSqlComplete {
             bool plain = dialect == "pg" ? Regex.IsMatch(p, @"^[a-z_][a-z0-9_$]*$") : dialect == "oracle" ? Regex.IsMatch(p, @"^[A-Z][A-Z0-9_$#]*$") : Regex.IsMatch(p, @"^[A-Za-z_@#][\w@$#]*$");
             return plain ? p : DgDb.QuoteName(dialect, p);
         }));
+    }
+}
+
+// ---- Joins across connections and files. One SELECT whose tables name where they live:
+//        FROM [Oracle prod].SALES.ORDERS o JOIN [Local SQL].dbo.customers c ON ... JOIN [file:C:\x.xlsx].Sheet1 r ON ...
+//      Each source gets its own query (only the columns used, and the WHERE parts that only touch it), they run in
+//      parallel, and the rows are joined, filtered, grouped, sorted and cut here, in memory.
+public class DgFedExpr {
+    public string Op = "";                 // lit col star bin not neg isnull in between like case fn agg
+    public string Sym = "", Table = "", Name = "", Fn = "", Text = "";
+    public object Value;
+    public List<DgFedExpr> Args = new List<DgFedExpr>();
+    public bool Negate, Distinct;
+    public int Src = -1, Col = -1;
+    public DgFedExpr(string op) { Op = op; }
+}
+
+public class DgFedSource {
+    public string Alias = "", Label = "", Rest = "", Conn = "", Dialect = "mssql", File = "", Sheet = "";
+    public bool IsFile, Nullable, All;
+    public string JoinType = "";            // "" for the first source; INNER LEFT RIGHT FULL CROSS
+    public DgFedExpr On;
+    public List<string> Cols = new List<string>();          // as described by the source
+    public List<string> Need = new List<string>();          // the columns asked for
+    public List<DgFedExpr> Push = new List<DgFedExpr>();
+    public List<object[]> Rows = new List<object[]>();
+    public List<string> Names = new List<string>();         // the columns of Rows
+    public string Sql = "";
+    public long Ms; public bool Truncated;
+}
+
+public class DgFedRun {
+    public volatile bool Done;
+    public DgSqlResult Result = new DgSqlResult();
+    volatile bool cancel;
+    readonly List<System.Data.Common.DbCommand> cmds = new List<System.Data.Common.DbCommand>();
+    string sql;
+
+    // ---- tokens
+    class Tok { public string T = ""; public int Pos, Len, Kind; public string U { get { return Kind == 0 ? T.ToUpperInvariant() : T; } } }   // 0 word 1 number 2 string 3 symbol 4 quoted name
+    static List<Tok> Lex(string s) {
+        var r = new List<Tok>(); int i = 0, n = s.Length;
+        while (i < n) {
+            char c = s[i];
+            if (char.IsWhiteSpace(c)) { i++; continue; }
+            if (c == '-' && i + 1 < n && s[i + 1] == '-') { while (i < n && s[i] != '\n') i++; continue; }
+            if (c == '/' && i + 1 < n && s[i + 1] == '*') { int e = s.IndexOf("*/", i + 2); i = e < 0 ? n : e + 2; continue; }
+            int st = i;
+            if (c == '\'' || ((c == 'N' || c == 'n') && i + 1 < n && s[i + 1] == '\'')) {
+                if (c != '\'') i++;
+                i++; var sb = new StringBuilder();
+                while (i < n) { if (s[i] == '\'') { if (i + 1 < n && s[i + 1] == '\'') { sb.Append('\''); i += 2; continue; } i++; break; } sb.Append(s[i]); i++; }
+                r.Add(new Tok { T = sb.ToString(), Pos = st, Len = i - st, Kind = 2 }); continue;
+            }
+            if (c == '[') { int e = s.IndexOf(']', i); i = e < 0 ? n : e + 1; r.Add(new Tok { T = s.Substring(st + 1, Math.Max(0, i - st - 2)), Pos = st, Len = i - st, Kind = 4 }); continue; }
+            if (c == '"' || c == '`') { int e = s.IndexOf(c, i + 1); i = e < 0 ? n : e + 1; r.Add(new Tok { T = s.Substring(st + 1, Math.Max(0, i - st - 2)), Pos = st, Len = i - st, Kind = 4 }); continue; }
+            if (char.IsLetter(c) || c == '_' || c == '@' || c == '#') { while (i < n && (char.IsLetterOrDigit(s[i]) || s[i] == '_' || s[i] == '@' || s[i] == '#' || s[i] == '$')) i++; r.Add(new Tok { T = s.Substring(st, i - st), Pos = st, Len = i - st, Kind = 0 }); continue; }
+            if (char.IsDigit(c) || (c == '.' && i + 1 < n && char.IsDigit(s[i + 1]))) {
+                while (i < n && (char.IsDigit(s[i]) || s[i] == '.')) i++;
+                if (i < n && (s[i] == 'e' || s[i] == 'E') && i + 1 < n && (char.IsDigit(s[i + 1]) || s[i + 1] == '-' || s[i + 1] == '+')) { i += 2; while (i < n && char.IsDigit(s[i])) i++; }
+                r.Add(new Tok { T = s.Substring(st, i - st), Pos = st, Len = i - st, Kind = 1 }); continue;
+            }
+            if (i + 1 < n && ((c == '<' && (s[i + 1] == '=' || s[i + 1] == '>')) || (c == '>' && s[i + 1] == '=') || (c == '!' && s[i + 1] == '=') || (c == '|' && s[i + 1] == '|'))) { i += 2; r.Add(new Tok { T = s.Substring(st, 2), Pos = st, Len = 2, Kind = 3 }); continue; }
+            i++; r.Add(new Tok { T = c.ToString(), Pos = st, Len = 1, Kind = 3 });
+        }
+        return r;
+    }
+
+    // a query is one of these when a table names a saved connection or a file: [Name].table, [file:path]
+    public static bool IsFederated(string sql, IEnumerable<string> connNames) {
+        var names = new HashSet<string>(connNames.Where(x => !string.IsNullOrEmpty(x)), StringComparer.OrdinalIgnoreCase);
+        var t = Lex(sql ?? "");
+        for (int i = 1; i < t.Count; i++) {
+            if (!(t[i - 1].Kind == 0 && (t[i - 1].U == "FROM" || t[i - 1].U == "JOIN")) && t[i - 1].T != ",") continue;
+            if (t[i].Kind != 4) continue;
+            if (t[i].T.StartsWith("file:", StringComparison.OrdinalIgnoreCase)) return true;
+            if (names.Contains(t[i].T) && i + 1 < t.Count && t[i + 1].T == ".") return true;
+        }
+        return false;
+    }
+
+    public static DgFedRun Start(string sql, Dictionary<string, string> conns, int maxPerSource, int maxRows) {
+        var r = new DgFedRun { sql = sql ?? "" };
+        var th = new System.Threading.Thread(() => r.Run(conns, maxPerSource, maxRows)) { IsBackground = true, Name = "DevTools cross-source query" };
+        th.Start();
+        return r;
+    }
+    public void Cancel() { cancel = true; lock (cmds) foreach (var c in cmds) { try { c.Cancel(); } catch { } } }
+
+    // ---- the parsed query
+    List<Tok> t; int p;
+    List<DgFedSource> sources = new List<DgFedSource>();
+    List<DgFedExpr> select = new List<DgFedExpr>(); List<string> selNames = new List<string>();
+    DgFedExpr where, having; List<DgFedExpr> groupBy = new List<DgFedExpr>();
+    List<DgFedExpr> orderBy = new List<DgFedExpr>(); List<bool> orderDesc = new List<bool>();
+    bool distinct; long top = -1, offset = 0;
+    Dictionary<string, string> conns;
+
+    class FedError : Exception { public int Pos; public FedError(string m, int pos) : base(m) { Pos = pos; } }
+    Tok Cur { get { return p < t.Count ? t[p] : null; } }
+    bool Is(string u) { return p < t.Count && (t[p].Kind == 0 ? t[p].U == u : t[p].T == u); }
+    bool IsAt(int k, string u) { return k < t.Count && (t[k].Kind == 0 ? t[k].U == u : t[k].T == u); }
+    bool Eat(string u) { if (Is(u)) { p++; return true; } return false; }
+    void Need(string u) { if (!Eat(u)) throw new FedError("Expected " + u + (Cur != null ? " before '" + Cur.T + "'" : " at the end"), Cur != null ? Cur.Pos : sql.Length); }
+    static readonly HashSet<string> Stop = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "FROM", "WHERE", "GROUP", "ORDER", "HAVING", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "ON", "LIMIT", "OFFSET", "FETCH", "UNION", "AS", "SELECT", "AND", "OR", "NOT", "WHEN", "THEN", "ELSE", "END", "OUTER", "IS", "IN", "LIKE", "BETWEEN", "ASC", "DESC", "BY", "USING" };
+
+    void Parse() {
+        t = Lex(sql); p = 0;
+        Need("SELECT");
+        if (Eat("DISTINCT")) distinct = true; else Eat("ALL");
+        if (Eat("TOP")) { bool par = Eat("("); top = Int(); if (par) Need(")"); }
+        do {
+            int st = p;
+            if (Is("*")) { p++; select.Add(new DgFedExpr("star")); selNames.Add("*"); continue; }
+            var e = Expr();
+            string name = "";
+            if (Eat("AS")) name = Name();
+            else if (Cur != null && (Cur.Kind == 4 || (Cur.Kind == 0 && !Stop.Contains(Cur.T)))) name = Name();
+            else if (Cur != null && Cur.Kind == 2 && IsAt(p - 1, "AS")) name = Cur.T;
+            if (name.Length == 0) name = e.Op == "col" ? e.Name : TextOf(st, p);
+            select.Add(e); selNames.Add(name);
+        } while (Eat(","));
+        Need("FROM");
+        sources.Add(Source(""));
+        while (true) {
+            string jt = null;
+            if (Eat(",")) jt = "CROSS";
+            else if (Is("JOIN") || Is("INNER")) { Eat("INNER"); Need("JOIN"); jt = "INNER"; }
+            else if (Is("LEFT")) { p++; Eat("OUTER"); Need("JOIN"); jt = "LEFT"; }
+            else if (Is("RIGHT")) { p++; Eat("OUTER"); Need("JOIN"); jt = "RIGHT"; }
+            else if (Is("FULL")) { p++; Eat("OUTER"); Need("JOIN"); jt = "FULL"; }
+            else if (Is("CROSS")) { p++; Need("JOIN"); jt = "CROSS"; }
+            if (jt == null) break;
+            var s = Source(jt);
+            if (jt != "CROSS") { Need("ON"); s.On = Expr(); }
+            sources.Add(s);
+        }
+        if (Eat("WHERE")) where = Expr();
+        if (Eat("GROUP")) { Need("BY"); do groupBy.Add(Expr()); while (Eat(",")); }
+        if (Eat("HAVING")) having = Expr();
+        if (Eat("ORDER")) { Need("BY"); do { orderBy.Add(Expr()); orderDesc.Add(Eat("DESC") ? true : (Eat("ASC") && false)); } while (Eat(",")); }
+        while (Cur != null && !Is(";")) {
+            if (Eat("LIMIT")) top = Int();
+            else if (Eat("OFFSET")) { offset = Int(); Eat("ROWS"); Eat("ROW"); }
+            else if (Eat("FETCH")) { if (!Eat("FIRST")) Need("NEXT"); top = Int(); if (!Eat("ROWS")) Eat("ROW"); Need("ONLY"); }
+            else throw new FedError("Not understood here: '" + Cur.T + "'. Across sources a query can use SELECT, JOIN, WHERE, GROUP BY, HAVING, ORDER BY, DISTINCT and TOP / LIMIT / FETCH FIRST.", Cur.Pos);
+        }
+        Eat(";");
+        if (Cur != null) throw new FedError("Run one SELECT at a time across sources (more SQL after ';').", Cur.Pos);
+    }
+    long Int() { var c = Cur; if (c == null || c.Kind != 1) throw new FedError("Expected a number", c != null ? c.Pos : sql.Length); p++; return long.Parse(c.T, CultureInfo.InvariantCulture); }
+    string Name() { var c = Cur; if (c == null || (c.Kind != 0 && c.Kind != 4)) throw new FedError("Expected a name", c != null ? c.Pos : sql.Length); p++; return c.T; }
+    string TextOf(int a, int b) { if (a >= b) return ""; int s = t[a].Pos, e = t[b - 1].Pos + t[b - 1].Len; return Regex.Replace(sql.Substring(s, e - s), @"\s+", " ").Trim(); }
+
+    DgFedSource Source(string joinType) {
+        var s = new DgFedSource { JoinType = joinType };
+        var first = Cur;
+        if (first == null) throw new FedError("Expected a table", sql.Length);
+        if (first.T == "(") throw new FedError("Subqueries in FROM aren't supported across sources; name tables directly.", first.Pos);
+        string key = null;
+        if (first.Kind == 4 && first.T.StartsWith("file:", StringComparison.OrdinalIgnoreCase)) {
+            p++;
+            s.IsFile = true; s.File = first.T.Substring(5).Trim().Trim('"');
+            if (Eat(".")) s.Sheet = Name();
+            s.Label = System.IO.Path.GetFileName(s.File) + (s.Sheet.Length > 0 ? " / " + s.Sheet : "");
+        } else {
+            if (first.Kind == 4 && IsAt(p + 1, ".") && conns.Keys.Any(k => k.Length > 0 && string.Equals(k, first.T, StringComparison.OrdinalIgnoreCase))) {
+                key = conns.Keys.First(k => string.Equals(k, first.T, StringComparison.OrdinalIgnoreCase));
+                p += 2;
+            } else key = "";
+            if (!conns.ContainsKey(key)) throw new FedError("No connection for " + first.T + ". Name a saved connection: [Name].schema.table, or a file: [file:C:\\path\\data.csv]", first.Pos);
+            int st = p;
+            Name(); while (Is(".") && p + 1 < t.Count && (t[p + 1].Kind == 0 || t[p + 1].Kind == 4)) { p += 2; }
+            s.Rest = sql.Substring(t[st].Pos, t[p - 1].Pos + t[p - 1].Len - t[st].Pos);
+            s.Conn = conns[key]; s.Dialect = DgDb.Dialect(s.Conn);
+            s.Label = (key.Length > 0 ? key : "this connection") + ": " + s.Rest;
+        }
+        Eat("AS");
+        if (Cur != null && (Cur.Kind == 4 || (Cur.Kind == 0 && !Stop.Contains(Cur.T)))) s.Alias = Name();
+        else s.Alias = s.IsFile ? (s.Sheet.Length > 0 ? s.Sheet : System.IO.Path.GetFileNameWithoutExtension(s.File)) : Regex.Replace(s.Rest.Split('.').Last(), @"[\[\]""]", "");
+        return s;
+    }
+
+    // ---- expressions (OR < AND < NOT < comparisons < + - || < * / % < unary)
+    DgFedExpr Expr() { var a = AndE(); while (Eat("OR")) { var b = AndE(); a = Bin("OR", a, b); } return a; }
+    DgFedExpr AndE() { var a = NotE(); while (Eat("AND")) { var b = NotE(); a = Bin("AND", a, b); } return a; }
+    DgFedExpr NotE() { if (Eat("NOT")) { var e = new DgFedExpr("not"); e.Args.Add(NotE()); return e; } return Cmp(); }
+    DgFedExpr Bin(string sym, DgFedExpr a, DgFedExpr b) { var e = new DgFedExpr("bin") { Sym = sym }; e.Args.Add(a); e.Args.Add(b); return e; }
+    DgFedExpr Cmp() {
+        var a = Add();
+        while (true) {
+            if (Cur != null && Cur.Kind == 3 && (Cur.T == "=" || Cur.T == "<>" || Cur.T == "!=" || Cur.T == "<" || Cur.T == ">" || Cur.T == "<=" || Cur.T == ">=")) { string s0 = Cur.T == "!=" ? "<>" : Cur.T; p++; a = Bin(s0, a, Add()); continue; }
+            if (Is("IS")) { p++; bool neg = Eat("NOT"); Need("NULL"); var e = new DgFedExpr("isnull") { Negate = neg }; e.Args.Add(a); a = e; continue; }
+            int save = p; bool not = Eat("NOT");
+            if (Eat("IN")) { Need("("); if (Is("SELECT")) throw new FedError("IN (SELECT ...) isn't supported across sources; join the table instead.", Cur.Pos); var e = new DgFedExpr("in") { Negate = not }; e.Args.Add(a); do e.Args.Add(Expr()); while (Eat(",")); Need(")"); a = e; continue; }
+            if (Eat("BETWEEN")) { var e = new DgFedExpr("between") { Negate = not }; e.Args.Add(a); e.Args.Add(Add()); Need("AND"); e.Args.Add(Add()); a = e; continue; }
+            if (Eat("LIKE") || Eat("ILIKE")) { var e = new DgFedExpr("like") { Negate = not }; e.Args.Add(a); e.Args.Add(Add()); a = e; continue; }
+            p = save; break;
+        }
+        return a;
+    }
+    DgFedExpr Add() { var a = Mul(); while (Cur != null && Cur.Kind == 3 && (Cur.T == "+" || Cur.T == "-" || Cur.T == "||")) { string s0 = Cur.T; p++; a = Bin(s0, a, Mul()); } return a; }
+    DgFedExpr Mul() { var a = Un(); while (Cur != null && Cur.Kind == 3 && (Cur.T == "*" || Cur.T == "/" || Cur.T == "%")) { string s0 = Cur.T; p++; a = Bin(s0, a, Un()); } return a; }
+    DgFedExpr Un() { if (Cur != null && Cur.Kind == 3 && Cur.T == "-") { p++; var e = new DgFedExpr("neg"); e.Args.Add(Un()); return e; } if (Cur != null && Cur.Kind == 3 && Cur.T == "+") { p++; return Un(); } return Prim(); }
+    static readonly HashSet<string> Aggs = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "COUNT", "SUM", "AVG", "MIN", "MAX" };
+    DgFedExpr Prim() {
+        var c = Cur;
+        if (c == null) throw new FedError("The query ends too early", sql.Length);
+        int st = p;
+        if (c.Kind == 1) { p++; var e = new DgFedExpr("lit"); long l; decimal d; e.Value = long.TryParse(c.T, NumberStyles.Integer, CultureInfo.InvariantCulture, out l) ? (object)l : decimal.TryParse(c.T, NumberStyles.Float, CultureInfo.InvariantCulture, out d) ? (object)d : double.Parse(c.T, CultureInfo.InvariantCulture); e.Text = c.T; return e; }
+        if (c.Kind == 2) { p++; return new DgFedExpr("lit") { Value = c.T, Text = "'" + c.T + "'" }; }
+        if (c.T == "(") { p++; if (Is("SELECT")) throw new FedError("Subqueries aren't supported across sources.", Cur.Pos); var e = Expr(); Need(")"); return e; }
+        if (c.Kind == 0 && c.U == "NULL") { p++; return new DgFedExpr("lit") { Value = null, Text = "NULL" }; }
+        if (c.Kind == 0 && (c.U == "TRUE" || c.U == "FALSE")) { p++; return new DgFedExpr("lit") { Value = c.U == "TRUE", Text = c.U }; }
+        if (c.Kind == 0 && (c.U == "DATE" || c.U == "TIMESTAMP") && p + 1 < t.Count && t[p + 1].Kind == 2) { p += 2; DateTime dt; if (!DateTime.TryParse(t[p - 1].T, CultureInfo.InvariantCulture, DateTimeStyles.None, out dt)) throw new FedError("Not a date: " + t[p - 1].T, t[p - 1].Pos); return new DgFedExpr("lit") { Value = dt, Text = c.U + " '" + t[p - 1].T + "'" }; }
+        if (c.Kind == 0 && c.U == "CASE") {
+            p++; var e = new DgFedExpr("case");
+            if (!Is("WHEN")) { e.Fn = "simple"; e.Args.Add(Expr()); } else e.Args.Add(null);
+            while (Eat("WHEN")) { e.Args.Add(Expr()); Need("THEN"); e.Args.Add(Expr()); }
+            e.Value = Eat("ELSE") ? (object)Expr() : null;
+            Need("END"); e.Text = TextOf(st, p); return e;
+        }
+        if (c.Kind == 0 && (c.U == "CAST" || c.U == "TRY_CAST") && IsAt(p + 1, "(")) {
+            p += 2; var e = new DgFedExpr("fn") { Fn = "CAST" }; e.Args.Add(Expr()); Need("AS");
+            int ts = p; while (Cur != null && Cur.T != ")") { if (Cur.T == "(") { while (Cur != null && Cur.T != ")") p++; } p++; }
+            e.Name = TextOf(ts, p).ToLowerInvariant(); Need(")"); e.Text = TextOf(st, p); return e;
+        }
+        if ((c.Kind == 0 || c.Kind == 4) && IsAt(p + 1, "(") && c.Kind == 0) {
+            p += 2;
+            var e = new DgFedExpr(Aggs.Contains(c.T) ? "agg" : "fn") { Fn = c.U };
+            if (e.Op == "agg") { if (Eat("DISTINCT")) e.Distinct = true; else Eat("ALL"); }
+            if (Is("*")) { p++; e.Args.Add(new DgFedExpr("star")); }
+            else if (!Is(")")) {
+                if (e.Fn == "CONVERT") { int ts = p; while (Cur != null && Cur.T != ",") { if (Cur.T == "(") { while (Cur != null && Cur.T != ")") p++; } p++; } e.Fn = "CAST"; e.Name = TextOf(ts, p).ToLowerInvariant(); Need(","); e.Args.Add(Expr()); while (Eat(",")) Expr(); }
+                else do e.Args.Add(Expr()); while (Eat(","));
+            }
+            Need(")");
+            if (Is("OVER")) throw new FedError("Window functions (OVER) aren't supported across sources.", Cur.Pos);
+            e.Text = TextOf(st, p);
+            return e;
+        }
+        if (c.Kind == 0 || c.Kind == 4) {
+            if (c.Kind == 0 && Stop.Contains(c.T)) throw new FedError("Unexpected '" + c.T + "'", c.Pos);
+            p++;
+            var parts = new List<string> { c.T };
+            while (Is(".") && p + 1 < t.Count && (t[p + 1].Kind == 0 || t[p + 1].Kind == 4 || t[p + 1].T == "*")) { parts.Add(t[p + 1].T); p += 2; }
+            if (parts[parts.Count - 1] == "*") return new DgFedExpr("star") { Table = string.Join(".", parts.Take(parts.Count - 1)) };
+            var e = new DgFedExpr("col") { Name = parts[parts.Count - 1], Table = parts.Count > 1 ? parts[parts.Count - 2] : "", Text = string.Join(".", parts) };
+            return e;
+        }
+        throw new FedError("Unexpected '" + c.T + "'", c.Pos);
+    }
+
+    // ---- columns: which source and column each name means
+    void Bind(DgFedExpr e) {
+        if (e == null) return;
+        if (e.Op == "col") {
+            if (e.Table.Length > 0) {
+                int si = sources.FindIndex(s => string.Equals(s.Alias, e.Table, StringComparison.OrdinalIgnoreCase));
+                if (si < 0) throw new Exception("No table or alias " + e.Table + " for " + e.Text);
+                int ci = Find(sources[si].Cols, e.Name);
+                if (ci < 0) throw new Exception("No column " + e.Name + " in " + sources[si].Label + " (it has: " + string.Join(", ", sources[si].Cols.Take(20)) + ")");
+                e.Src = si; e.Name = sources[si].Cols[ci];
+            } else {
+                var hits = new List<int>();
+                for (int i = 0; i < sources.Count; i++) if (Find(sources[i].Cols, e.Name) >= 0) hits.Add(i);
+                if (hits.Count == 0) throw new Exception("No column " + e.Name + " in any of the tables");
+                if (hits.Count > 1) throw new Exception("Column " + e.Name + " is in more than one table (" + string.Join(", ", hits.Select(h => sources[h].Alias)) + "): write alias." + e.Name);
+                e.Src = hits[0]; e.Name = sources[hits[0]].Cols[Find(sources[hits[0]].Cols, e.Name)];
+            }
+            var s0 = sources[e.Src];
+            if (!s0.Need.Contains(e.Name)) s0.Need.Add(e.Name);
+            return;
+        }
+        if (e.Op == "star" && e.Table.Length > 0) {
+            int si = sources.FindIndex(s => string.Equals(s.Alias, e.Table, StringComparison.OrdinalIgnoreCase));
+            if (si < 0) throw new Exception("No table or alias " + e.Table);
+            e.Src = si; sources[si].All = true; return;
+        }
+        foreach (var a in e.Args) Bind(a);
+        if (e.Op == "case" && e.Value is DgFedExpr) Bind((DgFedExpr)e.Value);
+    }
+    static int Find(List<string> cols, string name) { for (int i = 0; i < cols.Count; i++) if (string.Equals(cols[i], name, StringComparison.OrdinalIgnoreCase)) return i; return -1; }
+    static void Sources(DgFedExpr e, HashSet<int> into) { if (e == null) return; if (e.Op == "col" || (e.Op == "star" && e.Src >= 0)) into.Add(e.Src); foreach (var a in e.Args) Sources(a, into); if (e.Op == "case" && e.Value is DgFedExpr) Sources((DgFedExpr)e.Value, into); }
+    static bool HasAgg(DgFedExpr e) { if (e == null) return false; if (e.Op == "agg") return true; if (e.Args.Any(HasAgg)) return true; return e.Op == "case" && e.Value is DgFedExpr && HasAgg((DgFedExpr)e.Value); }
+    static List<DgFedExpr> Conjuncts(DgFedExpr e) { var r = new List<DgFedExpr>(); if (e == null) return r; if (e.Op == "bin" && e.Sym == "AND") { r.AddRange(Conjuncts(e.Args[0])); r.AddRange(Conjuncts(e.Args[1])); } else r.Add(e); return r; }
+
+    // a WHERE part a database can do itself (plain comparisons of columns and values, no functions)
+    static bool Pushable(DgFedExpr e) {
+        switch (e.Op) {
+            case "lit": return !(e.Value is bool);
+            case "col": return true;
+            case "bin": return e.Sym != "||" && e.Sym != "%" && e.Args.All(Pushable);
+            case "not": case "neg": case "isnull": case "in": case "between": case "like": return e.Args.All(Pushable);
+            default: return false;
+        }
+    }
+    static string Render(DgFedExpr e, string d) {
+        switch (e.Op) {
+            case "lit":
+                if (e.Value == null) return "NULL";
+                if (e.Value is string) return "'" + ((string)e.Value).Replace("'", "''") + "'";
+                if (e.Value is DateTime) { var dt = (DateTime)e.Value; string s = dt.TimeOfDay.Ticks == 0 ? dt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) : dt.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture); return d == "mssql" ? "'" + s + "'" : (dt.TimeOfDay.Ticks == 0 ? "DATE '" : "TIMESTAMP '") + s + "'"; }
+                return Convert.ToString(e.Value, CultureInfo.InvariantCulture);
+            case "col": return QuoteCol(d, e.Name);
+            case "bin": return "(" + Render(e.Args[0], d) + " " + e.Sym + " " + Render(e.Args[1], d) + ")";
+            case "not": return "(NOT " + Render(e.Args[0], d) + ")";
+            case "neg": return "(-" + Render(e.Args[0], d) + ")";
+            case "isnull": return "(" + Render(e.Args[0], d) + (e.Negate ? " IS NOT NULL)" : " IS NULL)");
+            case "in": return "(" + Render(e.Args[0], d) + (e.Negate ? " NOT IN (" : " IN (") + string.Join(", ", e.Args.Skip(1).Select(a => Render(a, d))) + "))";
+            case "between": return "(" + Render(e.Args[0], d) + (e.Negate ? " NOT BETWEEN " : " BETWEEN ") + Render(e.Args[1], d) + " AND " + Render(e.Args[2], d) + ")";
+            case "like": return "(" + Render(e.Args[0], d) + (e.Negate ? " NOT LIKE " : " LIKE ") + Render(e.Args[1], d) + ")";
+        }
+        throw new Exception("can't render " + e.Op);
+    }
+    static string QuoteCol(string d, string n) {
+        bool plain = d == "pg" ? Regex.IsMatch(n, @"^[a-z_][a-z0-9_$]*$") : d == "oracle" ? Regex.IsMatch(n, @"^[A-Z][A-Z0-9_$#]*$") : Regex.IsMatch(n, @"^[A-Za-z_@#][\w@$#]*$");
+        return plain ? n : DgDb.QuoteName(d, n);
+    }
+
+    // ---- reading the sources
+    static DgFedSource Describe(DgFedSource s) {
+        if (s.IsFile) { ReadFile(s, 0); s.Cols = s.Names.ToList(); return s; }
+        string q = s.Dialect == "mssql" ? "SELECT TOP 0 * FROM " + s.Rest : "SELECT * FROM " + s.Rest + " WHERE 1 = 0";
+        using (var c = DgDb.Open(s.Conn)) using (var cmd = c.CreateCommand()) {
+            cmd.CommandText = q; cmd.CommandTimeout = 60;
+            using (var rd = cmd.ExecuteReader(System.Data.CommandBehavior.SchemaOnly)) for (int i = 0; i < rd.FieldCount; i++) s.Cols.Add(rd.GetName(i));
+        }
+        return s;
+    }
+    void Fetch(DgFedSource s, int cap) {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        if (s.IsFile) { ReadFile(s, cap); s.Ms = sw.ElapsedMilliseconds; return; }
+        string cols = s.All || s.Need.Count == 0 ? "*" : string.Join(", ", s.Need.Select(n => QuoteCol(s.Dialect, n)));
+        string w = s.Push.Count > 0 ? " WHERE " + string.Join(" AND ", s.Push.Select(e => Render(e, s.Dialect))) : "";
+        int n1 = cap + 1;
+        s.Sql = s.Dialect == "mssql" ? "SELECT TOP (" + n1 + ") " + cols + " FROM " + s.Rest + w
+              : s.Dialect == "pg" ? "SELECT " + cols + " FROM " + s.Rest + w + " LIMIT " + n1
+              : "SELECT " + cols + " FROM " + s.Rest + w + " FETCH FIRST " + n1 + " ROWS ONLY";
+        using (var c = DgDb.Open(s.Conn)) using (var cmd = c.CreateCommand()) {
+            cmd.CommandText = s.Sql; cmd.CommandTimeout = 0;
+            lock (cmds) cmds.Add(cmd);
+            try {
+                using (var rd = cmd.ExecuteReader()) {
+                    for (int i = 0; i < rd.FieldCount; i++) s.Names.Add(rd.GetName(i));
+                    var sq = rd as System.Data.SqlClient.SqlDataReader;
+                    var udt = sq != null ? DgSqlRun.Udt(sq) : null;
+                    while (rd.Read()) {
+                        if (cancel) break;
+                        if (s.Rows.Count >= cap) { s.Truncated = true; break; }
+                        var v = new object[rd.FieldCount];
+                        if (sq != null) DgSqlRun.Read(sq, v, udt); else DgDb.ReadRow(rd, v);
+                        for (int i = 0; i < v.Length; i++) if (v[i] is DBNull) v[i] = null;
+                        s.Rows.Add(v);
+                    }
+                }
+            } finally { lock (cmds) cmds.Remove(cmd); }
+        }
+        s.Ms = sw.ElapsedMilliseconds;
+    }
+
+    // CSV / TSV / Excel: the first row is the header; numbers and dates are recognised per column
+    static void ReadFile(DgFedSource s, int cap) {
+        if (!System.IO.File.Exists(s.File)) throw new Exception("File not found: " + s.File);
+        List<List<string>> rows;
+        string ext = System.IO.Path.GetExtension(s.File).ToLowerInvariant();
+        if (ext == ".xlsx" || ext == ".xlsm") rows = DgXlsx.Read(s.File, s.Sheet, cap > 0 ? cap + 1 : 50);
+        else rows = Csv(System.IO.File.ReadAllText(s.File), cap > 0 ? cap + 1 : 50);
+        s.Names.Clear(); s.Rows.Clear();
+        if (rows.Count == 0) return;
+        var head = rows[0];
+        for (int i = 0; i < head.Count; i++) { string n = (head[i] ?? "").Trim(); if (n.Length == 0) n = "col" + (i + 1); string u = n; int k = 2; while (s.Names.Contains(u, StringComparer.OrdinalIgnoreCase)) u = n + "_" + k++; s.Names.Add(u); }
+        if (cap <= 0) return;
+        var data = rows.Skip(1).Where(r => r.Any(x => !string.IsNullOrWhiteSpace(x))).ToList();
+        if (data.Count > cap) { s.Truncated = true; data = data.Take(cap).ToList(); }
+        int nc = s.Names.Count;
+        var kinds = new int[nc];                     // 0 long, 1 decimal, 2 date, 3 text
+        for (int c = 0; c < nc; c++) {
+            int kind = 0;
+            foreach (var r in data) {
+                string v = c < r.Count ? (r[c] ?? "").Trim() : ""; if (v.Length == 0) continue;
+                long l; decimal d; DateTime dt;
+                if (kind == 0 && !(long.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out l) && !(v.Length > 1 && v[0] == '0'))) kind = 1;
+                if (kind == 1 && !(decimal.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out d) && !(v.Length > 1 && v[0] == '0' && v[1] != '.'))) kind = 2;
+                if (kind == 2 && !(Regex.IsMatch(v, @"^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?$") && DateTime.TryParse(v, CultureInfo.InvariantCulture, DateTimeStyles.None, out dt))) { kind = 3; break; }
+            }
+            kinds[c] = kind;
+        }
+        foreach (var r in data) {
+            var v = new object[nc];
+            for (int c = 0; c < nc; c++) {
+                string x = c < r.Count ? r[c] : null;
+                if (x == null || x.Trim().Length == 0) { v[c] = null; continue; }
+                string y = x.Trim();
+                v[c] = kinds[c] == 0 ? (object)long.Parse(y, CultureInfo.InvariantCulture) : kinds[c] == 1 ? (object)decimal.Parse(y, NumberStyles.Float, CultureInfo.InvariantCulture) : kinds[c] == 2 ? (object)DateTime.Parse(y, CultureInfo.InvariantCulture) : x;
+            }
+            s.Rows.Add(v);
+        }
+    }
+    // the columns of a CSV / Excel file with the kind of values in them: { name, int / decimal / date / text }
+    public static List<string[]> FileColumns(string file, string sheet) {
+        var s = new DgFedSource { IsFile = true, File = file, Sheet = sheet ?? "" };
+        ReadFile(s, 200);
+        var r = new List<string[]>();
+        for (int c = 0; c < s.Names.Count; c++) {
+            var v = s.Rows.Select(x => x[c]).FirstOrDefault(x => x != null);
+            r.Add(new[] { s.Names[c], v is long ? "int" : v is decimal ? "decimal" : v is DateTime ? "date" : "text" });
+        }
+        return r;
+    }
+    public static List<List<string>> Csv(string text, int max) {
+        var rows = new List<List<string>>();
+        text = text ?? ""; if (text.Length > 0 && text[0] == '\uFEFF') text = text.Substring(1);
+        int nl = text.IndexOf('\n'); string first = nl < 0 ? text : text.Substring(0, nl);
+        char sep = new[] { ',', ';', '\t', '|' }.OrderByDescending(ch => first.Count(x => x == ch)).First();
+        var row = new List<string>(); var cell = new StringBuilder(); bool q = false;
+        for (int i = 0; i < text.Length; i++) {
+            char c = text[i];
+            if (q) { if (c == '"') { if (i + 1 < text.Length && text[i + 1] == '"') { cell.Append('"'); i++; } else q = false; } else cell.Append(c); continue; }
+            if (c == '"' && cell.Length == 0) { q = true; continue; }
+            if (c == sep) { row.Add(cell.ToString()); cell.Clear(); continue; }
+            if (c == '\r') continue;
+            if (c == '\n') { row.Add(cell.ToString()); cell.Clear(); rows.Add(row); row = new List<string>(); if (rows.Count >= max) return rows; continue; }
+            cell.Append(c);
+        }
+        if (cell.Length > 0 || row.Count > 0) { row.Add(cell.ToString()); rows.Add(row); }
+        return rows;
+    }
+
+    // ---- values
+    static bool IsNum(object v) { return v is int || v is long || v is short || v is byte || v is decimal || v is double || v is float || v is uint || v is ulong || v is ushort || v is sbyte; }
+    static bool TryNum(object v, out decimal d, out double f, out bool isF) {
+        d = 0; f = 0; isF = false;
+        if (v == null) return false;
+        if (v is double || v is float) { f = Convert.ToDouble(v); isF = true; if (Math.Abs(f) < 7.9e27 && !double.IsNaN(f)) { d = (decimal)f; } return true; }
+        if (IsNum(v)) { d = Convert.ToDecimal(v); return true; }
+        if (v is bool) { d = (bool)v ? 1 : 0; return true; }
+        var s = v as string;
+        if (s != null && decimal.TryParse(s.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out d)) return true;
+        return false;
+    }
+    static bool TryDate(object v, out DateTime dt) {
+        dt = DateTime.MinValue;
+        if (v is DateTime) { dt = (DateTime)v; return true; }
+        if (v is DateTimeOffset) { dt = ((DateTimeOffset)v).DateTime; return true; }
+        var s = v as string;
+        return s != null && Regex.IsMatch(s.Trim(), @"^\d{4}-\d{2}-\d{2}") && DateTime.TryParse(s.Trim(), CultureInfo.InvariantCulture, DateTimeStyles.None, out dt);
+    }
+    // null when either is NULL; numbers by value, dates as dates, text without regard to case
+    static int? Compare(object a, object b) {
+        if (a == null || b == null) return null;
+        decimal da, db; double fa, fb; bool xa, xb;
+        if ((IsNum(a) || IsNum(b) || a is bool || b is bool) && TryNum(a, out da, out fa, out xa) && TryNum(b, out db, out fb, out xb)) {
+            if (xa || xb) return (xa ? fa : (double)da).CompareTo(xb ? fb : (double)db);
+            return da.CompareTo(db);
+        }
+        DateTime ta, tb;
+        if ((a is DateTime || b is DateTime || a is DateTimeOffset || b is DateTimeOffset) && TryDate(a, out ta) && TryDate(b, out tb)) return ta.CompareTo(tb);
+        return string.Compare(Str(a).TrimEnd(), Str(b).TrimEnd(), StringComparison.OrdinalIgnoreCase);
+    }
+    static string Str(object v) {
+        if (v == null) return null;
+        if (v is DateTime) { var d = (DateTime)v; return d.TimeOfDay.Ticks == 0 ? d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) : d.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture); }
+        if (v is byte[]) return "0x" + BitConverter.ToString((byte[])v).Replace("-", "");
+        if (v is IFormattable) return ((IFormattable)v).ToString(null, CultureInfo.InvariantCulture);
+        return v.ToString();
+    }
+    // a join / group / distinct key: equal values give equal keys across sources (42 = 42.0 = '42', text without case)
+    static string Key(object v) {
+        if (v == null) return null;
+        decimal d; double f; bool x;
+        if ((IsNum(v) || v is bool) && TryNum(v, out d, out f, out x)) return "n:" + (x && Math.Abs(f) >= 7.9e27 ? f.ToString("R", CultureInfo.InvariantCulture) : Norm(d));
+        var s = v as string;
+        if (s != null) { var tr = s.Trim(); if (tr.Length > 0 && tr.Length < 30 && decimal.TryParse(tr, NumberStyles.Float, CultureInfo.InvariantCulture, out d) && !(tr.Length > 1 && tr[0] == '0' && tr[1] != '.')) return "n:" + Norm(d); return "s:" + tr.ToUpperInvariant(); }
+        DateTime dt; if (TryDate(v, out dt)) return "d:" + dt.Ticks;
+        return "s:" + Str(v).ToUpperInvariant();
+    }
+    static string Norm(decimal d) { return (d / 1.000000000000000000000000000000000m).ToString(CultureInfo.InvariantCulture); }
+    static bool Truth(object v) { if (v is bool) return (bool)v; if (v == null) return false; decimal d; double f; bool x; return TryNum(v, out d, out f, out x) && d != 0; }
+
+    // ---- evaluating an expression on a joined row (one row per source; null = no matching row)
+    object Eval(DgFedExpr e, object[][] row, List<object[][]> group) {
+        switch (e.Op) {
+            case "lit": return e.Value;
+            case "col": { var r = row == null ? null : row[e.Src]; return r == null ? null : r[e.Col]; }
+            case "not": { var v = Eval(e.Args[0], row, group); if (v == null) return null; return !Truth(v); }
+            case "neg": { var v = Eval(e.Args[0], row, group); decimal d; double f; bool x; if (!TryNum(v, out d, out f, out x)) return null; return x ? (object)(-f) : -d; }
+            case "isnull": { var v = Eval(e.Args[0], row, group); return e.Negate ? v != null : v == null; }
+            case "in": {
+                var v = Eval(e.Args[0], row, group); if (v == null) return null;
+                bool hit = false, nul = false;
+                for (int i = 1; i < e.Args.Count; i++) { var c = Compare(v, Eval(e.Args[i], row, group)); if (c == null) nul = true; else if (c == 0) { hit = true; break; } }
+                if (hit) return !e.Negate; if (nul) return null; return e.Negate;
+            }
+            case "between": {
+                var v = Eval(e.Args[0], row, group); var lo = Compare(v, Eval(e.Args[1], row, group)); var hi = Compare(v, Eval(e.Args[2], row, group));
+                if (lo == null || hi == null) return null; bool b = lo >= 0 && hi <= 0; return e.Negate ? !b : b;
+            }
+            case "like": {
+                var v = Eval(e.Args[0], row, group); var pt = Eval(e.Args[1], row, group); if (v == null || pt == null) return null;
+                var rx = "^" + Regex.Escape(Str(pt)).Replace("%", ".*").Replace("_", ".") + "$";
+                bool b = Regex.IsMatch(Str(v), rx, RegexOptions.IgnoreCase | RegexOptions.Singleline); return e.Negate ? !b : b;
+            }
+            case "case": {
+                int i = 1;
+                if (e.Fn == "simple") { var v = Eval(e.Args[0], row, group); for (; i + 1 < e.Args.Count; i += 2) { var c = Compare(v, Eval(e.Args[i], row, group)); if (c == 0) return Eval(e.Args[i + 1], row, group); } }
+                else for (; i + 1 < e.Args.Count; i += 2) if (Truth(Eval(e.Args[i], row, group))) return Eval(e.Args[i + 1], row, group);
+                return e.Value is DgFedExpr ? Eval((DgFedExpr)e.Value, row, group) : null;
+            }
+            case "bin": return EvalBin(e, row, group);
+            case "agg": return Agg(e, group ?? new List<object[][]> { row });
+            case "fn": return Fn(e, row, group);
+            case "star": return null;
+        }
+        return null;
+    }
+    object EvalBin(DgFedExpr e, object[][] row, List<object[][]> group) {
+        if (e.Sym == "AND") { var a0 = Eval(e.Args[0], row, group); if (a0 != null && !Truth(a0)) return false; var b0 = Eval(e.Args[1], row, group); if (b0 != null && !Truth(b0)) return false; if (a0 == null || b0 == null) return null; return true; }
+        if (e.Sym == "OR") { var a0 = Eval(e.Args[0], row, group); if (a0 != null && Truth(a0)) return true; var b0 = Eval(e.Args[1], row, group); if (b0 != null && Truth(b0)) return true; if (a0 == null || b0 == null) return null; return false; }
+        var a = Eval(e.Args[0], row, group); var b = Eval(e.Args[1], row, group);
+        switch (e.Sym) {
+            case "=": { var c = Compare(a, b); return c == null ? (object)null : c == 0; }
+            case "<>": { var c = Compare(a, b); return c == null ? (object)null : c != 0; }
+            case "<": { var c = Compare(a, b); return c == null ? (object)null : c < 0; }
+            case ">": { var c = Compare(a, b); return c == null ? (object)null : c > 0; }
+            case "<=": { var c = Compare(a, b); return c == null ? (object)null : c <= 0; }
+            case ">=": { var c = Compare(a, b); return c == null ? (object)null : c >= 0; }
+            case "||": if (a == null && b == null) return null; return (Str(a) ?? "") + (Str(b) ?? "");
+        }
+        if (a == null || b == null) return null;
+        decimal da, db; double fa, fb; bool xa, xb;
+        bool na = TryNum(a, out da, out fa, out xa) && !(a is string && e.Sym == "+" && !IsNum(b)), nb = TryNum(b, out db, out fb, out xb) && !(b is string && e.Sym == "+" && !IsNum(a));
+        if (e.Sym == "+" && (!na || !nb)) {
+            if ((a is DateTime) && nb) return ((DateTime)a).AddDays((double)db);
+            return Str(a) + Str(b);                                  // SQL Server style text +
+        }
+        if (!na || !nb) { DateTime ta, tb; if (e.Sym == "-" && TryDate(a, out ta)) { if (nb) return ta.AddDays(-(double)db); if (TryDate(b, out tb)) return (decimal)(ta - tb).TotalDays; } return null; }
+        try {
+            if (xa || xb) { double x = xa ? fa : (double)da, y = xb ? fb : (double)db; switch (e.Sym) { case "+": return x + y; case "-": return x - y; case "*": return x * y; case "/": return y == 0 ? (object)null : x / y; case "%": return y == 0 ? (object)null : x % y; } }
+            bool ints = (IsInt(a) || a is string) && (IsInt(b) || b is string) && da == Math.Truncate(da) && db == Math.Truncate(db);
+            switch (e.Sym) {
+                case "+": return da + db;
+                case "-": return da - db;
+                case "*": return da * db;
+                case "/": if (db == 0) return null; return ints ? Math.Truncate(da / db) : da / db;   // 7 / 2 = 3 for whole numbers, like SQL Server
+                case "%": if (db == 0) return null; return da % db;
+            }
+        } catch (OverflowException) { double x = (double)da, y = (double)db; switch (e.Sym) { case "+": return x + y; case "-": return x - y; case "*": return x * y; case "/": return x / y; } }
+        return null;
+    }
+    static bool IsInt(object v) { return v is int || v is long || v is short || v is byte; }
+
+    object Agg(DgFedExpr e, List<object[][]> group) {
+        var arg = e.Args.Count > 0 ? e.Args[0] : null;
+        if (e.Fn == "COUNT" && (arg == null || arg.Op == "star")) return (long)group.Count;
+        var vals = new List<object>();
+        var seen = e.Distinct ? new HashSet<string>() : null;
+        foreach (var r in group) { var v = Eval(arg, r, null); if (v == null) continue; if (seen != null && !seen.Add(Key(v))) continue; vals.Add(v); }
+        switch (e.Fn) {
+            case "COUNT": return (long)vals.Count;
+            case "MIN": { object m = null; foreach (var v in vals) if (m == null || Compare(v, m) < 0) m = v; return m; }
+            case "MAX": { object m = null; foreach (var v in vals) if (m == null || Compare(v, m) > 0) m = v; return m; }
+            case "SUM": case "AVG": {
+                if (vals.Count == 0) return null;
+                decimal sum = 0; double fs = 0; bool fl = false;
+                foreach (var v in vals) { decimal d; double f; bool x; if (!TryNum(v, out d, out f, out x)) continue; if (x) fl = true; fs += x ? f : (double)d; if (!fl) { try { sum += d; } catch (OverflowException) { fl = true; } } }
+                if (e.Fn == "SUM") return fl ? (object)fs : sum;
+                return fl ? (object)(fs / vals.Count) : sum / vals.Count;
+            }
+        }
+        return null;
+    }
+
+    object Fn(DgFedExpr e, object[][] row, List<object[][]> group) {
+        Func<int, object> A = i => i < e.Args.Count ? Eval(e.Args[i], row, group) : null;
+        Func<int, string> S = i => Str(A(i));
+        Func<int, int> I = i => { decimal d; double f; bool x; return TryNum(A(i), out d, out f, out x) ? (int)d : 0; };
+        switch (e.Fn) {
+            case "COALESCE": case "ISNULL": case "NVL": case "IFNULL": for (int i = 0; i < e.Args.Count; i++) { var v = A(i); if (v != null) return v; } return null;
+            case "NULLIF": { var a = A(0); return Compare(a, A(1)) == 0 ? null : a; }
+            case "UPPER": case "UCASE": { var s = S(0); return s == null ? null : s.ToUpperInvariant(); }
+            case "LOWER": case "LCASE": { var s = S(0); return s == null ? null : s.ToLowerInvariant(); }
+            case "TRIM": { var s = S(0); return s == null ? null : s.Trim(); }
+            case "LTRIM": { var s = S(0); return s == null ? null : s.TrimStart(); }
+            case "RTRIM": { var s = S(0); return s == null ? null : s.TrimEnd(); }
+            case "LEN": case "LENGTH": { var s = S(0); return s == null ? null : (object)(long)(e.Fn == "LEN" ? s.TrimEnd().Length : s.Length); }
+            case "SUBSTRING": case "SUBSTR": { var s = S(0); if (s == null) return null; int st = Math.Max(1, I(1)) - 1; if (st >= s.Length) return ""; int n = e.Args.Count > 2 ? Math.Max(0, I(2)) : s.Length - st; return s.Substring(st, Math.Min(n, s.Length - st)); }
+            case "LEFT": { var s = S(0); if (s == null) return null; return s.Substring(0, Math.Min(Math.Max(0, I(1)), s.Length)); }
+            case "RIGHT": { var s = S(0); if (s == null) return null; int n = Math.Min(Math.Max(0, I(1)), s.Length); return s.Substring(s.Length - n); }
+            case "REPLACE": { var s = S(0); var a = S(1); if (s == null || string.IsNullOrEmpty(a)) return s; return Regex.Replace(s, Regex.Escape(a), (S(2) ?? "").Replace("$", "$$"), RegexOptions.IgnoreCase); }
+            case "CONCAT": return string.Concat(Enumerable.Range(0, e.Args.Count).Select(i => S(i) ?? ""));
+            case "ROUND": { var v = A(0); decimal d; double f; bool x; if (!TryNum(v, out d, out f, out x)) return null; int n = e.Args.Count > 1 ? I(1) : 0; return x ? (object)Math.Round(f, Math.Max(0, n)) : Math.Round(d, Math.Max(0, Math.Min(28, n)), MidpointRounding.AwayFromZero); }
+            case "ABS": { var v = A(0); decimal d; double f; bool x; if (!TryNum(v, out d, out f, out x)) return null; return x ? (object)Math.Abs(f) : Math.Abs(d); }
+            case "FLOOR": { decimal d; double f; bool x; if (!TryNum(A(0), out d, out f, out x)) return null; return Math.Floor(d); }
+            case "CEILING": case "CEIL": { decimal d; double f; bool x; if (!TryNum(A(0), out d, out f, out x)) return null; return Math.Ceiling(d); }
+            case "YEAR": { DateTime dt; return TryDate(A(0), out dt) ? (object)(long)dt.Year : null; }
+            case "MONTH": { DateTime dt; return TryDate(A(0), out dt) ? (object)(long)dt.Month : null; }
+            case "DAY": { DateTime dt; return TryDate(A(0), out dt) ? (object)(long)dt.Day : null; }
+            case "GETDATE": case "NOW": case "SYSDATE": case "CURRENT_TIMESTAMP": case "SYSDATETIME": return DateTime.Now;
+            case "CAST": {
+                var v = A(0); if (v == null) return null;
+                string ty = e.Name; decimal d; double f; bool x; DateTime dt;
+                if (Regex.IsMatch(ty, @"^(int|bigint|smallint|tinyint|integer|long)\b")) return TryNum(v, out d, out f, out x) ? (object)(long)Math.Truncate(d) : null;
+                if (Regex.IsMatch(ty, @"^(decimal|numeric|money|number)\b")) { if (!TryNum(v, out d, out f, out x)) return null; var m = Regex.Match(ty, @",\s*(\d+)"); return m.Success ? Math.Round(d, int.Parse(m.Groups[1].Value), MidpointRounding.AwayFromZero) : (ty.StartsWith("number") && !ty.Contains(",") && ty.Contains("(")) ? Math.Round(d, 0) : d; }
+                if (Regex.IsMatch(ty, @"^(float|real|double)\b")) return TryNum(v, out d, out f, out x) ? (object)(x ? f : (double)d) : null;
+                if (Regex.IsMatch(ty, @"^(date)\b") && !ty.StartsWith("datetime")) return TryDate(v, out dt) ? (object)dt.Date : null;
+                if (Regex.IsMatch(ty, @"^(datetime|datetime2|timestamp|smalldatetime)\b")) return TryDate(v, out dt) ? (object)dt : null;
+                if (Regex.IsMatch(ty, @"^(bit|bool|boolean)\b")) return Truth(v);
+                return Str(v);
+            }
+        }
+        throw new Exception("The function " + e.Fn + " isn't supported across sources");
+    }
+
+    // ---- joining
+    List<object[][]> Join(List<object[][]> left, DgFedSource s, int k) {
+        var outRows = new List<object[][]>();
+        int ns = sources.Count;
+        Func<object[][], object[], object[][]> combine = (l, r) => { var x = new object[ns][]; if (l != null) Array.Copy(l, x, ns); x[k] = r; return x; };
+        if (s.JoinType == "CROSS") { foreach (var l in left) foreach (var r in s.Rows) { if (cancel) return outRows; outRows.Add(combine(l, r)); } return outRows; }
+        // equal-key parts of ON: left side from the tables before, right side from this one -> a hash join
+        var leftKeys = new List<DgFedExpr>(); var rightKeys = new List<DgFedExpr>(); var rest = new List<DgFedExpr>();
+        foreach (var c in Conjuncts(s.On)) {
+            if (c.Op == "bin" && c.Sym == "=") {
+                var a = new HashSet<int>(); var b = new HashSet<int>(); Sources(c.Args[0], a); Sources(c.Args[1], b);
+                if (a.Count > 0 && b.Count == 1 && b.Contains(k) && !a.Contains(k) && a.All(i => i < k)) { leftKeys.Add(c.Args[0]); rightKeys.Add(c.Args[1]); continue; }
+                if (b.Count > 0 && a.Count == 1 && a.Contains(k) && !b.Contains(k) && b.All(i => i < k)) { leftKeys.Add(c.Args[1]); rightKeys.Add(c.Args[0]); continue; }
+            }
+            rest.Add(c);
+        }
+        var matchedRight = new bool[s.Rows.Count];
+        Func<object[][], bool> restOk = x => rest.All(c => Truth(Eval(c, x, null)));
+        if (leftKeys.Count > 0) {
+            var map = new Dictionary<string, List<int>>();
+            var probe = new object[ns][];
+            for (int i = 0; i < s.Rows.Count; i++) {
+                probe[k] = s.Rows[i];
+                var kk = KeyOf(rightKeys, probe); if (kk == null) continue;
+                List<int> l; if (!map.TryGetValue(kk, out l)) { l = new List<int>(); map[kk] = l; } l.Add(i);
+            }
+            foreach (var l in left) {
+                if (cancel) return outRows;
+                var kk = KeyOf(leftKeys, l);
+                bool any = false; List<int> hits;
+                if (kk != null && map.TryGetValue(kk, out hits))
+                    foreach (var i in hits) { var x = combine(l, s.Rows[i]); if (rest.Count == 0 || restOk(x)) { outRows.Add(x); matchedRight[i] = true; any = true; } }
+                if (!any && (s.JoinType == "LEFT" || s.JoinType == "FULL")) outRows.Add(combine(l, null));
+            }
+        } else {
+            foreach (var l in left) {
+                if (cancel) return outRows;
+                bool any = false;
+                for (int i = 0; i < s.Rows.Count; i++) { var x = combine(l, s.Rows[i]); if (Truth(Eval(s.On, x, null))) { outRows.Add(x); matchedRight[i] = true; any = true; } }
+                if (!any && (s.JoinType == "LEFT" || s.JoinType == "FULL")) outRows.Add(combine(l, null));
+            }
+        }
+        if (s.JoinType == "RIGHT" || s.JoinType == "FULL") for (int i = 0; i < s.Rows.Count; i++) if (!matchedRight[i]) outRows.Add(combine(null, s.Rows[i]));
+        return outRows;
+    }
+    string KeyOf(List<DgFedExpr> exprs, object[][] row) {
+        var sb = new StringBuilder();
+        foreach (var e in exprs) { var k = Key(Eval(e, row, null)); if (k == null) return null; sb.Append(k).Append('\u0001'); }
+        return sb.ToString();
+    }
+
+    // ---- the whole run
+    void Run(Dictionary<string, string> connMap, int maxPerSource, int maxRows) {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        conns = connMap;
+        try {
+            try { Parse(); }
+            catch (FedError fe) { int line = 1; for (int i = 0; i < Math.Min(fe.Pos, sql.Length); i++) if (sql[i] == '\n') line++; Result.ErrorLine = line; Result.Error = fe.Message + "  (line " + line + ")"; return; }
+            var dup = sources.GroupBy(s => s.Alias, StringComparer.OrdinalIgnoreCase).FirstOrDefault(g => g.Count() > 1);
+            if (dup != null) throw new Exception("Two tables are called " + dup.Key + ": give them different aliases.");
+            // which rows can be missing (outer joins): their WHERE parts must not be done by the database
+            for (int i = 1; i < sources.Count; i++) {
+                var jt = sources[i].JoinType;
+                if (jt == "LEFT" || jt == "FULL") sources[i].Nullable = true;
+                if (jt == "RIGHT" || jt == "FULL") for (int j = 0; j < i; j++) sources[j].Nullable = true;
+            }
+            // 1. the columns of every source (in parallel)
+            Parallel(sources.Select(s => (Action)(() => Describe(s))).ToList(), "Reading the columns");
+            if (cancel) { Result.Cancelled = true; return; }
+            // 2. what each name means, which columns each source sends, which WHERE parts it does itself
+            bool star = select.Any(e => e.Op == "star" && e.Table.Length == 0);
+            if (star) foreach (var s in sources) s.All = true;
+            foreach (var e in select) Bind(e);
+            foreach (var s in sources) Bind(s.On);
+            Bind(where); foreach (var g in groupBy) Bind(g); Bind(having);
+            for (int i = 0; i < orderBy.Count; i++) {
+                var o = orderBy[i];
+                bool alias = o.Op == "col" && o.Table.Length == 0 && selNames.Any(n => string.Equals(n, o.Name, StringComparison.OrdinalIgnoreCase)) && !sources.Any(s => Find(s.Cols, o.Name) >= 0);
+                if (!(o.Op == "lit" && o.Value is long) && !alias) Bind(o);
+            }
+            foreach (var c in Conjuncts(where)) {
+                var used = new HashSet<int>(); Sources(c, used);
+                if (used.Count == 1 && Pushable(c)) { var s = sources[used.First()]; if (!s.Nullable && !s.IsFile) s.Push.Add(c); }
+            }
+            // 3. the rows (in parallel)
+            Parallel(sources.Select(s => (Action)(() => Fetch(s, maxPerSource))).ToList(), "Reading the rows");
+            if (cancel) { Result.Cancelled = true; return; }
+            foreach (var s in sources) {
+                lock (Result.Messages) Result.Messages.Add(s.Alias + "  (" + s.Label + "): " + s.Rows.Count + " row" + (s.Rows.Count == 1 ? "" : "s") + " in " + s.Ms + " ms" + (s.Truncated ? "  -  CUT at " + maxPerSource + " rows, the result may miss rows" : "") + (s.Sql.Length > 0 ? "\n    " + s.Sql : ""));
+                if (s.Truncated) Result.Truncated = true;
+            }
+            // column positions in the fetched rows
+            Action<DgFedExpr> place = null;
+            place = e => { if (e == null) return; if (e.Op == "col" && e.Src >= 0) { e.Col = Find(sources[e.Src].Names, e.Name); if (e.Col < 0) throw new Exception("Column " + e.Name + " didn't come back from " + sources[e.Src].Label); } foreach (var a in e.Args) place(a); if (e.Op == "case" && e.Value is DgFedExpr) place((DgFedExpr)e.Value); };
+            foreach (var e in select) place(e); foreach (var s in sources) place(s.On); place(where); foreach (var g in groupBy) place(g); place(having); foreach (var o in orderBy) place(o);
+            // 4. join, filter
+            var rows = sources[0].Rows.Select(r => { var x = new object[sources.Count][]; x[0] = r; return x; }).ToList();
+            for (int k = 1; k < sources.Count; k++) { rows = Join(rows, sources[k], k); if (cancel) { Result.Cancelled = true; return; } }
+            if (where != null) rows = rows.Where(r => Truth(Eval(where, r, null))).ToList();
+            // 5. columns of the result
+            var outCols = new List<string>(); var outExpr = new List<DgFedExpr>();
+            for (int i = 0; i < select.Count; i++) {
+                var e = select[i];
+                if (e.Op == "star") {
+                    foreach (int si in e.Table.Length == 0 ? Enumerable.Range(0, sources.Count) : new[] { e.Src })
+                        for (int c = 0; c < sources[si].Names.Count; c++) { outCols.Add(sources[si].Names[c]); outExpr.Add(new DgFedExpr("col") { Src = si, Col = c, Name = sources[si].Names[c] }); }
+                } else { outCols.Add(selNames[i]); outExpr.Add(e); }
+            }
+            bool grouped = groupBy.Count > 0 || select.Any(HasAgg) || HasAgg(having);
+            var result = new List<object[]>(); var keys = new List<object[]>();
+            Func<object[][], List<object[][]>, object[], object[]> orderVals = (r, g, outRow) => orderBy.Select((o, i) => {
+                if (o.Op == "lit" && o.Value is long) { int n = (int)(long)o.Value - 1; return n >= 0 && n < outRow.Length ? outRow[n] : null; }
+                if (o.Op == "col" && o.Src < 0) { int n = outCols.FindIndex(c => string.Equals(c, o.Name, StringComparison.OrdinalIgnoreCase)); return n >= 0 ? outRow[n] : null; }
+                return Eval(o, r, g);
+            }).ToArray();
+            if (grouped) {
+                var groups = new Dictionary<string, List<object[][]>>(); var order = new List<string>();
+                foreach (var r in rows) {
+                    var sb = new StringBuilder(); foreach (var g in groupBy) sb.Append(Key(Eval(g, r, null)) ?? "\u0002").Append('\u0001');
+                    var k = sb.ToString(); List<object[][]> l; if (!groups.TryGetValue(k, out l)) { l = new List<object[][]>(); groups[k] = l; order.Add(k); } l.Add(r);
+                }
+                if (groupBy.Count == 0 && order.Count == 0) { groups[""] = new List<object[][]>(); order.Add(""); }
+                foreach (var k in order) {
+                    var g = groups[k]; var first = g.Count > 0 ? g[0] : new object[sources.Count][];
+                    if (having != null && !Truth(Eval(having, first, g))) continue;
+                    var o = outExpr.Select(e => Eval(e, first, g)).ToArray();
+                    result.Add(o); keys.Add(orderVals(first, g, o));
+                }
+            } else foreach (var r in rows) { var o = outExpr.Select(e => Eval(e, r, null)).ToArray(); result.Add(o); keys.Add(orderVals(r, null, o)); }
+            // 6. DISTINCT, ORDER BY, OFFSET / TOP
+            var idx = Enumerable.Range(0, result.Count).ToList();
+            if (distinct) { var seen = new HashSet<string>(); idx = idx.Where(i => seen.Add(string.Join("\u0001", result[i].Select(v => Key(v) ?? "\u0002")))).ToList(); }
+            if (orderBy.Count > 0) {
+                idx.Sort((a, b) => {
+                    for (int j = 0; j < orderBy.Count; j++) {
+                        object x = keys[a][j], y = keys[b][j]; int c;
+                        if (x == null && y == null) c = 0; else if (x == null) c = -1; else if (y == null) c = 1; else c = Compare(x, y) ?? 0;
+                        if (c != 0) return orderDesc[j] ? -c : c;
+                    }
+                    return a.CompareTo(b);
+                });
+            }
+            idx = idx.Skip((int)Math.Min(int.MaxValue, offset)).ToList();
+            if (top >= 0) idx = idx.Take((int)Math.Min(int.MaxValue, top)).ToList();
+            var tb = new System.Data.DataTable("Result 1");
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var n0 in outCols) { string n = string.IsNullOrEmpty(n0) ? "(no name)" : n0; string u = n; int k = 2; while (names.Contains(u)) u = n + " (" + k++ + ")"; names.Add(u); tb.Columns.Add(u, typeof(object)); }
+            tb.BeginLoadData();
+            foreach (var i in idx) {
+                if (maxRows > 0 && tb.Rows.Count >= maxRows) { Result.Truncated = true; break; }
+                tb.LoadDataRow(result[i].Select(v => DgSqlRun.Show(v)).ToArray(), true);
+            }
+            tb.EndLoadData();
+            Result.Tables.Add(tb);
+            lock (Result.Messages) Result.Messages.Add("Joined here: " + rows.Count + " row" + (rows.Count == 1 ? "" : "s") + " after the joins and WHERE, " + tb.Rows.Count + " in the result.");
+        } catch (Exception ex) {
+            if (cancel) Result.Cancelled = true;
+            else Result.Error = DgDb.ErrorText(ex is AggregateException && ex.InnerException != null ? ex.InnerException : ex);
+        } finally { Result.Ms = sw.ElapsedMilliseconds; Done = true; }
+    }
+
+    // runs the steps at the same time; the first error (with the source it came from) stops the query
+    void Parallel(List<Action> steps, string what) {
+        var errors = new List<Exception>();
+        var threads = steps.Select((a, i) => new System.Threading.Thread(() => { try { a(); } catch (Exception ex) { lock (errors) errors.Add(new Exception(sources[i].Alias + " (" + sources[i].Label + "): " + DgDb.ErrorText(ex), ex)); } }) { IsBackground = true }).ToList();
+        foreach (var th in threads) th.Start();
+        foreach (var th in threads) th.Join();
+        if (errors.Count > 0 && !cancel) throw errors[0];
     }
 }
 
@@ -28393,7 +29229,7 @@ function New-DiagramFromData {
 # PostgreSQL and Oracle too, through a driver found on this PC (ODBC, ODP.NET, Npgsql).
 # ======================================================================================
 $SqlDir = Join-Path $DataDir 'sql'
-$SqlUI = @{ Form = $null; Conns = (New-Object System.Collections.Generic.List[object]); Queries = (New-Object System.Collections.Generic.List[object]); History = (New-Object System.Collections.Generic.List[object]); Run = $null; Fl = @{} }
+$SqlUI = @{ Form = $null; Conns = (New-Object System.Collections.Generic.List[object]); Queries = (New-Object System.Collections.Generic.List[object]); History = (New-Object System.Collections.Generic.List[object]); Run = $null; Fl = @{}; FedCap = 200000 }
 
 function Import-SqlData {
     $SqlUI.Conns.Clear(); $SqlUI.Queries.Clear(); $SqlUI.History.Clear()
@@ -28632,6 +29468,20 @@ function Start-SqlRun {
     $ed = $SqlUI.Editor
     $sql = if ($ed.SelectionLength -gt 0) { $ed.SelectedText } else { $ed.Text }
     if (-not $sql.Trim()) { return }
+    # a query whose tables name other saved connections or files: each source runs its part, the join happens here
+    $names = @($SqlUI.Conns | ForEach-Object { [string]$_.Name })
+    if ([DgFedRun]::IsFederated($sql, [string[]]$names)) {
+        $map = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($cx in $SqlUI.Conns) { if ($cx.Name -and -not $map.ContainsKey([string]$cx.Name)) { $map[[string]$cx.Name] = Get-SqlConnString $cx } }
+        $map[''] = Get-SqlConnString $c0 $SqlUI.DbBox.Text
+        $SqlUI.RunSql = $sql; $SqlUI.TextPlan = $false
+        $SqlUI.Run = [DgFedRun]::Start($sql, $map, [int]$SqlUI.FedCap, [int]$SqlUI.MaxRows.Value)
+        $SqlUI.RunBtn.Enabled = $false; $SqlUI.CancelBtn.Enabled = $true
+        Set-SqlStatus 'Running across sources...' $C.Accent
+        $SqlUI.Started = Get-Date
+        $SqlUI.Timer.Start()
+        return
+    }
     $w = [DgSql]::Writes($sql, (Get-SqlDialect $c0))
     if ($w -and $c0.Confirm -ne $false) {
         if ([System.Windows.Forms.MessageBox]::Show($SqlUI.Form, "This changes data or objects ($w) on $($c0.Name) / $($SqlUI.DbBox.Text).`n`nRun it?", 'SQL client', 'YesNo', 'Warning') -ne 'Yes') { return }
@@ -29134,6 +29984,15 @@ function Get-SqlSchema {
         $SqlUI.SchemaKey = $key; $SqlUI.Schema = $null; $SqlUI.SchemaError = ''
         if ($c0) { try { $SqlUI.Schema = [DgSqlSchema]::Load((Get-SqlConnString $c0 $SqlUI.DbBox.Text)) } catch { $SqlUI.SchemaError = Get-SqlError $_ } }
     }
+    # the other saved connections, for [Name].schema.table
+    if ($SqlUI.Schema) {
+        $sig = (@($SqlUI.Conns | ForEach-Object { "$($_.Name)|$($_.Server)|$($_.Database)|$($_.Driver)" }) -join ';')
+        if ($SqlUI.SourcesSig -ne $sig -or $SqlUI.Schema.Sources.Count -eq 0) {
+            $SqlUI.SourcesSig = $sig
+            $SqlUI.Schema.Sources.Clear()
+            foreach ($cx in $SqlUI.Conns) { if ($cx.Name -and -not $SqlUI.Schema.Sources.ContainsKey([string]$cx.Name)) { try { $SqlUI.Schema.Sources[[string]$cx.Name] = Get-SqlConnString $cx } catch { } } }
+        }
+    }
     $SqlUI.Schema
 }
 
@@ -29148,8 +30007,8 @@ function New-SqlCompleteList($Form) {
         $g = $e.Graphics; $r = $e.Bounds
         $sel = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
         $b = New-Object System.Drawing.SolidBrush $(if ($sel) { $C.Sel } else { $C.Panel }); $g.FillRectangle($b, $r); $b.Dispose()
-        $kc = switch ($it.Kind) { 'table' { $C.Accent } 'column' { $C.Green } 'alias' { $C.Purple } 'function' { $C.Orange } 'schema' { $C.Yellow } default { $C.Dim } }
-        $tag = switch ($it.Kind) { 'table' { 'T' } 'column' { 'C' } 'alias' { 'A' } 'function' { 'f' } 'schema' { 'S' } default { 'K' } }
+        $kc = switch ($it.Kind) { 'table' { $C.Accent } 'column' { $C.Green } 'alias' { $C.Purple } 'function' { $C.Orange } 'schema' { $C.Yellow } 'connection' { $C.Red } default { $C.Dim } }
+        $tag = switch ($it.Kind) { 'table' { 'T' } 'column' { 'C' } 'alias' { 'A' } 'function' { 'f' } 'schema' { 'S' } 'connection' { 'DB' } default { 'K' } }
         $flags = [System.Windows.Forms.TextFormatFlags]'VerticalCenter, HorizontalCenter, NoPrefix, SingleLine, NoPadding'
         [System.Windows.Forms.TextRenderer]::DrawText($g, $tag, $FontSmall, (New-Object System.Drawing.Rectangle(($r.X + (Px 6)), $r.Y, (Px 16), $r.Height)), $kc, $flags)
         $dw = if ($it.Detail) { [Math]::Min([int]($r.Width * 0.45), [System.Windows.Forms.TextRenderer]::MeasureText($it.Detail, $FontSmall).Width + (Px 8)) } else { 0 }
@@ -29218,7 +30077,7 @@ function Register-SqlComplete($Ed) {
     $Ed.add_KeyPress({
         param($src, $e)
         $ch = $e.KeyChar
-        if ([char]::IsLetterOrDigit($ch) -or $ch -in '_', '.', '@', '$', '#') { $SqlUI.AcTyped = $true }
+        if ([char]::IsLetterOrDigit($ch) -or $ch -in '_', '.', '@', '$', '#', '[' -or ($ch -eq ' ' -and $SqlUI.Ac.Visible -and $SqlUI.AcItems -and $SqlUI.AcItems[0].Kind -eq 'connection')) { $SqlUI.AcTyped = $true }
         elseif ([int]$ch -eq 8) { $SqlUI.AcTyped = $SqlUI.Ac.Visible }
         else { $SqlUI.AcTyped = $false; Hide-SqlComplete }
     })
@@ -29329,7 +30188,7 @@ function Show-SqlClient {
     })
     $lbar = New-Object System.Windows.Forms.FlowLayoutPanel; $lbar.Dock = 'Top'; $lbar.AutoSize = $true; $lbar.WrapContents = $true; $lbar.BackColor = $C.Panel; $lbar.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 3), (Px 6), (Px 3))
     [void](New-Button 'Open in Diagram studio' 'Edit, style or export this diagram' { if ($SqlUI.LiveText) { Show-DiagramStudio; New-DiagramFromText 'Query' $SqlUI.LiveText } } $lbar $Glyph.Apps 2)
-    [void](New-Button 'Refresh columns' 'Read the tables and columns of the database again' { $SqlUI.SchemaKey = '-'; Update-SqlLive } $lbar $Glyph.Refresh 2)
+    [void](New-Button 'Refresh columns' 'Read the tables and columns of the database again' { $SqlUI.SchemaKey = '-'; $SqlUI.SourcesSig = ''; Update-SqlLive } $lbar $Glyph.Refresh 2)
     $SqlUI.LiveInfo = New-TbLabel $lbar '' -Dim; $SqlUI.LiveInfo.Margin = New-Object System.Windows.Forms.Padding((Px 8), (Px 8), 0, 0)
     $live.Panel2.Controls.Add($lcv); $live.Panel2.Controls.Add($lbar)
     $SqlUI.LiveCanvas = $lcv

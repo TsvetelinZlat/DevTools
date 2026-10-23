@@ -526,6 +526,20 @@ A database client for **SQL Server** (nothing to install: it uses the SQL Server
   - **Copy** or **Into the editor** for each fix (nothing is run for you), **Save .sqlplan** for SSMS / Azure Data Studio, **Open in Diagram studio**
   - PostgreSQL / Oracle: **Plan** and **Run with plan** show the database's own plan as text for the statement under the cursor (`EXPLAIN` / `EXPLAIN (ANALYZE, BUFFERS)`, Oracle `EXPLAIN PLAN` / `DBMS_XPLAN`).
 - **Suggestions** as you type (or **Ctrl+Space**): tables after `FROM` / `JOIN`, the columns of the statement's tables, `alias.` lists that table's columns (also tables in other databases), `schema.` its tables, plus keywords and functions of the database type. Up / Down choose, **Tab** puts it in, Esc closes.
+- **Joins across connections and files**: name where each table lives, and DevTools does the rest:
+  ```sql
+  SELECT o.order_id, c.name, r.region
+  FROM [Oracle prod].SALES.ORDERS o
+  JOIN [Local SQL].dbo.customers c ON c.id = o.customer_id
+  JOIN [file:C:\dataegions.xlsx].Sheet1 r ON r.code = c.region_code
+  WHERE o.order_date >= DATE '2026-01-01'
+  ```
+  - `[Name]` is a saved connection (SQL Server, PostgreSQL or Oracle); a table without one uses the current connection. `[file:path]` is a CSV / TSV file, `[file:path].Sheet` a sheet of an .xlsx (first row = column names; numbers and dates are recognised).
+  - Each source gets its own query in parallel: only the columns used, and the `WHERE` parts that only touch that table (not for the optional side of an outer join). The rows are then joined, filtered, grouped and sorted inside DevTools; **Messages** shows what each source ran and how many rows it sent.
+  - Supported across sources: `SELECT` with `DISTINCT` / `TOP`, every join type, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` (also by alias or number), `LIMIT` / `OFFSET` / `FETCH FIRST`, `COUNT / SUM / AVG / MIN / MAX` (with `DISTINCT`), `CASE`, `IN`, `BETWEEN`, `LIKE`, `IS NULL`, `CAST` and common functions (`COALESCE` / `ISNULL` / `NVL`, `UPPER`, `SUBSTRING`, `ROUND`, `YEAR` ...). Not across sources: subqueries, CTEs, window functions, `UNION`.
+  - Values match across sources the forgiving way: `42`, `42.0` and `'42'` are equal, text is compared without case.
+  - At most 200,000 rows are read from each source; when a source has more, Messages says the result may miss rows (add a `WHERE`).
+  - The live diagram and the suggestions follow these names too: after `[` you get your connections and `file:`, after `[Name].` its tables.
 - **Editor** with SQL colours. **F5** or **Ctrl+Enter** runs the selection, or everything; `GO` lines separate batches (as in SSMS). PostgreSQL / Oracle run one statement at a time (`;` between them; an Oracle PL/SQL block ends with a `/` line). **Cancel** (or Esc) stops a long query. **Max rows** caps what is shown per result.
 - **Results**: a tab per result set, plus **Messages** (rows affected, PRINT output, errors).
   - An error selects the line it happened on.
