@@ -26224,7 +26224,7 @@ function Get-DiagramFiles {
 }
 # the folder new diagrams go into: the one selected in the Saved tree (or the folder of the selected diagram)
 function Get-DiagramTargetDir {
-    $d = $DgUI.TargetDir
+    $d = if ($DgUI.Folders) { Get-DiagramDirOf (Get-DvFolderSelected $DgUI.Folders) } else { $DgDir }
     if ($d -and (Test-Path -LiteralPath $d) -and (Test-DiagramInside $d)) { return $d }
     $DgDir
 }
@@ -26352,73 +26352,76 @@ function New-DiagramFromText([string]$Name, [string]$Text) {
     Save-DiagramFile
     Update-DiagramList
 }
-# ---- the Saved tab: a folder tree (real folders under data\diagrams)
+# ---- the Saved tab: folders like in Notes (real folders under data\diagrams; "Work/Network" = data\diagrams\Work\Network)
+function Get-DiagramDirOf([string]$Folder) { if ($Folder) { Join-Path $DgDir ($Folder -replace '/', '\') } else { $DgDir } }
+function Get-DiagramFolderOf([string]$Dir) { (Get-DiagramRelative $Dir) -replace '\\', '/' }
+function Get-DiagramFolders {
+    if (-not (Test-Path -LiteralPath $DgDir)) { return @() }
+    @(Get-ChildItem -LiteralPath $DgDir -Directory -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Get-DiagramFolderOf $_.FullName })
+}
+function Get-DiagramItems {
+    foreach ($f in @(Get-DiagramFiles)) { [pscustomobject]@{ Folder = (Get-DiagramFolderOf (Split-Path -Parent $f.FullName)); Path = $f.FullName; Name = $f.BaseName; Time = $f.LastWriteTime } }
+}
+$DgCollapsedFile = Join-Path (Split-Path -Parent $DgDir) 'diagram-folders.json'
+function Save-DiagramCollapsed { if ($DgUI.Folders) { try { Write-JsonFile $DgCollapsedFile (ConvertTo-Json -InputObject @($DgUI.Folders.Collapsed) -Compress) } catch { } } }
+# keeps closed folders closed after a folder is renamed or moved
+function Move-DiagramCollapsed([string]$Old, [string]$New) {
+    $fl = $DgUI.Folders
+    if (-not $fl -or -not $Old) { return }
+    foreach ($p in @($fl.Collapsed)) { if ($p -eq $Old -or $p.StartsWith($Old + '/', [StringComparison]::OrdinalIgnoreCase)) { [void]$fl.Collapsed.Remove($p); if ($New) { [void]$fl.Collapsed.Add($New + $p.Substring($Old.Length)) } } }
+    Save-DiagramCollapsed
+}
+# the open diagram's file after a file or folder moved
+function Update-DiagramOpenPath([string]$Old, [string]$New) {
+    if (-not $DgUI.File) { return }
+    if ($DgUI.File -eq $Old) { $DgUI.File = $New }
+    elseif ($DgUI.File.StartsWith($Old + '\', [StringComparison]::OrdinalIgnoreCase)) { $DgUI.File = $New + $DgUI.File.Substring($Old.Length) }
+}
+function Show-DiagramFolder([string]$Folder) {
+    $fl = $DgUI.Folders
+    if (-not $fl) { return }
+    $x = $Folder; while ($x) { [void]$fl.Collapsed.Remove($x); $x = Get-DvFolderParent $x }
+    Save-DiagramCollapsed
+}
+
 function Update-DiagramList {
-    $tv = $DgUI.List
-    if (-not $tv) { return }
+    if (-not $DgUI.Folders) { return }
     if (-not (Test-Path -LiteralPath $DgDir)) { [void](New-Item -ItemType Directory -Path $DgDir -Force) }
-    # remember which folders are open
-    $open = $DgUI.OpenFolders
-    $tv.BeginUpdate()
-    try {
-        $tv.Nodes.Clear()
-        $sel = $null
-        $add = $null
-        $add = {
-            param($nodes, [string]$dir)
-            foreach ($d in @(Get-ChildItem -LiteralPath $dir -Directory -ErrorAction SilentlyContinue | Sort-Object Name)) {
-                $n = $nodes.Add($d.Name); $n.Tag = @{ Kind = 'folder'; Path = $d.FullName }; $n.ImageKey = 'folder'; $n.SelectedImageKey = 'folder'
-                & $add $n.Nodes $d.FullName
-                if ($open.Contains($d.FullName)) { $n.Expand() }
-            }
-            foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter '*.dgm' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
-                $n = $nodes.Add($f.BaseName); $n.Tag = @{ Kind = 'file'; Path = $f.FullName }; $n.ForeColor = $C.Fore; $n.ImageKey = 'file'; $n.SelectedImageKey = 'file'
-                if ($f.FullName -eq $DgUI.File) { $script:DgSelNode = $n }
-            }
-        }
-        $script:DgSelNode = $null
-        & $add $tv.Nodes $DgDir
-        foreach ($n in @($tv.Nodes)) { }
-        if ($script:DgSelNode) { $p = $script:DgSelNode.Parent; while ($p) { $p.Expand(); $p = $p.Parent }; $DgUI.TreeQuiet = $true; $tv.SelectedNode = $script:DgSelNode; $DgUI.TreeQuiet = $false }
-        if ($tv.Nodes.Count -eq 0) { $e = $tv.Nodes.Add('(no diagrams yet)'); $e.ForeColor = $C.Dim }
-    } finally { $tv.EndUpdate() }
-    $DgUI.FolderLabel.Text = "New diagrams go into:  \" + (Get-DiagramRelative (Get-DiagramTargetDir))
+    if ($DgUI.File) { Show-DiagramFolder (Get-DiagramFolderOf (Split-Path -Parent $DgUI.File)) }
+    Update-DvFolderList $DgUI.Folders
 }
 
 function New-DiagramNamed {
     $dir = Get-DiagramTargetDir
-    $rel = Get-DiagramRelative $dir
-    $n = Read-TextDialog 'New diagram' "Name  (saved in \$rel)" 'Diagram' $DgUI.Form
+    $rel = Get-DiagramFolderOf $dir
+    $n = Read-TextDialog 'New diagram' $(if ($rel) { "Name  (in the folder $($rel.Replace('/', ' > ')))" } else { 'Name' }) 'Diagram' $DgUI.Form
     if (-not $n) { return }
     New-DiagramFromText $n "title $n`r`ntheme midnight dark`r`n`r`na: Start`r`nb: Next step`r`na -> b"
     Select-ApiTab $DgUI.Tabs 'Text'
 }
 
-function Get-DiagramNodeDir($Node) {
-    if (-not $Node -or -not $Node.Tag) { return $DgDir }
-    if ($Node.Tag.Kind -eq 'folder') { $Node.Tag.Path } else { Split-Path -Parent $Node.Tag.Path }
-}
-
-function New-DiagramFolder($Parent = $null, [string]$Name = '') {
-    $dir = if ($Parent) { $Parent } else { Get-DiagramTargetDir }
-    $n = if ($Name) { $Name } else { Read-TextDialog 'New folder' "Folder name  (inside \$(Get-DiagramRelative $dir))" '' $DgUI.Form }
+# a folder ("Work/Network") inside $Parent ('' = the top)
+function New-DiagramFolder([string]$Parent = '', [string]$Name = '') {
+    $dir = Get-DiagramDirOf $Parent
+    $n = if ($Name) { $Name } else { Read-TextDialog 'New folder' $(if ($Parent) { "Folder name  (inside $($Parent.Replace('/', ' > ')))" } else { 'Folder name' }) '' $DgUI.Form }
     if (-not $n) { return }
     $n = (($n -replace '[\\/:*?"<>|]', ' ') -replace '\s+', ' ').Trim().TrimEnd('.')
     if (-not $n) { return }
     $path = Join-Path $dir $n
     if (Test-Path -LiteralPath $path) { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, "There is already a ""$n"" there.", 'Diagram studio'); return }
     [void](New-Item -ItemType Directory -Path $path -Force)
-    [void]$DgUI.OpenFolders.Add($dir); [void]$DgUI.OpenFolders.Add($path)
-    $DgUI.TargetDir = $path
+    $folder = Get-DiagramFolderOf $path
+    Show-DiagramFolder $folder
+    if ($DgUI.Folders) { $DgUI.Folders.SelectedFolder = $folder; $DgUI.Folders.FocusFolder = $true }
     Update-DiagramList
 }
 
-# moves a diagram or a folder into another folder (keeps the open diagram open)
+# moves a diagram file or a folder into another folder (keeps the open diagram open)
 function Move-DiagramItem([string]$Path, [string]$ToDir) {
     if (-not (Test-Path -LiteralPath $Path) -or -not (Test-DiagramInside $ToDir)) { return }
     $isDir = Test-Path -LiteralPath $Path -PathType Container
     if ($isDir -and ([IO.Path]::GetFullPath($ToDir).TrimEnd('\') + '\').StartsWith(([IO.Path]::GetFullPath($Path).TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)) { return }   # not into itself
-    if ((Split-Path -Parent $Path) -eq $ToDir) { return }
+    if ((Split-Path -Parent $Path) -eq $ToDir.TrimEnd('\')) { return }
     $name = Split-Path -Leaf $Path
     $dest = Join-Path $ToDir $name
     if (Test-Path -LiteralPath $dest) {
@@ -26427,82 +26430,115 @@ function Move-DiagramItem([string]$Path, [string]$ToDir) {
     }
     Save-DiagramFile
     try { Move-Item -LiteralPath $Path -Destination $dest -ErrorAction Stop } catch { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, "Couldn't move it: $($_.Exception.Message)", 'Diagram studio'); return }
-    if ($DgUI.File) {
-        if ($DgUI.File -eq $Path) { $DgUI.File = $dest }
-        elseif ($isDir -and $DgUI.File.StartsWith($Path + '\', [StringComparison]::OrdinalIgnoreCase)) { $DgUI.File = $dest + $DgUI.File.Substring($Path.Length) }
-    }
-    if ($isDir) { foreach ($o in @($DgUI.OpenFolders)) { if ($o -eq $Path -or $o.StartsWith($Path + '\', [StringComparison]::OrdinalIgnoreCase)) { [void]$DgUI.OpenFolders.Remove($o); [void]$DgUI.OpenFolders.Add($dest + $o.Substring($Path.Length)) } } }
-    [void]$DgUI.OpenFolders.Add($ToDir)
+    Update-DiagramOpenPath $Path $dest
+    if ($isDir) { Move-DiagramCollapsed (Get-DiagramFolderOf $Path) (Get-DiagramFolderOf $dest) }
+    Show-DiagramFolder (Get-DiagramFolderOf $ToDir)
     Update-DiagramTitle
     Update-DiagramList
 }
 
-function Rename-DiagramItem($Node, [string]$NewName = '') {
-    if (-not $Node -or -not $Node.Tag) { return }
-    $tg = $Node.Tag
-    $old = if ($tg.Kind -eq 'file') { [IO.Path]::GetFileNameWithoutExtension($tg.Path) } else { Split-Path -Leaf $tg.Path }
-    $n = if ($NewName) { $NewName } else { Read-TextDialog $(if ($tg.Kind -eq 'file') { 'Rename diagram' } else { 'Rename folder' }) 'New name' $old $DgUI.Form }
-    if (-not $n -or $n -eq $old) { return }
+# the file or folder a row of the list stands for
+function Get-DiagramRowPath($Row) { if (-not $Row) { return $null }; if ($Row.IsFolder) { Get-DiagramDirOf $Row.Path } else { $Row.Item.Path } }
+
+function Rename-DiagramItem($Row, [string]$NewName = '') {
+    if (-not $Row -or $Row.Empty) { return }
+    $path = Get-DiagramRowPath $Row
+    $old = if ($Row.IsFolder) { Split-Path -Leaf $path } else { [IO.Path]::GetFileNameWithoutExtension($path) }
+    $n = if ($NewName) { $NewName } else { Read-TextDialog $(if ($Row.IsFolder) { 'Rename folder' } else { 'Rename diagram' }) 'New name' $old $DgUI.Form }
+    if (-not $n -or $n -ceq $old) { return }
     $n = (($n -replace '[\\/:*?"<>|]', ' ') -replace '\s+', ' ').Trim().TrimEnd('.')
     if (-not $n) { return }
-    $dir = Split-Path -Parent $tg.Path
+    $dir = Split-Path -Parent $path
     Save-DiagramFile
-    if ($tg.Kind -eq 'file') {
-        $new = Join-Path $dir ((New-DiagramName $n $dir) + '.dgm')
-        Move-Item -LiteralPath $tg.Path -Destination $new
-        if ($DgUI.File -eq $tg.Path) { $DgUI.File = $new }
-    } else {
-        $new = Join-Path $dir $n
-        if (Test-Path -LiteralPath $new) { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, "There is already a ""$n"" there.", 'Diagram studio'); return }
-        Move-Item -LiteralPath $tg.Path -Destination $new
-        if ($DgUI.File -and $DgUI.File.StartsWith($tg.Path + '\', [StringComparison]::OrdinalIgnoreCase)) { $DgUI.File = $new + $DgUI.File.Substring($tg.Path.Length) }
-        if ($DgUI.TargetDir -and $DgUI.TargetDir.StartsWith($tg.Path, [StringComparison]::OrdinalIgnoreCase)) { $DgUI.TargetDir = $new + $DgUI.TargetDir.Substring($tg.Path.Length) }
-        if ($DgUI.OpenFolders.Remove($tg.Path)) { [void]$DgUI.OpenFolders.Add($new) }
-    }
+    try {
+        if (-not $Row.IsFolder) {
+            $new = Join-Path $dir ((New-DiagramName $n $dir) + '.dgm')
+            Move-Item -LiteralPath $path -Destination $new -ErrorAction Stop
+        } else {
+            $new = Join-Path $dir $n
+            if ((Test-Path -LiteralPath $new) -and $n -ne $old) { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, "There is already a ""$n"" there.", 'Diagram studio'); return }
+            Move-Item -LiteralPath $path -Destination $new -ErrorAction Stop
+            Move-DiagramCollapsed $Row.Path (Get-DiagramFolderOf $new)
+        }
+    } catch { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, "Couldn't rename it: $($_.Exception.Message)", 'Diagram studio'); return }
+    Update-DiagramOpenPath $path $new
     Update-DiagramTitle
     Update-DiagramList
 }
 
-function Remove-DiagramItem($Node) {
-    if (-not $Node -or -not $Node.Tag) { return }
-    $tg = $Node.Tag
-    if ($tg.Kind -eq 'file') {
-        if ([System.Windows.Forms.MessageBox]::Show($DgUI.Form, "Delete the diagram ""$($Node.Text)""?", 'Diagram studio', 'YesNo', 'Question') -ne 'Yes') { return }
-        if ($DgUI.File -eq $tg.Path) { $DgUI.File = ''; Update-DiagramTitle }
-        Remove-Item -LiteralPath $tg.Path -Force
-    } else {
-        $count = @(Get-ChildItem -LiteralPath $tg.Path -Filter '*.dgm' -File -Recurse -ErrorAction SilentlyContinue).Count
-        $msg = if ($count) { "Delete the folder ""$($Node.Text)"" and the $count diagram(s) in it?" } else { "Delete the empty folder ""$($Node.Text)""?" }
-        if ([System.Windows.Forms.MessageBox]::Show($DgUI.Form, $msg, 'Diagram studio', 'YesNo', 'Warning') -ne 'Yes') { return }
-        if ($DgUI.File -and $DgUI.File.StartsWith($tg.Path + '\', [StringComparison]::OrdinalIgnoreCase)) { $DgUI.File = ''; Update-DiagramTitle }
-        Remove-Item -LiteralPath $tg.Path -Recurse -Force
-        if ($DgUI.TargetDir -and $DgUI.TargetDir.StartsWith($tg.Path, [StringComparison]::OrdinalIgnoreCase)) { $DgUI.TargetDir = '' }
+# a diagram: deleted after asking.  A folder: like in Notes, only the folder goes - what is in it moves up one level.
+function Remove-DiagramItem($Row, [switch]$NoPrompt) {
+    if (-not $Row -or $Row.Empty) { return }
+    $path = Get-DiagramRowPath $Row
+    if (-not (Test-Path -LiteralPath $path)) { Update-DiagramList; return }
+    if (-not $Row.IsFolder) {
+        if (-not $NoPrompt -and [System.Windows.Forms.MessageBox]::Show($DgUI.Form, "Delete the diagram ""$($Row.Item.Name)""?", 'Diagram studio', 'YesNo', 'Question') -ne 'Yes') { return }
+        if ($DgUI.File -eq $path) { $DgUI.File = ''; Update-DiagramTitle }
+        Remove-Item -LiteralPath $path -Force
+        Update-DiagramList
+        return
     }
+    $parentDir = Split-Path -Parent $path
+    $parent = Get-DvFolderParent $Row.Path
+    $files = @(Get-ChildItem -LiteralPath $path -Filter '*.dgm' -File -ErrorAction SilentlyContinue).Count
+    $subs = @(Get-ChildItem -LiteralPath $path -Directory -ErrorAction SilentlyContinue).Count
+    if ($files + $subs -gt 0 -and -not $NoPrompt) {
+        $where = if ($parent) { """$($parent.Replace('/', ' > '))""" } else { 'the top level' }
+        if ([System.Windows.Forms.MessageBox]::Show($DgUI.Form, "Delete the folder ""$($Row.Label)""? Nothing inside is deleted: its $files diagram(s) and $subs subfolder(s) move up to $where.", 'Diagram studio', 'OKCancel', 'Question') -ne 'OK') { return }
+    }
+    Save-DiagramFile
+    foreach ($it in @(Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue)) {
+        $dest = Join-Path $parentDir $it.Name
+        if (Test-Path -LiteralPath $dest) {
+            if ($it.PSIsContainer) { $k = 2; while (Test-Path -LiteralPath "$dest $k") { $k++ }; $dest = "$dest $k" }
+            else { $dest = Join-Path $parentDir ((New-DiagramName $it.BaseName $parentDir $it.Extension) + $it.Extension) }
+        }
+        try { Move-Item -LiteralPath $it.FullName -Destination $dest -ErrorAction Stop } catch { [void][System.Windows.Forms.MessageBox]::Show($DgUI.Form, "Couldn't move ""$($it.Name)"" out: $($_.Exception.Message)", 'Diagram studio'); Update-DiagramList; return }
+        Update-DiagramOpenPath $it.FullName $dest
+        if ($it.PSIsContainer) { Move-DiagramCollapsed (Get-DiagramFolderOf $it.FullName) (Get-DiagramFolderOf $dest) }
+    }
+    Move-DiagramCollapsed $Row.Path ''
+    if (-not @(Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue).Count) { Remove-Item -LiteralPath $path -Force }
+    if ($DgUI.Folders) { $DgUI.Folders.SelectedFolder = $parent; $DgUI.Folders.FocusFolder = [bool]$parent }
+    Update-DiagramTitle
     Update-DiagramList
 }
 
-function Copy-DiagramItem($Node) {
-    if (-not $Node -or $Node.Tag.Kind -ne 'file') { return }
+function Copy-DiagramItem($Row) {
+    if (-not $Row -or $Row.IsFolder -or $Row.Empty) { return }
     Save-DiagramFile
-    $dir = Split-Path -Parent $Node.Tag.Path
-    $new = Join-Path $dir ((New-DiagramName ([IO.Path]::GetFileNameWithoutExtension($Node.Tag.Path) + ' copy') $dir) + '.dgm')
-    Copy-Item -LiteralPath $Node.Tag.Path -Destination $new
+    $src = $Row.Item.Path
+    $dir = Split-Path -Parent $src
+    $new = Join-Path $dir ((New-DiagramName ([IO.Path]::GetFileNameWithoutExtension($src) + ' copy') $dir) + '.dgm')
+    Copy-Item -LiteralPath $src -Destination $new
     Open-DiagramFile $new
 }
 
-# "Move to..." menu: every folder
-function Add-DiagramMoveMenu($Menu, [string]$Path) {
-    $mv = New-Object System.Windows.Forms.ToolStripMenuItem('Move to', (New-GlyphImage $Glyph.Folder))
-    $dirs = @($DgDir) + @(Get-ChildItem -LiteralPath $DgDir -Directory -Recurse -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object FullName)
-    foreach ($d in $dirs) {
-        if ($d -eq (Split-Path -Parent $Path)) { continue }
-        if (([IO.Path]::GetFullPath($d) + '\').StartsWith([IO.Path]::GetFullPath($Path) + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
-        $rel = Get-DiagramRelative $d
-        $it = New-Object System.Windows.Forms.ToolStripMenuItem($(if ($rel) { $rel } else { '(top)' }), $null, { param($s2, $e2) Move-DiagramItem $s2.Tag.Path $s2.Tag.To })
-        $it.Tag = @{ Path = $Path; To = $d }
-        [void]$mv.DropDownItems.Add($it)
+# the right-click menu, worded like the API chains one
+function Show-DiagramTreeMenu($Menu, $Row) {
+    if ($Row -and $Row.IsFolder) {
+        [void](Add-MenuItem $Menu 'New diagram here...' { $DgUI.Folders.SelectedFolder = $DgUI.Folders.MenuRow.Path; $DgUI.Folders.List.ClearSelected(); New-DiagramNamed } $Glyph.Add)
+        [void](Add-MenuItem $Menu 'New folder inside...' { New-DiagramFolder $DgUI.Folders.MenuRow.Path } $Glyph.Folder)
+        [void]$Menu.Items.Add('-')
+        [void](Add-MenuItem $Menu 'Rename folder...' { Rename-DiagramItem $DgUI.Folders.MenuRow } $Glyph.Edit 'F2')
+        Add-DvMoveMenu $Menu $DgUI.Folders (Get-DvFolderParent $Row.Path) $Row.Path { param($to) Move-DiagramItem (Get-DiagramRowPath $DgUI.Folders.MenuRow) (Get-DiagramDirOf $to) }
+        [void](Add-MenuItem $Menu 'Delete folder...' { Remove-DiagramItem $DgUI.Folders.MenuRow } $Glyph.Delete 'Del')
+        [void]$Menu.Items.Add('-')
+        [void](Add-MenuItem $Menu 'Show in Explorer' { Start-Process explorer.exe (Get-DiagramRowPath $DgUI.Folders.MenuRow) } $Glyph.Open)
+    } elseif ($Row) {
+        [void](Add-MenuItem $Menu 'Open' { Open-DiagramFile $DgUI.Folders.MenuRow.Item.Path; Select-ApiTab $DgUI.Tabs 'Text' } $Glyph.Open 'Enter')
+        [void](Add-MenuItem $Menu 'Duplicate' { Copy-DiagramItem $DgUI.Folders.MenuRow } $Glyph.Copy)
+        [void](Add-MenuItem $Menu 'Rename...' { Rename-DiagramItem $DgUI.Folders.MenuRow } $Glyph.Edit 'F2')
+        Add-DvMoveMenu $Menu $DgUI.Folders ([string]$Row.Item.Folder) '' { param($to) Move-DiagramItem $DgUI.Folders.MenuRow.Item.Path (Get-DiagramDirOf $to) }
+        [void](Add-MenuItem $Menu 'Delete' { Remove-DiagramItem $DgUI.Folders.MenuRow } $Glyph.Delete 'Del')
+        [void]$Menu.Items.Add('-')
+        [void](Add-MenuItem $Menu 'Show in Explorer' { Start-Process explorer.exe "/select,`"$($DgUI.Folders.MenuRow.Item.Path)`"" } $Glyph.Open)
+    } else {
+        [void](Add-MenuItem $Menu 'New diagram...' { $DgUI.Folders.SelectedFolder = ''; New-DiagramNamed } $Glyph.Add)
+        [void](Add-MenuItem $Menu 'New folder...' { New-DiagramFolder '' } $Glyph.Folder)
+        [void]$Menu.Items.Add('-')
+        [void](Add-MenuItem $Menu 'Show in Explorer' { Start-Process explorer.exe $DgDir } $Glyph.Open)
     }
-    if ($mv.DropDownItems.Count) { [void]$Menu.Items.Add($mv) }
 }
 
 # ---- edits from the canvas and the properties panel (all go through the text)
@@ -26955,81 +26991,31 @@ function Show-DiagramStudio([string]$Text = '') {
     $help.Dock = 'Bottom'; $help.Text = 'Syntax help'; $help.LinkColor = $C.Accent; $help.BackColor = $C.Bg; $help.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 2), 0, (Px 4)); $help.AutoSize = $false; $help.Height = $FontMain.Height + (Px 8)
     $help.add_LinkClicked({ Show-DiagramHelp })
     $pText.Controls.Add($ed); $pText.Controls.Add($warn); $pText.Controls.Add($help)
+    # Saved: folders like in Notes (click a folder to open / close it, drag diagrams and folders onto a folder)
+    $fl = New-DvFolderList $pSaved 'Search diagrams...'
+    $fl.GetFolders = { Get-DiagramFolders }
+    $fl.GetItems = { Get-DiagramItems }
+    $fl.Title = { param($it) $it.Name }
+    $fl.Meta = { param($it) 'edited ' + (Format-Age $it.Time) }
+    $fl.IsCurrent = { param($it) $DgUI.File -and $it.Path -eq $DgUI.File }
+    $fl.OnOpen = { param($it) if ($it.Path -ne $DgUI.File) { Open-DiagramFile $it.Path } }
+    $fl.OnMove = { param($row, $to) Move-DiagramItem (Get-DiagramRowPath $row) (Get-DiagramDirOf $to) }
+    $fl.OnMenu = { param($menu, $row) Show-DiagramTreeMenu $menu $row }
+    $fl.OnRename = { param($row) Rename-DiagramItem $row }
+    $fl.OnDelete = { param($row) Remove-DiagramItem $row }
+    $fl.OnCollapse = { Save-DiagramCollapsed }
+    $fl.EmptyText = 'No diagrams yet. Pick an example, or New diagram.'
+    try { if (Test-Path -LiteralPath $DgCollapsedFile) { foreach ($p in @(ConvertFrom-JsonList (Read-DataText $DgCollapsedFile))) { if ($p) { [void]$fl.Collapsed.Add([string]$p) } } } } catch { }
+    $DgUI.Folders = $fl
+    $hdr = New-Object System.Windows.Forms.Label
+    $hdr.Dock = 'Top'; $hdr.AutoSize = $false; $hdr.Height = Px 28; $hdr.Text = '  DIAGRAMS  (right-click for folders)'; $hdr.Font = $FontSmall; $hdr.ForeColor = $C.Accent; $hdr.BackColor = $C.Panel; $hdr.TextAlign = 'MiddleLeft'
     $sbar = New-Object System.Windows.Forms.FlowLayoutPanel
-    $sbar.Dock = 'Top'; $sbar.AutoSize = $true; $sbar.WrapContents = $true; $sbar.BackColor = $C.Bg; $sbar.Padding = New-Object System.Windows.Forms.Padding((Px 4), (Px 4), (Px 4), (Px 2))
-    [void](New-Button 'New folder' 'A folder inside the selected one' { New-DiagramFolder } $sbar $Glyph.Folder 2)
+    $sbar.Dock = 'Top'; $sbar.AutoSize = $true; $sbar.WrapContents = $true; $sbar.BackColor = $C.Panel; $sbar.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 6), (Px 6), (Px 2))
     [void](New-Button 'New diagram' 'A new diagram in the selected folder' { New-DiagramNamed } $sbar $Glyph.Add 2)
+    [void](New-Button 'Folder' 'A new folder inside the selected one' { New-DiagramFolder (Get-DvFolderSelected $DgUI.Folders) } $sbar $Glyph.Folder 2)
     [void](New-Button '' 'Open the diagrams folder in Explorer' { Start-Process explorer.exe (Get-DiagramTargetDir) } $sbar $Glyph.Open 2)
-    $DgUI.FolderLabel = New-Object System.Windows.Forms.Label
-    $DgUI.FolderLabel.Dock = 'Bottom'; $DgUI.FolderLabel.AutoSize = $false; $DgUI.FolderLabel.Height = $FontSmall.Height + (Px 10); $DgUI.FolderLabel.ForeColor = $C.Dim; $DgUI.FolderLabel.BackColor = $C.Bg; $DgUI.FolderLabel.Font = $FontSmall
-    $DgUI.FolderLabel.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 3), 0, 0)
-    $tv = New-Object System.Windows.Forms.TreeView
-    $tv.Dock = 'Fill'; $tv.BorderStyle = 'None'; $tv.BackColor = $C.Bg; $tv.ForeColor = $C.Fore; $tv.ItemHeight = $FontMain.Height + (Px 10); $tv.HideSelection = $false
-    $tv.ShowLines = $false; $tv.FullRowSelect = $true; $tv.AllowDrop = $true; $tv.LabelEdit = $false
-    $DgUI.OpenFolders = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $il = New-Object System.Windows.Forms.ImageList; $il.ColorDepth = 'Depth32Bit'; $il.ImageSize = New-Object System.Drawing.Size((Px 16), (Px 16))
-    $gf = New-GlyphImage $Glyph.Folder $C.Orange; $gd = New-GlyphImage $Glyph.Apps $C.Accent
-    if ($gf -and $gd) { $il.Images.Add('folder', $gf); $il.Images.Add('file', $gd); $tv.ImageList = $il }
-    $tv.add_AfterExpand({ param($src, $e) if ($e.Node.Tag) { [void]$DgUI.OpenFolders.Add($e.Node.Tag.Path) } })
-    $tv.add_AfterCollapse({ param($src, $e) if ($e.Node.Tag) { [void]$DgUI.OpenFolders.Remove($e.Node.Tag.Path) } })
-    $tv.add_AfterSelect({
-        param($src, $e)
-        if ($DgUI.TreeQuiet) { return }
-        $DgUI.TargetDir = Get-DiagramNodeDir $e.Node
-        $DgUI.FolderLabel.Text = "New diagrams go into:  \" + (Get-DiagramRelative (Get-DiagramTargetDir))
-    })
-    $tv.add_NodeMouseClick({ param($src, $e) if ($e.Button -eq 'Right') { $src.SelectedNode = $e.Node } })
-    $tv.add_NodeMouseDoubleClick({ param($src, $e) if ($e.Node.Tag -and $e.Node.Tag.Kind -eq 'file') { Open-DiagramFile $e.Node.Tag.Path; Select-ApiTab $DgUI.Tabs 'Text' } })
-    $tv.add_KeyDown({
-        param($src, $e)
-        $n = $src.SelectedNode
-        if ($e.KeyCode -eq 'Return' -and $n -and $n.Tag -and $n.Tag.Kind -eq 'file') { $e.SuppressKeyPress = $true; Open-DiagramFile $n.Tag.Path; Select-ApiTab $DgUI.Tabs 'Text' }
-        elseif ($e.KeyCode -eq 'F2' -and $n) { $e.SuppressKeyPress = $true; Rename-DiagramItem $n }
-        elseif ($e.KeyCode -eq 'Delete' -and $n) { $e.SuppressKeyPress = $true; Remove-DiagramItem $n }
-    })
-    # drag diagrams and folders onto a folder (or empty space = the top)
-    $tv.add_ItemDrag({ param($src, $e) if ($e.Item.Tag) { [void]$src.DoDragDrop($e.Item, [System.Windows.Forms.DragDropEffects]::Move) } })
-    $tv.add_DragOver({
-        param($src, $e)
-        if (-not $e.Data.GetDataPresent([System.Windows.Forms.TreeNode])) { $e.Effect = 'None'; return }
-        $pt = $src.PointToClient((New-Object System.Drawing.Point($e.X, $e.Y)))
-        $target = $src.GetNodeAt($pt)
-        $e.Effect = 'Move'
-        if ($target) { $src.SelectedNode = $target }
-    })
-    $tv.add_DragDrop({
-        param($src, $e)
-        $node = $e.Data.GetData([System.Windows.Forms.TreeNode])
-        if (-not $node -or -not $node.Tag) { return }
-        $pt = $src.PointToClient((New-Object System.Drawing.Point($e.X, $e.Y)))
-        $target = $src.GetNodeAt($pt)
-        $to = if ($target -and $target.Tag) { Get-DiagramNodeDir $target } else { $DgDir }
-        Move-DiagramItem $node.Tag.Path $to
-    })
-    $lm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
-    $lm.add_Opening({
-        param($src, $e)
-        $src.Items.Clear()
-        $n = $DgUI.List.SelectedNode; $tg = if ($n) { $n.Tag } else { $null }
-        if ($tg -and $tg.Kind -eq 'file') {
-            [void](Add-MenuItem $src 'Open' { Open-DiagramFile $DgUI.List.SelectedNode.Tag.Path; Select-ApiTab $DgUI.Tabs 'Text' } $Glyph.Open 'Enter')
-            [void](Add-MenuItem $src 'Duplicate' { Copy-DiagramItem $DgUI.List.SelectedNode } $Glyph.Copy)
-        }
-        [void](Add-MenuItem $src 'New diagram here' { $DgUI.TargetDir = Get-DiagramNodeDir $DgUI.List.SelectedNode; New-DiagramNamed } $Glyph.Add)
-        [void](Add-MenuItem $src 'New folder here' { New-DiagramFolder (Get-DiagramNodeDir $DgUI.List.SelectedNode) } $Glyph.Folder)
-        if ($tg) {
-            [void]$src.Items.Add('-')
-            [void](Add-MenuItem $src 'Rename...' { Rename-DiagramItem $DgUI.List.SelectedNode } $Glyph.Edit 'F2')
-            Add-DiagramMoveMenu $src $tg.Path
-            [void](Add-MenuItem $src 'Delete' { Remove-DiagramItem $DgUI.List.SelectedNode } $Glyph.Delete 'Del')
-        }
-        [void]$src.Items.Add('-')
-        [void](Add-MenuItem $src 'Show in Explorer' { $n = $DgUI.List.SelectedNode; if ($n -and $n.Tag -and $n.Tag.Kind -eq 'file') { Start-Process explorer.exe "/select,`"$($n.Tag.Path)`"" } else { Start-Process explorer.exe (Get-DiagramNodeDir $n) } } $Glyph.Open)
-    })
-    $tv.ContextMenuStrip = $lm
-    $pSaved.Controls.Add($tv); $pSaved.Controls.Add($DgUI.FolderLabel); $pSaved.Controls.Add($sbar)
-    $list = $tv
-    $DgUI.List = $list; $DgUI.Tabs = $tabs
+    $pSaved.Controls.Add($hdr); $pSaved.Controls.Add($sbar)
+    $DgUI.List = $fl.List; $DgUI.Tabs = $tabs
     Select-ApiTab $tabs 'Text'
 
     # top: commands
@@ -27140,7 +27126,7 @@ function Show-DiagramStudio([string]$Text = '') {
         elseif ($e.Control -and $e.KeyCode -eq 'S') { $e.SuppressKeyPress = $true; Save-DiagramFile }
     })
     $f.add_FormClosing({ $DgUI.TypeTimer.Stop(); $t = $DgUI.Editor.Text; if ($t -cne $DgUI.Text) { $DgUI.Text = $t }; Save-DiagramFile })
-    $f.add_FormClosed({ foreach ($k in 'TypeTimer', 'ColorTimer', 'SaveTimer') { if ($DgUI[$k]) { $DgUI[$k].Dispose(); $DgUI[$k] = $null } }; $DgUI.Form = $null; $DgUI.Canvas = $null; $DgUI.Props = $null; $DgUI.List = $null; $DgUI.ModeSet = $false })
+    $f.add_FormClosed({ foreach ($k in 'TypeTimer', 'ColorTimer', 'SaveTimer') { if ($DgUI[$k]) { $DgUI[$k].Dispose(); $DgUI[$k] = $null } }; $DgUI.Form = $null; $DgUI.Canvas = $null; $DgUI.Props = $null; $DgUI.List = $null; $DgUI.Folders = $null; $DgUI.ModeSet = $false })
     Register-ThemedWindow $f
     $f.Show()
     [PowerClipHost]::EnsureShown($f.Handle)
@@ -27193,6 +27179,259 @@ Graph TD / flowchart LR Mermaid text works as it is.
     $f.Controls.Add($r)
     Register-ThemedWindow $f
     $f.Show($DgUI.Form)
+}
+
+# ---- A folder list like the one in Notes: folder rows (open / close with a click, a count), item rows with a title
+#      and a grey line under it, a search box, drag and drop onto folders. Used by the Diagram studio and the SQL client.
+# $Fl fields set by the caller:
+#   GetFolders  {} -> folder paths like "Work/Network"
+#   GetItems    {} -> items, each with .Folder (a path or '') and anything the callbacks need
+#   Title       {param($item)} -> the item's title;  Meta {param($item)} -> the grey line;  IsCurrent {param($item)} -> bold / selected
+#   OnOpen      {param($item)} (click, or double-click when OpenOnDoubleClick)
+#   OnMove      {param($row, [string]$toFolder)}  (row.IsFolder: a folder path is moved)
+#   OnMenu      {param($menu, $row)}  (row may be $null: empty space)
+#   OnDelete / OnRename {param($row)}  (Del / F2)
+#   Collapsed   a HashSet of closed folder paths;  OnCollapse {} called after it changes (to save it)
+function New-DvFolderList($Parent, [string]$Cue = 'Search...') {
+    $fl = @{ View = (New-Object System.Collections.Generic.List[object]); Collapsed = (New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)); DropIndex = -1; Drag = $null; OpenOnDoubleClick = $false; SelectedFolder = ''; FocusFolder = $false }
+    $fl.TitleFont = New-Object System.Drawing.Font($UiFont, (Fz 10), [System.Drawing.FontStyle]::Bold)
+    $lb = New-Object System.Windows.Forms.ListBox
+    $lb.Dock = 'Fill'; $lb.BorderStyle = 'None'; $lb.DrawMode = 'OwnerDrawVariable'; $lb.IntegralHeight = $false; $lb.BackColor = $C.Panel; $lb.ForeColor = $C.Fore
+    $lb.Tag = $fl
+    $fl.List = $lb
+    $sp = New-Object System.Windows.Forms.Panel
+    $sp.Dock = 'Top'; $sp.Height = Px 38; $sp.BackColor = $C.Panel
+    $sp.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 4))
+    $sb = New-Object System.Windows.Forms.TextBox
+    $sb.Dock = 'Fill'; $sb.BorderStyle = 'FixedSingle'; $sb.BackColor = $C.Bg; $sb.ForeColor = $C.Fore; $sb.Tag = $fl
+    $sb.add_HandleCreated({ param($src, $e) [PowerClipHost]::SetCueBanner($src.Handle, $src.Tag.Cue) })
+    $fl.Cue = $Cue
+    $sb.add_TextChanged({ param($src, $e) Update-DvFolderList $src.Tag })
+    $sp.Controls.Add($sb)
+    $fl.Search = $sb
+    $Parent.Controls.Add($lb); $Parent.Controls.Add($sp)
+
+    $lb.add_MeasureItem({
+        param($src, $e)
+        $f = $src.Tag; $row = if ($e.Index -ge 0 -and $e.Index -lt $f.View.Count) { $f.View[$e.Index] } else { $null }
+        $e.ItemHeight = if ($row -and $row.IsFolder) { $FontMain.Height + (Px 16) } elseif ($row -and $row.Empty) { $FontMain.Height + (Px 20) } else { $f.TitleFont.Height + $FontSmall.Height + (Px 18) }
+    })
+    $lb.add_DrawItem({
+        param($src, $e)
+        $f = $src.Tag
+        if ($e.Index -lt 0 -or $e.Index -ge $f.View.Count) { return }
+        $row = $f.View[$e.Index]
+        $r = $e.Bounds; $g = $e.Graphics
+        $selected = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
+        $drop = $f.DropIndex -eq $e.Index
+        $brush = New-Object System.Drawing.SolidBrush $(if ($drop) { $C.SelLine } elseif ($selected -and -not $row.Empty) { $C.Sel } else { $C.Panel })
+        $g.FillRectangle($brush, $r); $brush.Dispose()
+        if ($row.Empty) { [System.Windows.Forms.TextRenderer]::DrawText($g, $row.Text, $FontSmall, (New-Object System.Drawing.Rectangle(($r.X + (Px 12)), $r.Y, ($r.Width - (Px 20)), $r.Height)), $C.Dim, $TextFlags); return }
+        if ($row.IsFolder) {
+            $x = $r.X + (Px 8) + $row.Depth * (Px 18)
+            $flags = [System.Windows.Forms.TextFormatFlags]'VerticalCenter, HorizontalCenter, NoPrefix, SingleLine, NoPadding'
+            if ($FontIconSmall) {
+                [System.Windows.Forms.TextRenderer]::DrawText($g, $(if ($row.Open) { [string][char]0xE70D } else { [string][char]0xE76C }), $FontIconSmall, (New-Object System.Drawing.Rectangle($x, $r.Y, (Px 16), $r.Height)), $C.Dim, $flags)
+                [System.Windows.Forms.TextRenderer]::DrawText($g, $Glyph.Folder, $FontIconSmall, (New-Object System.Drawing.Rectangle(($x + (Px 18)), $r.Y, (Px 20), $r.Height)), $C.Yellow, $flags)
+            } else {
+                [System.Windows.Forms.TextRenderer]::DrawText($g, $(if ($row.Open) { 'v' } else { '>' }), $FontMain, (New-Object System.Drawing.Rectangle($x, $r.Y, (Px 16), $r.Height)), $C.Dim, $flags)
+            }
+            $countText = [string]$row.Count
+            $cw = [System.Windows.Forms.TextRenderer]::MeasureText($countText, $FontSmall).Width
+            [System.Windows.Forms.TextRenderer]::DrawText($g, $row.Label, $f.TitleFont, (New-Object System.Drawing.Rectangle(($x + (Px 42)), $r.Y, ($r.Right - $x - (Px 60) - $cw), $r.Height)), $C.Fore, $TextFlags)
+            [System.Windows.Forms.TextRenderer]::DrawText($g, $countText, $FontSmall, (New-Object System.Drawing.Rectangle(($r.Right - $cw - (Px 12)), $r.Y, ($cw + (Px 4)), $r.Height)), $C.Dim, $TextFlags)
+        } else {
+            $indent = if ($row.Depth -gt 0) { (Px 26) + ($row.Depth - 1) * (Px 18) } else { 0 }
+            $current = $f.IsCurrent -and (& $f.IsCurrent $row.Item)
+            if (($selected -or $current) -and -not $drop) { $bar = New-Object System.Drawing.SolidBrush $C.Accent; $g.FillRectangle($bar, $r.X, ($r.Y + (Px 6)), (Px 3), ($r.Height - (Px 12))); $bar.Dispose() }
+            $x = $r.X + (Px 12) + $indent; $w = $r.Width - (Px 20) - $indent
+            $th = $f.TitleFont.Height + (Px 2)
+            $titleRect = New-Object System.Drawing.Rectangle($x, ($r.Y + (Px 7)), $w, $th)
+            [System.Windows.Forms.TextRenderer]::DrawText($g, (& $f.Title $row.Item), $f.TitleFont, $titleRect, $(if ($current) { $C.Accent } else { $C.Fore }), $TextFlags)
+            $meta = if ($f.Meta) { & $f.Meta $row.Item } else { '' }
+            [System.Windows.Forms.TextRenderer]::DrawText($g, $meta, $FontSmall, (New-Object System.Drawing.Rectangle($x, $titleRect.Bottom, $w, ($FontSmall.Height + (Px 2)))), $C.Dim, $TextFlags)
+        }
+        $g.DrawLine($LinePen, $r.X, $r.Bottom - 1, $r.Right, $r.Bottom - 1)
+    })
+    # click a folder: open / close it; drag a row onto a folder (or empty space = the top) to move it
+    $lb.add_MouseDown({
+        param($src, $e)
+        $f = $src.Tag; $f.Drag = $null
+        $i = $src.IndexFromPoint($e.Location)
+        if ($i -lt 0 -or $i -ge $f.View.Count -or -not $src.GetItemRectangle($i).Contains($e.Location)) { $i = -1 }
+        if ($e.Button -eq 'Right') { if ($i -ge 0) { $src.SelectedIndex = $i } else { $src.ClearSelected() }; return }
+        if ($e.Button -ne 'Left' -or $i -lt 0) { return }
+        $row = $f.View[$i]
+        if ($row.Empty) { return }
+        $f.Drag = @{ Row = $row; From = $e.Location; On = $false; Index = $i }
+    })
+    $lb.add_MouseMove({
+        param($src, $e)
+        $f = $src.Tag; $d = $f.Drag
+        if (-not $d -or $e.Button -ne 'Left') { return }
+        if (-not $d.On -and ([Math]::Abs($e.X - $d.From.X) + [Math]::Abs($e.Y - $d.From.Y)) -gt (Px 6)) { $d.On = $true; $src.Capture = $true; $src.Cursor = [System.Windows.Forms.Cursors]::Hand }
+        if (-not $d.On) { return }
+        $i = $src.IndexFromPoint($e.Location)
+        if ($i -ge 0 -and -not $src.GetItemRectangle($i).Contains($e.Location)) { $i = -1 }
+        $t = if ($i -ge 0 -and $f.View[$i].IsFolder) { $i } else { -1 }
+        if ($t -ne $f.DropIndex) { $old = $f.DropIndex; $f.DropIndex = $t; if ($old -ge 0 -and $old -lt $src.Items.Count) { $src.Invalidate($src.GetItemRectangle($old)) }; if ($t -ge 0) { $src.Invalidate($src.GetItemRectangle($t)) } }
+    })
+    $lb.add_MouseUp({
+        param($src, $e)
+        $f = $src.Tag; $d = $f.Drag; $f.Drag = $null
+        $src.Capture = $false; $src.Cursor = [System.Windows.Forms.Cursors]::Default
+        $di = $f.DropIndex; $f.DropIndex = -1
+        if (-not $d) { return }
+        if (-not $d.On) {
+            # a click
+            if ($d.Row.IsFolder) {
+                $f.SelectedFolder = $d.Row.Path; $f.FocusFolder = $true
+                if ($f.Collapsed.Contains($d.Row.Path)) { [void]$f.Collapsed.Remove($d.Row.Path) } else { [void]$f.Collapsed.Add($d.Row.Path) }
+                if ($f.OnCollapse) { & $f.OnCollapse }
+                Update-DvFolderList $f
+            } else {
+                $f.SelectedFolder = [string]$d.Row.Item.Folder
+                if (-not $f.OpenOnDoubleClick -and $f.OnOpen) { & $f.OnOpen $d.Row.Item }
+            }
+            return
+        }
+        $src.Invalidate()
+        $pt = $e.Location
+        if (-not $src.ClientRectangle.Contains($pt)) { return }
+        $to = ''
+        $i = $src.IndexFromPoint($pt)
+        if ($i -ge 0 -and $i -lt $f.View.Count -and $src.GetItemRectangle($i).Contains($pt)) { $tr = $f.View[$i]; $to = if ($tr.IsFolder) { $tr.Path } elseif ($tr.Empty) { '' } else { [string]$tr.Item.Folder } }
+        if ($d.Row.IsFolder -and ($to -eq $d.Row.Path -or $to.StartsWith($d.Row.Path + '/'))) { return }
+        if ($f.OnMove) { & $f.OnMove $d.Row $to }
+    })
+    $lb.add_DoubleClick({
+        param($src, $e)
+        $f = $src.Tag; $i = $src.SelectedIndex
+        if ($f.OpenOnDoubleClick -and $i -ge 0 -and $i -lt $f.View.Count -and -not $f.View[$i].IsFolder -and -not $f.View[$i].Empty -and $f.OnOpen) { & $f.OnOpen $f.View[$i].Item }
+    })
+    $lb.add_KeyDown({
+        param($src, $e)
+        $f = $src.Tag; $i = $src.SelectedIndex
+        if ($i -lt 0 -or $i -ge $f.View.Count -or $f.View[$i].Empty) { return }
+        $row = $f.View[$i]
+        if ($e.KeyCode -eq 'Return' -and -not $row.IsFolder -and $f.OnOpen) { $e.SuppressKeyPress = $true; & $f.OnOpen $row.Item }
+        elseif ($e.KeyCode -eq 'F2' -and $f.OnRename) { $e.SuppressKeyPress = $true; & $f.OnRename $row }
+        elseif ($e.KeyCode -eq 'Delete' -and $f.OnDelete) { $e.SuppressKeyPress = $true; & $f.OnDelete $row }
+        elseif (($e.KeyCode -eq 'Right' -or $e.KeyCode -eq 'Left') -and $row.IsFolder) {
+            $e.SuppressKeyPress = $true
+            if ($e.KeyCode -eq 'Left') { [void]$f.Collapsed.Add($row.Path) } else { [void]$f.Collapsed.Remove($row.Path) }
+            $f.SelectedFolder = $row.Path; $f.FocusFolder = $true
+            if ($f.OnCollapse) { & $f.OnCollapse }
+            Update-DvFolderList $f
+        }
+    })
+    $cm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $cm.Tag = $fl
+    $cm.add_Opening({
+        param($src, $e)
+        $src.Items.Clear()
+        $f = $src.Tag; $i = $f.List.SelectedIndex
+        $row = if ($i -ge 0 -and $i -lt $f.View.Count -and -not $f.View[$i].Empty) { $f.View[$i] } else { $null }
+        $f.MenuRow = $row
+        if ($f.OnMenu) { & $f.OnMenu $src $row }
+        if (-not $src.Items.Count) { $e.Cancel = $true }
+    })
+    $lb.ContextMenuStrip = $cm
+    $fl
+}
+
+function Get-DvFolderParent([string]$Path) { $i = $Path.LastIndexOf('/'); if ($i -gt 0) { $Path.Substring(0, $i) } else { '' } }
+function Get-DvFolderLeaf([string]$Path) { $i = $Path.LastIndexOf('/'); if ($i -ge 0) { $Path.Substring($i + 1) } else { $Path } }
+
+function Update-DvFolderList($Fl) {
+    if (-not $Fl -or -not $Fl.List -or $Fl.List.IsDisposed) { return }
+    $q = $Fl.Search.Text.Trim()
+    $items = @(& $Fl.GetItems)
+    $hits = @($items | Where-Object { -not $q -or (& $Fl.Title $_).IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or ($Fl.Meta -and (& $Fl.Meta $_).IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -ge 0) })
+    # every folder, also the parents of the ones the items are in
+    $folders = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($p in @(& $Fl.GetFolders) + @($items | ForEach-Object { [string]$_.Folder })) { $x = [string]$p; while ($x) { [void]$folders.Add($x); $x = Get-DvFolderParent $x } }
+    $Fl.View.Clear()
+    $add = $null
+    $add = {
+        param([string]$Parent, [int]$Depth)
+        foreach ($fp in @($folders | Where-Object { (Get-DvFolderParent $_) -eq $Parent } | Sort-Object { Get-DvFolderLeaf $_ })) {
+            $count = @($hits | Where-Object { $_.Folder -and ([string]$_.Folder -eq $fp -or ([string]$_.Folder).StartsWith($fp + '/', [StringComparison]::OrdinalIgnoreCase)) }).Count
+            if ($q -and $count -eq 0) { continue }
+            $open = [bool]($q -or -not $Fl.Collapsed.Contains($fp))
+            $Fl.View.Add([pscustomobject]@{ IsFolder = $true; Empty = $false; Path = $fp; Label = (Get-DvFolderLeaf $fp); Depth = $Depth; Count = $count; Open = $open })
+            if ($open) {
+                & $add $fp ($Depth + 1)
+                foreach ($it in @($hits | Where-Object { [string]$_.Folder -eq $fp } | Sort-Object { & $Fl.Title $_ })) { $Fl.View.Add([pscustomobject]@{ IsFolder = $false; Empty = $false; Item = $it; Depth = $Depth + 1 }) }
+            }
+        }
+    }
+    & $add '' 0
+    foreach ($it in @($hits | Where-Object { -not $_.Folder } | Sort-Object { & $Fl.Title $_ })) { $Fl.View.Add([pscustomobject]@{ IsFolder = $false; Empty = $false; Item = $it; Depth = 0 }) }
+    if ($Fl.View.Count -eq 0) { $Fl.View.Add([pscustomobject]@{ IsFolder = $false; Empty = $true; Text = $(if ($q) { 'Nothing found.' } elseif ($Fl.EmptyText) { $Fl.EmptyText } else { 'Nothing here yet.' }) }) }
+    $lb = $Fl.List
+    $lb.BeginUpdate()
+    try {
+        $lb.Items.Clear()
+        $pick = -1
+        for ($i = 0; $i -lt $Fl.View.Count; $i++) {
+            [void]$lb.Items.Add($i)
+            $row = $Fl.View[$i]
+            if ($row.Empty) { continue }
+            if ($Fl.FocusFolder) { if ($row.IsFolder -and $row.Path -eq $Fl.SelectedFolder) { $pick = $i } }
+            elseif (-not $row.IsFolder -and $Fl.IsCurrent -and (& $Fl.IsCurrent $row.Item)) { $pick = $i }
+        }
+        $Fl.FocusFolder = $false
+        if ($pick -ge 0) { $lb.SelectedIndex = $pick }
+    } finally { $lb.EndUpdate() }
+}
+
+# the folder of the selected row ('' = the top)
+function Get-DvFolderSelected($Fl) {
+    $i = $Fl.List.SelectedIndex
+    if ($i -ge 0 -and $i -lt $Fl.View.Count -and -not $Fl.View[$i].Empty) { $row = $Fl.View[$i]; if ($row.IsFolder) { return $row.Path } else { return [string]$row.Item.Folder } }
+    [string]$Fl.SelectedFolder
+}
+
+# "Move to" with every folder, indented
+function Add-DvMoveMenu($Menu, $Fl, [string]$Current, [string]$Exclude, [scriptblock]$OnPick) {
+    $mv = New-Object System.Windows.Forms.ToolStripMenuItem('Move to', (New-GlyphImage $Glyph.Folder))
+    $folders = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($p in @(& $Fl.GetFolders) + @(@(& $Fl.GetItems) | ForEach-Object { [string]$_.Folder })) { $x = [string]$p; while ($x) { [void]$folders.Add($x); $x = Get-DvFolderParent $x } }
+    $top = $mv.DropDownItems.Add('(top level)', $null, { param($s2, $e2) & $s2.Tag.Pick $s2.Tag.To }); $top.Tag = @{ Pick = $OnPick; To = '' }; $top.Enabled = [bool]$Current
+    foreach ($p in @($folders | Sort-Object)) {
+        if ($Exclude -and ($p -eq $Exclude -or $p.StartsWith($Exclude + '/'))) { continue }
+        $it = $mv.DropDownItems.Add(('    ' * ($p.Split('/').Count - 1)) + (Get-DvFolderLeaf $p), $null, { param($s2, $e2) & $s2.Tag.Pick $s2.Tag.To })
+        $it.Tag = @{ Pick = $OnPick; To = $p }; $it.Enabled = $p -ne $Current
+    }
+    [void]$Menu.Items.Add($mv)
+}
+
+# ---- folders that are only paths ("Work/Prod") on items with a .Folder, plus a list of folder paths (also the empty ones)
+function Set-DvItemFolder($Item, [string]$Folder) { if ($Item.PSObject.Properties['Folder']) { $Item.Folder = $Folder } else { $Item | Add-Member -NotePropertyName Folder -NotePropertyValue $Folder } }
+function Join-DvFolder([string]$Parent, [string]$Rest) { if ($Parent -and $Rest) { "$Parent/$Rest" } elseif ($Parent) { $Parent } else { $Rest } }
+function ConvertTo-DvFolderName([string]$Name) { (($Name -replace '[/\\]', ' ') -replace '\s+', ' ').Trim() }
+# a folder renamed or moved: the items, the folder list and the closed folders follow
+function Rename-DvFolderPath($Items, $Folders, $Collapsed, [string]$Old, [string]$New) {
+    $cmp = [StringComparison]::OrdinalIgnoreCase
+    foreach ($it in $Items) { $f = [string]$it.Folder; if ($f -eq $Old -or $f.StartsWith($Old + '/', $cmp)) { Set-DvItemFolder $it ($New + $f.Substring($Old.Length)) } }
+    for ($i = $Folders.Count - 1; $i -ge 0; $i--) { $f = [string]$Folders[$i]; if ($f -eq $Old -or $f.StartsWith($Old + '/', $cmp)) { $Folders[$i] = $New + $f.Substring($Old.Length) } }
+    if (-not $Folders.Contains($New)) { $Folders.Add($New) }
+    if ($Collapsed) { foreach ($p in @($Collapsed)) { if ($p -eq $Old -or $p.StartsWith($Old + '/', $cmp)) { [void]$Collapsed.Remove($p); [void]$Collapsed.Add($New + $p.Substring($Old.Length)) } } }
+    Optimize-DvFolders $Folders
+}
+# a folder deleted: like in Notes, what is in it moves up one level
+function Remove-DvFolderPath($Items, $Folders, $Collapsed, [string]$Path) {
+    $cmp = [StringComparison]::OrdinalIgnoreCase
+    $parent = Get-DvFolderParent $Path
+    foreach ($it in $Items) { $f = [string]$it.Folder; if ($f -eq $Path) { Set-DvItemFolder $it $parent } elseif ($f.StartsWith($Path + '/', $cmp)) { Set-DvItemFolder $it (Join-DvFolder $parent $f.Substring($Path.Length + 1)) } }
+    for ($i = $Folders.Count - 1; $i -ge 0; $i--) { $f = [string]$Folders[$i]; if ($f -eq $Path) { $Folders.RemoveAt($i) } elseif ($f.StartsWith($Path + '/', $cmp)) { $Folders[$i] = Join-DvFolder $parent $f.Substring($Path.Length + 1) } }
+    if ($Collapsed) { foreach ($p in @($Collapsed)) { if ($p -eq $Path -or $p.StartsWith($Path + '/', $cmp)) { [void]$Collapsed.Remove($p) } } }
+    Optimize-DvFolders $Folders
+}
+function Optimize-DvFolders($Folders) {
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    for ($i = 0; $i -lt $Folders.Count; $i++) { if (-not $Folders[$i] -or -not $seen.Add([string]$Folders[$i])) { $Folders.RemoveAt($i); $i-- } }
 }
 
 # ---- Data tab: CSV / TSV / Excel (pasted or a file) into a chart, a graph (from -> to) or a tree (id -> parent).
@@ -27401,7 +27640,7 @@ function New-DiagramFromData {
 # runs in the background (Cancel), results in grids, export, history, saved queries, charts / ER diagrams.
 # ======================================================================================
 $SqlDir = Join-Path $DataDir 'sql'
-$SqlUI = @{ Form = $null; Conns = (New-Object System.Collections.Generic.List[object]); Queries = (New-Object System.Collections.Generic.List[object]); History = (New-Object System.Collections.Generic.List[object]); Run = $null }
+$SqlUI = @{ Form = $null; Conns = (New-Object System.Collections.Generic.List[object]); Queries = (New-Object System.Collections.Generic.List[object]); History = (New-Object System.Collections.Generic.List[object]); Run = $null; Fl = @{} }
 
 function Import-SqlData {
     $SqlUI.Conns.Clear(); $SqlUI.Queries.Clear(); $SqlUI.History.Clear()
@@ -27409,6 +27648,7 @@ function Import-SqlData {
         $p = Join-Path $SqlDir $pair[0]
         if (Test-Path -LiteralPath $p) { try { foreach ($x in @(ConvertFrom-JsonList (Read-DataText $p))) { if ($x) { $pair[1].Add($x) } } } catch { Write-Log "sql $($pair[0]): $_" } }
     }
+    Import-SqlFolders
 }
 function Save-SqlData([string]$What) {
     if ($script:NoSave) { return }
@@ -27494,10 +27734,15 @@ function Edit-SqlConnection($Conn = $null) {
 function Update-SqlConnList([string]$Select = '') {
     $cb = $SqlUI.ConnBox
     $cb.Items.Clear()
-    foreach ($c0 in $SqlUI.Conns) { [void]$cb.Items.Add($c0.Name) }
+    $i = 0
+    for ($k = 0; $k -lt $SqlUI.Conns.Count; $k++) {
+        $c0 = $SqlUI.Conns[$k]
+        [void]$cb.Items.Add($(if ($c0.Folder) { "$(([string]$c0.Folder).Replace('/', ' > ')) > $($c0.Name)" } else { $c0.Name }))
+        if ($Select -and $c0.Name -eq $Select) { $i = $k }
+    }
     [void]$cb.Items.Add('New connection...')
-    $i = if ($Select) { [Math]::Max(0, $cb.Items.IndexOf($Select)) } else { 0 }
-    if ($SqlUI.Conns.Count) { $cb.SelectedIndex = $i } else { $cb.SelectedIndex = -1 }
+    if ($SqlUI.Conns.Count) { $cb.SelectedIndex = $i; $SqlUI.ConnName = $SqlUI.Conns[$i].Name } else { $cb.SelectedIndex = -1; $SqlUI.ConnName = '' }
+    if ($SqlUI.Fl.connections) { $SqlUI.Fl.connections.List.Invalidate() }
 }
 function Get-SqlConn { $i = $SqlUI.ConnBox.SelectedIndex; if ($i -ge 0 -and $i -lt $SqlUI.Conns.Count) { $SqlUI.Conns[$i] } else { $null } }
 
@@ -27684,8 +27929,7 @@ function New-SqlErDiagram([string[]]$Tables = $null) {
 function Update-SqlSideLists {
     $l = $SqlUI.HistList
     if ($l) { $l.BeginUpdate(); $l.Items.Clear(); foreach ($h in $SqlUI.History) { $t = ($h.Sql -replace '\s+', ' ').Trim(); [void]$l.Items.Add("$(if (-not $h.Ok) { '! ' })$($t.Substring(0, [Math]::Min(90, $t.Length)))") }; $l.EndUpdate() }
-    $q = $SqlUI.QueryList
-    if ($q) { $q.BeginUpdate(); $q.Items.Clear(); foreach ($x in $SqlUI.Queries) { [void]$q.Items.Add($x.Name) }; $q.EndUpdate() }
+    foreach ($k in 'queries', 'connections') { if ($SqlUI.Fl[$k]) { Update-DvFolderList $SqlUI.Fl[$k] } }
 }
 
 # ---- query plan tuner: the plan (estimated, or actual by running it) drawn, with suggestions and fixes
@@ -27796,6 +28040,217 @@ function Update-SqlLive {
     if ($refit) { $cv.UserView = $false; $cv.ZoomToFit() }
 }
 
+# ---- folders for saved queries and connections (like in Notes). folders.json keeps the folder lists (also empty
+#      folders) and which ones are closed; each query / connection has a .Folder ("Work/Prod", '' = the top).
+function Get-SqlItems([string]$Kind) { if ($Kind -eq 'connections') { $SqlUI.Conns } else { $SqlUI.Queries } }
+function Import-SqlFolders {
+    $SqlUI.FolderList = @{ queries = (New-Object System.Collections.Generic.List[string]); connections = (New-Object System.Collections.Generic.List[string]) }
+    $SqlUI.Closed = @{ queries = (New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)); connections = (New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)) }
+    $p = Join-Path $SqlDir 'folders.json'
+    if (-not (Test-Path -LiteralPath $p)) { return }
+    try {
+        $j = (Read-DataText $p) | ConvertFrom-Json
+        foreach ($k in 'queries', 'connections') {
+            foreach ($x in @($j.$k)) { if ($x) { $SqlUI.FolderList[$k].Add([string]$x) } }
+            foreach ($x in @($j."closed_$k")) { if ($x) { [void]$SqlUI.Closed[$k].Add([string]$x) } }
+        }
+    } catch { Write-Log "sql folders: $_" }
+}
+function Save-SqlFolders {
+    if ($script:NoSave) { return }
+    if (-not (Test-Path -LiteralPath $SqlDir)) { [void](New-Item -ItemType Directory -Path $SqlDir -Force) }
+    $o = [ordered]@{}
+    foreach ($k in 'queries', 'connections') { $o[$k] = @($SqlUI.FolderList[$k]); $o["closed_$k"] = @($SqlUI.Closed[$k]) }
+    try { Write-JsonFile (Join-Path $SqlDir 'folders.json') (ConvertTo-Json -InputObject $o -Depth 3) } catch { Write-Log "sql folders save: $_" }
+}
+function Save-SqlKind([string]$Kind) {
+    foreach ($it in (Get-SqlItems $Kind)) { $x = [string]$it.Folder; while ($x) { if (-not $SqlUI.FolderList[$Kind].Contains($x)) { $SqlUI.FolderList[$Kind].Add($x) }; $x = Get-DvFolderParent $x } }
+    Save-SqlData $Kind; Save-SqlFolders; Update-SqlSideLists; if ($Kind -eq 'connections') { Update-SqlConnList ([string]$SqlUI.ConnName) } }
+
+function New-SqlFolder([string]$Kind, [string]$Parent = '', [string]$Name = '') {
+    $n = if ($Name) { $Name } else { Read-TextDialog 'New folder' $(if ($Parent) { "Folder name  (inside $($Parent.Replace('/', ' > ')))" } else { 'Folder name' }) '' $SqlUI.Form }
+    $n = ConvertTo-DvFolderName $n
+    if (-not $n) { return }
+    $path = Join-DvFolder $Parent $n
+    if (-not $SqlUI.FolderList[$Kind].Contains($path)) { $SqlUI.FolderList[$Kind].Add($path) }
+    $x = $Parent; while ($x) { [void]$SqlUI.Closed[$Kind].Remove($x); $x = Get-DvFolderParent $x }
+    $fl = $SqlUI.Fl[$Kind]; if ($fl) { $fl.SelectedFolder = $path; $fl.FocusFolder = $true }
+    Save-SqlKind $Kind
+}
+function Rename-SqlFolder([string]$Kind, [string]$Path, [string]$Name = '') {
+    $old = Get-DvFolderLeaf $Path
+    $n = if ($Name) { $Name } else { Read-TextDialog 'Rename folder' 'New name' $old $SqlUI.Form }
+    $n = ConvertTo-DvFolderName $n
+    if (-not $n -or $n -ceq $old) { return }
+    $new = Join-DvFolder (Get-DvFolderParent $Path) $n
+    Rename-DvFolderPath (Get-SqlItems $Kind) $SqlUI.FolderList[$Kind] $SqlUI.Closed[$Kind] $Path $new
+    $fl = $SqlUI.Fl[$Kind]; if ($fl) { $fl.SelectedFolder = $new; $fl.FocusFolder = $true }
+    Save-SqlKind $Kind
+}
+function Remove-SqlFolder([string]$Kind, [string]$Path, [switch]$NoPrompt) {
+    $items = @(Get-SqlItems $Kind | Where-Object { [string]$_.Folder -eq $Path -or ([string]$_.Folder).StartsWith($Path + '/') }).Count
+    $subs = @($SqlUI.FolderList[$Kind] | Where-Object { $_.StartsWith($Path + '/') }).Count
+    $parent = Get-DvFolderParent $Path
+    if ($items + $subs -gt 0 -and -not $NoPrompt) {
+        $where = if ($parent) { """$($parent.Replace('/', ' > '))""" } else { 'the top level' }
+        $what = if ($Kind -eq 'connections') { 'connection(s)' } else { 'query(s)' }
+        if ([System.Windows.Forms.MessageBox]::Show($SqlUI.Form, "Delete the folder ""$(Get-DvFolderLeaf $Path)""? Nothing inside is deleted: its $items $what and $subs subfolder(s) move up to $where.", 'SQL client', 'OKCancel', 'Question') -ne 'OK') { return }
+    }
+    Remove-DvFolderPath (Get-SqlItems $Kind) $SqlUI.FolderList[$Kind] $SqlUI.Closed[$Kind] $Path
+    Save-SqlKind $Kind
+}
+# a row dragged onto a folder, or picked in "Move to"
+function Move-SqlRow([string]$Kind, $Row, [string]$To) {
+    if (-not $Row -or $Row.Empty) { return }
+    if ($Row.IsFolder) {
+        if ($To -eq $Row.Path -or $To.StartsWith($Row.Path + '/') -or (Get-DvFolderParent $Row.Path) -eq $To) { return }
+        $new = Join-DvFolder $To (Get-DvFolderLeaf $Row.Path)
+        Rename-DvFolderPath (Get-SqlItems $Kind) $SqlUI.FolderList[$Kind] $SqlUI.Closed[$Kind] $Row.Path $new
+    } else {
+        if ([string]$Row.Item.Folder -eq $To) { return }
+        Set-DvItemFolder $Row.Item $To
+        if ($To -and -not $SqlUI.FolderList[$Kind].Contains($To)) { $SqlUI.FolderList[$Kind].Add($To) }
+    }
+    $x = $To; while ($x) { [void]$SqlUI.Closed[$Kind].Remove($x); $x = Get-DvFolderParent $x }
+    Save-SqlKind $Kind
+}
+
+# ---- saved queries
+function Open-SqlQuery($Q) {
+    if (-not $Q) { return }
+    $SqlUI.QueryName = $Q.Name
+    $SqlUI.Editor.Text = $Q.Sql
+    if ($SqlUI.Fl.queries) { $SqlUI.Fl.queries.List.Invalidate() }
+}
+function Save-SqlQuery($Folder = $null) {
+    $t = $SqlUI.Editor.Text; if (-not $t.Trim()) { return }
+    if ($null -eq $Folder) { $Folder = if ($SqlUI.Fl.queries) { Get-DvFolderSelected $SqlUI.Fl.queries } else { '' } }
+    $first = ($t -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1).Trim()
+    $n = Read-TextDialog 'Save query' $(if ($Folder) { "Name  (in the folder $($Folder.Replace('/', ' > ')))" } else { 'Name' }) $(if ($SqlUI.QueryName) { $SqlUI.QueryName } else { $first }) $SqlUI.Form
+    if (-not $n) { return }
+    $same = @($SqlUI.Queries | Where-Object { $_.Name -eq $n -and [string]$_.Folder -eq $Folder }) | Select-Object -First 1
+    if ($same) {
+        if ([System.Windows.Forms.MessageBox]::Show($SqlUI.Form, "Replace the saved query ""$n""?", 'SQL client', 'YesNo', 'Question') -ne 'Yes') { return }
+        $same.Sql = $t
+    } else { $SqlUI.Queries.Insert(0, [pscustomobject]@{ Name = $n; Sql = $t; Folder = $Folder }) }
+    $SqlUI.QueryName = $n
+    Save-SqlKind 'queries'
+}
+function Rename-SqlQuery($Q) {
+    $n = Read-TextDialog 'Rename query' 'New name' $Q.Name $SqlUI.Form
+    if (-not $n -or $n -ceq $Q.Name) { return }
+    if ($SqlUI.QueryName -eq $Q.Name) { $SqlUI.QueryName = $n }
+    $Q.Name = $n; Save-SqlKind 'queries'
+}
+function Remove-SqlQuery($Q, [switch]$NoPrompt) {
+    if (-not $NoPrompt -and [System.Windows.Forms.MessageBox]::Show($SqlUI.Form, "Delete the saved query ""$($Q.Name)""?", 'SQL client', 'YesNo', 'Question') -ne 'Yes') { return }
+    [void]$SqlUI.Queries.Remove($Q); Save-SqlKind 'queries'
+}
+
+# ---- connections
+function Select-SqlConn($Conn) {
+    $i = $SqlUI.Conns.IndexOf($Conn)
+    if ($i -lt 0) { return }
+    $SqlUI.ConnBox.SelectedIndex = $i
+    $SqlUI.ConnName = $Conn.Name
+    $SqlUI.DbBox.Text = $Conn.Database
+    Update-SqlTree
+    if ($SqlUI.Fl.connections) { $SqlUI.Fl.connections.List.Invalidate() }
+}
+function Add-SqlConnection($Folder = $null) {
+    if ($null -eq $Folder) { $Folder = if ($SqlUI.Fl.connections) { Get-DvFolderSelected $SqlUI.Fl.connections } else { '' } }
+    $n = Edit-SqlConnection
+    if (-not $n) { Update-SqlConnList ([string]$SqlUI.ConnName); return }
+    Set-DvItemFolder $n $Folder
+    $SqlUI.Conns.Add($n); $SqlUI.ConnName = $n.Name
+    Save-SqlKind 'connections'
+    Select-SqlConn $n
+}
+function Edit-SqlConnItem($Conn) {
+    $i = $SqlUI.Conns.IndexOf($Conn); if ($i -lt 0) { return }
+    $n = Edit-SqlConnection $Conn
+    if (-not $n) { return }
+    Set-DvItemFolder $n ([string]$Conn.Folder)
+    $SqlUI.Conns[$i] = $n; $SqlUI.ConnName = $n.Name
+    Save-SqlKind 'connections'
+    Select-SqlConn $n
+}
+function Remove-SqlConnItem($Conn, [switch]$NoPrompt) {
+    if (-not $NoPrompt -and [System.Windows.Forms.MessageBox]::Show($SqlUI.Form, "Remove the connection ""$($Conn.Name)""?", 'SQL client', 'YesNo', 'Question') -ne 'Yes') { return }
+    [void]$SqlUI.Conns.Remove($Conn)
+    if ($SqlUI.ConnName -eq $Conn.Name) { $SqlUI.ConnName = '' }
+    Save-SqlKind 'connections'
+    Update-SqlTree
+}
+
+# the right-click menus of the two folder lists
+function Show-SqlFolderMenu([string]$Kind, $Menu, $Row) {
+    $SqlUI.MenuKind = $Kind
+    $q = $Kind -eq 'queries'
+    if ($Row -and $Row.IsFolder) {
+        if ($q) { [void](Add-MenuItem $Menu 'Save the editor here...' { Save-SqlQuery $SqlUI.Fl.queries.MenuRow.Path } $Glyph.Save) }
+        else { [void](Add-MenuItem $Menu 'New connection here...' { Add-SqlConnection $SqlUI.Fl.connections.MenuRow.Path } $Glyph.Add) }
+        [void](Add-MenuItem $Menu 'New folder inside...' { New-SqlFolder $SqlUI.MenuKind $SqlUI.Fl[$SqlUI.MenuKind].MenuRow.Path } $Glyph.Folder)
+        [void]$Menu.Items.Add('-')
+        [void](Add-MenuItem $Menu 'Rename folder...' { Rename-SqlFolder $SqlUI.MenuKind $SqlUI.Fl[$SqlUI.MenuKind].MenuRow.Path } $Glyph.Edit 'F2')
+        Add-DvMoveMenu $Menu $SqlUI.Fl[$Kind] (Get-DvFolderParent $Row.Path) $Row.Path { param($to) Move-SqlRow $SqlUI.MenuKind $SqlUI.Fl[$SqlUI.MenuKind].MenuRow $to }
+        [void](Add-MenuItem $Menu 'Delete folder...' { Remove-SqlFolder $SqlUI.MenuKind $SqlUI.Fl[$SqlUI.MenuKind].MenuRow.Path } $Glyph.Delete 'Del')
+    } elseif ($Row) {
+        if ($q) {
+            [void](Add-MenuItem $Menu 'Open' { Open-SqlQuery $SqlUI.Fl.queries.MenuRow.Item } $Glyph.Open 'Enter')
+            [void](Add-MenuItem $Menu 'Open and run' { Open-SqlQuery $SqlUI.Fl.queries.MenuRow.Item; Start-SqlRun } $Glyph.Play)
+            [void](Add-MenuItem $Menu 'Rename...' { Rename-SqlQuery $SqlUI.Fl.queries.MenuRow.Item } $Glyph.Edit 'F2')
+        } else {
+            [void](Add-MenuItem $Menu 'Use' { Select-SqlConn $SqlUI.Fl.connections.MenuRow.Item } $Glyph.Play 'Enter')
+            [void](Add-MenuItem $Menu 'Edit...' { Edit-SqlConnItem $SqlUI.Fl.connections.MenuRow.Item } $Glyph.Edit 'F2')
+        }
+        Add-DvMoveMenu $Menu $SqlUI.Fl[$Kind] ([string]$Row.Item.Folder) '' { param($to) Move-SqlRow $SqlUI.MenuKind $SqlUI.Fl[$SqlUI.MenuKind].MenuRow $to }
+        [void](Add-MenuItem $Menu $(if ($q) { 'Delete' } else { 'Remove' }) { $it = $SqlUI.Fl[$SqlUI.MenuKind].MenuRow.Item; if ($SqlUI.MenuKind -eq 'queries') { Remove-SqlQuery $it } else { Remove-SqlConnItem $it } } $Glyph.Delete 'Del')
+    } else {
+        if ($q) { [void](Add-MenuItem $Menu 'Save the editor...' { Save-SqlQuery '' } $Glyph.Save) }
+        else { [void](Add-MenuItem $Menu 'New connection...' { Add-SqlConnection '' } $Glyph.Add) }
+        [void](Add-MenuItem $Menu 'New folder...' { New-SqlFolder $SqlUI.MenuKind '' } $Glyph.Folder)
+    }
+}
+
+function New-SqlFolderList([string]$Kind, $Parent) {
+    $fl = New-DvFolderList $Parent $(if ($Kind -eq 'connections') { 'Search connections...' } else { 'Search saved queries...' })
+    $fl.Kind = $Kind
+    $fl.Collapsed = $SqlUI.Closed[$Kind]
+    $fl.GetFolders = [scriptblock]::Create("`$SqlUI.FolderList['$Kind']")
+    $fl.GetItems = [scriptblock]::Create("Get-SqlItems '$Kind'")
+    $fl.Title = { param($it) [string]$it.Name }
+    $fl.OnMenu = [scriptblock]::Create("param(`$menu, `$row) Show-SqlFolderMenu '$Kind' `$menu `$row")
+    $fl.OnMove = [scriptblock]::Create("param(`$row, `$to) Move-SqlRow '$Kind' `$row `$to")
+    $fl.OnCollapse = { Save-SqlFolders }
+    $fl.OnRename = [scriptblock]::Create("param(`$row) if (`$row.IsFolder) { Rename-SqlFolder '$Kind' `$row.Path } elseif ('$Kind' -eq 'queries') { Rename-SqlQuery `$row.Item } else { Edit-SqlConnItem `$row.Item }")
+    $fl.OnDelete = [scriptblock]::Create("param(`$row) if (`$row.IsFolder) { Remove-SqlFolder '$Kind' `$row.Path } elseif ('$Kind' -eq 'queries') { Remove-SqlQuery `$row.Item } else { Remove-SqlConnItem `$row.Item }")
+    if ($Kind -eq 'connections') {
+        $fl.Meta = { param($it) "$($it.Server)  /  $($it.Database)$(if (-not $it.Windows) { "  /  $($it.User)" })" }
+        $fl.IsCurrent = { param($it) $it -eq (Get-SqlConn) }
+        $fl.OnOpen = { param($it) if ($it -ne (Get-SqlConn)) { Select-SqlConn $it } }
+        $fl.EmptyText = 'No connections yet. Right-click: New connection.'
+    } else {
+        $fl.Meta = { param($it) $t = ([string]$it.Sql -replace '\s+', ' ').Trim(); $t.Substring(0, [Math]::Min(120, $t.Length)) }
+        $fl.IsCurrent = { param($it) $SqlUI.QueryName -and $it.Name -eq $SqlUI.QueryName }
+        $fl.OnOpen = { param($it) Open-SqlQuery $it }
+        $fl.OpenOnDoubleClick = $true
+        $fl.EmptyText = 'No saved queries yet. Save query keeps the editor here.'
+    }
+    $hdr = New-Object System.Windows.Forms.Label
+    $hdr.Dock = 'Top'; $hdr.AutoSize = $false; $hdr.Height = Px 28; $hdr.Font = $FontSmall; $hdr.ForeColor = $C.Accent; $hdr.BackColor = $C.Panel; $hdr.TextAlign = 'MiddleLeft'
+    $hdr.Text = if ($Kind -eq 'connections') { '  CONNECTIONS  (right-click for folders)' } else { '  SAVED QUERIES  (right-click for folders)' }
+    $bar = New-Object System.Windows.Forms.FlowLayoutPanel
+    $bar.Dock = 'Top'; $bar.AutoSize = $true; $bar.WrapContents = $true; $bar.BackColor = $C.Panel; $bar.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 6), (Px 6), (Px 2))
+    if ($Kind -eq 'connections') { [void](New-Button 'New connection' 'A new connection in the selected folder' { Add-SqlConnection } $bar $Glyph.Add 2) }
+    else { [void](New-Button 'Save query' 'Keep the editor in the selected folder' { Save-SqlQuery } $bar $Glyph.Save 2) }
+    $b = New-Button 'Folder' 'A new folder inside the selected one' { New-SqlFolder $this.Tag (Get-DvFolderSelected $SqlUI.Fl[$this.Tag]) } $bar $Glyph.Folder 2
+    $b.Tag = $Kind
+    $Parent.Controls.Add($hdr); $Parent.Controls.Add($bar)
+    $SqlUI.Fl[$Kind] = $fl
+    $fl
+}
+
 function Show-SqlClient {
     Hide-Picker
     if (-not (Initialize-Diagrams)) { return }
@@ -27808,9 +28263,9 @@ function Show-SqlClient {
     $SqlUI.Form = $f
 
     # left: object browser, saved queries, history
-    $left = New-Object System.Windows.Forms.Panel; $left.Dock = 'Left'; $left.Width = Px 330; $left.BackColor = $C.Bg
+    $left = New-Object System.Windows.Forms.Panel; $left.Dock = 'Left'; $left.Width = Px 390; $left.BackColor = $C.Bg
     $ltabs = New-TabSet $left
-    $pObj = Add-ApiTab $ltabs 'Objects'; $pSaved = Add-ApiTab $ltabs 'Saved'; $pHist = Add-ApiTab $ltabs 'History'
+    $pObj = Add-ApiTab $ltabs 'Objects'; $pConn = Add-ApiTab $ltabs 'Connections'; $pSaved = Add-ApiTab $ltabs 'Saved'; $pHist = Add-ApiTab $ltabs 'History'
     $tv = New-Object System.Windows.Forms.TreeView
     $tv.Dock = 'Fill'; $tv.BorderStyle = 'None'; $tv.BackColor = $C.Bg; $tv.ForeColor = $C.Fore; $tv.ItemHeight = $FontMain.Height + (Px 8); $tv.HideSelection = $false; $tv.ShowLines = $false
     $tv.add_BeforeExpand({ param($src, $e) Expand-SqlNode $e.Node })
@@ -27836,13 +28291,10 @@ function Show-SqlClient {
     })
     $tv.ContextMenuStrip = $tm
     $pObj.Controls.Add($tv); $SqlUI.Tree = $tv
-    $ql = New-Object System.Windows.Forms.ListBox; $ql.Dock = 'Fill'; $ql.BorderStyle = 'None'; $ql.BackColor = $C.Bg; $ql.ForeColor = $C.Fore; $ql.IntegralHeight = $false; $ql.ItemHeight = $FontMain.Height + (Px 8)
-    $ql.add_DoubleClick({ param($src, $e) $i = $src.SelectedIndex; if ($i -ge 0) { $SqlUI.Editor.Text = $SqlUI.Queries[$i].Sql } })
-    $qm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
-    [void](Add-MenuItem $qm 'Open' { $i = $SqlUI.QueryList.SelectedIndex; if ($i -ge 0) { $SqlUI.Editor.Text = $SqlUI.Queries[$i].Sql } } $Glyph.Open)
-    [void](Add-MenuItem $qm 'Delete' { $i = $SqlUI.QueryList.SelectedIndex; if ($i -ge 0) { $SqlUI.Queries.RemoveAt($i); Save-SqlData 'queries'; Update-SqlSideLists } } $Glyph.Delete)
-    $ql.ContextMenuStrip = $qm
-    $pSaved.Controls.Add($ql); $SqlUI.QueryList = $ql
+    $SqlUI.Fl = @{}
+    [void](New-SqlFolderList 'connections' $pConn)
+    [void](New-SqlFolderList 'queries' $pSaved)
+    $SqlUI.LeftTabs = $ltabs
     $hl = New-Object System.Windows.Forms.ListBox; $hl.Dock = 'Fill'; $hl.BorderStyle = 'None'; $hl.BackColor = $C.Bg; $hl.ForeColor = $C.Fore; $hl.IntegralHeight = $false; $hl.ItemHeight = $FontMain.Height + (Px 8); $hl.HorizontalScrollbar = $true
     $hl.add_DoubleClick({ param($src, $e) $i = $src.SelectedIndex; if ($i -ge 0) { $SqlUI.Editor.Text = $SqlUI.History[$i].Sql } })
     $pHist.Controls.Add($hl); $SqlUI.HistList = $hl
@@ -27854,24 +28306,11 @@ function Show-SqlClient {
     $SqlUI.ConnBox = New-TbCombo $top @() 220
     $SqlUI.ConnBox.add_SelectionChangeCommitted({
         param($src, $e)
-        if ($src.SelectedIndex -eq $SqlUI.Conns.Count) {
-            $n = Edit-SqlConnection
-            if ($n) { $SqlUI.Conns.Add($n); Save-SqlData 'connections'; Update-SqlConnList $n.Name; $SqlUI.DbBox.Text = $n.Database; Update-SqlTree } else { Update-SqlConnList }
-            return
-        }
-        $c0 = Get-SqlConn; if ($c0) { $SqlUI.DbBox.Text = $c0.Database }; Update-SqlTree
+        if ($src.SelectedIndex -eq $SqlUI.Conns.Count) { Add-SqlConnection; return }
+        $c0 = Get-SqlConn; if ($c0) { Select-SqlConn $c0 }
     })
-    [void](New-Button '' 'Edit the connection' {
-        $i = $SqlUI.ConnBox.SelectedIndex
-        if ($i -lt 0 -or $i -ge $SqlUI.Conns.Count) { $n = Edit-SqlConnection; if ($n) { $SqlUI.Conns.Add($n); Save-SqlData 'connections'; Update-SqlConnList $n.Name; $SqlUI.DbBox.Text = $n.Database; Update-SqlTree }; return }
-        $n = Edit-SqlConnection $SqlUI.Conns[$i]
-        if ($n) { $SqlUI.Conns[$i] = $n; Save-SqlData 'connections'; Update-SqlConnList $n.Name; $SqlUI.DbBox.Text = $n.Database; Update-SqlTree }
-    } $top $Glyph.Edit 2)
-    [void](New-Button '' 'Remove the connection' {
-        $i = $SqlUI.ConnBox.SelectedIndex; if ($i -lt 0 -or $i -ge $SqlUI.Conns.Count) { return }
-        if ([System.Windows.Forms.MessageBox]::Show($SqlUI.Form, "Remove the connection ""$($SqlUI.Conns[$i].Name)""?", 'SQL client', 'YesNo', 'Question') -ne 'Yes') { return }
-        $SqlUI.Conns.RemoveAt($i); Save-SqlData 'connections'; Update-SqlConnList; Update-SqlTree
-    } $top $Glyph.Delete 2)
+    [void](New-Button '' 'Edit the connection' { $c0 = Get-SqlConn; if ($c0) { Edit-SqlConnItem $c0 } else { Add-SqlConnection } } $top $Glyph.Edit 2)
+    [void](New-Button '' 'Remove the connection' { $c0 = Get-SqlConn; if ($c0) { Remove-SqlConnItem $c0 } } $top $Glyph.Delete 2)
     New-TbLabel $top 'Database' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding((Px 10), (Px 9), (Px 4), 0) }
     $SqlUI.DbBox = New-Object System.Windows.Forms.ComboBox; $SqlUI.DbBox.DropDownStyle = 'DropDown'; $SqlUI.DbBox.FlatStyle = 'Flat'; $SqlUI.DbBox.BackColor = $C.Bg; $SqlUI.DbBox.ForeColor = $C.Fore; $SqlUI.DbBox.Width = Px 180
     $SqlUI.DbBox.Margin = New-Object System.Windows.Forms.Padding(0, (Px 4), (Px 10), 0)
@@ -27885,12 +28324,7 @@ function Show-SqlClient {
     $SqlUI.CancelBtn.Enabled = $false
     New-TbLabel $top 'Max rows' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding((Px 10), (Px 9), (Px 4), 0) }
     $SqlUI.MaxRows = New-TbNumber $top 10000 1 1000000; $SqlUI.MaxRows.Width = Px 90
-    [void](New-Button 'Save query' 'Keep this query in Saved' {
-        $t = $SqlUI.Editor.Text; if (-not $t.Trim()) { return }
-        $n = Read-TextDialog 'Save query' 'Name' (($t -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1).Trim()) $SqlUI.Form
-        if (-not $n) { return }
-        $SqlUI.Queries.Insert(0, [pscustomobject]@{ Name = $n; Sql = $t }); Save-SqlData 'queries'; Update-SqlSideLists
-    } $top $Glyph.Save 2)
+    [void](New-Button 'Save query' 'Keep this query in Saved (in the folder selected there)' { Save-SqlQuery } $top $Glyph.Save 2)
     [void](New-Button 'ER diagram' 'A diagram of the tables of this database, their columns and keys' { New-SqlErDiagram } $top $Glyph.Apps 2)
     $SqlUI.LiveBtn = New-Button 'Live diagram' 'Show / hide the diagram of the query as you write it' {
         $SqlUI.LiveSplit.Panel2Collapsed = -not $SqlUI.LiveSplit.Panel2Collapsed
@@ -27950,7 +28384,7 @@ function Show-SqlClient {
         elseif ($e.Control -and $e.KeyCode -eq 'M') { $e.SuppressKeyPress = $true; Start-SqlPlan $true }
         elseif ($e.KeyCode -eq 'Escape' -and $SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }
     })
-    $f.add_FormClosed({ if ($SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }; foreach ($k in 'Timer', 'ColorTimer', 'LiveTimer', 'PlanTimer') { if ($SqlUI[$k]) { $SqlUI[$k].Dispose(); $SqlUI[$k] = $null } }; $SqlUI.Form = $null; $SqlUI.SchemaKey = '' })
+    $f.add_FormClosed({ if ($SqlUI.Run -and -not $SqlUI.Run.Done) { $SqlUI.Run.Cancel() }; foreach ($k in 'Timer', 'ColorTimer', 'LiveTimer', 'PlanTimer') { if ($SqlUI[$k]) { $SqlUI[$k].Dispose(); $SqlUI[$k] = $null } }; $SqlUI.Form = $null; $SqlUI.SchemaKey = ''; $SqlUI.Fl = @{} })
     Register-ThemedWindow $f
     $f.Show()
     [PowerClipHost]::EnsureShown($f.Handle)

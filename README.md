@@ -485,10 +485,12 @@ Diagrams from a few lines of text: architecture maps, flowcharts, org charts and
     - hover highlight, draw-in animation, minified
     - a **prefix for every class and id**, so several diagrams can sit on the same page without clashing
   - Every output has a live code view with **Copy**, **Save** and **Open in browser** to see the result.
-- Diagrams are saved as you go under `data\diagrams\` (one `.dgm` text file each). The **Saved** tab is a **folder tree** of real folders under it:
-  - **New folder** (inside the selected one, as deep as you like), **New diagram**, rename (F2), delete (Del; a folder asks first and says how many diagrams are in it), **Duplicate**, **Move to**, **Show in Explorer**.
-  - **Drag** diagrams and folders onto a folder to move them (onto empty space = the top). The open diagram follows when its folder moves or is renamed.
-  - New diagrams (**New**, **Examples**, the Data tab, the SQL client's Chart this / ER diagram) are saved in the folder selected in the tree; the line at the bottom shows which.
+- Diagrams are saved as you go under `data\diagrams\` (one `.dgm` text file each). The **Saved** tab shows them in **folders, like Notes** (real folders under it):
+  - Click a folder to open or close it (the number is how many diagrams are inside); click a diagram to open it. **Search** filters the list.
+  - **New diagram** and **Folder** at the top, or right-click: on a folder **New diagram here...**, **New folder inside...**, **Rename folder...**, **Move to**, **Delete folder...**; on a diagram **Open**, **Duplicate**, **Rename...**, **Move to**, **Delete**, **Show in Explorer**. F2 renames, Del deletes.
+  - Deleting a folder never deletes diagrams: what is inside moves up one level.
+  - **Drag** diagrams and folders onto a folder to move them (onto empty space = the top). The open diagram follows when its folder moves or is renamed. Closed folders stay closed.
+  - New diagrams (**New**, **Examples**, the Data tab, the SQL client's Chart this / ER diagram) are saved in the selected folder.
 
 ## SQL client
 
@@ -518,7 +520,8 @@ A SQL Server client with nothing to install (it uses the SQL Server support buil
   - **Copy** (with headers, pastes into Excel), **CSV...**, **JSON...**.
   - **Chart this** / **Diagram this** send the result to the Diagram studio's Data tab, ready to become a chart, a link graph or a tree.
   - **ER diagram** draws the tables of the database with their columns, keys and the 1 : n links between them.
-- **Saved** queries and the **History** of the last 200 runs (double-click to load one). Everything is kept under `data\sql\`.
+- **Connections** and **Saved** queries are kept in **folders, like Notes**: click a connection to use it, double-click a saved query to open it (right-click: **Open and run**). **Save query** saves into the selected folder (the same name there is replaced after asking). Right-click for **New folder inside...**, **Rename folder...**, **Move to** and **Delete folder...** (what's inside moves up a level), or drag connections, queries and folders onto a folder. The connection list at the top shows the folder too (`Work > Prod`).
+- **History** keeps the last 200 runs (double-click to load one). Everything is kept under `data\sql\` (`folders.json` holds the folders).
 
 ## Git
 
