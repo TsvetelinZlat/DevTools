@@ -531,7 +531,8 @@ A database client for **SQL Server** (nothing to install: it uses the SQL Server
   SELECT o.order_id, c.name, r.region
   FROM [Oracle prod].SALES.ORDERS o
   JOIN [Local SQL].dbo.customers c ON c.id = o.customer_id
-  JOIN [file:C:\dataegions.xlsx].Sheet1 r ON r.code = c.region_code
+  JOIN [file:C:\data
+egions.xlsx].Sheet1 r ON r.code = c.region_code
   WHERE o.order_date >= DATE '2026-01-01'
   ```
   - `[Name]` is a saved connection (SQL Server, PostgreSQL or Oracle); a table without one uses the current connection. `[file:path]` is a CSV / TSV file, `[file:path].Sheet` a sheet of an .xlsx (first row = column names; numbers and dates are recognised).
@@ -540,6 +541,12 @@ A database client for **SQL Server** (nothing to install: it uses the SQL Server
   - Values match across sources the forgiving way: `42`, `42.0` and `'42'` are equal, text is compared without case.
   - At most 200,000 rows are read from each source; when a source has more, Messages says the result may miss rows (add a `WHERE`).
   - The live diagram and the suggestions follow these names too: after `[` you get your connections and `file:`, after `[Name].` its tables.
+- **Examples** (top bar): ready queries to start from, added at the end of the editor and selected (F5 runs just that one):
+  - **Files** (they run as they are, on sample files DevTools makes in `data\sql\examples\`): query a CSV; join a CSV with an Excel sheet with GROUP BY / CASE; rows in one file but not the other
+  - **Across connections** (your first two saved connections are filled in; change the tables to yours): join two connections; a connection and an Excel file; Oracle + SQL Server + Excel; reconcile two systems (missing rows); compare totals between two systems
+  - **Other databases and schemas**: SQL Server `Db.schema.table`; Oracle `OWNER.TABLE` and `TABLE@LINK`
+  - **Per database**: SQL Server top / paging / dates; PostgreSQL `LIMIT` / `ILIKE` / `date_trunc`; Oracle `FETCH FIRST` / `NVL` / a PL/SQL block
+  - **Tips**: the keys for plans, the live diagram and suggestions
 - **Editor** with SQL colours. **F5** or **Ctrl+Enter** runs the selection, or everything; `GO` lines separate batches (as in SSMS). PostgreSQL / Oracle run one statement at a time (`;` between them; an Oracle PL/SQL block ends with a `/` line). **Cancel** (or Esc) stops a long query. **Max rows** caps what is shown per result.
 - **Results**: a tab per result set, plus **Messages** (rows affected, PRINT output, errors).
   - An error selects the line it happened on.

@@ -30087,6 +30087,197 @@ function Register-SqlComplete($Ed) {
     $Ed.add_LostFocus({ if ($SqlUI.Form) { [void]$SqlUI.Form.BeginInvoke([Action]{ if ($SqlUI.Ac -and -not $SqlUI.Editor.Focused) { Hide-SqlComplete } }) } })
 }
 
+# ---- examples: ready queries for each feature. {A} / {B} become your first two saved connections, {DIR} the sample files folder.
+$SqlExampleDir = Join-Path $SqlDir 'examples'
+$SqlExamples = @(
+    @{ Group = 'Files (run as they are)'; Title = 'Query a CSV file'; Sql = @'
+-- A CSV file is a table: the first row has the column names, numbers and dates are recognised.
+SELECT s.region_code, COUNT(*) AS orders, SUM(s.amount) AS total
+FROM [file:{DIR}\sales.csv] s
+WHERE s.order_date >= DATE '2026-02-01'
+GROUP BY s.region_code
+ORDER BY total DESC;
+'@ }
+    @{ Group = 'Files (run as they are)'; Title = 'Join a CSV with an Excel sheet'; Sql = @'
+-- [file:path].Sheet is a sheet of an .xlsx file. Joins, GROUP BY and HAVING run inside DevTools.
+SELECT r.region, r.manager, SUM(s.amount) AS sold, MAX(t.target) AS target,
+       SUM(s.amount) - MAX(t.target) AS gap,
+       CASE WHEN SUM(s.amount) >= MAX(t.target) THEN 'on target' ELSE 'behind' END AS status
+FROM [file:{DIR}\sales.csv] s
+JOIN [file:{DIR}\regions.csv] r ON r.code = s.region_code
+JOIN [file:{DIR}\targets.xlsx].Targets t ON t.region_code = s.region_code
+GROUP BY r.region, r.manager
+ORDER BY gap;
+'@ }
+    @{ Group = 'Files (run as they are)'; Title = 'Rows in one file but not in the other'; Sql = @'
+-- LEFT JOIN ... WHERE x IS NULL: the regions that have sales but no target.
+SELECT DISTINCT s.region_code
+FROM [file:{DIR}\sales.csv] s
+LEFT JOIN [file:{DIR}\targets.xlsx].Targets t ON t.region_code = s.region_code
+WHERE t.region_code IS NULL;
+'@ }
+    @{ Group = 'Across connections'; Title = 'Join two connections'; Sql = @'
+-- [Name] is a saved connection (Connections tab). Change the tables and columns to yours.
+-- Each connection gets only the columns used and its own WHERE parts; the join happens in DevTools.
+SELECT o.order_id, o.order_date, c.name, o.total
+FROM [{A}].dbo.orders o
+JOIN [{B}].dbo.customers c ON c.id = o.customer_id
+WHERE o.order_date >= DATE '2026-01-01'
+ORDER BY o.total DESC;
+'@ }
+    @{ Group = 'Across connections'; Title = 'A connection and an Excel file'; Sql = @'
+-- A table without [Name] uses the connection selected at the top.
+SELECT c.name, c.region_code, t.target
+FROM dbo.customers c
+JOIN [file:{DIR}\targets.xlsx].Targets t ON t.region_code = c.region_code;
+'@ }
+    @{ Group = 'Across connections'; Title = 'Three sources: Oracle, SQL Server and Excel'; Sql = @'
+-- Write each table in its own database's syntax (Oracle names are usually in capitals).
+SELECT o.ORDER_ID, c.name, r.region, o.AMOUNT
+FROM [{B}].SALES.ORDERS o
+JOIN [{A}].dbo.customers c ON c.id = o.CUSTOMER_ID
+JOIN [file:{DIR}\regions.csv] r ON r.code = c.region_code
+WHERE o.ORDER_DATE >= DATE '2026-01-01';
+'@ }
+    @{ Group = 'Across connections'; Title = 'Reconcile two systems (missing rows)'; Sql = @'
+-- Customers in system A that system B doesn't have.
+-- (The IS NULL filter is not sent to B: it has to see all of B's rows to know what is missing.)
+SELECT a.id, a.name
+FROM [{A}].dbo.customers a
+LEFT JOIN [{B}].dbo.customers b ON b.id = a.id
+WHERE b.id IS NULL;
+'@ }
+    @{ Group = 'Across connections'; Title = 'Compare totals between two systems'; Sql = @'
+-- FULL JOIN keeps the rows of both sides; COALESCE fills the gaps.
+SELECT COALESCE(a.customer_id, b.customer_id) AS customer_id,
+       a.total AS total_a, b.total AS total_b,
+       COALESCE(a.total, 0) - COALESCE(b.total, 0) AS difference
+FROM [{A}].dbo.invoices a
+FULL JOIN [{B}].dbo.invoices b ON b.customer_id = a.customer_id
+WHERE a.total IS NULL OR b.total IS NULL OR a.total <> b.total
+ORDER BY difference DESC;
+'@ }
+    @{ Group = 'Other databases and schemas'; Title = 'SQL Server: a table in another database'; Sql = @'
+-- Db.schema.table (or Db..table for dbo) on the same server: the live diagram reads its columns too.
+SELECT c.name, g.country_name
+FROM dbo.customers c
+JOIN Geography.dbo.countries g ON g.country_id = c.country_id;
+'@ }
+    @{ Group = 'Other databases and schemas'; Title = 'Oracle: another schema and a db link'; Sql = @'
+-- OWNER.TABLE reads another schema; TABLE@LINK goes through a database link.
+SELECT e.EMPLOYEE_ID, e.LAST_NAME, d.DEPARTMENT_NAME
+FROM HR.EMPLOYEES e
+JOIN DEPARTMENTS@REMOTE_LINK d ON d.DEPARTMENT_ID = e.DEPARTMENT_ID
+FETCH FIRST 50 ROWS ONLY
+'@ }
+    @{ Group = 'Per database'; Title = 'SQL Server: top, paging, dates'; Sql = @'
+SELECT TOP 100 o.order_id, o.total, DATEDIFF(day, o.order_date, GETDATE()) AS days_ago
+FROM dbo.orders o
+WHERE o.order_date >= DATEADD(month, -3, GETDATE())
+ORDER BY o.order_date DESC;
+
+-- page 3, 50 rows a page
+SELECT order_id, total FROM dbo.orders ORDER BY order_id OFFSET 100 ROWS FETCH NEXT 50 ROWS ONLY;
+'@ }
+    @{ Group = 'Per database'; Title = 'PostgreSQL: LIMIT, ILIKE, date_trunc'; Sql = @'
+SELECT date_trunc('month', o.order_date) AS month, COUNT(*) AS orders, SUM(o.total) AS total
+FROM public.orders o
+WHERE o.customer_name ILIKE '%smith%'
+GROUP BY 1
+ORDER BY 1 DESC
+LIMIT 12;
+'@ }
+    @{ Group = 'Per database'; Title = 'Oracle: FETCH FIRST, NVL, a PL/SQL block'; Sql = @'
+SELECT o.ORDER_ID, NVL(o.DISCOUNT, 0) AS discount, TRUNC(o.ORDER_DATE, 'MM') AS month
+FROM ORDERS o
+WHERE o.ORDER_DATE >= ADD_MONTHS(TRUNC(SYSDATE), -3)
+ORDER BY o.ORDER_DATE DESC
+FETCH FIRST 100 ROWS ONLY;
+
+-- a PL/SQL block ends with a line that holds only /
+BEGIN
+  DBMS_OUTPUT.PUT_LINE('hello');
+END;
+/
+'@ }
+    @{ Group = 'Tips'; Title = 'Plans, the live diagram and suggestions'; Sql = @'
+-- Put the cursor in a statement and:
+--   F5 / Ctrl+Enter   run it (or the selection)
+--   Ctrl+L            the plan without running it (SQL Server: drawn, with suggestions and fixes;
+--                     PostgreSQL / Oracle: their own text plan)
+--   Ctrl+M            run it and get the actual plan
+--   Ctrl+Space        suggestions: tables after FROM / JOIN, columns after alias., your connections after [
+-- The diagram on the right follows the statement under the cursor as you type.
+SELECT c.name, COUNT(o.order_id) AS orders
+FROM dbo.customers c
+LEFT JOIN dbo.orders o ON o.customer_id = c.id
+GROUP BY c.name
+HAVING COUNT(o.order_id) > 1;
+'@ }
+)
+
+# the sample files the file examples use (made once, in data\sql\examples)
+function New-SqlExampleFiles {
+    if (-not (Test-Path -LiteralPath $SqlExampleDir)) { [void](New-Item -ItemType Directory -Path $SqlExampleDir -Force) }
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    $f = Join-Path $SqlExampleDir 'regions.csv'
+    if (-not (Test-Path -LiteralPath $f)) { [IO.File]::WriteAllText($f, "code;region;manager`r`nEU;Europe;Maria`r`nUS;Americas;John`r`nAPAC;Asia Pacific;Li`r`nLATAM;Latin America;Sofia`r`n", $utf8) }
+    $f = Join-Path $SqlExampleDir 'sales.csv'
+    if (-not (Test-Path -LiteralPath $f)) {
+        $rows = @('order_id,region_code,amount,order_date', '1,EU,120.50,2026-01-05', '2,EU,80.00,2026-02-11', '3,US,45.25,2026-02-14', '4,US,60.00,2026-03-02', '5,APAC,30.00,2026-03-09', '6,LATAM,15.75,2026-03-20', '7,EU,99.90,2026-03-28', '8,APAC,12.00,2026-01-30')
+        [IO.File]::WriteAllText($f, ($rows -join "`r`n") + "`r`n", $utf8)
+    }
+    $f = Join-Path $SqlExampleDir 'targets.xlsx'
+    if (-not (Test-Path -LiteralPath $f)) {
+        $cells = @(@('region_code', 'target', 'year'), @('EU', 250, 2026), @('US', 150, 2026), @('APAC', 40, 2026))
+        $sb = New-Object System.Text.StringBuilder
+        for ($r = 0; $r -lt $cells.Count; $r++) {
+            [void]$sb.Append("<row r=`"$($r + 1)`">")
+            for ($c = 0; $c -lt $cells[$r].Count; $c++) {
+                $ref = [string][char](65 + $c) + ($r + 1); $v = $cells[$r][$c]
+                if ($v -is [string]) { [void]$sb.Append("<c r=`"$ref`" t=`"inlineStr`"><is><t>$([Security.SecurityElement]::Escape($v))</t></is></c>") } else { [void]$sb.Append("<c r=`"$ref`"><v>$v</v></c>") }
+            }
+            [void]$sb.Append('</row>')
+        }
+        $parts = [ordered]@{
+            '[Content_Types].xml' = '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'
+            '_rels/.rels' = '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+            'xl/workbook.xml' = '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Targets" sheetId="1" r:id="rId1"/></sheets></workbook>'
+            'xl/_rels/workbook.xml.rels' = '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>'
+            'xl/worksheets/sheet1.xml' = "<?xml version=`"1.0`" encoding=`"UTF-8`"?><worksheet xmlns=`"http://schemas.openxmlformats.org/spreadsheetml/2006/main`"><sheetData>$($sb.ToString())</sheetData></worksheet>"
+        }
+        $z = [IO.Compression.ZipFile]::Open($f, 'Create')
+        try { foreach ($k in $parts.Keys) { $e = $z.CreateEntry($k); $w = New-Object IO.StreamWriter($e.Open(), $utf8); try { $w.Write($parts[$k]) } finally { $w.Dispose() } } } finally { $z.Dispose() }
+    }
+}
+
+# an example into the editor: added at the end and selected, so F5 runs just it
+function Add-SqlExample($Ex) {
+    try { New-SqlExampleFiles } catch { Set-SqlStatus "Couldn't make the sample files: $($_.Exception.Message)" $C.Red }
+    $names = @($SqlUI.Conns | ForEach-Object { [string]$_.Name } | Where-Object { $_ })
+    $a = if ($names.Count -ge 1) { $names[0] } else { 'My SQL Server' }
+    $b = if ($names.Count -ge 2) { $names[1] } else { 'Oracle prod' }
+    $text = $Ex.Sql.Replace('{DIR}', $SqlExampleDir).Replace('{A}', $a).Replace('{B}', $b).Trim()
+    $ed = $SqlUI.Editor
+    $lead = if ($ed.TextLength -gt 0) { if ($ed.Text.EndsWith("`n")) { "`r`n" } else { "`r`n`r`n" } } else { '' }
+    $ed.AppendText($lead + "-- Example: $($Ex.Title)`r`n" + $text + "`r`n")
+    $start = $ed.TextLength - ("-- Example: $($Ex.Title)`r`n" + $text + "`r`n").Replace("`r`n", "`n").Length
+    $ed.Select([Math]::Max(0, $start), $ed.TextLength - [Math]::Max(0, $start)); $ed.ScrollToCaret(); [void]$ed.Focus()
+    Set-SqlStatus $(if ($Ex.Group -like 'Files*') { "Example added and selected: F5 runs it (the sample files are in $SqlExampleDir)." } else { 'Example added and selected: change the tables to yours, then F5.' }) $C.Accent
+}
+function Show-SqlExamplesMenu($Button) {
+    $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    foreach ($g in @($SqlExamples | ForEach-Object { $_.Group } | Select-Object -Unique)) {
+        $sub = New-Object System.Windows.Forms.ToolStripMenuItem($g)
+        $sub.DropDown.Renderer = $MenuRenderer
+        foreach ($ex in @($SqlExamples | Where-Object { $_.Group -eq $g })) { $it = $sub.DropDownItems.Add($ex.Title, $null, { param($s2, $e2) Add-SqlExample $s2.Tag }); $it.Tag = $ex }
+        [void]$m.Items.Add($sub)
+    }
+    [void]$m.Items.Add('-')
+    [void](Add-MenuItem $m 'Open the sample files folder' { New-SqlExampleFiles; Start-Process explorer.exe $SqlExampleDir } $Glyph.Open)
+    $m.Show($Button, (New-Object System.Drawing.Point(0, $Button.Height)))
+}
+
 function Show-SqlClient {
     Hide-Picker
     if (-not (Initialize-Diagrams)) { return }
@@ -30161,6 +30352,7 @@ function Show-SqlClient {
     New-TbLabel $top 'Max rows' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding((Px 10), (Px 9), (Px 4), 0) }
     $SqlUI.MaxRows = New-TbNumber $top 10000 1 1000000; $SqlUI.MaxRows.Width = Px 90
     [void](New-Button 'Save query' 'Keep this query in Saved (in the folder selected there)' { Save-SqlQuery } $top $Glyph.Save 2)
+    [void](New-Button 'Examples' 'Ready queries for each feature: files, joins across connections, other databases, per database, tips' { Show-SqlExamplesMenu $this } $top $Glyph.Text 2)
     [void](New-Button 'ER diagram' 'A diagram of the tables of this database, their columns and keys' { New-SqlErDiagram } $top $Glyph.Apps 2)
     $SqlUI.LiveBtn = New-Button 'Live diagram' 'Show / hide the diagram of the query as you write it' {
         $SqlUI.LiveSplit.Panel2Collapsed = -not $SqlUI.LiveSplit.Panel2Collapsed
@@ -30176,7 +30368,7 @@ function Show-SqlClient {
     $live.Dock = 'Fill'; $live.Orientation = 'Vertical'; $live.SplitterWidth = 5; $live.BackColor = $C.Line; $live.Panel1.BackColor = $C.Bg; $live.Panel2.BackColor = $C.Bg
     $split.Panel1.Controls.Add($live); $SqlUI.LiveSplit = $live
     $ed = New-TbRtb; $ed.Dock = 'Fill'; $ed.AcceptsTab = $true; $ed.WordWrap = $false
-    $ed.Text = "-- F5 or Ctrl+Enter runs the selection, or everything. GO separates batches.`r`n-- Suggestions pop up as you type (Ctrl+Space opens them): Up / Down choose, Tab puts one in.`r`n-- The diagram on the right follows the statement under the cursor as you write it.`r`nSELECT TOP 100 name, create_date FROM sys.tables ORDER BY create_date DESC;"
+    $ed.Text = "-- F5 or Ctrl+Enter runs the selection, or everything. GO separates batches.`r`n-- Suggestions pop up as you type (Ctrl+Space opens them): Up / Down choose, Tab puts one in.`r`n-- Examples (top bar) adds ready queries: files, joins across connections, other databases.`r`n-- The diagram on the right follows the statement under the cursor as you write it.`r`nSELECT TOP 100 name, create_date FROM sys.tables ORDER BY create_date DESC;"
     $live.Panel1.Controls.Add($ed); $SqlUI.Editor = $ed
     Register-SqlComplete $ed
     $lcv = New-Object DgCanvas
