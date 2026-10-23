@@ -152,7 +152,7 @@ Tools with an arrow open in their own window; the others open on the right. Type
   - **Compare...** compares the input with the clipboard (any of the formats), ignoring key order and formatting.
 - **JWT decoder**: header, payload and the standard claims with readable dates ("expires in 2 h" / "EXPIRED"). Enter the secret to check HS256 / HS384 / HS512 signatures. Nothing is sent anywhere.
 - **Regex tester**: matches are highlighted as you type, with a list of matches and groups and a **Replace** preview. Options: ignore case, ^ $ per line, . matches newline, ignore spaces. Matching stops after 2 seconds so a runaway pattern can't hang the window.
-  - **Language**: write the pattern the way your language wants it - .NET (C#, PowerShell), JavaScript, Python, Java / Kotlin, PHP (PCRE), Go (RE2) or grep -E / sed -E (POSIX). DevTools tests it with that language's rules where they differ (`\d` and `\w` are ASCII-only in JavaScript, Java, PHP and Go; Python's `(?P<name>...)`; POSIX classes like `[[:digit:]]`; `\h` and `\R` in PHP / Java; a pasted `/pattern/gi` or `#pattern#i` takes its flags from the literal) and the replacement syntax (`$1`, ``, `\g<name>`, `$<name>`, `&`). It warns about what the language can't do, e.g. no lookarounds or back-references in Go, no lazy quantifiers in POSIX, no `\A` in JavaScript.
+  - **Language**: write the pattern the way your language wants it - .NET (C#, PowerShell), JavaScript, Python, Java / Kotlin, PHP (PCRE), Go (RE2) or grep -E / sed -E (POSIX). DevTools tests it with that language's rules where they differ (`\d` and `\w` are ASCII-only in JavaScript, Java, PHP and Go; Python's `(?P<name>...)`; POSIX classes like `[[:digit:]]`; `\h` and `\R` in PHP / Java; a pasted `/pattern/gi` or `#pattern#i` takes its flags from the literal) and the replacement syntax (`$1`, `\1`, `\g<name>`, `$<name>`, `&`). It warns about what the language can't do, e.g. no lookarounds or back-references in Go, no lazy quantifiers in POSIX, no `\A` in JavaScript.
   - **Code** tab: ready-to-paste code that uses the pattern (and the replacement) in the chosen language, correctly quoted, with the flags from the checkboxes.
   - **Examples**: email, URL, IPv4, dates (with a reorder-to-DD.MM.YYYY replace), time, GUID, phone, numbers, hex colours, quoted strings, repeated words, key = value, log lines with named groups, HTML tags, JSON keys, password rules with lookaheads, trailing spaces, empty lines, text between two words, camelCase to snake_case. Each comes with sample text.
   - **Cheat sheet** tab: the common tokens with what they mean; double-click one to put it into the pattern (or into Replace for `$1` ...).
@@ -531,8 +531,7 @@ A database client for **SQL Server** (nothing to install: it uses the SQL Server
   SELECT o.order_id, c.name, r.region
   FROM [Oracle prod].SALES.ORDERS o
   JOIN [Local SQL].dbo.customers c ON c.id = o.customer_id
-  JOIN [file:C:\data
-egions.xlsx].Sheet1 r ON r.code = c.region_code
+  JOIN [file:C:\data\regions.xlsx].Sheet1 r ON r.code = c.region_code
   WHERE o.order_date >= DATE '2026-01-01'
   ```
   - `[Name]` is a saved connection (SQL Server, PostgreSQL or Oracle); a table without one uses the current connection. `[file:path]` is a CSV / TSV file, `[file:path].Sheet` a sheet of an .xlsx (first row = column names; numbers and dates are recognised).

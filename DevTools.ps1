@@ -8609,7 +8609,7 @@ function Invoke-CompareNormalize($St) {
         try {
             if ($x[0] -eq '{' -or $x[0] -eq '[') { $out = [PowerClipFormat]::JsonSorted($x); $kind = 'JSON' }
             elseif ($x[0] -eq '<') { $out = [PowerClipFormat]::Xml($x, $true); $kind = 'XML' }
-            elseif ($x -match '^(?i)(select|insert|update|delete|with|create|alter|merge)') { $out = [PowerClipFormat]::Sql($x); $kind = 'SQL' }
+            elseif ($x -match '^(?i)(select|insert|update|delete|with|create|alter|merge)\b') { $out = [PowerClipFormat]::Sql($x); $kind = 'SQL' }
             else { $done += "$(if ($s) { 'right' } else { 'left' }): not JSON, XML or SQL"; continue }
         } catch {
             $m = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
