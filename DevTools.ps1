@@ -21517,13 +21517,15 @@ public class DgEdge {
 
 public class DgGroup {
     public string Id = "", Title = "", Cat = "", Fill = "", Stroke = "";
-    public bool Dashed = true;
+    public bool Dashed = true, TitleLeft;                        // left: the title as a chip in the top-left corner
+    public float AtX = float.NaN, AtY = float.NaN, SetW, SetH;   // at / size: a frame of its own size (a zone wider than what it holds)
     public List<string> Members = new List<string>();
     public System.Drawing.RectangleF Box;
     public int SrcLine = -1;
 }
 
 public class DgDoc {
+    public bool HighContrast = true;                                                        // the vivid light look (darker text and borders, deeper colours); "contrast normal" turns it off
     public string Title = "", Subtitle = "", Theme = "midnight", Mode = "dark", Direction = "LR", Font = "", Mono = "", Hint = "", Layout = "", Route = "";
     public List<DgCategory> Cats = new List<DgCategory>();
     public List<string> Lanes = new List<string>();
@@ -21569,6 +21571,26 @@ public class DgTheme {
     static readonly string MidLight = "bg=#e6eaf1;grid=#c4ccda;card=#ffffff;chip=#e1e6ef;line=#aeb8cb;ink=#0f1729;muted=#435069;panel=rgba(255,255,255,0.97);ok=#0a8f5a;warn=#a86f00;bad=#cc2638;btn=#ffffff;btnLine=#b4bdcf;btnHover=#e9edf4;sel=#0b5fc2;pkt=#1a2645;tint=0;chipTint=0;frameTint=0";
     static readonly string[] MidPalD = { "#8b97ff", "#4ea8ff", "#3ddc97", "#ff8a95", "#f5b94a", "#b29dff", "#34d3b4", "#e879c6", "#ff5d6c", "#7dd3fc" };
     static readonly string[] MidPalL = { "#3f4fc4", "#0b5fc2", "#06804f", "#c22f45", "#a86f00", "#6340d6", "#08806b", "#b02a86", "#cc2638", "#0369a1" };
+
+    // the light look with more contrast: darker text and borders, stronger tints, deeper category colours (the dark look stays)
+    public DgTheme HighContrast() {
+        var t = new DgTheme { Name = Name, Dark = Dark, Glow = Glow, Font = Font, Mono = Mono, PaletteDark = PaletteDark };
+        var l = new Dictionary<string, string>(Light);
+        var ink = DgColors.Parse(l["ink"]);
+        Func<string, System.Drawing.Color, float, string> mix = (k, to, keep) => DgColors.Hex(DgColors.Blend(DgColors.Parse(l[k]), to, keep));
+        l["ink"] = mix("ink", System.Drawing.Color.Black, 0.45f);
+        l["muted"] = mix("muted", ink, 0.2f);
+        l["line"] = mix("line", ink, 0.3f);
+        l["btnLine"] = mix("btnLine", ink, 0.3f);
+        l["grid"] = mix("grid", ink, 0.9f);
+        l["chip"] = mix("chip", ink, 0.86f);
+        foreach (var k in new[] { "ok", "warn", "bad", "sel" }) l[k] = DgColors.Deepen(l[k]);
+        Func<string, int, string> up = (k, by) => { float f; return float.TryParse(l[k], NumberStyles.Float, CultureInfo.InvariantCulture, out f) ? ((int)f + by).ToString(CultureInfo.InvariantCulture) : l[k]; };
+        l["tint"] = up("tint", 10); l["chipTint"] = up("chipTint", 22); l["frameTint"] = up("frameTint", 4);
+        t.Light = l;
+        t.PaletteLight = PaletteLight.Select(c => DgColors.Deepen(c)).ToArray();
+        return t;
+    }
 
     public static readonly string[] Names = { "midnight", "daylight", "blueprint", "pastel", "mono", "neon", "corporate", "aurora", "ocean", "forest", "sunset", "arctic", "sand", "rose", "graphite", "dusk" };
 
@@ -21664,11 +21686,14 @@ public class DgColors {
     public bool Vars;                            // SVG with CSS variables
     public Dictionary<string, string> CatL = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), CatD = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
+    public bool High;                            // contrast high: stronger borders and lines
     public DgColors(DgDoc d, DgTheme t, bool dark, bool vars) {
+        High = d.HighContrast;
+        if (High) t = t.HighContrast();
         Doc = d; T = t; Dark = dark; Vars = vars;
         int i = 0;
         foreach (var c in d.Cats) {
-            string l = !string.IsNullOrEmpty(c.Light) ? c.Light : t.PaletteLight[i % t.PaletteLight.Length];
+            string l = !string.IsNullOrEmpty(c.Light) ? (High ? Deepen(c.Light) : c.Light) : t.PaletteLight[i % t.PaletteLight.Length];
             string k = !string.IsNullOrEmpty(c.Dark) ? c.Dark : (!string.IsNullOrEmpty(c.Light) ? c.Light : t.PaletteDark[i % t.PaletteDark.Length]);
             CatL[c.Id] = l; CatD[c.Id] = k; i++;
         }
@@ -21703,6 +21728,17 @@ public class DgColors {
     public static System.Drawing.Color Blend(System.Drawing.Color a, System.Drawing.Color b, float t) {
         t = Math.Max(0, Math.Min(1, t));
         return System.Drawing.Color.FromArgb((int)(a.A * t + b.A * (1 - t)), (int)(a.R * t + b.R * (1 - t)), (int)(a.G * t + b.G * (1 - t)), (int)(a.B * t + b.B * (1 - t)));
+    }
+    // darker but just as colourful (mixing in black turns colours grey): lightness down to 42% at most, saturation up a little
+    public static string Deepen(string s) {
+        var c = Parse(s);
+        double r = c.R / 255.0, g = c.G / 255.0, b = c.B / 255.0, mx = Math.Max(r, Math.Max(g, b)), mn = Math.Min(r, Math.Min(g, b));
+        double l = (mx + mn) / 2, d = mx - mn, sat = d == 0 ? 0 : d / (1 - Math.Abs(2 * l - 1)), h = 0;
+        if (d > 0) h = mx == r ? ((g - b) / d + 6) % 6 : mx == g ? (b - r) / d + 2 : (r - g) / d + 4;
+        l = Math.Min(l, 0.42); sat = Math.Min(1, sat * 1.15);
+        double ch = (1 - Math.Abs(2 * l - 1)) * sat, x = ch * (1 - Math.Abs(h % 2 - 1)), m = l - ch / 2;
+        double[] v = h < 1 ? new[] { ch, x, 0.0 } : h < 2 ? new[] { x, ch, 0.0 } : h < 3 ? new[] { 0.0, ch, x } : h < 4 ? new[] { 0.0, x, ch } : h < 5 ? new[] { x, 0.0, ch } : new[] { ch, 0.0, x };
+        return Hex(System.Drawing.Color.FromArgb((int)Math.Round((v[0] + m) * 255), (int)Math.Round((v[1] + m) * 255), (int)Math.Round((v[2] + m) * 255)));
     }
     public static string Hex(System.Drawing.Color c) { return c.A < 255 ? string.Format("rgba({0},{1},{2},{3})", c.R, c.G, c.B, (c.A / 255f).ToString("0.##", CultureInfo.InvariantCulture)) : "#" + c.R.ToString("x2") + c.G.ToString("x2") + c.B.ToString("x2"); }
     // #rgb, #rrggbb, #rrggbbaa, rgb(), rgba(), a few names
@@ -21767,6 +21803,7 @@ public static class DgText {
                         case "routing": case "route": d.Route = rest.ToLowerInvariant(); continue;
                         case "spacing": d.Spacing = Math.Max(0.4f, Math.Min(4f, F(rest, 1))); continue;
                         case "radius": d.Radius = Math.Max(0, Math.Min(40, F(rest, 10))); continue;
+                        case "contrast": { var cv = rest.ToLowerInvariant(); d.HighContrast = !(cv.Contains("normal") || cv.Contains("soft") || cv.Contains("low")); continue; }
                         case "font": d.Font = Unq(rest); continue;
                         case "mono": d.Mono = Unq(rest); continue;
                         case "hide": foreach (var x in rest.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries)) d.Off.Add(x); continue;
@@ -21920,6 +21957,9 @@ public static class DgText {
             switch (a.Key) {
                 case "solid": g.Dashed = false; break;
                 case "dashed": g.Dashed = true; break;
+                case "left": g.TitleLeft = true; break;
+                case "at": { var p = Regex.Matches(a.Value, @"-?\d+(?:\.\d+)?").Cast<Match>().Select(x => F(x.Value, 0)).ToList(); if (p.Count > 1) { g.AtX = p[0]; g.AtY = p[1]; } break; }
+                case "size": { var p = Regex.Matches(a.Value, @"\d+(?:\.\d+)?").Cast<Match>().Select(x => F(x.Value, 0)).ToList(); if (p.Count > 1) { g.SetW = p[0]; g.SetH = p[1]; } break; }
                 case "fill": g.Fill = a.Value; break;
                 case "stroke": case "border": g.Stroke = a.Value; break;
                 case "cat": case "category": g.Cat = AutoCat(d, a.Value).Id; break;
@@ -22615,6 +22655,7 @@ public static class DgLayout {
             if (ms.Count == 0) { g.Box = System.Drawing.RectangleF.Empty; continue; }
             float x0 = ms.Min(n => n.X) - 16, y0 = ms.Min(n => n.Y) - 30, x1 = ms.Max(n => n.X + n.W) + 16, y1 = ms.Max(n => n.Y + n.H) + 14;
             float tw = DgMeasure.Width(g.Title, 14, 600, false) + 32;
+            if (!float.IsNaN(g.AtX) && g.SetW > 0 && g.SetH > 0) { g.Box = new System.Drawing.RectangleF(g.AtX, g.AtY, g.SetW, g.SetH); continue; }
             if (x1 - x0 < tw) { float c = (x0 + x1) / 2; x0 = c - tw / 2; x1 = c + tw / 2; }
             g.Box = new System.Drawing.RectangleF(x0, y0, x1 - x0, y1 - y0);
         }
@@ -23017,9 +23058,13 @@ public static class DgRender {
             float o = rel == null || g.Members.Any(m => rel.Contains(m)) ? 1f : 0.35f;
             p.Begin("dg-group", "dg-group-" + DgText.CssId(g.Id), "data-group=\"" + DgSvgPainter.Esc(g.Id) + "\"");
             string fill = g.Fill.Length > 0 ? g.Fill : (ck != null ? c.Mix(ck, "frameTint", "bg") : c.Mix("ink", "3", "bg"));
-            string stroke = g.Stroke.Length > 0 ? g.Stroke : (ck != null ? c.Mix(ck, "60", "card") : c.Get("line"));
+            string stroke = g.Stroke.Length > 0 ? g.Stroke : (ck != null ? c.Mix(ck, c.High ? "100" : "60", "card") : c.Get("line"));
             p.Rect(g.Box.X, g.Box.Y, g.Box.Width, g.Box.Height, d.Radius + 2, fill, stroke, 1.2f, g.Dashed ? 1 : 0, o);
-            p.Text(g.Box.X + g.Box.Width / 2, g.Box.Y + 21, g.Title, 13.5f, 600, c.Get("ink"), "middle", false, o, 0, null);
+            if (g.TitleLeft) {
+                float cw = DgMeasure.Width(g.Title, 11, 700, true) + 16;
+                p.Rect(g.Box.X + 12, g.Box.Y + 10, cw, 20, 5, ck != null ? c.Mix(ck, "chipTint", "chip") : g.Fill.Length > 0 ? fill : c.Get("chip"), stroke, 1, 0, o);
+                p.Text(g.Box.X + 12 + cw / 2, g.Box.Y + 24, g.Title, 11, 700, ck != null ? c.Get(ck) : g.Stroke.Length > 0 ? g.Stroke : c.Get("ink"), "middle", true, o, 0, null);
+            } else p.Text(g.Box.X + g.Box.Width / 2, g.Box.Y + 21, g.Title, 13.5f, 600, c.Get("ink"), "middle", false, o, 0, null);
             p.End();
         }
         // links between nodes, then the nodes, then links inside a node (between its items) on top
@@ -23040,7 +23085,7 @@ public static class DgRender {
             float o = hid ? 0.12f : (rel == null || e.From == v.Hover || e.To == v.Hover ? 1f : 0.15f);
             if (v.Down.Contains(e.From) || v.Down.Contains(e.To)) o *= 0.55f;
             string col = e.Color.Length > 0 ? e.Color : (ck != null ? c.Get(ck) : c.Mix("muted", "70", "card"));
-            float sw = e.Width > 0 ? e.Width : 1.6f;
+            float sw = e.Width > 0 ? e.Width : c.High ? 2.8f : 1.6f;
             bool glow = e.GlowSet ? e.Glow : c.T.Glow || e.Animate;
             p.Begin("dg-link", "dg-link-" + DgText.CssId(e.Id), "data-link=\"" + DgSvgPainter.Esc(e.Id) + "\" data-from=\"" + DgSvgPainter.Esc(e.From) + "\" data-to=\"" + DgSvgPainter.Esc(e.To) + "\"" + (e.Cat.Length > 0 ? " data-cat=\"" + DgSvgPainter.Esc(e.Cat) + "\"" : ""));
             if (glow) p.Path(e.PathD, null, col, sw + 6.5f, 0, 0.08f * o, "dg-glow");
@@ -23055,7 +23100,7 @@ public static class DgRender {
                 if (!float.IsNaN(e.LabelAt.X)) m = e.LabelAt;
                 float tw = DgMeasure.Width(e.Label, 10.5f, 500, false) + 12;
                 e.LabelBox = new System.Drawing.RectangleF(m.X - tw / 2, m.Y - 9, tw, 18);
-                p.Rect(m.X - tw / 2, m.Y - 9, tw, 18, 9, c.Get("bg"), c.Mix("line", "80", "bg"), 1, 0, o);
+                p.Rect(m.X - tw / 2, m.Y - 9, tw, 18, 9, c.High ? c.Get("card") : c.Get("bg"), c.High ? c.Get("line") : c.Mix("line", "80", "bg"), c.High ? 1.4f : 1, 0, o);
                 p.Text(m.X, m.Y + 3.8f, e.Label, 10.5f, 500, c.Get("muted"), "middle", false, o, 0, null);
             }
             p.End();
@@ -23082,9 +23127,9 @@ public static class DgRender {
         string status = down ? "down" : n.Status;
         string ink = n.TextColor.Length > 0 ? n.TextColor : c.Get("ink");
         string fill = n.Fill.Length > 0 ? n.Fill : (ck != null ? c.Mix(ck, card ? "tint" : "14", "card") : c.Get("card"));
-        string stroke = n.Stroke.Length > 0 ? n.Stroke : (ck != null ? c.Mix(ck, "60", "card") : c.Get("line"));
+        string stroke = n.Stroke.Length > 0 ? n.Stroke : (ck != null ? c.Mix(ck, c.High ? "100" : "60", "card") : c.Get("line"));
         if (down) stroke = c.Get("bad");
-        float sw = card ? 1.4f : 1.3f;
+        float sw = c.High ? 2.2f : card ? 1.4f : 1.3f;
         string data = "data-node=\"" + DgSvgPainter.Esc(n.Id) + "\"" + (n.Cat.Length > 0 ? " data-cat=\"" + DgSvgPainter.Esc(n.Cat) + "\"" : "");
         p.Begin("dg-node" + (n.Url.Length > 0 ? " dg-link-node" : ""), "dg-node-" + DgText.CssId(n.Id), data);
         float x = n.X, y = n.Y, w = n.W, h = n.H;
@@ -23112,7 +23157,7 @@ public static class DgRender {
             for (int i = 0; i < n.ItemBoxes.Count; i++) {
                 var r = n.ItemBoxes[i]; bool small = r.Height < 24;
                 p.Begin("dg-item", null, "data-item=\"" + DgSvgPainter.Esc(n.Id + "." + n.Items[i]) + "\"");
-                p.Rect(r.X, r.Y, r.Width, r.Height, small ? 4 : 6, ck != null ? c.Mix(ck, "chipTint", "chip") : c.Get("chip"), ck != null ? c.Mix(ck, "45", "card") : c.Get("line"), small ? 1.3f : 1, 0, o);
+                p.Rect(r.X, r.Y, r.Width, r.Height, small ? 4 : 6, ck != null ? c.Mix(ck, "chipTint", "chip") : c.Get("chip"), ck != null ? c.Mix(ck, c.High ? "85" : "45", "card") : c.Get("line"), c.High ? 1.6f : small ? 1.3f : 1, 0, o);
                 p.Text(r.X + r.Width / 2, r.Y + r.Height / 2 + (small ? 3.2f : 3.8f), n.Items[i], small ? 8.5f : 10.5f, small ? 600 : 400, ink, "middle", small, o, 0, null);
                 p.End();
             }
@@ -29141,6 +29186,8 @@ function Update-DiagramProps {
         $sn.add_ValueChanged({ param($src, $e) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'spacing', $(if ($src.Value -ne 100) { ([double]$src.Value / 100).ToString([Globalization.CultureInfo]::InvariantCulture) } else { $null }))) })
         $rn = New-TbNumber $p ([int]$d.Radius) 0 40; Add-DgProp $p 'Corner radius' $null | Out-Null; $p.Controls.SetChildIndex($rn, $p.Controls.Count - 1)
         $rn.add_ValueChanged({ param($src, $e) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'radius', $(if ($src.Value -ne 10) { [string]$src.Value } else { $null }))) })
+        $hc = New-CheckBox $p 'Vivid light look (higher contrast)' $d.HighContrast; $hc.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, 0)
+        $hc.add_CheckedChanged({ param($src, $e) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'contrast', $(if ($src.Checked) { $null } else { 'normal' }))) })
         foreach ($feat in @(@('header', 'Title and totals at the top'), @('legend', 'Legend (click a flow to hide it)'), @('grid', 'Dotted background'))) {
             $cb = New-CheckBox $p $feat[1] (-not $d.Off.Contains($feat[0])); $cb.Tag = $feat[0]; $cb.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, 0)
             $cb.add_CheckedChanged({ param($src, $e) $off = @($DgUI.Doc.Off | Where-Object { $_ -ne $src.Tag }); if (-not $src.Checked) { $off += $src.Tag }; Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'hide', $(if ($off) { $off -join ' ' } else { $null }))) })
@@ -29552,7 +29599,7 @@ title My diagram                  theme midnight dark   (daylight blueprint past
                                   sunset arctic sand rose graphite dusk;  dark | light | auto = the page starts in that look)
 direction LR                      LR TB RL BT  (auto layout)       layout lanes | layered | grid | circle | force
 route ortho                       ortho | curve | straight         spacing 1.2     radius 10     font Segoe UI
-hide header legend grid           turn parts off
+hide header legend grid           turn parts off                   contrast normal  (the softer light look)
 category prod "Production" #3f4fc4 / #8b97ff      a colour for light / dark (bare words in [ ] become categories too)
 lanes "Clients" | "Servers" | "Storage"           columns; put shapes in them with  lane 2
 
