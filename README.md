@@ -471,7 +471,7 @@ Diagrams from a few lines of text: architecture maps, flowcharts, org charts and
 - **Edit / Preview**: in Preview, the canvas behaves like the web page will.
   - Hovering a shape dims everything unrelated.
   - Clicking a shape shows its details: description, tags, what it receives from and sends to.
-  - **Simulate outage** stops its traffic.
+  - **Simulate outage** (for shapes where *Simulate outage button* is ticked in their properties, or `outage` in the text) stops the traffic the shape sends, also on two-way links, while the other side keeps sending; packets that reach a down shape are dropped and burst in red (*Packet drops at an outage*; `hide drops` turns the bursts off).
   - The legend chips hide or show each flow. **Pause** and the speed stop or change the packets; **Dark / Light** switches the colours.
 - **Export**:
   - **Copy as picture**, or **PNG** at 1x / 2x / 3x (with a transparent option).

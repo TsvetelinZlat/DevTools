@@ -21485,7 +21485,7 @@ public class DgNode {
     public List<string> Tags = new List<string>(), Lines = new List<string>(), Items = new List<string>();
     public int Lane = -1, SrcLine = -1, Order, Rank = -1;
     public float X, Y, W, H, FontSize, SetW, SetH;
-    public bool HasPos, Spark, Bold, Dashed, Declared, Hidden;
+    public bool HasPos, Spark, Bold, Dashed, Declared, Hidden, Outage;   // Outage: the web page offers Simulate outage for this shape
     public List<System.Drawing.RectangleF> ItemBoxes = new List<System.Drawing.RectangleF>();   // absolute, after layout
     public System.Drawing.RectangleF Box { get { return new System.Drawing.RectangleF(X, Y, W, H); } }
     public System.Drawing.PointF Center { get { return new System.Drawing.PointF(X + W / 2, Y + H / 2); } }
@@ -22042,6 +22042,7 @@ public static class DgText {
                 case "in": case "group": { if (v.Trim().Length == 0) { n.Cat = AutoCat(d, a.Key).Id; break; } var g = d.FindGroup(v.Trim()); if (g == null) { g = new DgGroup { Id = v.Trim(), Title = v.Trim() }; d.Groups.Add(g); } if (!g.Members.Contains(n.Id)) g.Members.Add(n.Id); n.Group = g.Id; break; }
                 case "cat": case "category": case "flow": n.Cat = AutoCat(d, v.Trim()).Id; break;
                 case "spark": case "sparkline": n.Spark = true; break;
+                case "outage": n.Outage = true; break;
                 case "bold": n.Bold = true; break;
                 case "dashed": n.Dashed = true; break;
                 case "hidden": n.Hidden = true; break;
@@ -23024,6 +23025,7 @@ public class DgGdiPainter : IDgPainter {
 public class DgView {
     public string Hover = "";
     public HashSet<string> Selected = new HashSet<string>(), Down = new HashSet<string>(StringComparer.Ordinal), HiddenCats = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, float> Loss = new Dictionary<string, float>(StringComparer.Ordinal);   // simulated packet loss (0..1) per shape, in the preview
     public string SelectedEdge = "";
     public bool Editing;            // selection outlines, connect handles
     public Dictionary<string, List<float>> Spark = new Dictionary<string, List<float>>();
@@ -23128,7 +23130,7 @@ public static class DgRender {
         bool card = DgLayout.IsCard(n);
         string shape = card ? "card" : (string.IsNullOrEmpty(n.Shape) ? "rounded" : n.Shape);
         bool down = v.Down.Contains(n.Id) || n.Status == "down";
-        string status = down ? "down" : n.Status;
+        string status = down ? "down" : v.Loss.ContainsKey(n.Id) ? "warn" : n.Status;
         string ink = n.TextColor.Length > 0 ? n.TextColor : c.Get("ink");
         string fill = n.Fill.Length > 0 ? n.Fill : (ck != null ? c.Mix(ck, card ? "tint" : "14", "card") : c.Get("card"));
         string stroke = n.Stroke.Length > 0 ? n.Stroke : (ck != null ? c.Mix(ck, c.High ? "100" : "60", "card") : c.Get("line"));
@@ -23384,6 +23386,8 @@ public class DgCanvas : System.Windows.Forms.Panel {
     public List<string> MovedIds = new List<string>();
 
     class Packet { public DgEdge E; public float D, Len; public bool Back; }
+    class Burst { public DgEdge E; public System.Drawing.PointF At; public float Age; }      // a dropped packet, drawn as a fading red ring
+    readonly List<Burst> bursts = new List<Burst>();
     List<Packet> packets = new List<Packet>();
     Dictionary<string, float> spawnAcc = new Dictionary<string, float>();
     Dictionary<string, float> flowCount = new Dictionary<string, float>();
@@ -23665,14 +23669,17 @@ public class DgCanvas : System.Windows.Forms.Panel {
         foreach (var e in Doc.Edges) {
             if (!e.Animate || e.Pts.Count < 2) continue;
             any = true;
-            if (View.Down.Contains(e.From) || (!string.IsNullOrEmpty(e.Cat) && View.HiddenCats.Contains(e.Cat))) continue;
+            if (!string.IsNullOrEmpty(e.Cat) && View.HiddenCats.Contains(e.Cat)) continue;
+            // each direction stops when the shape sending it is down (on a two-way link the other direction goes on)
+            bool fwd = !View.Down.Contains(e.From), bwd = e.TwoWay && !View.Down.Contains(e.To);
+            if (!fwd && !bwd) { spawnAcc[e.Id] = 0; continue; }
             float acc; spawnAcc.TryGetValue(e.Id, out acc);
             acc += dt * Speed * 1.6f * e.Density;
             while (acc >= 1) {
                 acc -= 1;
                 float len = DgRoute.Length(e.Pts);
-                packets.Add(new Packet { E = e, D = 0, Len = len, Back = false });
-                if (e.Both && rnd.NextDouble() < 0.9) packets.Add(new Packet { E = e, D = -(float)rnd.NextDouble() * 40, Len = len, Back = true });
+                if (fwd) packets.Add(new Packet { E = e, D = 0, Len = len, Back = false });
+                if (bwd && (!fwd || rnd.NextDouble() < 0.9)) packets.Add(new Packet { E = e, D = fwd ? -(float)rnd.NextDouble() * 40 : 0, Len = len, Back = true });
             }
             spawnAcc[e.Id] = acc;
         }
@@ -23684,9 +23691,13 @@ public class DgCanvas : System.Windows.Forms.Panel {
             string target = p.Back ? p.E.From : p.E.To;
             if (p.D >= p.Len) {
                 packets.RemoveAt(i);
-                if (!View.Down.Contains(target)) { float c; flowCount.TryGetValue(target, out c); flowCount[target] = c + 1; }
+                float lp; View.Loss.TryGetValue(target, out lp);
+                if (View.Down.Contains(target) || (lp > 0 && rnd.NextDouble() < lp)) {
+                    float a0; if (Doc.On("drops") && bursts.Count < 300) bursts.Add(new Burst { E = p.E, At = DgRoute.At(p.E.Pts, p.Back ? 0 : p.Len, out a0) });
+                } else { float c; flowCount.TryGetValue(target, out c); flowCount[target] = c + 1; }
             }
         }
+        for (int i = bursts.Count - 1; i >= 0; i--) { bursts[i].Age += dt; if (bursts[i].Age > 0.7f) bursts.RemoveAt(i); }
         if (packets.Count > 2500) packets.RemoveRange(0, packets.Count - 2500);
         if ((now - lastSample).TotalSeconds >= 1) {
             float secs = (float)(now - lastSample).TotalSeconds; lastSample = now;
@@ -23744,6 +23755,12 @@ public class DgCanvas : System.Windows.Forms.Panel {
                 float o = rel == null || p.E.From == View.Hover || p.E.To == View.Hover ? 1f : 0.15f;
                 using (var b = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb((int)(60 * o), col))) g.FillEllipse(b, pt.X - 5, pt.Y - 5, 10, 10);
                 using (var b = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb((int)(255 * o), col))) g.FillEllipse(b, pt.X - 2.6f, pt.Y - 2.6f, 5.2f, 5.2f);
+            }
+            var badCol = DgColors.Parse(c.Raw("bad"));
+            foreach (var bu in bursts) {
+                float k = bu.Age / 0.7f, r = 3 + k * 13, o = (1 - k) * (rel == null || bu.E.From == View.Hover || bu.E.To == View.Hover ? 1f : 0.15f);
+                using (var b = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb((int)(75 * o), badCol))) g.FillEllipse(b, bu.At.X - r, bu.At.Y - r, 2 * r, 2 * r);
+                using (var pen = new System.Drawing.Pen(System.Drawing.Color.FromArgb((int)(255 * o), badCol), 1.6f)) g.DrawEllipse(pen, bu.At.X - r, bu.At.Y - r, 2 * r, 2 * r);
             }
         }
         // connect handle on the hovered node, the link being drawn, the selection box
@@ -23836,7 +23853,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
 public class DgHtmlOptions {
     public string Kind = "page";             // page, widget, react
     public string Prefix = "dg", Mode = "auto", Height = "";
-    public bool Header = true, Flows = true, ThemeSwitch = true, Zoom = true, Legend = true, Panel = true, Hover = true, Outage = true, Hint = true, Glow = true, WebFont = false;      // WebFont: a Google Fonts link (needs internet), off unless asked
+    public bool Header = true, Flows = true, ThemeSwitch = true, Zoom = true, Legend = true, Panel = true, Hover = true, Outage = true, Drops = true, Hint = true, Glow = true, WebFont = false;      // WebFont: a Google Fonts link (needs internet), off unless asked
 }
 
 public static class DgHtml {
@@ -23859,7 +23876,7 @@ public static class DgHtml {
         sb.Append("\"p\":" + J(prefix) + ",\"title\":" + J(d.Title) + ",\"theme\":" + J(o.Mode) + "," + (d.Chart != null ? "\"chart\":1," : ""));
         var b = d.Bounds;
         sb.Append("\"bounds\":[" + Nm(b.X) + "," + Nm(b.Y) + "," + Nm(b.Width) + "," + Nm(b.Height) + "],");
-        sb.Append("\"opt\":{\"hover\":" + B(o.Hover) + ",\"panel\":" + B(o.Panel) + ",\"flows\":" + B(o.Flows) + ",\"outage\":" + B(o.Outage) + ",\"glow\":" + B(o.Glow) + "},");
+        sb.Append("\"opt\":{\"hover\":" + B(o.Hover) + ",\"panel\":" + B(o.Panel) + ",\"flows\":" + B(o.Flows) + ",\"outage\":" + B(o.Outage) + ",\"drops\":" + B(o.Drops && d.On("drops")) + ",\"glow\":" + B(o.Glow) + "},");
         sb.Append("\"cats\":{");
         sb.Append(string.Join(",", d.Cats.Select(c => J(DgText.CssId(c.Id)) + ":" + J(c.Name))));
         sb.Append("},\"nodes\":{");
@@ -23878,6 +23895,7 @@ public static class DgHtml {
             if (n.Url.Length > 0) x.Append(",\"u\":" + J(n.Url));
             if (n.Url.Length > 0 && n.Button.Length > 0) x.Append(",\"gb\":" + J(n.Button));
             if (n.Url.Length > 0 && n.LinkText.Length > 0) x.Append(",\"bt\":" + J(n.LinkText));
+            if (n.Outage) x.Append(",\"ou\":1");
             if (n.Spark && DgLayout.IsCard(n)) x.Append(",\"sp\":[" + Nm(n.X + 14) + "," + Nm(n.Y + n.H - 14 - 28) + "," + Nm(n.W - 28) + ",26]");
             x.Append("}");
             parts.Add(x.ToString());
@@ -27640,7 +27658,7 @@ public static class DgAssets {
   function qa(s) { return Array.prototype.slice.call(root.querySelectorAll(s)); }
   function cls(n) { return '.' + P + '-' + n; }
   var stage = q(cls('stage')), svg = stage.querySelector('svg'), vp = svg.querySelector(cls('vp')), pk = svg.querySelector(cls('pk'));
-  var st = { paused: false, speed: 1, hidden: {}, down: {}, sel: null, hover: null };
+  var st = { paused: false, speed: 1, hidden: {}, down: {}, loss: {}, sel: null, hover: null };
   var view = { x: 0, y: 0, k: 1 }, userMoved = false, drag = null, justDragged = false;
   var listeners = {}, fixed = {}, alive = true, raf = 0;
   var nodeEls = qa('[data-node]'), linkEls = qa('[data-link]');
@@ -27791,7 +27809,7 @@ public static class DgAssets {
       el.classList.toggle(P + '-cut', !!(st.down[f] || st.down[t]));
     });
     qa('[data-series]').forEach(function (el) { el.classList.toggle(P + '-off', !!st.hidden[el.getAttribute('data-series')]); });
-    qa(cls('status')).forEach(function (el) { var g = el.closest('[data-node]'); if (!g) return; var n = g.getAttribute('data-node'); var s = st.down[n] ? 'down' : (D.nodes[n] && D.nodes[n].s) || 'ok'; el.style.fill = 'var(--' + (s === 'down' || s === 'bad' ? 'bad' : s === 'warn' ? 'warn' : 'ok') + ')'; });
+    qa(cls('status')).forEach(function (el) { var g = el.closest('[data-node]'); if (!g) return; var n = g.getAttribute('data-node'); var s = st.down[n] ? 'down' : st.loss[n] ? 'warn' : (D.nodes[n] && D.nodes[n].s) || 'ok'; el.style.fill = 'var(--' + (s === 'down' || s === 'bad' ? 'bad' : s === 'warn' ? 'warn' : 'ok') + ')'; });
   }
 
   // ---- packets along animated links
@@ -27809,7 +27827,7 @@ public static class DgAssets {
     var f = (d - c[i]) / ((c[i + 1] - c[i]) || 1);
     return [p[i][0] + (p[i + 1][0] - p[i][0]) * f, p[i][1] + (p[i + 1][1] - p[i][1]) * f];
   }
-  var packets = [], pool = [], arrivals = {}, drops = {}, seen = {}, hist = {}, totals = { sent: 0, delivered: 0, dropped: 0 }, last = 0, lastSample = 0, perSec = { sent: 0, delivered: 0, dropped: 0 };
+  var bursts = [], bpool = [], packets = [], pool = [], arrivals = {}, drops = {}, seen = {}, hist = {}, totals = { sent: 0, delivered: 0, dropped: 0 }, last = 0, lastSample = 0, perSec = { sent: 0, delivered: 0, dropped: 0 };
   Object.keys(D.nodes).forEach(function (id) { hist[id] = []; for (var i = 0; i < 40; i++) hist[id].push(0); seen[id] = 0; drops[id] = 0; });
   function step(ts) {
     if (!alive) return;
@@ -27819,12 +27837,15 @@ public static class DgAssets {
     if (!st.paused && O.flows) {
       L.forEach(function (o) {
         var l = o.l;
-        if (!l.a || st.down[l.f] || (l.c && st.hidden[l.c])) return;
+        if (!l.a || (l.c && st.hidden[l.c])) return;
+        // each direction stops when the box sending it is down (on a two-way link the other direction goes on, and is dropped at the down box)
+        var fwd = !st.down[l.f], bwd = (l.b || l.w) && !st.down[l.t];
+        if (!fwd && !bwd) { o.acc = 0; return; }
         o.acc += dt * st.speed * 1.6 * (l.n || 1);
         while (o.acc >= 1) {
-          o.acc -= 1; totals.sent++; perSec.sent++;
-          packets.push({ o: o, d: 0, back: false });
-          if (l.b && Math.random() < 0.9) packets.push({ o: o, d: -Math.random() * 40, back: true });
+          o.acc -= 1;
+          if (fwd) { totals.sent++; perSec.sent++; packets.push({ o: o, d: 0, back: false }); }
+          if (bwd && (!fwd || Math.random() < 0.9)) { totals.sent++; perSec.sent++; packets.push({ o: o, d: fwd ? -Math.random() * 40 : 0, back: true }); }
         }
       });
       var v = 120 * st.speed;
@@ -27832,12 +27853,17 @@ public static class DgAssets {
         var p = packets[i]; p.d += v * dt;
         if (p.d >= p.o.total) {
           packets.splice(i, 1);
-          var to = p.back ? p.o.l.f : p.o.l.t;
-          if (st.down[to]) { drops[to]++; totals.dropped++; perSec.dropped++; }
+          var to = p.back ? p.o.l.f : p.o.l.t, lp = st.loss[to] || 0;
+          // lost at a down box (or one given packet loss through the API): a red burst where it arrived, when that option is on
+          if (st.down[to] || (lp && Math.random() < lp)) {
+            drops[to]++; totals.dropped++; perSec.dropped++;
+            if (O.drops && bursts.length < 300) { var at = pointAt(p.o, p.back ? 0 : p.o.total); bursts.push({ x: at[0], y: at[1], a: 0, l: p.o.l }); }
+          }
           else { arrivals[to] = (arrivals[to] || 0) + 1; seen[to]++; if (!outs[to]) { totals.delivered++; perSec.delivered++; } }
         }
       }
       if (packets.length > 3000) packets.splice(0, packets.length - 3000);
+      for (var k = bursts.length - 1; k >= 0; k--) { bursts[k].a += dt; if (bursts[k].a > 0.7) bursts.splice(k, 1); }
     }
     draw();
     if (ts - lastSample >= 1000) { sample((ts - lastSample) / 1000); lastSample = ts; }
@@ -27854,6 +27880,15 @@ public static class DgAssets {
       el.setAttribute('cx', pt[0].toFixed(1)); el.setAttribute('cy', pt[1].toFixed(1));
       el.style.fill = l.c ? 'var(--c-' + l.c + ')' : 'var(--pkt)';
       el.style.opacity = !rel || l.f === id || l.t === id ? 1 : 0.15;
+    }
+    while (bpool.length < bursts.length) { var bc = document.createElementNS(NS, 'circle'); bc.setAttribute('class', P + '-drop'); pk.appendChild(bc); bpool.push(bc); }
+    for (var j = 0; j < bpool.length; j++) {
+      var be = bpool[j];
+      if (j >= bursts.length) { be.style.display = 'none'; continue; }
+      var b = bursts[j], k2 = b.a / 0.7;
+      be.style.display = '';
+      be.setAttribute('cx', b.x.toFixed(1)); be.setAttribute('cy', b.y.toFixed(1)); be.setAttribute('r', (3 + k2 * 13).toFixed(1));
+      be.style.opacity = ((1 - k2) * (!rel || b.l.f === id || b.l.t === id ? 1 : 0.15)).toFixed(2);
     }
   }
   function sample(secs) {
@@ -27896,7 +27931,7 @@ public static class DgAssets {
     // a two-way link (l.w) counts in both directions
     var ins = uniq(D.links.filter(function (l) { return l.f !== l.t && (l.t === st.sel || (l.w && l.f === st.sel)); }).map(function (l) { return title(l.t === st.sel ? l.f : l.t); }));
     var out = uniq(D.links.filter(function (l) { return l.f !== l.t && (l.f === st.sel || (l.w && l.t === st.sel)); }).map(function (l) { return title(l.f === st.sel ? l.t : l.f); }));
-    var col = n.c ? 'var(--c-' + n.c + ')' : 'var(--ink)', down = !!st.down[st.sel];
+    var col = n.c ? 'var(--c-' + n.c + ')' : 'var(--ink)', down = !!st.down[st.sel], loss = st.loss[st.sel] || 0;
     panel.innerHTML =
       '<div class=""' + P + '-ph""><div><div class=""' + P + '-pk2"">' + (n.b ? '<span class=""' + P + '-chip"" style=""color:' + col + '"">' + esc(n.b) + '</span>' : '') +
       '<span class=""' + P + '-grp"">' + esc(n.g || (n.cn && n.cn !== n.b ? n.cn : '')) + '</span></div><div class=""' + P + '-pt"">' + esc(n.t) + '</div></div><button type=""button"" class=""' + P + '-x"" title=""Close"">\u2715</button></div>' +
@@ -27906,8 +27941,8 @@ public static class DgAssets {
       '<div class=""' + P + '-pg""><div><span>Packets observed</span><b class=""' + P + '-po"">0</b></div><div><span>Dropped here</span><b class=""' + P + '-pdr"">0</b></div></div>' +
       '<div class=""' + P + '-pio""><div><span>Receives from</span>' + esc(ins.join(', ') || '-') + '</div><div><span>Sends to</span>' + esc(out.join(', ') || '-') + '</div></div>' +
       (n.u ? '<a class=""' + P + '-lnk"" href=""' + esc(n.u) + '"" target=""_blank"" rel=""noopener"" title=""' + esc(n.u) + '"">' + esc(n.bt || n.gb || 'Open webpage') + ' \u2197</a>' : '') +
-      '<div class=""' + P + '-pf""><span class=""' + P + '-st' + (down ? ' ' + P + '-bad' : '') + '""><i></i>' + (down ? 'Down' : 'Operational') + '</span>' +
-      (O.outage ? '<button type=""button"" class=""' + P + '-out"">' + (down ? 'End outage' : 'Simulate outage') + '</button>' : '') + '</div>';
+      '<div class=""' + P + '-pf""><span class=""' + P + '-st' + (down ? ' ' + P + '-bad' : loss ? ' ' + P + '-warn' : '') + '""><i></i>' + (down ? 'Down' : loss ? 'Packet loss ' + Math.round(loss * 100) + '%' : 'Operational') + '</span>' +
+      (O.outage && (n.ou || down) ? '<button type=""button"" class=""' + P + '-out"">' + (down ? 'End outage' : 'Simulate outage') + '</button>' : '') + '</div>';
     panel.hidden = false;
     panel.querySelector(cls('x')).onclick = function () { select(null); };
     var ob = panel.querySelector(cls('out'));
@@ -27971,6 +28006,8 @@ public static class DgAssets {
 
   var api = {
     setStatus: function (id, s) { if (!D.nodes[id]) return; if (s === 'down') st.down[id] = 1; else { delete st.down[id]; D.nodes[id].s = s || 'ok'; } highlight(); if (st.sel === id) select(id); emit('status', { id: id, status: s }); },
+    // packet loss at a box: 0..1 (or a percentage); the share of arriving packets it drops
+    setLoss: function (id, v) { if (!D.nodes[id]) return; v = +v || 0; if (v > 1) v = v / 100; if (v > 0) st.loss[id] = Math.min(1, v); else delete st.loss[id]; highlight(); if (st.sel === id) select(id); emit('loss', { id: id, loss: st.loss[id] || 0 }); },
     setMetric: function (id, text) { if (text == null) delete fixed[id]; else fixed[id] = String(text); },
     select: function (id) { select(id); },
     on: function (ev, f) { (listeners[ev] = listeners[ev] || []).push(f); return api; },
@@ -28065,10 +28102,12 @@ public static class DgAssets {
 .__P__-pio div{display:flex;flex-direction:column;gap:4px}
 .__P__-lnk{display:inline-block;margin-top:12px;padding:7px 14px;border-radius:8px;background:var(--sel);color:var(--card);font-size:12.5px;font-weight:600;text-decoration:none;box-shadow:0 4px 12px rgba(0,0,0,.18)}
 .__P__-lnk:hover{filter:brightness(1.1)}
-.__P__-pf{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-top:14px;border-top:1px solid var(--btnLine)}
+.__P__-pf{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding-top:14px;border-top:1px solid var(--btnLine)}
 .__P__-st{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ok)}
 .__P__-st i{width:8px;height:8px;border-radius:50%;background:currentColor}
 .__P__-out{height:30px;padding:0 12px;border-radius:6px;border:1px solid var(--bad);background:transparent;color:var(--bad);font-family:var(--font);font-size:12px;cursor:pointer}
+.__P__-st.__P__-warn{color:var(--warn)}
+.__P__-drop{fill:var(--bad);fill-opacity:.3;stroke:var(--bad);stroke-width:1.6;pointer-events:none}
 /* narrow: under 640px wide (set by the script from the diagram's own width) */
 .__P__-narrow .__P__-bar{top:8px;left:8px;right:8px;gap:6px;flex-direction:column;align-items:stretch}
 .__P__-narrow .__P__-head{padding:7px 11px;gap:3px 12px;border-radius:9px;flex-wrap:nowrap;flex-direction:column;align-items:flex-start}
@@ -28305,12 +28344,12 @@ lanes "Clients" | "Entry" | "Load balancers" | "Sites" | "Databases"
 
 clients: Clients [shape actor, lane 1]
 vip: Virtual IP [badge VIP, live, shape pill, lane 2]
-lb1: Load balancer A [badge ACTIVE, live, lane 3, spark, status ok]
+lb1: Load balancer A [badge ACTIVE, live, lane 3, spark, status ok, outage]
   desc Takes all traffic while it is healthy.
-lb2: Load balancer B [badge STANDBY, live, lane 3, spark, status warn]
+lb2: Load balancer B [badge STANDBY, live, lane 3, spark, status warn, outage]
   desc Takes over within seconds if A stops answering heartbeats.
-app1: Site 1 [badge APP, live, lane 4, spark]
-app2: Site 2 [badge APP, live, lane 4, spark]
+app1: Site 1 [badge APP, live, lane 4, spark, outage]
+app2: Site 2 [badge APP, live, lane 4, spark, outage]
 db1: Database 1 [shape cylinder, repl, lane 5]
 db2: Database 2 [shape cylinder, repl, lane 5]
 
@@ -29175,6 +29214,9 @@ function Update-DiagramProps {
         Add-DgProp $p 'Link (opens when clicked in the web page)' (New-DgBox $node.Url { param($v) Set-DiagramText ([DgText]::SetNodeKey($DgUI.Text, $DgUI.PropId, 'url', $(if ($v) { '"' + $v + '"' } else { $null }))) }) | Out-Null
         $gb = New-CheckBox $p 'Open webpage button on hover' ($node.Button.Length -gt 0); $gb.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, 0)
         $gb.add_CheckedChanged({ param($src, $e) Set-DiagramNodeAttr $DgUI.PropId 'button' $(if ($src.Checked) { '' } else { $null }) })
+        $ob = New-CheckBox $p 'Simulate outage button (web page)' $node.Outage; $ob.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, 0)
+        $tooltip.SetToolTip($ob, 'The details panel of this shape offers Simulate outage: its traffic stops, and packets reaching it are dropped')
+        $ob.add_CheckedChanged({ param($src, $e) Set-DiagramNodeAttr $DgUI.PropId 'outage' $(if ($src.Checked) { '' } else { $null }) })
         $row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.AutoSize = $true; $row.WrapContents = $true; $row.MaximumSize = New-Object System.Drawing.Size((Px (260 * $TextZoom)), 0); $row.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0)
         [void](New-DgColorButton $row 'Fill' $node.Fill { param($v) Set-DiagramNodeAttr $DgUI.PropId 'fill' $v })
         [void](New-DgColorButton $row 'Border' $node.Stroke { param($v) Set-DiagramNodeAttr $DgUI.PropId 'stroke' $v })
@@ -29229,7 +29271,7 @@ function Update-DiagramProps {
         $rn.add_ValueChanged({ param($src, $e) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'radius', $(if ($src.Value -ne 10) { [string]$src.Value } else { $null }))) })
         $hc = New-CheckBox $p 'Vivid light look (higher contrast)' $d.HighContrast; $hc.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, 0)
         $hc.add_CheckedChanged({ param($src, $e) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'contrast', $(if ($src.Checked) { $null } else { 'normal' }))) })
-        foreach ($feat in @(@('header', 'Title and totals at the top'), @('legend', 'Legend (click a flow to hide it)'), @('grid', 'Dotted background'))) {
+        foreach ($feat in @(@('header', 'Title and totals at the top'), @('legend', 'Legend (click a flow to hide it)'), @('grid', 'Dotted background'), @('drops', 'Packet drops at an outage (red bursts)'))) {
             $cb = New-CheckBox $p $feat[1] (-not $d.Off.Contains($feat[0])); $cb.Tag = $feat[0]; $cb.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, 0)
             $cb.add_CheckedChanged({ param($src, $e) $off = @($DgUI.Doc.Off | Where-Object { $_ -ne $src.Tag }); if (-not $src.Checked) { $off += $src.Tag }; Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'hide', $(if ($off) { $off -join ' ' } else { $null }))) })
         }
@@ -29289,14 +29331,14 @@ function Show-DiagramDetails($P, $Node) {
     New-TbLabel $P $(if ($ins) { $ins -join ', ' } else { '-' }) | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0) }
     New-TbLabel $P 'Sends to' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0) }
     New-TbLabel $P $(if ($outs) { $outs -join ', ' } else { '-' }) | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0) }
-    $isDown = $cv.View.Down.Contains($Node.Id)
-    $st = New-TbLabel $P $(if ($isDown) { 'DOWN (simulated outage)' } else { 'Operational' })
-    $st.ForeColor = if ($isDown) { $C.Red } else { $C.Green }; $st.Margin = New-Object System.Windows.Forms.Padding(0, (Px 12), 0, (Px 4))
-    [void](New-Button $(if ($isDown) { 'End outage' } else { 'Simulate outage' }) 'Stop the traffic from this shape (only in the preview)' {
+    $isDown = $cv.View.Down.Contains($Node.Id); $isLossy = $cv.View.Loss.ContainsKey($Node.Id)
+    $st = New-TbLabel $P $(if ($isDown) { 'DOWN (simulated outage)' } elseif ($isLossy) { "Packet loss $([int]($cv.View.Loss[$Node.Id] * 100))% (simulated)" } else { 'Operational' })
+    $st.ForeColor = if ($isDown) { $C.Red } elseif ($isLossy) { $C.Yellow } else { $C.Green }; $st.Margin = New-Object System.Windows.Forms.Padding(0, (Px 12), 0, (Px 4))
+    if ($Node.Outage -or $isDown) { [void](New-Button $(if ($isDown) { 'End outage' } else { 'Simulate outage' }) 'Stop the traffic from this shape (only in the preview)' {
         $id = $DgUI.PropId; $v = $DgUI.Canvas.View
         if ($v.Down.Contains($id)) { [void]$v.Down.Remove($id) } else { [void]$v.Down.Add($id) }
         $DgUI.Canvas.Invalidate(); Update-DiagramProps
-    } $P $Glyph.Pause 2)
+    } $P $Glyph.Pause 2) }
 }
 
 # ---- export: picture, PNG, SVG code
@@ -29337,7 +29379,7 @@ function Show-DiagramCode([string]$Kind = 'page') {
     $io = New-Object System.Windows.Forms.FlowLayoutPanel; $io.AutoSize = $true; $io.WrapContents = $true; $io.BackColor = $C.Panel; $io.MaximumSize = New-Object System.Drawing.Size((Px 1060), 0)
     $st.Feat = [ordered]@{}
     foreach ($ft in @(@('Header', 'Title and live totals'), @('Flows', 'Flowing packets, pause and speed'), @('ThemeSwitch', 'Dark / light switch'), @('Zoom', 'Zoom and fit buttons'), @('Legend', 'Legend (hide flows)'),
-                      @('Panel', 'Details panel on click'), @('Hover', 'Hover dimming'), @('Outage', 'Simulate outage'), @('Hint', 'Hint text'), @('Glow', 'Glow on packets'), @('WebFont', 'Load the font from Google Fonts (needs internet)'))) {
+                      @('Panel', 'Details panel on click'), @('Hover', 'Hover dimming'), @('Outage', 'Simulate outage (shapes that offer it)'), @('Drops', 'Packet drops at an outage'), @('Hint', 'Hint text'), @('Glow', 'Glow on packets'), @('WebFont', 'Load the font from Google Fonts (needs internet)'))) {
         $cb = New-CheckBox $io $ft[1] ($ft[0] -ne 'WebFont'); $st.Feat[$ft[0]] = $cb      # pages work offline unless asked
     }
     $opt.Controls.Add($io); $opt.SetFlowBreak($st.Height, $true)
@@ -29648,7 +29690,7 @@ title My diagram                  theme midnight dark   (daylight blueprint past
                                   sunset arctic sand rose graphite dusk;  dark | light | auto = the page starts in that look)
 direction LR                      LR TB RL BT  (auto layout)       layout lanes | layered | grid | circle | force
 route ortho                       ortho | curve | straight         spacing 1.2     radius 10     font Segoe UI
-hide header legend grid           turn parts off                   contrast normal  (the softer light look)
+hide header legend grid drops     turn parts off                   contrast normal  (the softer light look)
 category prod "Production" #3f4fc4 / #8b97ff      a colour for light / dark (bare words in [ ] become categories too)
 lanes "Clients" | "Servers" | "Storage"           columns; put shapes in them with  lane 2
 
