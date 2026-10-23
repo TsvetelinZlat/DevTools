@@ -21570,7 +21570,7 @@ public class DgTheme {
     static readonly string[] MidPalD = { "#8b97ff", "#4ea8ff", "#3ddc97", "#ff8a95", "#f5b94a", "#b29dff", "#34d3b4", "#e879c6", "#ff5d6c", "#7dd3fc" };
     static readonly string[] MidPalL = { "#3f4fc4", "#0b5fc2", "#06804f", "#c22f45", "#a86f00", "#6340d6", "#08806b", "#b02a86", "#cc2638", "#0369a1" };
 
-    public static readonly string[] Names = { "midnight", "daylight", "blueprint", "pastel", "mono", "neon", "corporate" };
+    public static readonly string[] Names = { "midnight", "daylight", "blueprint", "pastel", "mono", "neon", "corporate", "aurora", "ocean", "forest", "sunset", "arctic", "sand", "rose", "graphite", "dusk" };
 
     public static DgTheme Get(string name) {
         var t = new DgTheme { Name = (name ?? "").ToLowerInvariant() };
@@ -21604,6 +21604,51 @@ public class DgTheme {
                 t.Light = P("bg=#f4f6f8;grid=#dde3e9;card=#ffffff;chip=#eef1f4;line=#c5ced8;ink=#1b2733;muted=#5b6b7b;panel=rgba(255,255,255,0.98);ok=#1a7f37;warn=#9a6700;bad=#cf222e;btn=#ffffff;btnLine=#c5ced8;btnHover=#eef1f4;sel=#0969da;pkt=#1b2733;tint=4;chipTint=12;frameTint=3");
                 t.PaletteDark = new[] { "#58a6ff", "#3fb950", "#d29922", "#f85149", "#bc8cff", "#39c5cf", "#ff9bce", "#e3b341" };
                 t.PaletteLight = new[] { "#1f6feb", "#2da44e", "#bf8700", "#cf222e", "#8250df", "#0a7ea4", "#bf3989", "#9a6700" }; break;
+            case "aurora":   // northern lights: teal and violet on a deep night
+                t.Dark = P("bg=#061219;grid=#123039;card=#0a1b24;chip=#11303d;line=#1e4350;ink=#e8fbff;muted=#8cb0bb;panel=rgba(8,24,32,0.92);ok=#4ef0b0;warn=#ffd166;bad=#ff6b8b;btn=#0d2430;btnLine=#22495a;btnHover=#133243;sel=#5ef2d6;pkt=#f0fffb;tint=10;chipTint=26;frameTint=6");
+                t.Light = P("bg=#edf6f5;grid=#cde3e1;card=#ffffff;chip=#e0f0ee;line=#a6cdc8;ink=#0a272b;muted=#3c5f63;panel=rgba(255,255,255,0.97);ok=#08805b;warn=#9a6200;bad=#bf2348;btn=#ffffff;btnLine=#b0d3cf;btnHover=#e4f2f0;sel=#0a776c;pkt=#0a272b;tint=6;chipTint=16;frameTint=4");
+                t.PaletteDark = new[] { "#5ef2d6", "#b98cff", "#ff8fd1", "#7aa2ff", "#c3f584", "#ffb86b", "#66d9ff", "#4ef0b0" };
+                t.PaletteLight = new[] { "#0a776c", "#7041cc", "#b3307c", "#2f5fd0", "#4a7a0c", "#ad5600", "#0272a3", "#08805b" }; t.Glow = true; break;
+            case "ocean":   // deep sea blues with coral and sand
+                t.Dark = P("bg=#04111e;grid=#0f2943;card=#091c30;chip=#0f2846;line=#1c3c5e;ink=#e9f5ff;muted=#8fb1d0;panel=rgba(6,22,38,0.93);ok=#2dd4bf;warn=#fbbf24;bad=#fb7185;btn=#0b2138;btnLine=#1f4166;btnHover=#11304f;sel=#38bdf8;pkt=#f0f9ff;tint=9;chipTint=24;frameTint=5");
+                t.Light = P("bg=#eff6fb;grid=#d0e2f0;card=#ffffff;chip=#e1edf8;line=#a5c2db;ink=#071f36;muted=#3f5e7b;panel=rgba(255,255,255,0.97);ok=#0b7468;warn=#a35400;bad=#c0234a;btn=#ffffff;btnLine=#adc7de;btnHover=#e5f0f9;sel=#0369a1;pkt=#071f36;tint=5;chipTint=14;frameTint=3");
+                t.PaletteDark = new[] { "#38bdf8", "#ff8a7a", "#fbbf24", "#2dd4bf", "#a5b4fc", "#5eead4", "#fdba74", "#f9a8d4" };
+                t.PaletteLight = new[] { "#0369a1", "#c2412f", "#a35400", "#0b7468", "#4f46e5", "#0e7490", "#b45309", "#be185d" }; break;
+            case "forest":   // moss, pine and amber, calm and natural
+                t.Dark = P("bg=#0b130e;grid=#1b2a20;card=#111c15;chip=#1a2a1f;line=#2b3f31;ink=#eef5ec;muted=#9bb09f;panel=rgba(14,24,18,0.94);ok=#7bd88f;warn=#e9c46a;bad=#ef7a6b;btn=#15221a;btnLine=#2d4234;btnHover=#1c2d22;sel=#9be28a;pkt=#f4fbef;tint=11;chipTint=26;frameTint=6");
+                t.Light = P("bg=#f3f5ee;grid=#dce2d2;card=#ffffff;chip=#ebefe3;line=#c1cab3;ink=#1a281d;muted=#536257;panel=rgba(255,255,255,0.97);ok=#2c7a38;warn=#8f6108;bad=#b3402d;btn=#ffffff;btnLine=#c6cfb9;btnHover=#eef1e7;sel=#2c6b3b;pkt=#1a281d;tint=6;chipTint=16;frameTint=4");
+                t.PaletteDark = new[] { "#9be28a", "#e9c46a", "#8fb8ff", "#f4a261", "#c5a3e0", "#7cc6b0", "#e5989b", "#cfe88a" };
+                t.PaletteLight = new[] { "#2c7a38", "#8f6108", "#2f5fa8", "#b0561a", "#6f4a9e", "#1d7766", "#a84452", "#55761c" }; break;
+            case "sunset":   // dusk: coral, gold and plum
+                t.Dark = P("bg=#150b13;grid=#2c1725;card=#1e111b;chip=#2d1827;line=#452339;ink=#fff1ec;muted=#c59ca9;panel=rgba(30,17,27,0.93);ok=#5fd8a5;warn=#ffc75f;bad=#ff6f61;btn=#251421;btnLine=#4a2740;btnHover=#311b2c;sel=#ff9a76;pkt=#fff6ef;tint=11;chipTint=28;frameTint=6");
+                t.Light = P("bg=#fdf4ee;grid=#f0ddd0;card=#ffffff;chip=#fae9df;line=#e3c4b2;ink=#2d141f;muted=#77525e;panel=rgba(255,255,255,0.97);ok=#0e7a52;warn=#9c5f00;bad=#c12d20;btn=#ffffff;btnLine=#e6cbbb;btnHover=#fbeee6;sel=#c03d0c;pkt=#2d141f;tint=6;chipTint=16;frameTint=4");
+                t.PaletteDark = new[] { "#ff9a76", "#ffc75f", "#c792ea", "#6fd6c3", "#f671a8", "#8ab4ff", "#ff6f61", "#ffd6a5" };
+                t.PaletteLight = new[] { "#c03d0c", "#9c5f00", "#7c3aed", "#0f766e", "#b8175a", "#2f5fd0", "#c12d20", "#8f5313" }; t.Glow = true; break;
+            case "arctic":   // frost blues and soft snow, quiet and clean
+                t.Dark = P("bg=#232831;grid=#323a47;card=#2b313c;chip=#38404e;line=#4a5467;ink=#eceff4;muted=#a7b1c4;panel=rgba(43,49,60,0.95);ok=#a3be8c;warn=#ebcb8b;bad=#e07a83;btn=#313845;btnLine=#4a5467;btnHover=#3a4251;sel=#88c0d0;pkt=#f4f6fa;tint=10;chipTint=24;frameTint=5");
+                t.Light = P("bg=#eceff4;grid=#d8dee9;card=#ffffff;chip=#e5e9f0;line=#c2cad8;ink=#232a36;muted=#4c566a;panel=rgba(255,255,255,0.97);ok=#4f7a3a;warn=#8d6a12;bad=#a63d47;btn=#ffffff;btnLine=#c7cfdc;btnHover=#e8ecf2;sel=#3f6a99;pkt=#232a36;tint=6;chipTint=16;frameTint=4");
+                t.PaletteDark = new[] { "#88c0d0", "#a3be8c", "#ebcb8b", "#b48ead", "#d08770", "#81a1c1", "#8fbcbb", "#e07a83" };
+                t.PaletteLight = new[] { "#2f7385", "#4f7a3a", "#8d6a12", "#7f5079", "#a3532c", "#43649a", "#367a77", "#a63d47" }; break;
+            case "sand":   // warm paper and ink with solar accents
+                t.Dark = P("bg=#002730;grid=#0a3a46;card=#06323d;chip=#0c414f;line=#1c5462;ink=#f2ecd9;muted=#9aabab;panel=rgba(6,50,61,0.95);ok=#a2b819;warn=#d9a514;bad=#ff6b66;btn=#08394a;btnLine=#1f5867;btnHover=#0d4655;sel=#3ea2e8;pkt=#fdf6e3;tint=12;chipTint=28;frameTint=6");
+                t.Light = P("bg=#fbf4e1;grid=#ece5d0;card=#fffcf3;chip=#f4eedb;line=#dcd4bd;ink=#06323d;muted=#52666c;panel=rgba(255,252,243,0.97);ok=#5e6e00;warn=#865f00;bad=#b52623;btn=#fffcf3;btnLine=#ddd5be;btnHover=#f6f0de;sel=#1c6fb0;pkt=#06323d;tint=7;chipTint=18;frameTint=4");
+                t.PaletteDark = new[] { "#3ea2e8", "#d9a514", "#f472b4", "#2fbfb4", "#ef7342", "#a2b819", "#9a9ef0", "#ff6b66" };
+                t.PaletteLight = new[] { "#1c6fb0", "#865f00", "#ad2a6a", "#18776f", "#a83c10", "#5e6e00", "#5057a6", "#b52623" }; break;
+            case "rose":   // blush and plum, soft and elegant
+                t.Dark = P("bg=#160c12;grid=#2b1822;card=#1f1219;chip=#2e1a25;line=#452a39;ink=#fdeef4;muted=#c99db2;panel=rgba(31,18,25,0.93);ok=#6ee7b7;warn=#fcd34d;bad=#fb7185;btn=#26161f;btnLine=#4a2d3d;btnHover=#321e29;sel=#ff8fb8;pkt=#fff5f9;tint=11;chipTint=28;frameTint=6");
+                t.Light = P("bg=#fff5f8;grid=#f4dbe5;card=#ffffff;chip=#fcebf1;line=#ebc4d3;ink=#381124;muted=#7d5167;panel=rgba(255,255,255,0.97);ok=#0b7a55;warn=#985c00;bad=#c0193d;btn=#ffffff;btnLine=#edcad8;btnHover=#fdeef3;sel=#b8175a;pkt=#381124;tint=6;chipTint=16;frameTint=4");
+                t.PaletteDark = new[] { "#ff8fb8", "#c4a1ff", "#ffb38a", "#7dd3c0", "#f9d27a", "#8fb4ff", "#f0a6ca", "#e98df7" };
+                t.PaletteLight = new[] { "#b8175a", "#6d28d9", "#b8410c", "#0f766e", "#956000", "#2f5fd0", "#9d174d", "#9b1aa8" }; break;
+            case "graphite":   // neutral greys with one amber accent
+                t.Dark = P("bg=#111214;grid=#222428;card=#1a1b1e;chip=#25272b;line=#35383e;ink=#f2f2f3;muted=#9ea2aa;panel=rgba(26,27,30,0.95);ok=#4ade80;warn=#f5a524;bad=#f87171;btn=#1f2023;btnLine=#383b41;btnHover=#292b2f;sel=#f5a524;pkt=#ffffff;tint=6;chipTint=20;frameTint=4");
+                t.Light = P("bg=#f5f5f4;grid=#e2e2df;card=#ffffff;chip=#efefed;line=#d0d0cc;ink=#1c1c1e;muted=#5c5d63;panel=rgba(255,255,255,0.98);ok=#15803d;warn=#9a4d06;bad=#b91c1c;btn=#ffffff;btnLine=#d4d4d0;btnHover=#efefed;sel=#a84a07;pkt=#1c1c1e;tint=4;chipTint=12;frameTint=3");
+                t.PaletteDark = new[] { "#f5a524", "#60a5fa", "#4ade80", "#f87171", "#a78bfa", "#2dd4bf", "#f472b6", "#e5e7eb" };
+                t.PaletteLight = new[] { "#a84a07", "#1d4ed8", "#15803d", "#b91c1c", "#6d28d9", "#0f766e", "#be185d", "#3f3f46" }; break;
+            case "dusk":   // violet night with candy neon accents
+                t.Dark = P("bg=#181922;grid=#292b3a;card=#20212d;chip=#2b2d3d;line=#3d4054;ink=#f8f8f2;muted=#a9acc6;panel=rgba(32,33,45,0.94);ok=#50fa7b;warn=#f1fa8c;bad=#ff5f6d;btn=#262836;btnLine=#40435a;btnHover=#2f3142;sel=#bd93f9;pkt=#ffffff;tint=10;chipTint=26;frameTint=6");
+                t.Light = P("bg=#f7f6fc;grid=#e3e1f0;card=#ffffff;chip=#efedf8;line=#d2cfe6;ink=#1f1d2e;muted=#5b5876;panel=rgba(255,255,255,0.97);ok=#137a3a;warn=#8a6a00;bad=#c81e3a;btn=#ffffff;btnLine=#d6d3e8;btnHover=#f0eef9;sel=#6d28d9;pkt=#1f1d2e;tint=6;chipTint=16;frameTint=4");
+                t.PaletteDark = new[] { "#bd93f9", "#ff79c6", "#8be9fd", "#50fa7b", "#ffb86c", "#f1fa8c", "#ff6e6e", "#9aa5ff" };
+                t.PaletteLight = new[] { "#6d28d9", "#b81a75", "#0e7490", "#137a3a", "#b4500e", "#7a6400", "#c81e3a", "#3b4fd8" }; t.Glow = true; break;
             default:
                 t.Name = "midnight"; t.Dark = P(MidDark); t.Light = P(MidLight); t.PaletteDark = MidPalD; t.PaletteLight = MidPalL; t.Glow = true; break;
         }
@@ -21714,8 +21759,8 @@ public static class DgText {
                         case "title": d.Title = Unq(rest); continue;
                         case "subtitle": d.Subtitle = Unq(rest); continue;
                         case "hint": d.Hint = Unq(rest); continue;
-                        case "theme": { var p = rest.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries); foreach (var x in p) { var w = x.ToLowerInvariant(); if (w == "dark" || w == "light") d.Mode = w; else d.Theme = w; } continue; }
-                        case "mode": d.Mode = rest.ToLowerInvariant().Contains("light") ? "light" : "dark"; continue;
+                        case "theme": { var p = rest.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries); foreach (var x in p) { var w = x.ToLowerInvariant(); if (w == "dark" || w == "light") d.Mode = w; else if (w == "auto" || w == "system") d.Mode = "auto"; else d.Theme = w; } continue; }
+                        case "mode": { var m = rest.ToLowerInvariant(); d.Mode = m.Contains("light") ? "light" : (m.Contains("auto") || m.Contains("system")) ? "auto" : "dark"; continue; }
                         case "direction": case "dir": d.Direction = Dir(rest); continue;
                         case "graph": case "flowchart": d.Direction = Dir(rest); continue;
                         case "layout": d.Layout = rest.ToLowerInvariant(); continue;
@@ -23816,8 +23861,9 @@ public static class DgHtml {
     // the root element with its parts (no script)
     static string Markup(DgDoc d, DgTheme t, DgHtmlOptions o, string height) {
         var sb = new StringBuilder();
-        string mode = o.Mode == "light" ? "light" : "dark";
-        sb.Append("<div class=\"dg-root\" id=\"dg-root\" data-theme=\"" + mode + "\">\n");
+        // "auto": no data-theme until the script runs, so the CSS follows the visitor's setting from the first paint (no dark flash)
+        string mode = o.Mode == "light" || o.Mode == "dark" ? " data-theme=\"" + o.Mode + "\"" : "";
+        sb.Append("<div class=\"dg-root\" id=\"dg-root\"" + mode + ">\n");
         sb.Append("<div class=\"dg-stage\">\n" + Svg(d, t) + "\n</div>\n");
         sb.Append("<div class=\"dg-bar\">\n");
         if (o.Header) sb.Append("  <div class=\"dg-head\"><div class=\"dg-ttl\"><span class=\"dg-live\"></span><span>" + DgSvgPainter.Esc(string.IsNullOrEmpty(d.Title) ? "Diagram" : d.Title) + "</span></div>" + (o.Flows ? "<div class=\"dg-stats\"></div>" : "") + "</div>\n");
@@ -27844,7 +27890,8 @@ public static class DgAssets {
   function on(sel, ev, f) { var el = q(sel); if (el) el.addEventListener(ev, f); }
   on(cls('pause'), 'click', function () { st.paused = !st.paused; this.textContent = st.paused ? 'Play' : 'Pause'; });
   qa(cls('speed') + ' button').forEach(function (b) { b.addEventListener('click', function () { st.speed = parseFloat(b.getAttribute('data-v')); qa(cls('speed') + ' button').forEach(function (x) { x.classList.toggle(P + '-act', x === b); }); }); });
-  var themeKey = 'devtools-diagram-theme:' + P + ':' + (D.title || '');
+  // keyed by the starting theme too: choosing a new start in DevTools shows it again, even to visitors who clicked before
+  var themeKey = 'devtools-diagram-theme:' + P + ':' + (D.title || '') + ':' + (D.theme || '');
   qa(cls('theme') + ' button').forEach(function (b) { b.addEventListener('click', function (e) { e.preventDefault(); var v = b.getAttribute('data-v'); setTheme(v); try { localStorage.setItem(themeKey, v); } catch (x) { } }); });
   // the diagram's buttons never act on the page around it (a form there would be submitted and the page reloaded)
   root.addEventListener('click', function (e) { var t = e.target; while (t && t !== root) { if (t.tagName === 'BUTTON') { e.preventDefault(); return; } t = t.parentNode; } });
@@ -28597,7 +28644,7 @@ function Update-Diagram([switch]$Fit) {
     $DgUI.Doc = $d
     $cv = $DgUI.Canvas
     $cv.Theme = [DgTheme]::Get($d.Theme)
-    if (-not $DgUI.ModeSet) { $cv.Dark = $d.Mode -ne 'light' }
+    if (-not $DgUI.ModeSet) { $cv.Dark = if ($d.Mode -eq 'auto') { [bool]$script:IsDark } else { $d.Mode -ne 'light' } }
     $cv.SetDoc($d, (-not $Fit))
     if ($Fit) { $cv.UserView = $false; $cv.ZoomToFit() }
     $w = @($d.Warnings)
@@ -29083,7 +29130,9 @@ function Update-DiagramProps {
     } else {
         New-TbLabel $p 'Diagram' -Title | Out-Null
         Add-DgProp $p 'Title' (New-DgBox $d.Title { param($v) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'title', $(if ($v) { $v } else { $null }))) }) | Out-Null
-        Add-DgProp $p 'Theme' (New-DgCombo ([DgTheme]::Names) $d.Theme { param($v) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'theme', "$v $(if ($DgUI.Canvas.Dark) { 'dark' } else { 'light' })")) }) 160 | Out-Null
+        Add-DgProp $p 'Theme' (New-DgCombo ([DgTheme]::Names) $d.Theme { param($v) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'theme', "$v $($DgUI.Doc.Mode)")) }) 160 | Out-Null
+        $starts = @('Dark', 'Light', "Visitor's system setting")
+        Add-DgProp $p 'Starts in' (New-DgCombo $starts $starts[[Math]::Max(0, @('dark', 'light', 'auto').IndexOf($d.Mode))] { param($v) $DgUI.ModeSet = $false; Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'theme', "$($DgUI.Doc.Theme) $(@('dark', 'light', 'auto')[[Array]::IndexOf(@('Dark', 'Light', "Visitor's system setting"), $v)])")) }) 160 | Out-Null
         $layouts = @('auto', 'lanes', 'layered', 'grid', 'circle', 'force')
         Add-DgProp $p 'Layout' (New-DgCombo $layouts $(if ($d.Layout) { $d.Layout } else { 'auto' }) { param($v) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'layout', $(if ($v -ne 'auto') { $v } else { $null }))) -Fit }) 160 | Out-Null
         Add-DgProp $p 'Direction' (New-DgCombo @('LR  left to right', 'TB  top to bottom', 'RL  right to left', 'BT  bottom to top') $(switch ($d.Direction) { 'TB' { 'TB  top to bottom' } 'RL' { 'RL  right to left' } 'BT' { 'BT  bottom to top' } default { 'LR  left to right' } }) { param($v) Set-DiagramText ([DgText]::SetDirective($DgUI.Text, 'direction', ($v -split ' ')[0])) -Fit }) 160 | Out-Null
@@ -29179,9 +29228,10 @@ function Show-DiagramCode([string]$Kind = 'page') {
     $kinds = @('Interactive web page', 'Embeddable widget (paste into a page)', 'React component', 'Plain SVG')
     $st.Kind = New-TbCombo $opt $kinds 270
     $st.Kind.SelectedIndex = [Math]::Max(0, @('page', 'widget', 'react', 'svg').IndexOf($Kind))
-    New-TbLabel $opt 'Colours' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding((Px 8), (Px 9), (Px 4), 0) }
-    $st.Mode = New-TbCombo $opt @('Follows the system theme', 'Dark', 'Light') 190
-    $st.Mode.SelectedIndex = if ($DgUI.Canvas.Dark) { 1 } else { 2 }
+    New-TbLabel $opt 'Starts in' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding((Px 8), (Px 9), (Px 4), 0) }
+    $st.Mode = New-TbCombo $opt @("Visitor's system setting", 'Dark', 'Light') 190
+    $st.Mode.SelectedIndex = [Math]::Max(0, @('auto', 'dark', 'light').IndexOf($DgUI.Doc.Mode))
+    $tooltip.SetToolTip($st.Mode, 'The look the page opens in. Visitors can still switch with Dark / Light, and their choice is remembered until you pick a different start here')
     New-TbLabel $opt 'Prefix' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding((Px 8), (Px 9), (Px 4), 0) }
     $st.Prefix = New-TbBox -Mono; $st.Prefix.Width = Px 140; $st.Prefix.Text = [DgSvg]::SuggestPrefix($DgUI.Doc); $st.Prefix.Margin = New-Object System.Windows.Forms.Padding(0, (Px 5), (Px 8), 0)
     $tooltip.SetToolTip($st.Prefix, 'Every class and id starts with this, so several diagrams can sit on the same page without clashing')
@@ -29498,7 +29548,8 @@ function Show-DiagramHelp {
     $t = @'
 DIAGRAM TEXT  -  a line each; indent to add details to the shape above
 
-title My diagram                  theme midnight dark   (daylight blueprint pastel mono neon corporate; dark / light)
+title My diagram                  theme midnight dark   (daylight blueprint pastel mono neon corporate aurora ocean forest
+                                  sunset arctic sand rose graphite dusk;  dark | light | auto = the page starts in that look)
 direction LR                      LR TB RL BT  (auto layout)       layout lanes | layered | grid | circle | force
 route ortho                       ortho | curve | straight         spacing 1.2     radius 10     font Segoe UI
 hide header legend grid           turn parts off
