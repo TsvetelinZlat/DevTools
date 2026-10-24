@@ -23153,7 +23153,9 @@ public static class DgRender {
             if (n.Badge.Length > 0 || status.Length > 0 || n.Metric.Length > 0) {
                 if (status.Length > 0 || n.Badge.Length > 0) p.Ellipse(bx, ty + 9.5f, 4, 4, StatusCol(c, status), null, 0, o, "dg-status");
                 string rate = n.Metric; string r2; if (v.Rate.TryGetValue(n.Id, out r2)) rate = r2;
-                if (rate.Length > 0) p.Text(x + w - 14, ty + 13, rate, 10, 400, c.Get("muted"), "end", true, o, 0, "dg-rate");
+                // the live rate ("12.3k pps", up to 9 characters) only where it fits beside the badge and the dot
+                float room = (x + w - 14) - (bx + 10);
+                if (rate.Length > 0 && room >= DgMeasure.Width(rate.Trim().Length > 0 ? rate : "99.9k pps", 10, 400, true)) p.Text(x + w - 14, ty + 13, rate, 10, 400, c.Get("muted"), "end", true, o, 0, "dg-rate");
                 ty += 28;
             }
             float ts = DgLayout.TitleSize(n, true);
