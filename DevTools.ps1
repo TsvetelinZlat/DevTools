@@ -21480,6 +21480,8 @@ public class DgCategory { public string Id = "", Name = "", Light = "", Dark = "
 
 public class DgNode {
     public string Id = "", Label = "", Badge = "", Cat = "", Shape = "", Fill = "", Stroke = "", TextColor = "", Icon = "", Status = "", Metric = "", Url = "", Desc = "", Group = "";
+    public System.Drawing.PointF TitleOff, BadgeOff, LinesOff;     // titleat / badgeat / linesat: moved this far inside the shape
+    public System.Drawing.RectangleF TitleBox, BadgeBox, LinesBox;  // where they were drawn (for dragging them)
     public string Align = "", VAlign = "";   // text inside the shape: left | center | right, top | middle | bottom (empty: the shape's usual)
     public string LinkText = "";    // the text on the link's button (details panel and hover button); empty: "Open webpage"
     public string Button = "";      // "Open webpage" (or its own text): a button by the box in the web page, when it has a url
@@ -22002,7 +22004,7 @@ public static class DgText {
     static bool KnownKey(string k) {
         switch (k) {
             case "badge": case "lane": case "at": case "size": case "w": case "width": case "h": case "height": case "shape": case "fill": case "stroke": case "border": case "color": case "text":
-            case "icon": case "status": case "metric": case "url": case "link": case "button": case "linktext": case "buttontext": case "align": case "valign": case "font": case "lines": case "items": case "in": case "group": case "cat": case "category": case "flow":
+            case "icon": case "status": case "metric": case "url": case "link": case "button": case "linktext": case "buttontext": case "align": case "valign": case "titleat": case "badgeat": case "linesat": case "font": case "lines": case "items": case "in": case "group": case "cat": case "category": case "flow":
             case "desc": case "tags": case "label": case "via": case "density": case "arrow": case "from": case "to": case "route": case "labelat": return true;
         }
         return false;
@@ -22046,6 +22048,9 @@ public static class DgText {
                 case "outage": n.Outage = true; break;
                 case "bold": n.Bold = true; break;
                 case "align": { var a2 = v.Trim().ToLowerInvariant(); n.Align = a2 == "centre" || a2 == "middle" ? "center" : (a2 == "left" || a2 == "center" || a2 == "right" ? a2 : ""); break; }
+                case "titleat": { var q = Points(v); if (q.Count > 0) n.TitleOff = q[0]; break; }
+                case "badgeat": { var q = Points(v); if (q.Count > 0) n.BadgeOff = q[0]; break; }
+                case "linesat": { var q = Points(v); if (q.Count > 0) n.LinesOff = q[0]; break; }
                 case "valign": { var a2 = v.Trim().ToLowerInvariant(); n.VAlign = a2 == "center" || a2 == "centre" ? "middle" : (a2 == "top" || a2 == "middle" || a2 == "bottom" ? a2 : ""); break; }
                 case "dashed": n.Dashed = true; break;
                 case "hidden": n.Hidden = true; break;
@@ -23161,6 +23166,8 @@ public static class DgRender {
                 float rowW = (n.Badge.Length > 0 ? DgMeasure.Width(n.Badge, 10.5f, 600, true) + 14 + 12 : 0) + (status.Length > 0 || n.Outage ? 8 : 0);
                 bx = n.Align == "center" ? x + w / 2 - rowW / 2 : x + w - 14 - rowW;
             }
+            n.TitleBox = n.BadgeBox = n.LinesBox = System.Drawing.RectangleF.Empty;
+            float rowTy = ty; ty += n.BadgeOff.Y; bx += n.BadgeOff.X; float rowX0 = bx;
             if (n.Badge.Length > 0) {
                 float bw = DgMeasure.Width(n.Badge, 10.5f, 600, true) + 14;
                 p.Rect(bx, ty, bw, 19, 4, ck != null ? c.Mix(ck, "chipTint", "chip") : c.Get("chip"), null, 0, 0, o);
@@ -23172,13 +23179,20 @@ public static class DgRender {
                 string rate = n.Metric; string r2; if (v.Rate.TryGetValue(n.Id, out r2)) rate = r2;
                 // the live rate ("12.3k pps", up to 9 characters) only where it fits beside the badge and the dot
                 float room = (x + w - 14) - (bx + 10);
-                if (n.Align != "right" && rate.Length > 0 && room >= DgMeasure.Width(rate.Trim().Length > 0 ? rate : "99.9k pps", 10, 400, true)) p.Text(x + w - 14, ty + 13, rate, 10, 400, c.Get("muted"), "end", true, o, 0, "dg-rate");
-                ty += 28;
-            }
+                if (n.Align != "right" && n.BadgeOff.IsEmpty && rate.Length > 0 && room >= DgMeasure.Width(rate.Trim().Length > 0 ? rate : "99.9k pps", 10, 400, true)) p.Text(x + w - 14, ty + 13, rate, 10, 400, c.Get("muted"), "end", true, o, 0, "dg-rate");
+                n.BadgeBox = new System.Drawing.RectangleF(rowX0 - 3, ty - 3, Math.Max(12, bx + (status.Length > 0 || n.Outage ? 8 : 0) - rowX0) + 6, 25);
+                ty = rowTy + 28;
+            } else ty = rowTy;
             float ts = DgLayout.TitleSize(n, true);
-            p.Text(ax, ty + ts - 1, n.Title, ts, 600, ink, anc, false, o, 0, "dg-title");
+            float tw0 = DgMeasure.Width(n.Title, ts, 600, false), tax = ax + n.TitleOff.X;
+            p.Text(tax, ty + ts - 1 + n.TitleOff.Y, n.Title, ts, 600, ink, anc, false, o, 0, "dg-title");
+            n.TitleBox = new System.Drawing.RectangleF((anc == "middle" ? tax - tw0 / 2 : anc == "end" ? tax - tw0 : tax) - 3, ty + n.TitleOff.Y - 2, tw0 + 6, ts + 6);
             ty += ts + 8;
-            foreach (var ln in n.Lines) { p.Text(ax, ty + 11, ln, 11.5f, 400, c.Get("muted"), anc, false, o, 0, null); ty += 16; }
+            if (n.Lines.Count > 0) {
+                float lw0 = n.Lines.Max(q => DgMeasure.Width(q, 11.5f, 400, false)), lax = ax + n.LinesOff.X, ly0 = ty + n.LinesOff.Y;
+                foreach (var ln in n.Lines) { p.Text(lax, ty + 11 + n.LinesOff.Y, ln, 11.5f, 400, c.Get("muted"), anc, false, o, 0, null); ty += 16; }
+                n.LinesBox = new System.Drawing.RectangleF((anc == "middle" ? lax - lw0 / 2 : anc == "end" ? lax - lw0 : lax) - 3, ly0 - 1, lw0 + 6, n.Lines.Count * 16 + 4);
+            }
             for (int i = 0; i < n.ItemBoxes.Count; i++) {
                 var r = n.ItemBoxes[i]; bool small = r.Height < 24;
                 p.Begin("dg-item", null, "data-item=\"" + DgSvgPainter.Esc(n.Id + "." + n.Items[i]) + "\"");
@@ -23258,13 +23272,17 @@ public static class DgRender {
             bool side = shape != "actor" && shape != "circle" && shape != "diamond";
             string anc2 = side && n.Align == "left" ? "start" : side && n.Align == "right" ? "end" : "middle";
             float tx = anc2 == "start" ? x + 14 : anc2 == "end" ? x + w - 14 : x + w / 2;
+            n.TitleBox = n.BadgeBox = n.LinesBox = System.Drawing.RectangleF.Empty;
             if (n.Badge.Length > 0 && shape != "actor") {
                 float bw = DgMeasure.Width(n.Badge, 9.5f, 600, true) + 10;
-                float bx2 = anc2 == "start" ? tx : anc2 == "end" ? tx - bw : tx - bw / 2;
-                p.Rect(bx2, top - ts - 15, bw, 15, 3, ck != null ? c.Mix(ck, "chipTint", "chip") : c.Get("chip"), null, 0, 0, o);
-                p.Text(bx2 + bw / 2, top - ts - 4, n.Badge, 9.5f, 600, ck != null ? c.Get(ck) : ink, "middle", true, o, 0, null);
+                float bx2 = (anc2 == "start" ? tx : anc2 == "end" ? tx - bw : tx - bw / 2) + n.BadgeOff.X, by2 = top - ts - 15 + n.BadgeOff.Y;
+                p.Rect(bx2, by2, bw, 15, 3, ck != null ? c.Mix(ck, "chipTint", "chip") : c.Get("chip"), null, 0, 0, o);
+                p.Text(bx2 + bw / 2, by2 + 11, n.Badge, 9.5f, 600, ck != null ? c.Get(ck) : ink, "middle", true, o, 0, null);
+                n.BadgeBox = new System.Drawing.RectangleF(bx2 - 3, by2 - 3, bw + 6, 21);
             }
-            foreach (var ln in lines) { p.Text(tx, top, ln, ts, n.Bold ? 600 : 500, ink, anc2, false, o, 0, "dg-title"); top += lh; }
+            float tlw = lines.Count == 0 ? 0 : lines.Max(q => DgMeasure.Width(q, ts, n.Bold ? 600 : 500, false)), ttx = tx + n.TitleOff.X, tt0 = top + n.TitleOff.Y;
+            foreach (var ln in lines) { p.Text(ttx, top + n.TitleOff.Y, ln, ts, n.Bold ? 600 : 500, ink, anc2, false, o, 0, "dg-title"); top += lh; }
+            if (lines.Count > 0) n.TitleBox = new System.Drawing.RectangleF((anc2 == "middle" ? ttx - tlw / 2 : anc2 == "end" ? ttx - tlw : ttx) - 3, tt0 - ts - 1, tlw + 6, lines.Count * lh + 4);
             if (status.Length > 0) p.Ellipse(x + w - 9, y + 9, 3.5f, 3.5f, StatusCol(c, status), null, 0, o, "dg-status");
         }
         p.End();
@@ -23405,7 +23423,8 @@ public class DgCanvas : System.Windows.Forms.Panel {
     public event EventHandler SelectionChanged, NodeOpened, Moved, EdgeAdded, DeleteRequested, LegendChanged, CopyRequested, PasteRequested, DuplicateRequested, LabelMoved;
     public DgEdge MovedLabel, MovedEdge;
     public bool MovedSource;
-    public event EventHandler EndMoved, RouteMoved, Resized;
+    public event EventHandler EndMoved, RouteMoved, Resized, PartMoved;
+    public string PartMovedId = "", PartMovedKind = "";   // title / badge / lines of a shape, dragged inside it (PartMoved)
     public string ResizedId = "";                    // the shape whose size was dragged (Resized)
     DgEdge labelEdge, endEdge;
     bool endSource;
@@ -23424,7 +23443,8 @@ public class DgCanvas : System.Windows.Forms.Panel {
     DateTime last = DateTime.Now, lastSample = DateTime.Now;
     Random rnd = new Random(7);
 
-    enum Mode { None, Pan, Drag, Box, Link, Label, End, Route, Resize }
+    enum Mode { None, Pan, Drag, Box, Link, Label, End, Route, Resize, Part }
+    DgNode partNode; string partKind = ""; System.Drawing.PointF partFrom;
     DgNode resizeNode; int resizeAxis;              // 1 width, 2 height, 3 both
     Mode mode = Mode.None;
     System.Drawing.Point down;
@@ -23552,6 +23572,21 @@ public class DgCanvas : System.Windows.Forms.Panel {
         if (Math.Abs(w.Y - B) <= r && Math.Abs(w.X - (n.X + n.W / 2)) <= r * 1.6f) return 2;
         node = null; return 0;
     }
+    // a part (badge row, lines, title) of the one selected shape under the mouse
+    string PartHit(System.Drawing.PointF w, out DgNode node) {
+        node = null;
+        if (!Editable || View.Selected.Count != 1) return "";
+        var n = Doc.Find(View.Selected.First());
+        if (n == null || n.Hidden || OnHandle(n, w)) return "";
+        node = n;
+        if (!n.BadgeBox.IsEmpty && n.BadgeBox.Contains(w)) return "badge";
+        if (!n.LinesBox.IsEmpty && n.LinesBox.Contains(w)) return "lines";
+        if (!n.TitleBox.IsEmpty && n.TitleBox.Contains(w)) return "title";
+        node = null; return "";
+    }
+    static System.Drawing.PointF PartOff(DgNode n, string k) { return k == "badge" ? n.BadgeOff : k == "lines" ? n.LinesOff : n.TitleOff; }
+    static void SetPartOff(DgNode n, string k, System.Drawing.PointF v) { if (k == "badge") n.BadgeOff = v; else if (k == "lines") n.LinesOff = v; else n.TitleOff = v; }
+
     IEnumerable<System.Drawing.PointF> ResizeHandles(DgNode n) {
         yield return new System.Drawing.PointF(n.X + n.W, n.Y + n.H * 0.8f);      // below the connection dot
         yield return new System.Drawing.PointF(n.X + n.W / 2, n.Y + n.H);
@@ -23584,6 +23619,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
             if (best != null) { mode = Mode.End; endEdge = best; endSource = src; View.Selected.Clear(); View.SelectedEdge = best.Id; if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); Invalidate(); return; }
         }
         { DgNode rn; int ax = ResizeHit(w, out rn); if (ax > 0) { mode = Mode.Resize; resizeNode = rn; resizeAxis = ax; return; } }
+        { DgNode pn; string pk = PartHit(w, out pn); if (pk.Length > 0) { mode = Mode.Part; partNode = pn; partKind = pk; partFrom = PartOff(pn, pk); dragAnchor = w; return; } }
         if (Editable) foreach (var le in Doc.Edges) if (le.Label.Length > 0 && !le.LabelBox.IsEmpty && le.LabelBox.Contains(w)) { mode = Mode.Label; labelEdge = le; View.Selected.Clear(); View.SelectedEdge = le.Id; if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); return; }
         var n = NodeAt(w);
         if (n != null && OnHandle(n, w)) { mode = Mode.Link; linkFrom = n.Id; mouseW = w; return; }
@@ -23631,6 +23667,10 @@ public class DgCanvas : System.Windows.Forms.Panel {
             case Mode.End: if (moved && endEdge != null) { SnapEnd(endEdge, endSource, w); DgRoute.All(Doc); packets.Clear(); Invalidate(); } return;
             case Mode.Route: if (moved && endEdge != null) { endEdge.Via = new List<System.Drawing.PointF> { new System.Drawing.PointF((float)Math.Round(w.X), (float)Math.Round(w.Y)) }; endEdge.Route = endEdge.Route == "straight" ? "" : endEdge.Route; DgRoute.All(Doc); packets.Clear(); Invalidate(); } return;
             case Mode.Label: if (moved && labelEdge != null) { labelEdge.LabelAt = new System.Drawing.PointF((float)Math.Round(w.X), (float)Math.Round(w.Y)); Invalidate(); } return;
+            case Mode.Part:
+                if (!moved || partNode == null) return;
+                SetPartOff(partNode, partKind, new System.Drawing.PointF((float)Math.Round(partFrom.X + w.X - dragAnchor.X), (float)Math.Round(partFrom.Y + w.Y - dragAnchor.Y)));
+                Invalidate(); return;
             case Mode.Resize:
                 if (!moved || resizeNode == null) return;
                 if ((resizeAxis & 1) != 0) { resizeNode.W = Math.Max(60, (float)Math.Round((w.X - resizeNode.X) / 4) * 4); resizeNode.SetW = resizeNode.W; }
@@ -23645,6 +23685,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
             return;
         }
         { DgNode rn; int ax = ResizeHit(w, out rn); if (ax > 0) { Cursor = ax == 3 ? System.Windows.Forms.Cursors.SizeNWSE : ax == 1 ? System.Windows.Forms.Cursors.SizeWE : System.Windows.Forms.Cursors.SizeNS; return; } }
+        { DgNode pn; if (PartHit(w, out pn).Length > 0) { Cursor = System.Windows.Forms.Cursors.SizeAll; return; } }
         var n = NodeAt(w);
         string h = n == null ? "" : n.Id;
         Cursor = n != null ? (OnHandle(n, w) ? System.Windows.Forms.Cursors.Cross : System.Windows.Forms.Cursors.Hand) : (EdgeAt(w) != null ? System.Windows.Forms.Cursors.Hand : System.Windows.Forms.Cursors.Default);
@@ -23661,6 +23702,8 @@ public class DgCanvas : System.Windows.Forms.Panel {
         else if (m == Mode.Route && moved && endEdge != null) { MovedEdge = endEdge; if (RouteMoved != null) RouteMoved(this, EventArgs.Empty); }
         else if (m == Mode.Label && moved && labelEdge != null) { MovedLabel = labelEdge; if (LabelMoved != null) LabelMoved(this, EventArgs.Empty); }
         else if (m == Mode.Drag && moved) { MovedIds = dragFrom.Keys.ToList(); if (Moved != null) Moved(this, EventArgs.Empty); }
+        else if (m == Mode.Part && moved && partNode != null) { PartMovedId = partNode.Id; PartMovedKind = partKind; partNode = null; if (PartMoved != null) PartMoved(this, EventArgs.Empty); }
+        else if (m == Mode.Part && !moved) { partNode = null; }
         else if (m == Mode.Resize && moved && resizeNode != null) { ResizedId = resizeNode.Id; resizeNode = null; if (Resized != null) Resized(this, EventArgs.Empty); }
         else if (m == Mode.Box) {
             var ids = Doc.Nodes.Where(n => !n.Hidden && box.IntersectsWith(n.Box)).Select(n => n.Id).ToList();
@@ -23838,6 +23881,9 @@ public class DgCanvas : System.Windows.Forms.Panel {
                     using (var b = new System.Drawing.SolidBrush(DgColors.Parse(c.Raw("bg"))))
                     using (var pen = new System.Drawing.Pen(DgColors.Parse(c.Raw("sel")), 1.6f / Zoom))
                         foreach (var hp in ResizeHandles(sn)) { g.FillRectangle(b, hp.X - hs / 2, hp.Y - hs / 2, hs, hs); g.DrawRectangle(pen, hp.X - hs / 2, hp.Y - hs / 2, hs, hs); }
+                    // the parts that can be dragged inside it: faint dashed outlines
+                    using (var pp = new System.Drawing.Pen(System.Drawing.Color.FromArgb(110, DgColors.Parse(c.Raw("sel"))), 1 / Zoom) { DashPattern = new float[] { 3, 3 } })
+                        foreach (var pb in new[] { sn.BadgeBox, sn.TitleBox, sn.LinesBox }) if (!pb.IsEmpty) g.DrawRectangle(pp, pb.X, pb.Y, pb.Width, pb.Height);
                 }
             }
             if (mode == Mode.Link) {
@@ -24110,6 +24156,9 @@ public static class DgClip {
         if (n.Bold) a.Add("bold");
         if (n.Align.Length > 0) a.Add("align " + n.Align);
         if (n.VAlign.Length > 0) a.Add("valign " + n.VAlign);
+        if (!n.TitleOff.IsEmpty) a.Add("titleat " + N(n.TitleOff.X) + " " + N(n.TitleOff.Y));
+        if (!n.BadgeOff.IsEmpty) a.Add("badgeat " + N(n.BadgeOff.X) + " " + N(n.BadgeOff.Y));
+        if (!n.LinesOff.IsEmpty) a.Add("linesat " + N(n.LinesOff.X) + " " + N(n.LinesOff.Y));
         if (n.Dashed) a.Add("dashed");
         if (n.SetW > 0 || n.SetH > 0) a.Add("size " + N(n.SetW > 0 ? n.SetW : n.W) + " " + N(n.SetH > 0 ? n.SetH : n.H));
         if (!string.IsNullOrEmpty(group)) a.Add("in " + group);
@@ -29304,6 +29353,7 @@ function Update-DiagramProps {
         $p.Controls.Add($row)
         $b2 = New-Object System.Windows.Forms.FlowLayoutPanel; $b2.AutoSize = $true; $b2.WrapContents = $true; $b2.MaximumSize = New-Object System.Drawing.Size((Px (260 * $TextZoom)), 0); $b2.Margin = New-Object System.Windows.Forms.Padding(0, (Px 10), 0, 0)
         [void](New-Button 'Auto position' 'Let the layout place it again' { Set-DiagramNodeAttr $DgUI.PropId 'at' $null } $b2 $Glyph.Refresh 2)
+        if (-not $node.TitleOff.IsEmpty -or -not $node.BadgeOff.IsEmpty -or -not $node.LinesOff.IsEmpty) { [void](New-Button 'Reset text positions' 'Put the title, badge and lines back where they belong' { $t = $DgUI.Text; foreach ($k in 'titleat', 'badgeat', 'linesat') { $t = [DgText]::SetNodeAttr($t, $DgUI.PropId, $k, $null) }; Set-DiagramText $t } $b2 $Glyph.Refresh 2) }
         [void](New-Button 'Delete' 'Delete this shape and its links (Del)' { Remove-DiagramSelection } $b2 $Glyph.Delete 2)
         $p.Controls.Add($b2)
         $DgUI.PropId = $id
@@ -29685,6 +29735,12 @@ function Show-DiagramStudio([string]$Text = '') {
         $t = $DgUI.Text
         foreach ($id in $src.MovedIds) { $n = $DgUI.Doc.Find($id); if ($n) { $t = [DgText]::SetNodeAttr($t, $id, 'at', "$([int]$n.X) $([int]$n.Y)") } }
         Set-DiagramText $t
+    })
+    $cv.add_PartMoved({
+        param($src, $e)
+        $n = $DgUI.Doc.Find($src.PartMovedId); if (-not $n) { return }
+        $o = switch ($src.PartMovedKind) { 'badge' { $n.BadgeOff } 'lines' { $n.LinesOff } default { $n.TitleOff } }
+        Set-DiagramText ([DgText]::SetNodeAttr($DgUI.Text, $n.Id, "$($src.PartMovedKind)at", $(if ($o.X -or $o.Y) { "$([int]$o.X) $([int]$o.Y)" } else { $null })))
     })
     $cv.add_Resized({
         param($src, $e)
