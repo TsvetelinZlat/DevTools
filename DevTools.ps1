@@ -23545,14 +23545,15 @@ public class DgCanvas : System.Windows.Forms.Panel {
         var n = Doc.Find(View.Selected.First());
         if (n == null || n.Hidden) return 0;
         float r = 7 / Zoom, R = n.X + n.W, B = n.Y + n.H;
+        if (OnHandle(n, w)) return 0;                  // the connection dot (middle of the right edge) wins
         node = n;
         if (Math.Abs(w.X - R) <= r && Math.Abs(w.Y - B) <= r) return 3;
-        if (Math.Abs(w.X - R) <= r && Math.Abs(w.Y - (n.Y + n.H / 2)) <= r * 1.6f) return 1;
+        if (Math.Abs(w.X - R) <= r && Math.Abs(w.Y - (n.Y + n.H * 0.8f)) <= r) return 1;
         if (Math.Abs(w.Y - B) <= r && Math.Abs(w.X - (n.X + n.W / 2)) <= r * 1.6f) return 2;
         node = null; return 0;
     }
     IEnumerable<System.Drawing.PointF> ResizeHandles(DgNode n) {
-        yield return new System.Drawing.PointF(n.X + n.W, n.Y + n.H / 2);
+        yield return new System.Drawing.PointF(n.X + n.W, n.Y + n.H * 0.8f);      // below the connection dot
         yield return new System.Drawing.PointF(n.X + n.W / 2, n.Y + n.H);
         yield return new System.Drawing.PointF(n.X + n.W, n.Y + n.H);
     }
