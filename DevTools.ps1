@@ -23151,7 +23151,7 @@ public static class DgRender {
                 bx += bw + 12;
             }
             if (n.Badge.Length > 0 || status.Length > 0 || n.Metric.Length > 0) {
-                if (status.Length > 0 || n.Badge.Length > 0) p.Ellipse(bx, ty + 9.5f, 4, 4, StatusCol(c, status), null, 0, o, "dg-status");
+                if (status.Length > 0 || n.Outage) p.Ellipse(bx, ty + 9.5f, 4, 4, StatusCol(c, status), null, 0, o, "dg-status");      // a dot only where there is a status
                 string rate = n.Metric; string r2; if (v.Rate.TryGetValue(n.Id, out r2)) rate = r2;
                 // the live rate ("12.3k pps", up to 9 characters) only where it fits beside the badge and the dot
                 float room = (x + w - 14) - (bx + 10);
@@ -27943,8 +27943,10 @@ public static class DgAssets {
       '<div class=""' + P + '-pg""><div><span>Packets observed</span><b class=""' + P + '-po"">0</b></div><div><span>Dropped here</span><b class=""' + P + '-pdr"">0</b></div></div>' +
       '<div class=""' + P + '-pio""><div><span>Receives from</span>' + esc(ins.join(', ') || '-') + '</div><div><span>Sends to</span>' + esc(out.join(', ') || '-') + '</div></div>' +
       (n.u ? '<a class=""' + P + '-lnk"" href=""' + esc(n.u) + '"" target=""_blank"" rel=""noopener"" title=""' + esc(n.u) + '"">' + esc(n.bt || n.gb || 'Open webpage') + ' \u2197</a>' : '') +
-      '<div class=""' + P + '-pf""><span class=""' + P + '-st' + (down ? ' ' + P + '-bad' : loss ? ' ' + P + '-warn' : '') + '""><i></i>' + (down ? 'Down' : loss ? 'Packet loss ' + Math.round(loss * 100) + '%' : 'Operational') + '</span>' +
-      (O.outage && (n.ou || down) ? '<button type=""button"" class=""' + P + '-out"">' + (down ? 'End outage' : 'Simulate outage') + '</button>' : '') + '</div>';
+      // a status only for shapes that have one (status set in the text, or Simulate outage offered); notes and steps show none
+      (down || loss || n.s || n.ou ? '<div class=""' + P + '-pf""><span class=""' + P + '-st' + (down || /^(down|bad|error)$/.test(n.s) ? ' ' + P + '-bad' : loss || /^warn/.test(n.s) ? ' ' + P + '-warn' : '') + '""><i></i>' +
+        (down ? 'Down' : loss ? 'Packet loss ' + Math.round(loss * 100) + '%' : /^(down|bad|error)$/.test(n.s) ? 'Down' : /^warn/.test(n.s) ? 'Warning' : 'Operational') + '</span>' +
+        (O.outage && (n.ou || down) ? '<button type=""button"" class=""' + P + '-out"">' + (down ? 'End outage' : 'Simulate outage') + '</button>' : '') + '</div>' : '');
     panel.hidden = false;
     panel.querySelector(cls('x')).onclick = function () { select(null); };
     var ob = panel.querySelector(cls('out'));
@@ -29334,8 +29336,13 @@ function Show-DiagramDetails($P, $Node) {
     New-TbLabel $P 'Sends to' -Dim | ForEach-Object { $_.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0) }
     New-TbLabel $P $(if ($outs) { $outs -join ', ' } else { '-' }) | ForEach-Object { $_.MaximumSize = New-Object System.Drawing.Size((Px 250), 0) }
     $isDown = $cv.View.Down.Contains($Node.Id); $isLossy = $cv.View.Loss.ContainsKey($Node.Id)
-    $st = New-TbLabel $P $(if ($isDown) { 'DOWN (simulated outage)' } elseif ($isLossy) { "Packet loss $([int]($cv.View.Loss[$Node.Id] * 100))% (simulated)" } else { 'Operational' })
-    $st.ForeColor = if ($isDown) { $C.Red } elseif ($isLossy) { $C.Yellow } else { $C.Green }; $st.Margin = New-Object System.Windows.Forms.Padding(0, (Px 12), 0, (Px 4))
+    # a status only for shapes that have one (status in the text, or Simulate outage offered)
+    $sv = "$($Node.Status)".ToLower()
+    if ($isDown -or $isLossy -or $sv -or $Node.Outage) {
+        $bad = $isDown -or $sv -in 'down', 'bad', 'error'; $warn = -not $bad -and ($isLossy -or $sv -like 'warn*')
+        $st = New-TbLabel $P $(if ($isDown) { 'DOWN (simulated outage)' } elseif ($isLossy) { "Packet loss $([int]($cv.View.Loss[$Node.Id] * 100))% (simulated)" } elseif ($bad) { 'Down' } elseif ($warn) { 'Warning' } else { 'Operational' })
+        $st.ForeColor = if ($bad) { $C.Red } elseif ($warn) { $C.Yellow } else { $C.Green }; $st.Margin = New-Object System.Windows.Forms.Padding(0, (Px 12), 0, (Px 4))
+    }
     if ($Node.Outage -or $isDown) { [void](New-Button $(if ($isDown) { 'End outage' } else { 'Simulate outage' }) 'Stop the traffic from this shape (only in the preview)' {
         $id = $DgUI.PropId; $v = $DgUI.Canvas.View
         if ($v.Down.Contains($id)) { [void]$v.Down.Remove($id) } else { [void]$v.Down.Add($id) }
