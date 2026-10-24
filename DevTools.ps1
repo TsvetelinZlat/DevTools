@@ -21480,6 +21480,7 @@ public class DgCategory { public string Id = "", Name = "", Light = "", Dark = "
 
 public class DgNode {
     public string Id = "", Label = "", Badge = "", Cat = "", Shape = "", Fill = "", Stroke = "", TextColor = "", Icon = "", Status = "", Metric = "", Url = "", Desc = "", Group = "";
+    public string Align = "", VAlign = "";   // text inside the shape: left | center | right, top | middle | bottom (empty: the shape's usual)
     public string LinkText = "";    // the text on the link's button (details panel and hover button); empty: "Open webpage"
     public string Button = "";      // "Open webpage" (or its own text): a button by the box in the web page, when it has a url
     public List<string> Tags = new List<string>(), Lines = new List<string>(), Items = new List<string>();
@@ -22001,7 +22002,7 @@ public static class DgText {
     static bool KnownKey(string k) {
         switch (k) {
             case "badge": case "lane": case "at": case "size": case "w": case "width": case "h": case "height": case "shape": case "fill": case "stroke": case "border": case "color": case "text":
-            case "icon": case "status": case "metric": case "url": case "link": case "button": case "linktext": case "buttontext": case "font": case "lines": case "items": case "in": case "group": case "cat": case "category": case "flow":
+            case "icon": case "status": case "metric": case "url": case "link": case "button": case "linktext": case "buttontext": case "align": case "valign": case "font": case "lines": case "items": case "in": case "group": case "cat": case "category": case "flow":
             case "desc": case "tags": case "label": case "via": case "density": case "arrow": case "from": case "to": case "route": case "labelat": return true;
         }
         return false;
@@ -22044,6 +22045,8 @@ public static class DgText {
                 case "spark": case "sparkline": n.Spark = true; break;
                 case "outage": n.Outage = true; break;
                 case "bold": n.Bold = true; break;
+                case "align": { var a2 = v.Trim().ToLowerInvariant(); n.Align = a2 == "centre" || a2 == "middle" ? "center" : (a2 == "left" || a2 == "center" || a2 == "right" ? a2 : ""); break; }
+                case "valign": { var a2 = v.Trim().ToLowerInvariant(); n.VAlign = a2 == "center" || a2 == "centre" ? "middle" : (a2 == "top" || a2 == "middle" || a2 == "bottom" ? a2 : ""); break; }
                 case "dashed": n.Dashed = true; break;
                 case "hidden": n.Hidden = true; break;
                 case "ok": case "up": n.Status = "ok"; break;
@@ -23143,7 +23146,21 @@ public static class DgRender {
         if (shape == "card") {
             p.Rect(x, y, w, h, d.Radius, fill, stroke, sw, n.Dashed ? 1 : 0, o, "dg-box");
             float ty = y + 14;
+            float tsC = DgLayout.TitleSize(n, true);
+            bool hdr = n.Badge.Length > 0 || status.Length > 0 || n.Metric.Length > 0;
+            if (n.VAlign == "middle" || n.VAlign == "bottom") {
+                float block = (hdr ? 28 : 0) + tsC + 8 + n.Lines.Count * 16 - 8;
+                float limit = n.ItemBoxes.Count > 0 ? n.ItemBoxes.Min(r => r.Y) - 8 : (n.Spark ? y + h - 14 - 28 - 6 : y + h - 14);
+                float free = Math.Max(0, limit - ty - block);
+                ty += n.VAlign == "middle" ? free / 2 : free;
+            }
+            string anc = n.Align == "center" ? "middle" : n.Align == "right" ? "end" : "start";
+            float ax = n.Align == "center" ? x + w / 2 : n.Align == "right" ? x + w - 14 : x + 14;
             float bx = x + 14;
+            if (n.Align == "center" || n.Align == "right") {
+                float rowW = (n.Badge.Length > 0 ? DgMeasure.Width(n.Badge, 10.5f, 600, true) + 14 + 12 : 0) + (status.Length > 0 || n.Outage ? 8 : 0);
+                bx = n.Align == "center" ? x + w / 2 - rowW / 2 : x + w - 14 - rowW;
+            }
             if (n.Badge.Length > 0) {
                 float bw = DgMeasure.Width(n.Badge, 10.5f, 600, true) + 14;
                 p.Rect(bx, ty, bw, 19, 4, ck != null ? c.Mix(ck, "chipTint", "chip") : c.Get("chip"), null, 0, 0, o);
@@ -23155,13 +23172,13 @@ public static class DgRender {
                 string rate = n.Metric; string r2; if (v.Rate.TryGetValue(n.Id, out r2)) rate = r2;
                 // the live rate ("12.3k pps", up to 9 characters) only where it fits beside the badge and the dot
                 float room = (x + w - 14) - (bx + 10);
-                if (rate.Length > 0 && room >= DgMeasure.Width(rate.Trim().Length > 0 ? rate : "99.9k pps", 10, 400, true)) p.Text(x + w - 14, ty + 13, rate, 10, 400, c.Get("muted"), "end", true, o, 0, "dg-rate");
+                if (n.Align != "right" && rate.Length > 0 && room >= DgMeasure.Width(rate.Trim().Length > 0 ? rate : "99.9k pps", 10, 400, true)) p.Text(x + w - 14, ty + 13, rate, 10, 400, c.Get("muted"), "end", true, o, 0, "dg-rate");
                 ty += 28;
             }
             float ts = DgLayout.TitleSize(n, true);
-            p.Text(x + 14, ty + ts - 1, n.Title, ts, 600, ink, "start", false, o, 0, "dg-title");
+            p.Text(ax, ty + ts - 1, n.Title, ts, 600, ink, anc, false, o, 0, "dg-title");
             ty += ts + 8;
-            foreach (var ln in n.Lines) { p.Text(x + 14, ty + 11, ln, 11.5f, 400, c.Get("muted"), "start", false, o, 0, null); ty += 16; }
+            foreach (var ln in n.Lines) { p.Text(ax, ty + 11, ln, 11.5f, 400, c.Get("muted"), anc, false, o, 0, null); ty += 16; }
             for (int i = 0; i < n.ItemBoxes.Count; i++) {
                 var r = n.ItemBoxes[i]; bool small = r.Height < 24;
                 p.Begin("dg-item", null, "data-item=\"" + DgSvgPainter.Esc(n.Id + "." + n.Items[i]) + "\"");
@@ -23233,12 +23250,21 @@ public static class DgRender {
             var lines = DgLayout.Wrap(n.Title, ts, n.Bold ? 600 : 500, shape == "diamond" ? w / 1.45f - 30 : w - 30);
             float lh = ts + 5;
             float top = shape == "actor" ? y + h - 8 : y + h / 2 - lines.Count * lh / 2 + ts * 0.82f + (n.Badge.Length > 0 ? 9 : 0) + (shape == "cylinder" ? 5 : 0);
+            if (shape != "actor" && (n.VAlign == "top" || n.VAlign == "bottom")) {
+                float blockH = lines.Count * lh + (n.Badge.Length > 0 ? 18 : 0);
+                float t0 = n.VAlign == "top" ? y + 12 + (shape == "cylinder" ? 10 : 0) : y + h - 12 - blockH - (shape == "doc" ? 8 : 0);
+                top = t0 + (n.Badge.Length > 0 ? 18 : 0) + ts * 0.82f;
+            }
+            bool side = shape != "actor" && shape != "circle" && shape != "diamond";
+            string anc2 = side && n.Align == "left" ? "start" : side && n.Align == "right" ? "end" : "middle";
+            float tx = anc2 == "start" ? x + 14 : anc2 == "end" ? x + w - 14 : x + w / 2;
             if (n.Badge.Length > 0 && shape != "actor") {
                 float bw = DgMeasure.Width(n.Badge, 9.5f, 600, true) + 10;
-                p.Rect(x + w / 2 - bw / 2, top - ts - 15, bw, 15, 3, ck != null ? c.Mix(ck, "chipTint", "chip") : c.Get("chip"), null, 0, 0, o);
-                p.Text(x + w / 2, top - ts - 4, n.Badge, 9.5f, 600, ck != null ? c.Get(ck) : ink, "middle", true, o, 0, null);
+                float bx2 = anc2 == "start" ? tx : anc2 == "end" ? tx - bw : tx - bw / 2;
+                p.Rect(bx2, top - ts - 15, bw, 15, 3, ck != null ? c.Mix(ck, "chipTint", "chip") : c.Get("chip"), null, 0, 0, o);
+                p.Text(bx2 + bw / 2, top - ts - 4, n.Badge, 9.5f, 600, ck != null ? c.Get(ck) : ink, "middle", true, o, 0, null);
             }
-            foreach (var ln in lines) { p.Text(x + w / 2, top, ln, ts, n.Bold ? 600 : 500, ink, "middle", false, o, 0, "dg-title"); top += lh; }
+            foreach (var ln in lines) { p.Text(tx, top, ln, ts, n.Bold ? 600 : 500, ink, anc2, false, o, 0, "dg-title"); top += lh; }
             if (status.Length > 0) p.Ellipse(x + w - 9, y + 9, 3.5f, 3.5f, StatusCol(c, status), null, 0, o, "dg-status");
         }
         p.End();
@@ -23379,7 +23405,8 @@ public class DgCanvas : System.Windows.Forms.Panel {
     public event EventHandler SelectionChanged, NodeOpened, Moved, EdgeAdded, DeleteRequested, LegendChanged, CopyRequested, PasteRequested, DuplicateRequested, LabelMoved;
     public DgEdge MovedLabel, MovedEdge;
     public bool MovedSource;
-    public event EventHandler EndMoved, RouteMoved;
+    public event EventHandler EndMoved, RouteMoved, Resized;
+    public string ResizedId = "";                    // the shape whose size was dragged (Resized)
     DgEdge labelEdge, endEdge;
     bool endSource;
     public System.Drawing.PointF MouseCanvas;       // where the mouse is (canvas units)
@@ -23397,7 +23424,8 @@ public class DgCanvas : System.Windows.Forms.Panel {
     DateTime last = DateTime.Now, lastSample = DateTime.Now;
     Random rnd = new Random(7);
 
-    enum Mode { None, Pan, Drag, Box, Link, Label, End, Route }
+    enum Mode { None, Pan, Drag, Box, Link, Label, End, Route, Resize }
+    DgNode resizeNode; int resizeAxis;              // 1 width, 2 height, 3 both
     Mode mode = Mode.None;
     System.Drawing.Point down;
     System.Drawing.PointF dragAnchor;
@@ -23427,6 +23455,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
         Invalidate();
     }
 
+    public System.Drawing.PointF ToCanvas(System.Drawing.Point client) { return W(client); }      // a point in the control -> diagram units
     System.Drawing.PointF W(System.Drawing.Point p) { return new System.Drawing.PointF(p.X / Zoom + Pan.X, p.Y / Zoom + Pan.Y); }
     public bool UserView;                     // the user zoomed or panned: no more automatic fitting
     protected override void OnResize(EventArgs e) { base.OnResize(e); if (!UserView) ZoomToFit(); }
@@ -23509,6 +23538,25 @@ public class DgCanvas : System.Windows.Forms.Panel {
     System.Drawing.PointF LinkHandle(DgNode n) { return new System.Drawing.PointF(n.X + n.W, n.Y + n.H / 2); }
     bool OnHandle(DgNode n, System.Drawing.PointF w) { var h = LinkHandle(n); float r = 8 / Zoom; return Editable && Math.Abs(w.X - h.X) <= r && Math.Abs(w.Y - h.Y) <= r; }
 
+    // a resize handle of the one selected shape under the mouse: 1 right edge, 2 bottom edge, 3 corner, 0 none
+    int ResizeHit(System.Drawing.PointF w, out DgNode node) {
+        node = null;
+        if (!Editable || View.Selected.Count != 1) return 0;
+        var n = Doc.Find(View.Selected.First());
+        if (n == null || n.Hidden) return 0;
+        float r = 7 / Zoom, R = n.X + n.W, B = n.Y + n.H;
+        node = n;
+        if (Math.Abs(w.X - R) <= r && Math.Abs(w.Y - B) <= r) return 3;
+        if (Math.Abs(w.X - R) <= r && Math.Abs(w.Y - (n.Y + n.H / 2)) <= r * 1.6f) return 1;
+        if (Math.Abs(w.Y - B) <= r && Math.Abs(w.X - (n.X + n.W / 2)) <= r * 1.6f) return 2;
+        node = null; return 0;
+    }
+    IEnumerable<System.Drawing.PointF> ResizeHandles(DgNode n) {
+        yield return new System.Drawing.PointF(n.X + n.W, n.Y + n.H / 2);
+        yield return new System.Drawing.PointF(n.X + n.W / 2, n.Y + n.H);
+        yield return new System.Drawing.PointF(n.X + n.W, n.Y + n.H);
+    }
+
     public void Select(IEnumerable<string> ids) { View.Selected = new HashSet<string>(ids); View.SelectedEdge = ""; Invalidate(); if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); }
     public string SelectedId { get { return View.Selected.Count == 1 ? View.Selected.First() : ""; } }
 
@@ -23534,6 +23582,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
             }
             if (best != null) { mode = Mode.End; endEdge = best; endSource = src; View.Selected.Clear(); View.SelectedEdge = best.Id; if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); Invalidate(); return; }
         }
+        { DgNode rn; int ax = ResizeHit(w, out rn); if (ax > 0) { mode = Mode.Resize; resizeNode = rn; resizeAxis = ax; return; } }
         if (Editable) foreach (var le in Doc.Edges) if (le.Label.Length > 0 && !le.LabelBox.IsEmpty && le.LabelBox.Contains(w)) { mode = Mode.Label; labelEdge = le; View.Selected.Clear(); View.SelectedEdge = le.Id; if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty); return; }
         var n = NodeAt(w);
         if (n != null && OnHandle(n, w)) { mode = Mode.Link; linkFrom = n.Id; mouseW = w; return; }
@@ -23581,6 +23630,11 @@ public class DgCanvas : System.Windows.Forms.Panel {
             case Mode.End: if (moved && endEdge != null) { SnapEnd(endEdge, endSource, w); DgRoute.All(Doc); packets.Clear(); Invalidate(); } return;
             case Mode.Route: if (moved && endEdge != null) { endEdge.Via = new List<System.Drawing.PointF> { new System.Drawing.PointF((float)Math.Round(w.X), (float)Math.Round(w.Y)) }; endEdge.Route = endEdge.Route == "straight" ? "" : endEdge.Route; DgRoute.All(Doc); packets.Clear(); Invalidate(); } return;
             case Mode.Label: if (moved && labelEdge != null) { labelEdge.LabelAt = new System.Drawing.PointF((float)Math.Round(w.X), (float)Math.Round(w.Y)); Invalidate(); } return;
+            case Mode.Resize:
+                if (!moved || resizeNode == null) return;
+                if ((resizeAxis & 1) != 0) { resizeNode.W = Math.Max(60, (float)Math.Round((w.X - resizeNode.X) / 4) * 4); resizeNode.SetW = resizeNode.W; }
+                if ((resizeAxis & 2) != 0) { resizeNode.H = Math.Max(30, (float)Math.Round((w.Y - resizeNode.Y) / 4) * 4); resizeNode.SetH = resizeNode.H; }
+                DgLayout.ItemBoxes(resizeNode); DgRoute.All(Doc); packets.Clear(); Invalidate(); return;
         }
         if (Doc.Chart != null) {
             var hit = DgChartRender.HitAt(Doc.Chart, w);
@@ -23589,6 +23643,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
             if (hs != View.Hover || (hit != null && tipAt != e.Location)) { View.Hover = hs; tip = hit == null ? "" : hit.Tip; tipAt = e.Location; Invalidate(); }
             return;
         }
+        { DgNode rn; int ax = ResizeHit(w, out rn); if (ax > 0) { Cursor = ax == 3 ? System.Windows.Forms.Cursors.SizeNWSE : ax == 1 ? System.Windows.Forms.Cursors.SizeWE : System.Windows.Forms.Cursors.SizeNS; return; } }
         var n = NodeAt(w);
         string h = n == null ? "" : n.Id;
         Cursor = n != null ? (OnHandle(n, w) ? System.Windows.Forms.Cursors.Cross : System.Windows.Forms.Cursors.Hand) : (EdgeAt(w) != null ? System.Windows.Forms.Cursors.Hand : System.Windows.Forms.Cursors.Default);
@@ -23605,6 +23660,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
         else if (m == Mode.Route && moved && endEdge != null) { MovedEdge = endEdge; if (RouteMoved != null) RouteMoved(this, EventArgs.Empty); }
         else if (m == Mode.Label && moved && labelEdge != null) { MovedLabel = labelEdge; if (LabelMoved != null) LabelMoved(this, EventArgs.Empty); }
         else if (m == Mode.Drag && moved) { MovedIds = dragFrom.Keys.ToList(); if (Moved != null) Moved(this, EventArgs.Empty); }
+        else if (m == Mode.Resize && moved && resizeNode != null) { ResizedId = resizeNode.Id; resizeNode = null; if (Resized != null) Resized(this, EventArgs.Empty); }
         else if (m == Mode.Box) {
             var ids = Doc.Nodes.Where(n => !n.Hidden && box.IntersectsWith(n.Box)).Select(n => n.Id).ToList();
             Select(ids); box = System.Drawing.RectangleF.Empty;
@@ -23773,6 +23829,16 @@ public class DgCanvas : System.Windows.Forms.Panel {
                 using (var b = new System.Drawing.SolidBrush(DgColors.Parse(c.Raw("sel")))) g.FillEllipse(b, h.X - 5, h.Y - 5, 10, 10);
                 using (var pen = new System.Drawing.Pen(DgColors.Parse(c.Raw("bg")), 1.5f)) g.DrawEllipse(pen, h.X - 5, h.Y - 5, 10, 10);
             }
+            // resize handles on the one selected shape
+            if (View.Selected.Count == 1) {
+                var sn = Doc.Find(View.Selected.First());
+                if (sn != null && !sn.Hidden) {
+                    float hs = 7 / Zoom;
+                    using (var b = new System.Drawing.SolidBrush(DgColors.Parse(c.Raw("bg"))))
+                    using (var pen = new System.Drawing.Pen(DgColors.Parse(c.Raw("sel")), 1.6f / Zoom))
+                        foreach (var hp in ResizeHandles(sn)) { g.FillRectangle(b, hp.X - hs / 2, hp.Y - hs / 2, hs, hs); g.DrawRectangle(pen, hp.X - hs / 2, hp.Y - hs / 2, hs, hs); }
+                }
+            }
             if (mode == Mode.Link) {
                 var f = Doc.Find(linkFrom);
                 if (f != null) using (var pen = new System.Drawing.Pen(DgColors.Parse(c.Raw("sel")), 2 / Zoom) { DashPattern = new float[] { 4, 3 } }) g.DrawLine(pen, LinkHandle(f), mouseW);
@@ -23807,7 +23873,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
         // legend: one chip per flow / category used by links (click to hide)
         legendHits.Clear();
         if (Doc.On("legend")) {
-            var cats = Doc.Chart != null ? Doc.Cats.ToList() : Doc.Cats.Where(k => Doc.Edges.Any(e => e.Cat == k.Id) || Doc.Nodes.Any(n => n.Cat == k.Id)).ToList();
+            var cats = Doc.Chart != null ? Doc.Cats.ToList() : Doc.Cats.Where(k => Doc.Edges.Any(e => e.Cat == k.Id)).ToList();      // like the web page: only flows that links use
             float maxX = ZoomButtons()[0].X - 12 * s;
             // rows from the bottom: measure first, then lay out so the last row sits at the bottom
             var widths = cats.Select(k => g.MeasureString(k.Name, fUi).Width + 38 * s).ToList();
@@ -24002,8 +24068,9 @@ public static class DgHtml {
             if (kind == "widget") {
                 outText = "<!-- " + (string.IsNullOrEmpty(d.Title) ? "Diagram" : d.Title).Replace("--", "-") + ": made with DevTools Diagram studio. Paste anywhere in a page; window.diagrams['" + prefix + "'] is its API. -->\n" + font + markup + script;
             } else {
+                // the page fills the window only when the diagram is the whole page; pasted into another page it changes nothing there
                 outText = "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>" + DgSvgPainter.Esc(string.IsNullOrEmpty(d.Title) ? "Diagram" : d.Title) + "</title>\n" + font +
-                          "<style>html,body{margin:0;height:100%;overflow:hidden}</style>\n</head>\n<body>\n" + markup + script + "</body>\n</html>\n";
+                          "<style>body:has(> .dg-root:only-of-type){margin:0;overflow:hidden}</style>\n</head>\n<body>\n" + markup + script + "</body>\n</html>\n";
             }
         }
         // ids, classes and selectors get the prefix (data-* attributes and CSS variables are scoped by the root)
@@ -24040,6 +24107,8 @@ public static class DgClip {
         if (n.TextColor.Length > 0) a.Add("color " + n.TextColor);
         if (n.FontSize > 0) a.Add("font " + N(n.FontSize));
         if (n.Bold) a.Add("bold");
+        if (n.Align.Length > 0) a.Add("align " + n.Align);
+        if (n.VAlign.Length > 0) a.Add("valign " + n.VAlign);
         if (n.Dashed) a.Add("dashed");
         if (n.SetW > 0 || n.SetH > 0) a.Add("size " + N(n.SetW > 0 ? n.SetW : n.W) + " " + N(n.SetH > 0 ? n.SetH : n.H));
         if (!string.IsNullOrEmpty(group)) a.Add("in " + group);
@@ -29074,16 +29143,20 @@ function Copy-DiagramSelection([switch]$Quiet) {
     if (-not $Quiet) { try { [System.Windows.Forms.Clipboard]::SetText($t) } catch { } }
     $t
 }
-function Paste-DiagramClip([string]$Clip = '', [switch]$Offset) {
+function Paste-DiagramClip([string]$Clip = '', [switch]$Offset, $At = $null) {
     if (-not $Clip) { try { $Clip = [System.Windows.Forms.Clipboard]::GetText() } catch { $Clip = '' } }
     if (-not $Clip.Trim()) { return }
     $cv = $DgUI.Canvas
     $x = [float]::NaN; $y = [float]::NaN
     if (-not $Offset) {
-        if ($cv.MouseInside) { $x = $cv.MouseCanvas.X; $y = $cv.MouseCanvas.Y }
+        if ($At) { $x = $At.X; $y = $At.Y }                                      # Paste here: where the menu was opened
+        elseif ($cv.MouseInside) { $x = $cv.MouseCanvas.X; $y = $cv.MouseCanvas.Y }
         else { $b = $DgUI.Doc.Bounds; $x = $b.Right + 40; $y = $b.Y + 40 }     # free space to the right
     }
-    $new = [DgClip]::Paste($DgUI.Text, $DgUI.Doc, $Clip, $x, $y)
+    # the shapes already there stay where they are (an automatic layout would otherwise rearrange them around the pasted ones)
+    $base = $DgUI.Text
+    foreach ($n in @($DgUI.Doc.Nodes | Where-Object { -not $_.HasPos -and -not $_.Hidden })) { $base = [DgText]::SetNodeAttr($base, $n.Id, 'at', "$([int]$n.X) $([int]$n.Y)") }
+    $new = [DgClip]::Paste($base, $DgUI.Doc, $Clip, $x, $y)
     if ($new -ceq $DgUI.Text) { return }
     Set-DiagramText $new
     $cv.Select([string[]]@([DgClip]::Pasted))
@@ -29203,6 +29276,8 @@ function Update-DiagramProps {
         Add-DgProp $p 'Category (colour; type a new name to add one)' (New-DgCombo (@('(none)') + $cats) $(if ($node.Cat) { $node.Cat } else { '(none)' }) { param($v) Set-DiagramNodeAttr $DgUI.PropId 'cat' $(if ($v -and $v -ne '(none)') { $v -replace '\W', '' } else { $null }) } -Editable) | Out-Null
         $shapes = @('auto', 'card', 'rounded', 'rect', 'pill', 'circle', 'diamond', 'hexagon', 'parallelogram', 'cylinder', 'doc', 'note', 'actor', 'table', 'text')
         Add-DgProp $p 'Shape' (New-DgCombo $shapes $(if ($node.Shape) { $node.Shape } else { 'auto' }) { param($v) Set-DiagramNodeAttr $DgUI.PropId 'shape' $(if ($v -ne 'auto') { $v } else { $null }) }) 160 | Out-Null
+        Add-DgProp $p 'Text across' (New-DgCombo @('usual', 'left', 'center', 'right') $(if ($node.Align) { $node.Align } else { 'usual' }) { param($v) Set-DiagramNodeAttr $DgUI.PropId 'align' $(if ($v -ne 'usual') { $v } else { $null }) }) 160 | Out-Null
+        Add-DgProp $p 'Text up / down' (New-DgCombo @('usual', 'top', 'middle', 'bottom') $(if ($node.VAlign) { $node.VAlign } else { 'usual' }) { param($v) Set-DiagramNodeAttr $DgUI.PropId 'valign' $(if ($v -ne 'usual') { $v } else { $null }) }) 160 | Out-Null
         if ($d.LaneMode) {
             $lanes = @('auto') + @(for ($i = 0; $i -lt [Math]::Max($d.Lanes.Count, 1); $i++) { "$($i + 1)  $(if ($i -lt $d.Lanes.Count) { $d.Lanes[$i] })" })
             Add-DgProp $p 'Lane (column)' (New-DgCombo $lanes $(if ($node.Lane -ge 0) { $lanes[$node.Lane + 1] } else { 'auto' }) { param($v) Set-DiagramNodeAttr $DgUI.PropId 'lane' $(if ($v -ne 'auto') { ($v -split ' ')[0] } else { $null }) }) 200 | Out-Null
@@ -29531,6 +29606,7 @@ function Show-DiagramStudio([string]$Text = '') {
     $pText = Add-ApiTab $tabs 'Text'
     $DgUI.Tabs = $tabs
     Add-DiagramDataTab $tabs
+    Add-DiagramShapesTab $tabs
     $pSaved = Add-ApiTab $tabs 'Saved'
     $ed = New-TbRtb; $ed.Dock = 'Fill'; $ed.AcceptsTab = $true; $ed.WordWrap = $false
     $DgUI.Editor = $ed
@@ -29609,6 +29685,13 @@ function Show-DiagramStudio([string]$Text = '') {
         foreach ($id in $src.MovedIds) { $n = $DgUI.Doc.Find($id); if ($n) { $t = [DgText]::SetNodeAttr($t, $id, 'at', "$([int]$n.X) $([int]$n.Y)") } }
         Set-DiagramText $t
     })
+    $cv.add_Resized({
+        param($src, $e)
+        $n = $DgUI.Doc.Find($src.ResizedId); if (-not $n) { return }
+        $t = [DgText]::SetNodeAttr($DgUI.Text, $n.Id, 'size', "$([int]$n.W) $([int]$n.H)")
+        $t = [DgText]::SetNodeAttr($t, $n.Id, 'at', "$([int]$n.X) $([int]$n.Y)")
+        Set-DiagramText $t
+    })
     $cv.add_EdgeAdded({ param($src, $e) Set-DiagramText ([DgText]::AddLine($DgUI.Text, "$($src.NewEdgeFrom) -> $($src.NewEdgeTo)")) })
     $cv.add_DeleteRequested({ Remove-DiagramSelection })
     $cv.add_NodeOpened({ if ($DgUI.Canvas.Editable) { Edit-DiagramLabel } })
@@ -29650,7 +29733,7 @@ function Show-DiagramStudio([string]$Text = '') {
             [void](Add-MenuItem $src 'Duplicate' { Copy-DiagramDuplicate } $Glyph.Copy 'Ctrl+D')
         }
         $clipText = ''; try { $clipText = [System.Windows.Forms.Clipboard]::GetText() } catch { }
-        if ($clipText.Trim()) { [void](Add-MenuItem $src 'Paste here' { Paste-DiagramClip } $Glyph.Paste 'Ctrl+V') }
+        if ($clipText.Trim()) { [void](Add-MenuItem $src 'Paste here' { Paste-DiagramClip -At $DgUI.MenuAt } $Glyph.Paste 'Ctrl+V') }
         if ($n) {
             [void](Add-MenuItem $src 'Rename' { Edit-DiagramLabel } $Glyph.Edit 'Double-click')
             [void](Add-MenuItem $src 'Auto position' { $t = $DgUI.Text; foreach ($id in @($DgUI.Canvas.View.Selected)) { $t = [DgText]::SetNodeAttr($t, $id, 'at', $null) }; Set-DiagramText $t } $Glyph.Refresh)
@@ -29714,6 +29797,7 @@ web: Web app [badge WEB, prod, lane 1, status ok, spark]
 db[(Orders DB)]   a([Pill])   b{Decision?}   c((Circle))   d{{Hex}}   e[/Lean/]    (Mermaid shapes)
 [shape card|rounded|rect|pill|circle|diamond|hexagon|parallelogram|cylinder|doc|note|actor|table|text]   (text = free text, no box)
 [fill #123456, stroke #..., color #..., font 16, bold, dashed, size 240 90, at 120 80, url "https://..."]
+[align left|center|right, valign top|middle|bottom]   where the text sits in the shape; drag a selected shape's edge or corner to resize it
 
 LINKS
 a -> b            a --> b        a -.-> b (dashed)     a ==> b (thick)      a --- b (no arrow)     a <-> b (both)
@@ -30191,6 +30275,130 @@ function New-DiagramFromData {
     Select-ApiTab $DgUI.Tabs 'Text'
 }
 
+# ---- the Shapes tab: ready-made shapes to click (added in the middle of the view) or drag onto the canvas (dropped where you let go)
+$DgShapeLibrary = [ordered]@{
+    'Basics' = [ordered]@{
+        'Card'      = "card: Card title [badge TAG]`n  lines `"A line of description`""
+        'Box'       = 'box: Box [shape rounded]'
+        'Rectangle' = 'rect: Rectangle [shape rect]'
+        'Pill'      = 'pill: Start / end [shape pill]'
+        'Circle'    = 'circle: Circle [shape circle, size 90 90]'
+        'Decision'  = 'decision: Decision? [shape diamond, size 140 90]'
+        'Hexagon'   = 'hex: Hexagon [shape hexagon]'
+        'Note'      = 'note: A note [shape note, size 180 80]'
+        'Text'      = 'text: Free text [shape text]'
+        'Database'  = 'db: Database [shape cylinder, badge DB]'
+        'Document'  = 'doc: Document [shape doc]'
+        'Person'    = 'person: Person [shape actor]'
+        'Table'     = "table: orders [shape table]`n  lines `"id int PK`" `"customer_id int FK`" `"total decimal`""
+    }
+    'Infrastructure' = [ordered]@{
+        'Server'        = "server: Server [badge SRV, status ok, outage]`n  lines `"Role or hostname`""
+        'Firewall'      = "firewall: Firewall [badge FW, status ok, outage]`n  lines `"Perimeter / internal`""
+        'Router/switch' = "router: Router / switch [badge NET, status ok, outage]`n  lines `"Core / access`""
+        'Load balancer' = "lb: Load balancer [badge LB, status ok, spark, outage]`n  lines `"L4 / L7`""
+        'SIEM'          = "siem: SIEM [badge SIEM, status ok, outage]`n  lines `"Detection and alerts`""
+        'Storage'       = "storage: Object storage [badge S3, status ok, outage]`n  lines `"Archive and replay`""
+        'Cloud service' = "cloud: Cloud service [badge CLOUD, outage]`n  lines `"SaaS / API`""
+        'Client PC'     = 'pc: Client [badge PC]'
+        'Users'         = 'users: Users [shape actor]'
+    }
+    'Security and zones' = [ordered]@{
+        'Firewall marker' = 'fwmark: FIREWALL [shape pill, bold, font 10, fill #c0262d, stroke #8f1219, color #ffffff, size 82 22]'
+        'DMZ zone'        = "group dmz `"DMZ`" [left, dashed, fill rgba(250,204,21,0.14), stroke #d4a106] {`n  dmzbox: Device in the DMZ [badge DMZ]`n}"
+        'Inside zone'     = "group inside `"Inside network`" [left, dashed] {`n  insidebox: Internal system [badge NET]`n}"
+        'Healthy'         = 'healthy: Healthy service [badge SVC, status ok, outage]'
+        'Warning'         = 'warning: Degraded service [badge SVC, status warn, outage]'
+        'Down'            = 'down: Failed service [badge SVC, status down, outage]'
+    }
+    'Process' = [ordered]@{
+        'Pipeline step'   = "step: Step [badge 1 STEP, size 130 110]`n  lines `"What happens`" `"in this step`""
+        '3-step pipeline' = "step1: Receive [badge 1, size 120 96]`nstep2: Process [badge 2, size 120 96]`nstep3: Send [badge 3, size 120 96]`nstep1 -> step2 -> step3 [animate]"
+        'Start / end'     = "start: Start [shape pill]`nfinish: End [shape pill]`nstart -> finish"
+    }
+}
+
+function Add-DiagramShapesTab($Tabs) {
+    $p = Add-ApiTab $Tabs 'Shapes'
+    $fl = New-Object System.Windows.Forms.FlowLayoutPanel
+    $fl.Dock = 'Fill'; $fl.AutoScroll = $true; $fl.WrapContents = $true; $fl.BackColor = $C.Bg
+    $fl.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 8))
+    $p.Controls.Add($fl)
+    $DgUI.ShapesPanel = $fl; $DgUI.ShapesDrawn = $false
+    $tip = New-TbLabel $fl 'Click a shape to add it in the middle of the view, or drag it onto the canvas. Drag its edges to resize it.' -Dim
+    $tip.AutoSize = $false; $tip.Size = New-Object System.Drawing.Size((Px 390), ($FontMain.Height * 2 + (Px 8))); $fl.SetFlowBreak($tip, $true)
+    foreach ($grp in $DgShapeLibrary.Keys) {
+        # the group's heading on a row of its own (the last tile of the group before also ends its row)
+        if ($fl.Controls.Count) { $fl.SetFlowBreak($fl.Controls[$fl.Controls.Count - 1], $true) }
+        $h = New-Object System.Windows.Forms.Label
+        $h.Text = $grp; $h.AutoSize = $false; $h.Font = $FontTitle; $h.Size = New-Object System.Drawing.Size((Px 380), ($FontTitle.Height + (Px 6))); $h.ForeColor = $C.Fore; $h.BackColor = $C.Bg
+        $h.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 14), 0, (Px 4))
+        $fl.Controls.Add($h); $fl.SetFlowBreak($h, $true)
+        foreach ($name in $DgShapeLibrary[$grp].Keys) {
+            $tile = New-Object System.Windows.Forms.Panel
+            $tile.Size = New-Object System.Drawing.Size((Px 122), (Px 104)); $tile.Margin = New-Object System.Windows.Forms.Padding((Px 3)); $tile.BackColor = $C.Panel; $tile.Cursor = 'Hand'
+            $pic = New-Object System.Windows.Forms.PictureBox
+            $pic.Dock = 'Fill'; $pic.SizeMode = 'Zoom'; $pic.BackColor = $C.Panel; $pic.Cursor = 'Hand'
+            $lbl = New-Object System.Windows.Forms.Label
+            $lbl.Dock = 'Bottom'; $lbl.Height = Px 22; $lbl.TextAlign = 'MiddleCenter'; $lbl.Text = $name; $lbl.ForeColor = $C.Fore; $lbl.BackColor = $C.Panel; $lbl.Cursor = 'Hand'
+            $tile.Controls.Add($pic); $tile.Controls.Add($lbl)
+            $tile.Tag = @{ Text = $DgShapeLibrary[$grp][$name]; Pic = $pic }
+            $tooltip.SetToolTip($pic, "$name - click to add, or drag onto the canvas")
+            foreach ($ctl in @($tile, $pic, $lbl)) {
+                $ctl.add_MouseDown({ param($src, $e) $t = if ($src -is [System.Windows.Forms.PictureBox] -or $src -is [System.Windows.Forms.Label]) { $src.Parent } else { $src }; $DgUI.ShapeDown = @{ Tile = $t; At = $e.Location; Dragged = $false } })
+                $ctl.add_MouseMove({
+                    param($src, $e)
+                    $sd = $DgUI.ShapeDown
+                    if (-not $sd -or $e.Button -ne 'Left' -or $sd.Dragged) { return }
+                    if ([Math]::Abs($e.X - $sd.At.X) + [Math]::Abs($e.Y - $sd.At.Y) -lt 6) { return }
+                    $sd.Dragged = $true
+                    $data = New-Object System.Windows.Forms.DataObject
+                    $data.SetData('DevToolsDiagramShape', [string]$sd.Tile.Tag.Text)
+                    [void]$src.DoDragDrop($data, [System.Windows.Forms.DragDropEffects]::Copy)
+                })
+                $ctl.add_MouseUp({
+                    param($src, $e)
+                    $sd = $DgUI.ShapeDown; $DgUI.ShapeDown = $null
+                    if (-not $sd -or $sd.Dragged -or $e.Button -ne 'Left') { return }
+                    Add-DiagramLibraryShape ([string]$sd.Tile.Tag.Text)
+                })
+                $ctl.add_MouseEnter({ param($src, $e) $t = if ($src -is [System.Windows.Forms.PictureBox] -or $src -is [System.Windows.Forms.Label]) { $src.Parent } else { $src }; foreach ($x in @($t) + @($t.Controls)) { $x.BackColor = $C.Hover } })
+                $ctl.add_MouseLeave({ param($src, $e) $t = if ($src -is [System.Windows.Forms.PictureBox] -or $src -is [System.Windows.Forms.Label]) { $src.Parent } else { $src }; foreach ($x in @($t) + @($t.Controls)) { $x.BackColor = $C.Panel } })
+            }
+            $fl.Controls.Add($tile)
+        }
+    }
+    $fl.PerformLayout()
+    # the previews are drawn the first time the tab is shown, in the diagram's theme
+    $p.add_VisibleChanged({ param($src, $e) if ($src.Visible) { Update-DiagramShapePreviews } })
+}
+
+# A shape from the library, added in the middle of what the canvas shows (or at a point, when dropped)
+function Add-DiagramLibraryShape([string]$Text, $At = $null) {
+    $cv = $DgUI.Canvas
+    if (-not $At) { $At = $cv.ToCanvas((New-Object System.Drawing.Point([int]($cv.ClientSize.Width / 2 - 60), [int]($cv.ClientSize.Height / 2 - 40)))) }
+    Paste-DiagramClip $Text -At $At
+}
+
+function Update-DiagramShapePreviews([switch]$Force) {
+    if (-not $DgUI.ShapesPanel -or -not $DgUI.Canvas -or ($DgUI.ShapesDrawn -and -not $Force)) { return }
+    $DgUI.ShapesDrawn = $true
+    $r = New-Object DgCanvas
+    try {
+        $r.Theme = $DgUI.Canvas.Theme
+        foreach ($tile in @($DgUI.ShapesPanel.Controls | Where-Object { $_.Tag -is [hashtable] -and $_.Tag.Pic })) {
+            try {
+                $d = [DgText]::Parse("hide header legend grid`n" + $tile.Tag.Text); [DgLayout]::Apply($d)
+                $r.SetDoc($d, $true)
+                $b = $d.Bounds; $sc = [Math]::Min(2.0, [Math]::Min((Px 240) / [Math]::Max(1, $b.Width), (Px 150) / [Math]::Max(1, $b.Height)))
+                $old = $tile.Tag.Pic.Image
+                $tile.Tag.Pic.Image = $r.RenderBitmap([float]$sc, $false, $DgUI.Canvas.Dark)
+                if ($old) { $old.Dispose() }
+            } catch { Write-Log "shape preview: $_" }
+        }
+    } finally { $r.Dispose() }
+}
+
 # ---- importing diagrams: Import... or a file dropped on the window. .dgm / .txt / Mermaid (.mmd, a ```mermaid block in .md),
 #      draw.io (.drawio / .xml, its SVG and PNG exports), Graphviz (.dot / .gv), CSV / Excel (into the Data tab), and the
 #      SVG / HTML / React / PNG exports of DevTools (they carry the diagram text, so it comes back as it was)
@@ -30252,9 +30460,9 @@ function Open-DiagramImport {
 # files dropped anywhere on the window are imported
 function Register-DiagramDrop($Control) {
     $Control.AllowDrop = $true
-    $Control.add_DragEnter({ param($src, $e) if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { $e.Effect = 'Copy' } })
+    $Control.add_DragEnter({ param($src, $e) if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop) -or ($src -is [DgCanvas] -and $e.Data.GetDataPresent('DevToolsDiagramShape'))) { $e.Effect = 'Copy' } })
     # (imported after the drop returns, so Explorer isn't kept waiting)
-    $Control.add_DragDrop({ param($src, $e) $DgUI.DropFiles = @($e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)); if ($DgUI.DropFiles.Count) { [void]$DgUI.Form.BeginInvoke([Action]{ $files = $DgUI.DropFiles; $DgUI.DropFiles = $null; foreach ($p in $files) { Import-DiagramFile $p } }) } })
+    $Control.add_DragDrop({ param($src, $e) if ($src -is [DgCanvas] -and $e.Data.GetDataPresent('DevToolsDiagramShape')) { Add-DiagramLibraryShape ([string]$e.Data.GetData('DevToolsDiagramShape')) ($src.ToCanvas($src.PointToClient((New-Object System.Drawing.Point($e.X, $e.Y))))); return }; $DgUI.DropFiles = @($e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)); if ($DgUI.DropFiles.Count) { [void]$DgUI.Form.BeginInvoke([Action]{ $files = $DgUI.DropFiles; $DgUI.DropFiles = $null; foreach ($p in $files) { Import-DiagramFile $p } }) } })
     foreach ($ch in $Control.Controls) { if ($ch -isnot [System.Windows.Forms.TextBox]) { Register-DiagramDrop $ch } }
 }
 
