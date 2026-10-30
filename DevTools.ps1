@@ -23968,7 +23968,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
 public class DgHtmlOptions {
     public string Kind = "page";             // page, widget, react
     public string Prefix = "dg", Mode = "auto", Height = "";
-    public bool Header = true, Flows = true, ThemeSwitch = true, Zoom = true, Legend = true, Panel = true, Hover = true, Outage = true, Drops = true, Hint = true, Glow = true, WebFont = false;      // WebFont: a Google Fonts link (needs internet), off unless asked
+    public bool Header = true, Flows = true, ThemeSwitch = true, Zoom = true, Legend = true, Panel = true, Hover = true, Outage = true, Drops = true, FullBtn = true, Hint = true, Glow = true, WebFont = false;      // WebFont: a Google Fonts link (needs internet), off unless asked
 }
 
 public static class DgHtml {
@@ -24054,11 +24054,12 @@ public static class DgHtml {
         sb.Append("</div>\n");
         // the controls sit in the bottom row, before the legend
         var tools = new StringBuilder();
-        if (o.Flows || o.ThemeSwitch || o.Zoom) {
+        if (o.Flows || o.ThemeSwitch || o.Zoom || o.FullBtn) {
             tools.Append("<div class=\"dg-tools\">");
             if (o.Flows) tools.Append("<button type=\"button\" class=\"dg-pause\">Pause</button><div class=\"dg-seg dg-speed\"><button type=\"button\" data-v=\"0.5\">0.5x</button><button type=\"button\" data-v=\"1\" class=\"dg-act\">1x</button><button type=\"button\" data-v=\"2\">2x</button><button type=\"button\" data-v=\"4\">4x</button></div>");
             if (o.ThemeSwitch) tools.Append("<div class=\"dg-seg dg-theme\"><button type=\"button\" data-v=\"dark\">Dark</button><button type=\"button\" data-v=\"light\">Light</button></div>");
             if (o.Zoom) tools.Append("<button type=\"button\" class=\"dg-zout\" title=\"Zoom out\">\u2212</button><span class=\"dg-zoom\">100%</span><button type=\"button\" class=\"dg-zin\" title=\"Zoom in\">+</button><button type=\"button\" class=\"dg-fit\">Fit</button>");
+            if (o.FullBtn) tools.Append("<button type=\"button\" class=\"dg-full\">Fullscreen</button>");
             tools.Append("</div>");
         }
         sb.Append("<div class=\"dg-foot\">" + tools + (o.Legend ? "<div class=\"dg-legend\"></div>" : "<span></span>") +
@@ -28107,6 +28108,25 @@ public static class DgAssets {
   on(cls('zin'), 'click', function () { zoomAt(stage.clientWidth / 2, stage.clientHeight / 2, 1.2); });
   on(cls('zout'), 'click', function () { zoomAt(stage.clientWidth / 2, stage.clientHeight / 2, 1 / 1.2); });
   on(cls('fit'), 'click', function () { fit(true); });
+  // fullscreen: the browser's own; where the host page forbids it (an iframe), the diagram fills the window or frame instead
+  function isFull() { return document.fullscreenElement === root || root.classList.contains(P + '-max'); }
+  function fullChanged() {
+    var b = q(cls('full')); if (b) b.textContent = isFull() ? 'Exit fullscreen' : 'Fullscreen';
+    setTimeout(function () { narrow(); fit(true); }, 60);
+  }
+  function toggleFull() {
+    if (document.fullscreenElement === root) { document.exitFullscreen(); return; }
+    if (root.classList.contains(P + '-max')) { root.classList.remove(P + '-max'); fullChanged(); return; }
+    var cover = function () { root.classList.add(P + '-max'); fullChanged(); };
+    if (!root.requestFullscreen) { cover(); return; }
+    var r = root.requestFullscreen(); if (r && r.catch) r.catch(cover);
+    // some hosts neither allow nor refuse it
+    setTimeout(function () { if (document.fullscreenElement !== root && !root.classList.contains(P + '-max')) cover(); }, 700);
+  }
+  function onFullKey(e) { if (e.key === 'Escape' && root.classList.contains(P + '-max')) { root.classList.remove(P + '-max'); fullChanged(); } }
+  on(cls('full'), 'click', toggleFull);
+  document.addEventListener('fullscreenchange', fullChanged);
+  document.addEventListener('keydown', onFullKey);
 
   stage.addEventListener('wheel', onWheel, { passive: false });
   stage.addEventListener('pointerdown', onDown);
@@ -28137,10 +28157,12 @@ public static class DgAssets {
     pause: function (b) { st.paused = b !== false; var pb = q(cls('pause')); if (pb) pb.textContent = st.paused ? 'Play' : 'Pause'; },
     speed: function (v) { st.speed = v; },
     theme: function (t) { setTheme(t); },
+    fullscreen: function () { toggleFull(); },
     fit: function () { fit(true); },
     showFlow: function (c, show) { if (show === false) st.hidden[c] = 1; else delete st.hidden[c]; highlight(); },
     destroy: function () {
       alive = false; cancelAnimationFrame(raf); if (ro) ro.disconnect();
+      document.removeEventListener('fullscreenchange', fullChanged); document.removeEventListener('keydown', onFullKey);
       window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); window.removeEventListener('pointercancel', onUp);
       stage.removeEventListener('wheel', onWheel); stage.removeEventListener('pointerdown', onDown); stage.removeEventListener('click', onClick); stage.removeEventListener('pointerleave', onLeave);
     }
@@ -28189,6 +28211,8 @@ public static class DgAssets {
 .__P__-tools{pointer-events:auto;display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:8px;border-radius:10px;font-family:var(--mono);font-size:12px}
 .__P__-tools button{height:30px;padding:0 11px;border-radius:6px;border:1px solid var(--btnLine);background:var(--btn);color:var(--ink);font:inherit;cursor:pointer;white-space:nowrap}
 .__P__-tools button:hover{background:var(--btnHover)}
+.__P__-root:fullscreen{width:100vw;height:100vh}
+.__P__-max{position:fixed!important;left:0;top:0;width:100vw!important;height:100vh!important;z-index:2147483000}
 .__P__-seg{display:flex;gap:2px;padding:2px;border-radius:7px;border:1px solid var(--btnLine)}
 .__P__-seg button{height:26px;border:none;background:transparent;color:var(--muted);padding:0 9px}
 .__P__-seg button.__P__-act{background:var(--sel);color:var(--bg)}
@@ -29487,6 +29511,35 @@ function Save-DiagramPng([float]$Scale) {
     try { [DgImport]::PngAddText($path, 'devtools-diagram', [DgImport]::Marker($DgUI.Text)) } catch { }      # so Import gets the diagram back from the picture
 }
 
+# The canvas alone on the whole screen (F11, the Fullscreen button); Esc or the small label comes back
+function Set-DiagramFullscreen([bool]$On) {
+    $f = $DgUI.Form; $cv = $DgUI.Canvas
+    if (-not $f -or [bool]$DgUI.Full -eq $On) { return }
+    if ($On) { Save-DiagramPropEdits }
+    $f.SuspendLayout()
+    if ($On) {
+        $DgUI.FullWas = @{ Border = $f.FormBorderStyle; State = $f.WindowState }
+        foreach ($pn in $DgUI.FullPanels) { $pn.Visible = $false }
+        $f.WindowState = 'Normal'; $f.FormBorderStyle = 'None'; $f.WindowState = 'Maximized'
+        if (-not $DgUI.FullExit) {
+            $x = New-Object System.Windows.Forms.Label
+            $x.Text = 'Exit fullscreen (Esc)'; $x.AutoSize = $true; $x.Cursor = 'Hand'; $x.BackColor = $C.Panel; $x.ForeColor = $C.Fore
+            $x.Padding = New-Object System.Windows.Forms.Padding((Px 10), (Px 6), (Px 10), (Px 6))
+            $x.add_Click({ Set-DiagramFullscreen $false })
+            $cv.Controls.Add($x); $DgUI.FullExit = $x
+        }
+        $DgUI.FullExit.Visible = $true
+    } else {
+        $DgUI.FullExit.Visible = $false
+        $f.WindowState = 'Normal'; $f.FormBorderStyle = $DgUI.FullWas.Border; $f.WindowState = $DgUI.FullWas.State
+        foreach ($pn in $DgUI.FullPanels) { $pn.Visible = $true }
+    }
+    $DgUI.Full = $On
+    $f.ResumeLayout(); $f.PerformLayout()
+    if ($On) { $DgUI.FullExit.Location = New-Object System.Drawing.Point(($cv.ClientSize.Width - $DgUI.FullExit.Width - (Px 14)), (Px 14)) }
+    $cv.UserView = $false; $cv.ZoomToFit(); $cv.Focus() | Out-Null
+}
+
 function Show-DiagramCode([string]$Kind = 'page') {
     $f = New-Object System.Windows.Forms.Form
     $f.Text = 'Diagram code'; $f.Icon = $IconActive; $f.StartPosition = 'CenterParent'
@@ -29513,7 +29566,7 @@ function Show-DiagramCode([string]$Kind = 'page') {
     # interactive options
     $io = New-Object System.Windows.Forms.FlowLayoutPanel; $io.AutoSize = $true; $io.WrapContents = $true; $io.BackColor = $C.Panel; $io.MaximumSize = New-Object System.Drawing.Size((Px 1060), 0)
     $st.Feat = [ordered]@{}
-    foreach ($ft in @(@('Header', 'Title and live totals'), @('Flows', 'Flowing packets, pause and speed'), @('ThemeSwitch', 'Dark / light switch'), @('Zoom', 'Zoom and fit buttons'), @('Legend', 'Legend (hide flows)'),
+    foreach ($ft in @(@('Header', 'Title and live totals'), @('Flows', 'Flowing packets, pause and speed'), @('ThemeSwitch', 'Dark / light switch'), @('Zoom', 'Zoom and fit buttons'), @('FullBtn', 'Fullscreen button'), @('Legend', 'Legend (hide flows)'),
                       @('Panel', 'Details panel on click'), @('Hover', 'Hover dimming'), @('Outage', 'Simulate outage (shapes that offer it)'), @('Drops', 'Packet drops at an outage'), @('Hint', 'Hint text'), @('Glow', 'Glow on packets'), @('WebFont', 'Load the font from Google Fonts (needs internet)'))) {
         $cb = New-CheckBox $io $ft[1] ($ft[0] -ne 'WebFont'); $st.Feat[$ft[0]] = $cb      # pages work offline unless asked
     }
@@ -29719,6 +29772,7 @@ function Show-DiagramStudio([string]$Text = '') {
     $DgUI.PauseBtn = New-Button 'Pause' 'Pause / play the flowing packets' { $cv = $DgUI.Canvas; $cv.Paused = -not $cv.Paused; $this.Text = if ($cv.Paused) { 'Play' } else { 'Pause' } } $top $Glyph.Pause 2
     $sp = New-TbCombo $top @('0.5x', '1x', '2x', '4x') 70; $sp.SelectedIndex = 1
     $sp.add_SelectedIndexChanged({ param($src, $e) $DgUI.Canvas.Speed = @(0.5, 1, 2, 4)[$src.SelectedIndex] })
+    [void](New-Button 'Fullscreen' 'Show only the diagram, on the whole screen (F11). Esc comes back.' { Set-DiagramFullscreen $true } $top ([string][char]0xE740) 2)
     [void](New-Button 'Re-layout' 'Forget moved positions and lay everything out again' {
         $t = $DgUI.Text
         foreach ($n in $DgUI.Doc.Nodes) { if ($n.HasPos) { $t = [DgText]::SetNodeAttr($t, $n.Id, 'at', $null) } }
@@ -29802,6 +29856,7 @@ function Show-DiagramStudio([string]$Text = '') {
     $cv.ContextMenuStrip = $cm
 
     $f.Controls.Add($cv); $f.Controls.Add($right); $f.Controls.Add($left); $f.Controls.Add($top)
+    $DgUI.FullPanels = @($right, $left, $top); $DgUI.Full = $false
     $cv.BringToFront()
 
     $DgUI.ColorTimer = New-TbDebounce 500 { if ($DgUI.Form) { Set-DiagramColors } }
@@ -29818,6 +29873,8 @@ function Show-DiagramStudio([string]$Text = '') {
         if ($e.Control -and $e.KeyCode -eq 'Z') { $e.SuppressKeyPress = $true; Undo-Diagram }
         elseif ($e.Control -and $e.KeyCode -eq 'Y') { $e.SuppressKeyPress = $true; Redo-Diagram }
         elseif ($e.Control -and $e.KeyCode -eq 'S') { $e.SuppressKeyPress = $true; Save-DiagramNow }
+        elseif ($e.KeyCode -eq 'F11') { $e.SuppressKeyPress = $true; Set-DiagramFullscreen (-not $DgUI.Full) }
+        elseif ($e.KeyCode -eq 'Escape' -and $DgUI.Full) { $e.SuppressKeyPress = $true; Set-DiagramFullscreen $false }
     })
     Register-DiagramDrop $f
     $f.add_FormClosing({ Save-DiagramPropEdits; $DgUI.TypeTimer.Stop(); $t = $DgUI.Editor.Text; if ($t -cne $DgUI.Text) { $DgUI.Text = $t }; Save-DiagramFile })
