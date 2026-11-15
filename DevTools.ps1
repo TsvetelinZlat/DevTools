@@ -15,9 +15,97 @@
         Esc           close
         just type     search
 #>
-param()
+param(
+    [switch]$Build      # compile every C# module into .\bin and exit (run it after changing the code, before copying the folder to another PC)
+)
 
 $ErrorActionPreference = 'Stop'
+
+# ---------------------------------------------------------------------------
+# Compiled code: the C# parts of DevTools live in .\bin as ready-made DLLs, next to this script.
+#
+# They used to be compiled with Add-Type on every start. Add-Type runs the C# compiler in %TEMP%
+# (AppData\Local\Temp): it writes the source and a DLL there and loads that DLL. Where Temp is cleaned or DLLs
+# in the user profile are removed (company PCs), the DLL was gone before it could be loaded and the tool
+# "couldn't start". Now nothing is written outside this folder:
+#   - a module's DLL is loaded from .\bin (from its bytes, so the file is never locked and a
+#     "downloaded from the internet" mark on a copied folder doesn't matter);
+#   - a DLL is rebuilt only when its source in this script has changed (the source's fingerprint is the
+#     DLL's version number). The compiler is the one inside Windows' own .NET Framework, and it gets .\bin
+#     as its working folder, so even a rebuild never touches the user profile;
+#   - only if .\bin can't be written at all (a read-only share) and the DLL is missing does it compile
+#     in memory the old way, and says so in the log.
+# ---------------------------------------------------------------------------
+$script:BinDir = Join-Path (Split-Path -Parent $PSCommandPath) 'bin'
+$script:CodeNotes = New-Object System.Collections.Generic.List[string]     # written to the debug log once it exists
+
+function Import-DevCode {
+    param([Parameter(Mandatory)][string]$Name, [string[]]$References = @(), [Parameter(Mandatory)][string]$Source, [switch]$BuildOnly)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $h = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes(($References -join ',') + "`n" + $Source.Replace("`r", '')))
+    $sha.Dispose()
+    $ver = New-Object Version(([BitConverter]::ToUInt16($h, 0) % 65535), ([BitConverter]::ToUInt16($h, 2) % 65535), ([BitConverter]::ToUInt16($h, 4) % 65535), ([BitConverter]::ToUInt16($h, 6) % 65535))
+    $dll = Join-Path $script:BinDir "DevTools.$Name.dll"
+    $fresh = $false
+    if ([IO.File]::Exists($dll)) { try { $fresh = [Reflection.AssemblyName]::GetAssemblyName($dll).Version -eq $ver } catch { } }
+    if (-not $fresh) {
+        $errors = $null
+        try {
+            if (-not [IO.Directory]::Exists($script:BinDir)) { [void][IO.Directory]::CreateDirectory($script:BinDir) }
+            if ([IO.File]::Exists($dll)) { [IO.File]::Delete($dll) }
+            $provider = New-Object Microsoft.CSharp.CSharpCodeProvider
+            $cp = New-Object System.CodeDom.Compiler.CompilerParameters
+            $cp.GenerateInMemory = $false; $cp.GenerateExecutable = $false; $cp.IncludeDebugInformation = $false
+            $cp.OutputAssembly = $dll
+            $cp.TempFiles = New-Object System.CodeDom.Compiler.TempFileCollection($script:BinDir, $false)   # the compiler's scratch files: here, not %TEMP%
+            foreach ($r in @('System', 'System.Core') + $References | Select-Object -Unique) { [void]$cp.ReferencedAssemblies.Add("$r.dll") }
+            [void]$cp.ReferencedAssemblies.Add([psobject].Assembly.Location)
+            $stamp = "[assembly: System.Reflection.AssemblyVersion(""$ver"")]"
+            # csc.exe itself puts a scratch file in %TEMP% while it writes the DLL, and fails when that folder is
+            # missing or blocked. For the moment it runs, its TEMP is .\bin too.
+            $oldTemp = $env:TEMP; $oldTmp = $env:TMP
+            $env:TEMP = $script:BinDir; $env:TMP = $script:BinDir
+            try { $res = $provider.CompileAssemblyFromSource($cp, [string[]]@($Source, $stamp)) }
+            finally { $env:TEMP = $oldTemp; $env:TMP = $oldTmp; $provider.Dispose() }
+            if (@($res.Errors | Where-Object { $_.ErrorNumber -eq 'CS0016' }).Count) { throw "the folder can't be written ($(@($res.Errors)[0].ErrorText))" }      # not a code error: handled below
+            if ($res.Errors.HasErrors) {
+                $errors = (@($res.Errors | Where-Object { -not $_.IsWarning } | Select-Object -First 8 | ForEach-Object { "line $($_.Line): $($_.ErrorText)" }) -join "`n")
+            } else { $fresh = $true; $script:CodeNotes.Add("code: built bin\DevTools.$Name.dll") }
+        } catch { $script:CodeNotes.Add("code: bin\DevTools.$Name.dll could not be built here: $($_.Exception.Message)") }
+        if ($errors) { throw "DevTools.$Name did not compile:`n$errors" }
+    }
+    if ($BuildOnly) { if (-not $fresh) { throw "DevTools.$Name could not be written to $script:BinDir" }; return }
+    if ($fresh) { [void][Reflection.Assembly]::Load([IO.File]::ReadAllBytes($dll)); return }
+    $script:CodeNotes.Add("code: DevTools.$Name compiled in memory (uses %TEMP%)")
+    if ($References.Count) { Add-Type -ReferencedAssemblies $References -TypeDefinition $Source -ErrorAction Stop } else { Add-Type -TypeDefinition $Source -ErrorAction Stop }
+}
+
+# -Build: compile every module (also the ones that normally wait until their tool is first opened) and exit.
+if ($Build) {
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$null, [ref]$null)
+    $texts = @{}
+    foreach ($a in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
+        if ($a.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and $a.Right -is [System.Management.Automation.Language.CommandExpressionAst] -and
+            $a.Right.Expression -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $texts[$a.Left.VariablePath.UserPath] = $a.Right.Expression.Value }
+    }
+    $count = 0
+    foreach ($c in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Import-DevCode' }, $true)) {
+        $arg = @{}; $key = $null
+        foreach ($el in $c.CommandElements | Select-Object -Skip 1) {
+            if ($el -is [System.Management.Automation.Language.CommandParameterAst]) { $key = $el.ParameterName; continue }
+            if (-not $key) { continue }
+            $arg[$key] = if ($el -is [System.Management.Automation.Language.VariableExpressionAst]) { $texts[$el.VariablePath.UserPath] } else { try { $el.SafeGetValue() } catch { $null } }
+            $key = $null
+        }
+        if (-not $arg.Name) { continue }        # the call a few lines below, not a module
+        if (-not $arg.Source) { throw "Import-DevCode '$($arg.Name)' at line $($c.Extent.StartLineNumber): the source isn't a constant" }
+        Import-DevCode -Name $arg.Name -References @($arg.References | Where-Object { $_ }) -Source $arg.Source -BuildOnly
+        $count++
+        Write-Host ("  DevTools.{0}.dll" -f $arg.Name)
+    }
+    Write-Host "$count modules are up to date in $script:BinDir"
+    return
+}
 
 # Clipboard and WinForms need a single-threaded apartment. Relaunch if needed.
 if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
@@ -34,7 +122,7 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 # change notifications, plus a few user32/dwmapi calls.
 # ---------------------------------------------------------------------------
 if (-not ('PowerClipHost' -as [type])) {
-    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+    Import-DevCode -Name 'Host' -References System.Windows.Forms, System.Drawing -Source @'
 using System;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
@@ -226,6 +314,7 @@ public class PowerClipButton : Button {
     public string Glyph = "";
     public int Variant;
     public bool Selected;                         // for toggle groups (chips, segmented buttons)
+    public bool Soft;                             // Selected is shown as a tinted button with accent-coloured content (toolbar toggles), not a solid accent one
     private bool hover, down;
 
     public PowerClipButton() {
@@ -276,6 +365,11 @@ public class PowerClipButton : Button {
             fill = down ? PowerClipTheme.Mix(a, Color.Black, 0.18) : (hover ? PowerClipTheme.Mix(a, PowerClipTheme.Dark ? Color.White : Color.Black, 0.10) : a);
             border = fill;
             fore = PowerClipTheme.AccentFore;
+            if (Soft && Variant != 1) {
+                fill = PowerClipTheme.Mix(a, parent, down ? 0.62 : (hover ? 0.70 : 0.78));
+                border = PowerClipTheme.Mix(a, parent, 0.35);
+                fore = PowerClipTheme.Dark ? PowerClipTheme.Mix(a, Color.White, 0.45) : PowerClipTheme.Mix(a, Color.Black, 0.25);
+            }
         } else if (Variant == 2 || Variant == 3) {
             fill = down ? PowerClipTheme.Pressed : (hover ? PowerClipTheme.Hover : parent);
             border = fill;
@@ -285,7 +379,7 @@ public class PowerClipButton : Button {
             border = PowerClipTheme.Line;
             fore = PowerClipTheme.Fore;
         }
-        if (!Enabled) { fore = PowerClipTheme.Dim; if (on) { fill = PowerClipTheme.Mix(fill, parent, 0.5); border = fill; fore = PowerClipTheme.AccentFore; } }
+        if (!Enabled) { fore = PowerClipTheme.Dim; if (on && !(Soft && Variant != 1)) { fill = PowerClipTheme.Mix(fill, parent, 0.5); border = fill; fore = PowerClipTheme.AccentFore; } }
         if (Focused && ShowFocusCues && !on) border = PowerClipTheme.Accent;
         var r = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
         using (GraphicsPath p = PowerClipTheme.Round(r, 5 * S)) {
@@ -356,7 +450,7 @@ public class PowerClipMenuRenderer : ToolStripProfessionalRenderer {
 # Diff engine and side-by-side diff view used by the Compare window.
 # ---------------------------------------------------------------------------
 if (-not ('PowerClipDiffView' -as [type])) {
-    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+    Import-DevCode -Name 'DiffView' -References System.Windows.Forms, System.Drawing -Source @'
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -1369,7 +1463,7 @@ public class PowerClipDiffView : Control {
 # Notes page: a free-form canvas of text boxes and pictures (OneNote style).
 # ---------------------------------------------------------------------------
 if (-not ('PowerClipNoteCanvas' -as [type])) {
-    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+    Import-DevCode -Name 'NoteCanvas' -References System.Windows.Forms, System.Drawing -Source @'
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -2279,7 +2373,7 @@ public class PowerClipNoteCanvas : Panel {
 # Folder compare and find-in-files engines (background threads).
 # ---------------------------------------------------------------------------
 if (-not ('PowerClipSearch' -as [type])) {
-    Add-Type -TypeDefinition @'
+    Import-DevCode -Name 'Search' -Source @'
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -2550,7 +2644,7 @@ public class PowerClipSearch {
 # Transform operations (hex, Base64, hashes, AES, case, lines, JSON ...).
 # ---------------------------------------------------------------------------
 if (-not ('PowerClipTransform' -as [type])) {
-    Add-Type -ReferencedAssemblies System.Security, System.Core, System.Xml, System.Xml.Linq -TypeDefinition @'
+    Import-DevCode -Name 'Transform' -References System.Security, System.Core, System.Xml, System.Xml.Linq -Source @'
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -3491,7 +3585,7 @@ public static class PowerClipFormat {
 # Network checks: ping, TCP ports, nslookup / tracert, local adapters (background threads).
 # ---------------------------------------------------------------------------
 if (-not ('PowerClipNet' -as [type])) {
-    Add-Type -TypeDefinition @'
+    Import-DevCode -Name 'Net' -Source @'
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -3729,7 +3823,7 @@ public class PowerClipNet {
 # API tester engine: HTTP requests, curl import, code generation, JSON colouring.
 # ---------------------------------------------------------------------------
 if (-not ('PowerClipHttp' -as [type])) {
-    Add-Type -TypeDefinition @'
+    Import-DevCode -Name 'Http' -Source @'
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -4193,7 +4287,7 @@ public class PowerClipHttp {
 # File layout: "DTV1" | iterations (int32) | salt (16) | iv (16) | ciphertext | HMAC of everything before it (32).
 # ---------------------------------------------------------------------------
 if (-not ('PowerClipVault' -as [type])) {
-    Add-Type -ReferencedAssemblies System.Core, System.Security -TypeDefinition @'
+    Import-DevCode -Name 'Vault' -References System.Core, System.Security -Source @'
 using System;
 using System.IO;
 using System.Security.Cryptography;
@@ -4341,7 +4435,7 @@ public static class PowerClipVault {
 # Developer toolbox engines: JSON, cron, QR codes, port table, TLS certificate check, host monitor, file hashes.
 # ---------------------------------------------------------------------------
 if (-not ('DevJson' -as [type])) {
-    Add-Type -ReferencedAssemblies System.Drawing, System.Core, System.Xml, System.Xml.Linq -TypeDefinition @'
+    Import-DevCode -Name 'Json' -References System.Drawing, System.Core, System.Xml, System.Xml.Linq -Source @'
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -5930,7 +6024,7 @@ public static class DevData {
 # Image editor canvas
 # ---------------------------------------------------------------------------
 if (-not ('PowerClipImageEditor' -as [type])) {
-    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing, System.Core -TypeDefinition @'
+    Import-DevCode -Name 'ImageEditor' -References System.Windows.Forms, System.Drawing, System.Core -Source @'
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -6817,6 +6911,16 @@ $TextsDir     = Join-Path $DataDir 'texts'
 foreach ($d in $DataDir, $ImagesDir, $FilesDir, $TextsDir) { if (-not (Test-Path $d)) { [void](New-Item -ItemType Directory -Path $d) } }
 $FirstRun = -not (Test-Path $HistoryFile)
 
+# Scratch files (a page for "Open in browser", a recording before it's saved, a picture handed to Paint) go to
+# data\temp, not to %TEMP% in the user profile: DevTools then needs nothing outside its own folder.
+# What is older than two days is removed at start.
+$WorkDir = Join-Path $DataDir 'temp'
+function Get-WorkFile([string]$Name) {
+    if (-not [IO.Directory]::Exists($WorkDir)) { [void][IO.Directory]::CreateDirectory($WorkDir) }
+    Join-Path $WorkDir $Name
+}
+try { if ([IO.Directory]::Exists($WorkDir)) { foreach ($old in [IO.Directory]::GetFiles($WorkDir)) { if ([IO.File]::GetLastWriteTime($old) -lt (Get-Date).AddDays(-2)) { [IO.File]::Delete($old) } } } } catch { }
+
 $script:Paused   = $false
 $script:MaxItems = 500          # unpinned clips kept; pinned clips are never trimmed
 $script:MaxFileMB = 10          # copied files/folders and images bigger than this are not saved
@@ -6859,6 +6963,7 @@ function Write-Log([string]$Message) {
         try { Add-Content -Path (Join-Path $DataDir 'debug.log') -Value "$(Get-Date -Format 'HH:mm:ss.fff')  $Message" } catch { }
     }
 }
+foreach ($note in $script:CodeNotes) { Write-Log $note }; $script:CodeNotes.Clear()
 
 # Writes a data file safely (temp file, then swap). Encrypted when data encryption is on (see Test-ProtectPath).
 function Write-JsonFile([string]$Path, [string]$Json) {
@@ -7569,6 +7674,17 @@ $Glyph = @{     # icon font code points (Segoe Fluent Icons / MDL2 Assets)
     Lock = [string][char]0xE72E; View = [string][char]0xE7B3; Apps = [string][char]0xE71D; Toolbox = [string][char]0xE90F; Lightning = [string][char]0xE945
     StarOn = [string][char]0xE735; StarOff = [string][char]0xE734
 }
+# One icon per tool: no two tools in the Toolbox, the favourites bar, the tray menu or the palette share one.
+# (Start DevTools with POWERCLIP_DEBUG set and data\debug.log names any tool that got an icon another tool has.)
+foreach ($pair in @(
+    'TSnippets=E8D2', 'TStack=E81E', 'TJson=E8FD', 'TRegex=E71C', 'TJwt=E8D7', 'TMarkdown=E8A1', 'TNumbers=E8EF', 'TUnits=ECC6', 'TCron=E823', 'TTime=E909',
+    'TGen=E8B1', 'TQr=ED14', 'TStego=ED1A', 'TCodeImg=E91B', 'THash=E9D5', 'TLog=E9F9', 'TChains=E71B', 'TTestApi=EC27', 'TDiagram=F003', 'TSql=E80A',
+    'TNetTools=E968', 'TDns=E8CE', 'TSubnet=ECA5', 'THosts=E7F4', 'TPorts=E8AC', 'TCert=EB95', 'TCertMake=E83D', 'TEnv=E950', 'TProcs=E9D9', 'TGit=EA3C',
+    'TShot=E722', 'TOcr=E8C1', 'TRecord=E714', 'TTimer=E916', 'TReminder=EA8F', 'TMouse=E962',
+    # Diagram studio command bar
+    'Library=E8F1', 'Import=E8E5', 'Export=E72D', 'Redo=E7A6', 'Duplicate=ECCD', 'Pointer=E8B0', 'Pan=E7C2', 'Area=EF20', 'Link=E71B', 'Shape=F158',
+    'Layout=F0E2', 'Contrast=E793', 'FitView=E9A6', 'ZoomIn=E8A3', 'ZoomOut=E71F', 'Fullscreen=E740', 'PaneLeft=E8A0', 'PaneRight=E89F', 'Help=E9CE'
+)) { $k, $v = $pair -split '='; $Glyph[$k] = [string][char][Convert]::ToInt32($v, 16) }
 
 $C = @{}
 $FontMain  = New-Object System.Drawing.Font($UiFont, (Fz 10))
@@ -18252,7 +18368,7 @@ Register-PaletteCommand 'Clipboard history' 'Ctrl+Shift+V' $Glyph.Paste { Show-P
 Register-PaletteCommand 'Paste clipboard as plain text' 'Ctrl+Alt+V' $Glyph.Paste { param($it) Invoke-PasteText ([System.Windows.Forms.Clipboard]::GetText()) $PalUI.Target } 'unformatted'
 Register-PaletteCommand 'Notes' 'Ctrl+N in the picker' $Glyph.Notes { Show-Notes }
 Register-PaletteCommand 'New note' '' $Glyph.Add { Show-Notes; [void](New-Note); $NoteUI.Title.Focus() }
-Register-PaletteCommand 'Snippets' '' $Glyph.Text { Show-Snippets } 'templates'
+Register-PaletteCommand 'Snippets' '' $Glyph.TSnippets { Show-Snippets } 'templates'
 Register-PaletteCommand 'New snippet' '' $Glyph.Add { New-Snippet } 'template'
 Register-PaletteCommand 'Compare' 'Ctrl+D' $Glyph.Compare { Show-Compare } 'diff winmerge text folders images pictures binary hex files'
 Register-PaletteCommand 'Compare folders' '' $Glyph.Folder { Show-FolderCompare } 'diff directories'
@@ -18260,26 +18376,26 @@ Register-PaletteCommand 'Compare images' '' $Glyph.Photo { [void](Show-CompareHu
 Register-PaletteCommand 'Compare files byte by byte' '' $Glyph.Compare { [void](Show-CompareHub 'Files') } 'diff binary hex exe dll zip hash'
 Register-PaletteCommand 'Find in files' 'Ctrl+Shift+F' $Glyph.Search { Show-FindInFiles } 'grep search'
 Register-PaletteCommand 'Transform text' 'Ctrl+T' $Glyph.Code { [void](Show-Transform) } 'hex base64 hash aes encode decode'
-Register-PaletteCommand 'Network tools' 'Ctrl+Shift+N' $Glyph.Network { [void](Show-Network) } 'ping tcp nslookup dns traceroute'
+Register-PaletteCommand 'Network tools' 'Ctrl+Shift+N' $Glyph.TNetTools { [void](Show-Network) } 'ping tcp nslookup dns traceroute'
 Register-PaletteCommand 'API tester' 'Ctrl+Shift+A' $Glyph.Globe { Show-ApiTester } 'http rest postman curl'
-Register-PaletteCommand 'Git' '' $Glyph.Code { Show-Git } 'git repository commit branch merge push pull graph history log stash rebase'
-Register-PaletteCommand 'Test API: start / stop' '' $Glyph.Network { if ($TestApi -and $TestApi.Running) { Stop-TestApi; $tray.ShowBalloonTip(2000, 'Test API', 'Stopped.', 'Info') } else { $u = Start-TestApi; if ($u) { $tray.ShowBalloonTip(3000, 'Test API running', "$u  -  demo / demo", 'Info') } } } 'mock server local practice login token cookie csrf'
-Register-PaletteCommand 'API chains' '' $Glyph.Apps { Show-ApiChains } 'chain flow login cookie token sequence workflow requests http'
-Register-PaletteCommand 'Edit the picture on the clipboard' '' $Glyph.Photo { Edit-ClipboardImage } 'image screenshot annotate draw arrow crop blur'
-Register-PaletteCommand 'Paste stack: collect what I copy next' '' $Glyph.Paste { Start-PasteStack } 'queue paste one after another multiple sequence'
-Register-PaletteCommand 'Paste stack: paste the next one' 'Ctrl+Alt+Space' $Glyph.Paste { Invoke-PasteNext } 'queue'
-Register-PaletteCommand 'Paste stack: stop' '' $Glyph.Paste { Stop-PasteStack } 'queue cancel clear'
+Register-PaletteCommand 'Git' '' $Glyph.TGit { Show-Git } 'git repository commit branch merge push pull graph history log stash rebase'
+Register-PaletteCommand 'Test API: start / stop' '' $Glyph.TTestApi { if ($TestApi -and $TestApi.Running) { Stop-TestApi; $tray.ShowBalloonTip(2000, 'Test API', 'Stopped.', 'Info') } else { $u = Start-TestApi; if ($u) { $tray.ShowBalloonTip(3000, 'Test API running', "$u  -  demo / demo", 'Info') } } } 'mock server local practice login token cookie csrf'
+Register-PaletteCommand 'API chains' '' $Glyph.TChains { Show-ApiChains } 'chain flow login cookie token sequence workflow requests http'
+Register-PaletteCommand 'Edit the picture on the clipboard' '' $Glyph.Edit { Edit-ClipboardImage } 'image screenshot annotate draw arrow crop blur'
+Register-PaletteCommand 'Paste stack: collect what I copy next' '' $Glyph.TStack { Start-PasteStack } 'queue paste one after another multiple sequence'
+Register-PaletteCommand 'Paste stack: paste the next one' 'Ctrl+Alt+Space' $Glyph.TStack { Invoke-PasteNext } 'queue'
+Register-PaletteCommand 'Paste stack: stop' '' $Glyph.TStack { Stop-PasteStack } 'queue cancel clear'
 Register-PaletteCommand 'Sync now' '' $Glyph.Refresh { $r = Invoke-Sync; $tray.ShowBalloonTip(3000, 'Sync', $r, 'Info') } 'onedrive dropbox between computers'
-Register-PaletteCommand 'New reminder...' '' $Glyph.History { New-QuickReminder } 'remind me alarm notify later todo'
-Register-PaletteCommand 'Start a 5-minute timer' '' $Glyph.History { Start-Countdown 5 } 'countdown alarm'
-Register-PaletteCommand 'Start a 25-minute Pomodoro' '' $Glyph.History { Set-ClockMode 'pomodoro'; Start-Clock; $tray.ShowBalloonTip(2000, 'Pomodoro started', "$($Pomodoro.Work) minutes of focus.", 'Info') } 'focus timer'
+Register-PaletteCommand 'New reminder...' '' $Glyph.TReminder { New-QuickReminder } 'remind me alarm notify later todo'
+Register-PaletteCommand 'Start a 5-minute timer' '' $Glyph.TTimer { Start-Countdown 5 } 'countdown alarm'
+Register-PaletteCommand 'Start a 25-minute Pomodoro' '' $Glyph.TTimer { Set-ClockMode 'pomodoro'; Start-Clock; $tray.ShowBalloonTip(2000, 'Pomodoro started', "$($Pomodoro.Work) minutes of focus.", 'Info') } 'focus timer'
 Register-PaletteCommand 'Stop the timer' '' $Glyph.Pause { Suspend-Clock } 'pause stopwatch pomodoro'
-Register-PaletteCommand 'Mouse mover: on / off' '' $Glyph.Apps { Switch-MouseMover } 'keep active awake jiggler teams idle away move 0 pixel'
-Register-PaletteCommand 'Auto clicker: start in 3 s' 'Esc stops' $Glyph.Apps { Start-MouseClicker } 'click autoclick mouse'
+Register-PaletteCommand 'Mouse mover: on / off' '' $Glyph.TMouse { Switch-MouseMover } 'keep active awake jiggler teams idle away move 0 pixel'
+Register-PaletteCommand 'Auto clicker: start in 3 s' 'Esc stops' $Glyph.TMouse { Start-MouseClicker } 'click autoclick mouse'
 Register-PaletteCommand 'Auto clicker: stop' '' $Glyph.Pause { Stop-MouseClicker } 'click autoclick mouse'
-Register-PaletteCommand 'Take a screenshot' 'Ctrl+Shift+X' $Glyph.Photo { Start-ScreenCapture } 'capture snip screen window region'
-Register-PaletteCommand 'Take a screenshot in 3 seconds' '' $Glyph.Photo { Start-ScreenCapture 3 } 'capture delay timer menu'
-Register-PaletteCommand 'Copy text from the clipboard picture (OCR)' '' $Glyph.Text { Copy-ClipImageText } 'ocr read text image screenshot recognise'
+Register-PaletteCommand 'Take a screenshot' 'Ctrl+Shift+X' $Glyph.TShot { Start-ScreenCapture } 'capture snip screen window region'
+Register-PaletteCommand 'Take a screenshot in 3 seconds' '' $Glyph.TShot { Start-ScreenCapture 3 } 'capture delay timer menu'
+Register-PaletteCommand 'Copy text from the clipboard picture (OCR)' '' $Glyph.TOcr { Copy-ClipImageText } 'ocr read text image screenshot recognise'
 Register-PaletteCommand 'Toolbox' 'Ctrl+B' $Glyph.Toolbox { Show-Toolbox } 'tools utilities'
 Register-PaletteCommand 'Secrets' 'Ctrl+Shift+S' $Glyph.Lock { Show-Vault } 'passwords vault keys tokens'
 Register-PaletteCommand 'Lock secrets' '' $Glyph.Lock { Lock-Vault }
@@ -18517,7 +18633,7 @@ function New-PaletteForm {
 # Markdown to HTML, code colouring, number bases, environment variables (Toolbox pages and Notes).
 # ---------------------------------------------------------------------------
 if (-not ('DevMarkdown' -as [type])) {
-    Add-Type -ReferencedAssemblies System.Core, System.Numerics, System.Windows.Forms, System.Drawing -TypeDefinition @'
+    Import-DevCode -Name 'Markdown' -References System.Core, System.Numerics, System.Windows.Forms, System.Drawing -Source @'
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -23415,6 +23531,11 @@ public class DgCanvas : System.Windows.Forms.Panel {
     public DgTheme Theme = DgTheme.Get("midnight");
     public bool Dark = true, Animate = true, Editable = true, Paused, HoverDim = true;
     public bool Draggable;      // shapes can be moved even when not Editable (the SQL client's live diagram)
+    public bool ZoomBar = true; // the -, %, +, Fit buttons drawn in the corner (off when the window has its own zoom controls)
+    public int Tool;            // what the left button does: 0 select / move, 1 pan, 2 select an area, 3 draw a link from any shape
+    public event EventHandler ViewChanged;          // the zoom changed
+    float legendH;                                  // height the legend takes at the bottom (pixels), from the last paint
+    System.Drawing.PointF boxFrom;
     public float Speed = 1f, UiScale = 1f;
     public DgView View = new DgView();
     public float Zoom = 1f;
@@ -23487,15 +23608,19 @@ public class DgCanvas : System.Windows.Forms.Panel {
         Zoom = z;
         Pan = new System.Drawing.PointF(w.X - at.X / Zoom, w.Y - at.Y / Zoom);
         Invalidate();
+        if (ViewChanged != null) ViewChanged(this, EventArgs.Empty);
     }
     public void ZoomToFit() {
         var b = Doc.Bounds;
         if (b.Width <= 0 || Width <= 0) return;
-        float top = Doc.On("header") ? 64 * UiScale : 10, bottom = 54 * UiScale;
+        // room for what is drawn on top: the header, and at the bottom the legend rows and the zoom buttons
+        float top = Doc.On("header") ? 64 * UiScale : 10, bottom = Math.Max(ZoomBar ? 54 * UiScale : 14 * UiScale, legendH + 14 * UiScale);
+        if (Height - top - bottom < 80) { top = Math.Min(top, 10); bottom = 10; }
         float z = Math.Min((Width - 24) / b.Width, (Height - top - bottom) / b.Height);
         Zoom = Math.Max(0.15f, Math.Min(1.6f, z));
         Pan = new System.Drawing.PointF(b.X - ((Width / Zoom) - b.Width) / 2, b.Y - top / Zoom - ((Height - top - bottom) / Zoom - b.Height) / 2);
         Invalidate();
+        if (ViewChanged != null) ViewChanged(this, EventArgs.Empty);
     }
     public System.Drawing.Bitmap RenderBitmap(float scale, bool background, bool dark) {
         var b = Doc.Bounds;
@@ -23608,6 +23733,8 @@ public class DgCanvas : System.Windows.Forms.Panel {
             Invalidate(); if (LegendChanged != null) LegendChanged(this, EventArgs.Empty); return;
         }
         if (ZoomClick(e.Location)) return;
+        if (Tool == 1) { mode = Mode.Pan; panFrom = Pan; return; }
+        if (Tool == 3 && Editable && Doc.Chart == null) { var cn = NodeAt(w); if (cn != null) { mode = Mode.Link; linkFrom = cn.Id; mouseW = w; return; } }
         if (Editable && Doc.Chart == null) {
             DgEdge best = null; bool src = false; float bd = 9 / Zoom;
             foreach (var ee in Doc.Edges) {
@@ -23647,7 +23774,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
             Invalidate(); return;
         }
         bool shift = (System.Windows.Forms.Control.ModifierKeys & System.Windows.Forms.Keys.Shift) != 0;
-        if (shift && Editable) { mode = Mode.Box; box = new System.Drawing.RectangleF(w, System.Drawing.SizeF.Empty); return; }
+        if ((shift || Tool == 2) && Editable) { mode = Mode.Box; boxFrom = w; box = new System.Drawing.RectangleF(w, System.Drawing.SizeF.Empty); return; }
         mode = Mode.Pan; panFrom = Pan;
     }
     protected override void OnMouseMove(System.Windows.Forms.MouseEventArgs e) {
@@ -23662,7 +23789,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
                 float dx = w.X - dragAnchor.X, dy = w.Y - dragAnchor.Y;
                 foreach (var kv in dragFrom) { var m = Doc.Find(kv.Key); if (m == null) continue; m.X = (float)Math.Round((kv.Value.X + dx) / 4) * 4; m.Y = (float)Math.Round((kv.Value.Y + dy) / 4) * 4; m.HasPos = true; DgLayout.ItemBoxes(m); }
                 DgRoute.All(Doc); packets.Clear(); Invalidate(); return;
-            case Mode.Box: box = System.Drawing.RectangleF.FromLTRB(Math.Min(box.X, w.X), Math.Min(box.Y, w.Y), Math.Max(box.X, w.X), Math.Max(box.Y, w.Y)); mouseW = w; Invalidate(); return;
+            case Mode.Box: box = System.Drawing.RectangleF.FromLTRB(Math.Min(boxFrom.X, w.X), Math.Min(boxFrom.Y, w.Y), Math.Max(boxFrom.X, w.X), Math.Max(boxFrom.Y, w.Y)); mouseW = w; Invalidate(); return;
             case Mode.Link: mouseW = w; Invalidate(); return;
             case Mode.End: if (moved && endEdge != null) { SnapEnd(endEdge, endSource, w); DgRoute.All(Doc); packets.Clear(); Invalidate(); } return;
             case Mode.Route: if (moved && endEdge != null) { endEdge.Via = new List<System.Drawing.PointF> { new System.Drawing.PointF((float)Math.Round(w.X), (float)Math.Round(w.Y)) }; endEdge.Route = endEdge.Route == "straight" ? "" : endEdge.Route; DgRoute.All(Doc); packets.Clear(); Invalidate(); } return;
@@ -23684,11 +23811,13 @@ public class DgCanvas : System.Windows.Forms.Panel {
             if (hs != View.Hover || (hit != null && tipAt != e.Location)) { View.Hover = hs; tip = hit == null ? "" : hit.Tip; tipAt = e.Location; Invalidate(); }
             return;
         }
-        { DgNode rn; int ax = ResizeHit(w, out rn); if (ax > 0) { Cursor = ax == 3 ? System.Windows.Forms.Cursors.SizeNWSE : ax == 1 ? System.Windows.Forms.Cursors.SizeWE : System.Windows.Forms.Cursors.SizeNS; return; } }
-        { DgNode pn; if (PartHit(w, out pn).Length > 0) { Cursor = System.Windows.Forms.Cursors.SizeAll; return; } }
+        if (Tool != 1) {
+            { DgNode rn; int ax = ResizeHit(w, out rn); if (ax > 0) { Cursor = ax == 3 ? System.Windows.Forms.Cursors.SizeNWSE : ax == 1 ? System.Windows.Forms.Cursors.SizeWE : System.Windows.Forms.Cursors.SizeNS; return; } }
+            { DgNode pn; if (PartHit(w, out pn).Length > 0) { Cursor = System.Windows.Forms.Cursors.SizeAll; return; } }
+        }
         var n = NodeAt(w);
         string h = n == null ? "" : n.Id;
-        Cursor = n != null ? (OnHandle(n, w) ? System.Windows.Forms.Cursors.Cross : System.Windows.Forms.Cursors.Hand) : (EdgeAt(w) != null ? System.Windows.Forms.Cursors.Hand : System.Windows.Forms.Cursors.Default);
+        Cursor = Tool == 1 ? System.Windows.Forms.Cursors.SizeAll : Tool == 3 && Editable && n != null ? System.Windows.Forms.Cursors.Cross : Tool == 2 && Editable && n == null ? System.Windows.Forms.Cursors.Cross : n != null ? (OnHandle(n, w) ? System.Windows.Forms.Cursors.Cross : System.Windows.Forms.Cursors.Hand) : (EdgeAt(w) != null ? System.Windows.Forms.Cursors.Hand : System.Windows.Forms.Cursors.Default);
         if (h != View.Hover) { View.Hover = HoverDim ? h : ""; hoverId = h; Invalidate(); }
     }
     string hoverId = "", tip = "";
@@ -23759,6 +23888,7 @@ public class DgCanvas : System.Windows.Forms.Panel {
     }
     bool ZoomClick(System.Drawing.Point p) {
         var b = ZoomButtons();
+        if (!ZoomBar) return false;
         if (b[0].Contains(p)) SetZoom(Zoom / 1.2f); else if (b[1].Contains(p)) SetZoom(1f); else if (b[2].Contains(p)) SetZoom(Zoom * 1.2f); else if (b[3].Contains(p)) { ZoomToFit(); UserView = false; } else return false;
         return true;
     }
@@ -23919,13 +24049,18 @@ public class DgCanvas : System.Windows.Forms.Panel {
         }
         // legend: one chip per flow / category used by links (click to hide)
         legendHits.Clear();
+        float lh = 0;
         if (Doc.On("legend")) {
             var cats = Doc.Chart != null ? Doc.Cats.ToList() : Doc.Cats.Where(k => Doc.Edges.Any(e => e.Cat == k.Id)).ToList();      // like the web page: only flows that links use
-            float maxX = ZoomButtons()[0].X - 12 * s;
+            float maxX = ZoomBar ? ZoomButtons()[0].X - 12 * s : Width - 14 * s;
             // rows from the bottom: measure first, then lay out so the last row sits at the bottom
             var widths = cats.Select(k => g.MeasureString(k.Name, fUi).Width + 38 * s).ToList();
+            // too narrow for a chip beside the zoom buttons: the whole legend goes above them, on the full width
+            bool above = ZoomBar && widths.Count > 0 && 14 * s + widths.Max() > maxX;
+            if (above) maxX = Width - 14 * s;
             int rows = 1; { float xx = 14 * s; foreach (var w0 in widths) { if (xx + w0 > maxX && xx > 14 * s) { rows++; xx = 14 * s; } xx += w0 + 8 * s; } }
-            float x = 14 * s, y = Height - 44 * s - (rows - 1) * 36 * s;
+            float x = 14 * s, y = Height - 44 * s - (rows - 1) * 36 * s - (above ? 36 * s : 0);
+            lh = widths.Count == 0 ? 0 : Height - y;
             int ki = 0;
             foreach (var k in cats) {
                 var w = widths[ki++];
@@ -23953,9 +24088,14 @@ public class DgCanvas : System.Windows.Forms.Panel {
             using (var b = new System.Drawing.SolidBrush(ink)) g.DrawString(tip, fUi, b, r.X + 9 * s, r.Y + 5 * s);
         }
         // zoom buttons
+        // the legend grew or shrank: fit again so the diagram stays clear of it (unless the user chose the view)
+        if (Math.Abs(lh - legendH) > 0.5f) {
+            legendH = lh;
+            if (!UserView && IsHandleCreated) BeginInvoke((System.Windows.Forms.MethodInvoker)delegate { if (!UserView && !IsDisposed) ZoomToFit(); });
+        }
         var zb = ZoomButtons();
         string[] t = { "-", ((int)Math.Round(Zoom * 100)) + "%", "+", "Fit" };
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; ZoomBar && i < 4; i++) {
             var r = zb[i];
             using (var gp = DgGdiPainter.RoundRect(r.X, r.Y, r.Width, r.Height, 6 * s)) { using (var b = new System.Drawing.SolidBrush(panel)) g.FillPath(b, gp); using (var p = new System.Drawing.Pen(line)) g.DrawPath(p, gp); }
             var sz = g.MeasureString(t[i], fMono);
@@ -28283,7 +28423,7 @@ public static class DgAssets {
 function Initialize-Diagrams {
     if ('DgDoc' -as [type]) { return $true }
     $old = [System.Windows.Forms.Cursor]::Current; [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::WaitCursor
-    try { Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem, System.Data; Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing, System.Core, System.Xml, System.Xml.Linq, System.IO.Compression, System.IO.Compression.FileSystem, System.Data -TypeDefinition $DgSource -ErrorAction Stop; $true }
+    try { Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem, System.Data; Import-DevCode -Name 'Diagrams' -References System.Windows.Forms, System.Drawing, System.Core, System.Xml, System.Xml.Linq, System.IO.Compression, System.IO.Compression.FileSystem, System.Data -Source $DgSource; $true }
     catch { Write-Log "diagram engine: $_"; [void][System.Windows.Forms.MessageBox]::Show("The diagram engine couldn't start:`n$($_.Exception.Message)", 'Diagram studio'); $false }
     finally { [System.Windows.Forms.Cursor]::Current = $old }
 }
@@ -28890,6 +29030,7 @@ function Update-Diagram([switch]$Fit) {
     $DgUI.Warn.ForeColor = if ($w.Count) { $C.Yellow } else { $C.Dim }
     Update-DiagramProps
     Update-DiagramTitle
+    Update-DiagramStatus
     if ($DgUI.File) { $DgUI.SaveTimer.Stop(); $DgUI.SaveTimer.Start() }
 }
 
@@ -29520,6 +29661,7 @@ function Set-DiagramFullscreen([bool]$On) {
     if ($On) {
         $DgUI.FullWas = @{ Border = $f.FormBorderStyle; State = $f.WindowState }
         foreach ($pn in $DgUI.FullPanels) { $pn.Visible = $false }
+        $cv.ZoomBar = $true
         $f.WindowState = 'Normal'; $f.FormBorderStyle = 'None'; $f.WindowState = 'Maximized'
         if (-not $DgUI.FullExit) {
             $x = New-Object System.Windows.Forms.Label
@@ -29533,8 +29675,10 @@ function Set-DiagramFullscreen([bool]$On) {
         $DgUI.FullExit.Visible = $false
         $f.WindowState = 'Normal'; $f.FormBorderStyle = $DgUI.FullWas.Border; $f.WindowState = $DgUI.FullWas.State
         foreach ($pn in $DgUI.FullPanels) { $pn.Visible = $true }
+        $cv.ZoomBar = $false
     }
     $DgUI.Full = $On
+    if (-not $On) { Set-DiagramPanels }          # a panel that was hidden stays hidden
     $f.ResumeLayout(); $f.PerformLayout()
     if ($On) { $DgUI.FullExit.Location = New-Object System.Drawing.Point(($cv.ClientSize.Width - $DgUI.FullExit.Width - (Px 14)), (Px 14)) }
     $cv.UserView = $false; $cv.ZoomToFit(); $cv.Focus() | Out-Null
@@ -29630,10 +29774,10 @@ function Show-DiagramCode([string]$Kind = 'page') {
         $script:Modal = $true
         try { if ($dd.ShowDialog($s.Form) -eq 'OK') { [IO.File]::WriteAllText($dd.FileName, $s.Text, (New-Object System.Text.UTF8Encoding $false)); $s.Info.Text = "Saved $(Split-Path -Leaf $dd.FileName)." } } finally { $script:Modal = $false; $dd.Dispose() }
     } $bar $Glyph.Save 2)
-    $st.OpenBtn = New-Button 'Open in browser' 'See it in your web browser (a temporary file on this PC)' {
+    $st.OpenBtn = New-Button 'Open in browser' 'See it in your web browser (a temporary file in DevTools'' data folder)' {
         $s = $this.FindForm().Tag
         $kind = @('page', 'widget', 'react', 'svg')[$s.Kind.SelectedIndex]
-        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('devtools-diagram-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.html')
+        $tmp = Get-WorkFile ('diagram-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.html')
         $page = if ($kind -eq 'page') { $s.Text } else { "<!doctype html><html><head><meta charset=""utf-8""><title>Diagram</title><style>html,body{margin:0;background:#8a8f99}body{padding:16px}</style></head><body>`n" + $s.Text + "`n</body></html>" }
         [IO.File]::WriteAllText($tmp, $page, (New-Object System.Text.UTF8Encoding $false))
         Start-Process $tmp
@@ -29680,6 +29824,104 @@ function Show-DiagramExamplesMenu($Anchor) {
         [void]$subs[$grp].DropDownItems.Add($it)
     }
     $m.Show($Anchor, (New-Object System.Drawing.Point(0, $Anchor.Height)))
+}
+
+# ---- Diagram studio command bar ------------------------------------------------------------------
+# A group of buttons; every group but the first starts with a thin dividing line. The group is one unit
+# for wrapping, so its buttons always stay together.
+function New-DgBarGroup($Bar, [switch]$First) {
+    $g = New-Object System.Windows.Forms.FlowLayoutPanel
+    $g.AutoSize = $true; $g.AutoSizeMode = 'GrowAndShrink'; $g.WrapContents = $false; $g.BackColor = $Bar.BackColor
+    $g.Margin = New-Object System.Windows.Forms.Padding(0, (Px 1), 0, (Px 1))
+    if (-not $First) {
+        $line = New-Object System.Windows.Forms.Panel
+        $line.Size = New-Object System.Drawing.Size(1, (Px 20)); $line.BackColor = $C.Line
+        $line.Margin = New-Object System.Windows.Forms.Padding((Px 7), (Px 5), (Px 7), 0)
+        $g.Controls.Add($line)
+    }
+    $Bar.Controls.Add($g)
+    $g
+}
+
+# One command: its own icon, the name in the tooltip (and for screen readers). -Label also shows the name
+# beside the icon while the window is wide enough. Without the icon font the name is always shown.
+function New-DgBarButton($Group, [string]$Icon, [string]$Name, [string]$Tip, [scriptblock]$OnClick, [switch]$Label, [int]$Variant = 2) {
+    $b = New-Button $(if ($Label -or -not $IconFontName) { $Name } else { '' }) $Tip $OnClick $Group $Icon $Variant
+    $b.Margin = New-Object System.Windows.Forms.Padding((Px 1), 0, (Px 1), 0)
+    $b.AccessibleName = $Name; $b.AccessibleDescription = $Tip; $b.Tag = $Name; $b.Soft = $true
+    if ($Label -and $IconFontName -and $null -ne $DgUI.BarLabelled) { $DgUI.BarLabelled.Add($b) }
+    $b
+}
+
+# Narrow window: the labelled buttons become icons (their names stay in the tooltips), so the bar keeps to one or two rows.
+function Update-DgBarLayout {
+    $f = $DgUI.Form; if (-not $f -or $null -eq $DgUI.BarLabelled -or -not $DgUI.Bar) { return }
+    if (-not $DgUI.BarFullWidth) {            # measured once, while every label is showing
+        $sum = $DgUI.Bar.Padding.Horizontal
+        foreach ($g in $DgUI.Bar.Controls) { $sum += $g.PreferredSize.Width + $g.Margin.Horizontal }
+        $DgUI.BarFullWidth = $sum
+    }
+    $compact = $f.ClientSize.Width -lt $DgUI.BarFullWidth
+    if ($DgUI.BarCompact -ne $compact) {
+        $DgUI.BarCompact = $compact
+        foreach ($b in $DgUI.BarLabelled) { $b.Text = if ($compact) { '' } else { [string]$b.Tag } }
+    }
+    # the left panel takes about a third of the window, until its edge is dragged
+    if ($DgUI.Left -and -not $DgUI.LeftUser -and -not $DgUI.Full) {
+        $w = [Math]::Max((Px 300), [Math]::Min((Px 430), [int]($f.ClientSize.Width * 0.3)))
+        if ($DgUI.Left.Width -ne $w) { $DgUI.Left.Width = $w }
+    }
+}
+
+function Get-DiagramViewCentre {
+    $cv = $DgUI.Canvas
+    New-Object System.Drawing.PointF(($cv.Width / 2 / $cv.Zoom + $cv.Pan.X), ($cv.Height / 2 / $cv.Zoom + $cv.Pan.Y))
+}
+
+# The active canvas tool: 0 select, 1 pan, 2 select an area, 3 connect. Its button is the filled one.
+function Set-DiagramTool([int]$Tool) {
+    $cv = $DgUI.Canvas; if (-not $cv) { return }
+    if (-not $cv.Editable -and $Tool -ge 2) { $Tool = 0 }
+    $cv.Tool = $Tool
+    for ($i = 0; $i -lt $DgUI.ToolBtns.Count; $i++) { $DgUI.ToolBtns[$i].Selected = ($i -eq $Tool); $DgUI.ToolBtns[$i].Invalidate() }
+    Update-DiagramStatus
+}
+
+function Set-DiagramMode([bool]$Edit) {
+    $cv = $DgUI.Canvas; if (-not $cv) { return }
+    $cv.Editable = $Edit
+    $DgUI.EditBtn.Selected = $Edit; $DgUI.PreviewBtn.Selected = -not $Edit; $DgUI.EditBtn.Invalidate(); $DgUI.PreviewBtn.Invalidate()
+    foreach ($b in $DgUI.EditOnly) { $b.Enabled = $Edit }
+    if (-not $Edit -and $cv.Tool -ge 2) { Set-DiagramTool 0 }
+    $cv.View.Selected.Clear(); $cv.View.SelectedEdge = ''; $cv.Invalidate()
+    if ($DgUI.Doc) { Update-DiagramProps }
+    Update-DiagramStatus
+}
+
+function Set-DiagramPanels {
+    if (-not $DgUI.Form -or $DgUI.Full) { return }
+    $DgUI.Form.SuspendLayout()
+    $DgUI.Left.Visible = $DgUI.ShowLeft; $DgUI.SplitL.Visible = $DgUI.ShowLeft
+    $DgUI.Props.Visible = $DgUI.ShowRight; $DgUI.SplitR.Visible = $DgUI.ShowRight
+    $DgUI.Form.ResumeLayout()
+    $DgUI.LeftBtn.Selected = $DgUI.ShowLeft; $DgUI.RightBtn.Selected = $DgUI.ShowRight; $DgUI.LeftBtn.Invalidate(); $DgUI.RightBtn.Invalidate()
+}
+
+# Status bar: what the diagram holds, what is selected, what the active tool does; the zoom; undo / redo availability.
+function Update-DiagramStatus {
+    $cv = $DgUI.Canvas; if (-not $cv -or -not $DgUI.StatusText) { return }
+    $d = $DgUI.Doc
+    $parts = @()
+    if ($d) { $parts += "$(@($d.Nodes).Count) shapes"; $parts += "$(@($d.Edges).Count) links" }
+    if ($cv.View.Selected.Count) { $parts += "$($cv.View.Selected.Count) selected" } elseif ($cv.View.SelectedEdge) { $parts += '1 link selected' }
+    $hint = if (-not $cv.Editable) { 'Preview: click a shape for its details; click a legend chip to hide that flow' }
+    else { @('Select: drag shapes to move them, drag the dot on a shape to link it, Shift+drag selects an area, double-click renames',
+             'Pan: drag anywhere to move the view (the mouse wheel scrolls, Ctrl+wheel zooms)',
+             'Select area: drag a box around shapes; Ctrl+click adds or removes one',
+             'Connect: drag from one shape to another to link them')[$cv.Tool] }
+    $DgUI.StatusText.Text = ($parts -join "  $Dot  ") + "      $hint"
+    $DgUI.ZoomBtn.Text = "$([int][Math]::Round($cv.Zoom * 100))%"
+    if ($DgUI.UndoBtn) { $DgUI.UndoBtn.Enabled = $DgUI.Undo.Count -gt 0; $DgUI.RedoBtn.Enabled = $DgUI.Redo.Count -gt 0 }
 }
 
 function Show-DiagramStudio([string]$Text = '') {
@@ -29749,41 +29991,101 @@ function Show-DiagramStudio([string]$Text = '') {
     $DgUI.List = $fl.List; $DgUI.Tabs = $tabs
     Select-ApiTab $tabs 'Text'
 
-    # top: commands
+    # top: the command bar. Groups of icon buttons (file, edit, canvas tools, insert, mode, view) with a thin line
+    # between them. A group never breaks in the middle: when the window is narrow whole groups move to a second
+    # row, and the buttons that have a label drop it (the name stays in the tooltip).
     $top = New-Object System.Windows.Forms.FlowLayoutPanel
-    $top.Dock = 'Top'; $top.AutoSize = $true; $top.WrapContents = $true; $top.BackColor = $C.Panel; $top.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 6))
-    [void](New-Button 'New' 'A new, empty diagram (in the folder selected in Saved)' { New-DiagramNamed } $top $Glyph.Add 2)
-    $exb = New-Button 'Examples' 'Start from an example' { Show-DiagramExamplesMenu $this } $top $Glyph.Apps 2
-    [void](New-Button 'Import...' 'Open a diagram from a file (or drop it on this window): .dgm / .txt, Mermaid, draw.io, Graphviz DOT, CSV / Excel, or an SVG / HTML / PNG exported by DevTools' { Open-DiagramImport } $top $Glyph.Open 2)
-    [void](New-Button 'Save' 'Save this diagram now, with everything typed in the properties (Ctrl+S). It also saves by itself a moment after each change.' { Save-DiagramNow } $top $Glyph.Save 2)
-    $exp = New-Button 'Export' 'Picture, PNG, SVG, an interactive web page, a widget or a React component' { Show-DiagramExportMenu $this } $top $Glyph.Save 1
-    [void](New-Button '' 'Undo (Ctrl+Z)' { Undo-Diagram } $top ([string][char]0xE7A7) 2)
-    [void](New-Button '' 'Redo (Ctrl+Y)' { Redo-Diagram } $top ([string][char]0xE7A6) 2)
-    $DgUI.ModeBtn = New-Button 'Edit' 'Edit: drag, link and style shapes.  Preview: click shapes for details and try outages, as in the web page.' {
-        $cv = $DgUI.Canvas; $cv.Editable = -not $cv.Editable
-        $this.Text = if ($cv.Editable) { 'Edit' } else { 'Preview' }
-        $cv.View.Selected.Clear(); $cv.View.SelectedEdge = ''; $cv.Invalidate(); Update-DiagramProps
-    } $top $Glyph.Edit 2
-    $DgUI.DarkBtn = New-Button 'Dark' 'Switch between the dark and the light colours' {
-        $cv = $DgUI.Canvas; $cv.Dark = -not $cv.Dark; $DgUI.ModeSet = $true
-        $this.Text = if ($cv.Dark) { 'Dark' } else { 'Light' }
-        $cv.Invalidate()
-    } $top ([string][char]0xE793) 2
-    $DgUI.PauseBtn = New-Button 'Pause' 'Pause / play the flowing packets' { $cv = $DgUI.Canvas; $cv.Paused = -not $cv.Paused; $this.Text = if ($cv.Paused) { 'Play' } else { 'Pause' } } $top $Glyph.Pause 2
-    $sp = New-TbCombo $top @('0.5x', '1x', '2x', '4x') 70; $sp.SelectedIndex = 1
-    $sp.add_SelectedIndexChanged({ param($src, $e) $DgUI.Canvas.Speed = @(0.5, 1, 2, 4)[$src.SelectedIndex] })
-    [void](New-Button 'Fullscreen' 'Show only the diagram, on the whole screen (F11). Esc comes back.' { Set-DiagramFullscreen $true } $top ([string][char]0xE740) 2)
-    [void](New-Button 'Re-layout' 'Forget moved positions and lay everything out again' {
+    $top.Dock = 'Top'; $top.AutoSize = $true; $top.AutoSizeMode = 'GrowAndShrink'; $top.WrapContents = $true; $top.BackColor = $C.Panel
+    $top.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 6))
+    $DgUI.BarLabelled = New-Object System.Collections.Generic.List[object]; $DgUI.BarCompact = $null; $DgUI.BarFullWidth = 0; $DgUI.Bar = $top
+    $DgUI.EditOnly = New-Object System.Collections.Generic.List[object]
+
+    $g = New-DgBarGroup $top -First
+    [void](New-DgBarButton $g $Glyph.Add 'New' 'New: an empty diagram, in the folder selected in Saved' { New-DiagramNamed } -Label)
+    [void](New-DgBarButton $g $Glyph.Library 'Examples' 'Examples: start from a ready-made diagram' { Show-DiagramExamplesMenu $this } -Label)
+    [void](New-DgBarButton $g $Glyph.Import 'Import' 'Import: open a diagram from a file (or drop it on this window): .dgm / .txt, Mermaid, draw.io, Graphviz DOT, CSV / Excel, or an SVG / HTML / PNG exported by DevTools' { Open-DiagramImport } -Label)
+    [void](New-DgBarButton $g $Glyph.Save 'Save' 'Save now, with everything typed in the properties (Ctrl+S). It also saves by itself a moment after each change.' { Save-DiagramNow } -Label)
+    [void](New-DgBarButton $g $Glyph.Export 'Export' 'Export: picture, PNG, SVG, an interactive web page, a widget or a React component' { Show-DiagramExportMenu $this } -Label -Variant 1)
+
+    $g = New-DgBarGroup $top
+    $DgUI.UndoBtn = New-DgBarButton $g $Glyph.Undo 'Undo' 'Undo (Ctrl+Z)' { Undo-Diagram }
+    $DgUI.RedoBtn = New-DgBarButton $g $Glyph.Redo 'Redo' 'Redo (Ctrl+Y)' { Redo-Diagram }
+    [void](New-DgBarButton $g $Glyph.Copy 'Copy' 'Copy the selected shapes, to paste into any diagram (Ctrl+C)' { [void](Copy-DiagramSelection) })
+    $DgUI.EditOnly.Add((New-DgBarButton $g $Glyph.Paste 'Paste' 'Paste shapes, or text from the clipboard as a diagram (Ctrl+V)' { Paste-DiagramClip }))
+    $DgUI.EditOnly.Add((New-DgBarButton $g $Glyph.Duplicate 'Duplicate' 'Duplicate the selected shapes (Ctrl+D)' { Copy-DiagramDuplicate }))
+    $DgUI.EditOnly.Add((New-DgBarButton $g $Glyph.Delete 'Delete' 'Delete the selected shapes or link (Del)' { Remove-DiagramSelection }))
+
+    # canvas tools: one is always the active one (shown filled)
+    $g = New-DgBarGroup $top
+    $DgUI.ToolBtns = @(
+        (New-DgBarButton $g $Glyph.Pointer 'Select' 'Select and move (V): click or drag shapes, drag the dot on a shape to link it, drag empty space to move the view' { Set-DiagramTool 0 }),
+        (New-DgBarButton $g $Glyph.Pan 'Pan' 'Pan (H): drag anywhere to move the view; nothing gets selected or moved' { Set-DiagramTool 1 }),
+        (New-DgBarButton $g $Glyph.Area 'Select area' 'Select an area (M): drag a box around the shapes you want' { Set-DiagramTool 2 }),
+        (New-DgBarButton $g $Glyph.Link 'Connect' 'Connect (L): drag from one shape to another to link them' { Set-DiagramTool 3 })
+    )
+    $DgUI.EditOnly.Add($DgUI.ToolBtns[2]); $DgUI.EditOnly.Add($DgUI.ToolBtns[3])
+
+    $g = New-DgBarGroup $top
+    $DgUI.EditOnly.Add((New-DgBarButton $g $Glyph.Shape 'Add shape' 'Add a shape in the middle of the view (more kinds in the Shapes tab)' { $mid = Get-DiagramViewCentre; Add-DiagramNode $mid.X $mid.Y }))
+    $DgUI.EditOnly.Add((New-DgBarButton $g $Glyph.Text 'Add text' 'Add free text in the middle of the view' { $mid = Get-DiagramViewCentre; Add-DiagramNode $mid.X $mid.Y -Text }))
+    $DgUI.EditOnly.Add((New-DgBarButton $g $Glyph.Layout 'Re-layout' 'Re-layout: forget moved positions and lay everything out again' {
         $t = $DgUI.Text
         foreach ($n in $DgUI.Doc.Nodes) { if ($n.HasPos) { $t = [DgText]::SetNodeAttr($t, $n.Id, 'at', $null) } }
         Set-DiagramText $t -Fit
-    } $top $Glyph.Refresh 2)
+    }))
+
+    # Edit / Preview: the one in use is filled
+    $g = New-DgBarGroup $top
+    $DgUI.EditBtn = New-DgBarButton $g $Glyph.Edit 'Edit' 'Edit: drag, link and style shapes' { Set-DiagramMode $true } -Label
+    $DgUI.PreviewBtn = New-DgBarButton $g $Glyph.View 'Preview' 'Preview: click shapes for details and try outages, as in the exported web page' { Set-DiagramMode $false } -Label
+
+    $g = New-DgBarGroup $top
+    [void](New-DgBarButton $g $Glyph.Contrast 'Dark / light' 'Switch the diagram between its dark and its light colours' {
+        $cv = $DgUI.Canvas; $cv.Dark = -not $cv.Dark; $DgUI.ModeSet = $true; $cv.Invalidate()
+    })
+    $DgUI.PauseBtn = New-DgBarButton $g $Glyph.Pause 'Pause' 'Pause / play the flowing packets' {
+        $cv = $DgUI.Canvas; $cv.Paused = -not $cv.Paused
+        $this.Glyph = if ($cv.Paused) { $Glyph.Play } else { $Glyph.Pause }; $this.Invalidate()
+    }
+    $sp = New-TbCombo $g @('0.5x', '1x', '2x', '4x') 64; $sp.SelectedIndex = 1; $sp.Margin = New-Object System.Windows.Forms.Padding((Px 3), (Px 3), (Px 3), 0)
+    $tooltip.SetToolTip($sp, 'How fast the packets flow')
+    $sp.add_SelectedIndexChanged({ param($src, $e) $DgUI.Canvas.Speed = @(0.5, 1, 2, 4)[$src.SelectedIndex] })
+
+    $g = New-DgBarGroup $top
+    $DgUI.LeftBtn = New-DgBarButton $g $Glyph.PaneLeft 'Left panel' 'Show / hide the left panel: text, data, shapes and saved diagrams (Ctrl+1)' { $DgUI.ShowLeft = -not $DgUI.ShowLeft; Set-DiagramPanels }
+    $DgUI.RightBtn = New-DgBarButton $g $Glyph.PaneRight 'Properties' 'Show / hide the properties panel (Ctrl+2)' { $DgUI.ShowRight = -not $DgUI.ShowRight; Set-DiagramPanels }
+    [void](New-DgBarButton $g $Glyph.Fullscreen 'Fullscreen' 'Fullscreen: only the diagram, on the whole screen (F11). Esc comes back.' { Set-DiagramFullscreen $true })
+    [void](New-DgBarButton $g $Glyph.Help 'Help' 'Syntax help and shortcuts' { Show-DiagramHelp })
+
+    # bottom: status bar - what is in the diagram and what the active tool does on the left, zoom on the right
+    $status = New-Object System.Windows.Forms.Panel
+    $status.Dock = 'Bottom'; $status.Height = Px 36; $status.BackColor = $C.Panel
+    $zoomBar = New-Object System.Windows.Forms.FlowLayoutPanel
+    $zoomBar.Dock = 'Right'; $zoomBar.AutoSize = $true; $zoomBar.AutoSizeMode = 'GrowAndShrink'; $zoomBar.WrapContents = $false; $zoomBar.BackColor = $C.Panel
+    $zoomBar.Padding = New-Object System.Windows.Forms.Padding(0, (Px 3), (Px 8), 0)
+    [void](New-DgBarButton $zoomBar $Glyph.ZoomOut 'Zoom out' 'Zoom out (Ctrl+-, or Ctrl+mouse wheel)' { $DgUI.Canvas.SetZoom($DgUI.Canvas.Zoom / 1.2) })
+    $DgUI.ZoomBtn = New-Button '100%' 'Zoom: click for 100%' { $DgUI.Canvas.SetZoom(1) } $zoomBar '' 2
+    $DgUI.ZoomBtn.AutoSize = $false; $DgUI.ZoomBtn.Size = New-Object System.Drawing.Size((Px (58 * $TextZoom)), (Px 30)); $DgUI.ZoomBtn.Margin = New-Object System.Windows.Forms.Padding((Px 1), 0, (Px 1), 0)
+    [void](New-DgBarButton $zoomBar $Glyph.ZoomIn 'Zoom in' 'Zoom in (Ctrl++, or Ctrl+mouse wheel)' { $DgUI.Canvas.SetZoom($DgUI.Canvas.Zoom * 1.2) })
+    [void](New-DgBarButton $zoomBar $Glyph.FitView 'Fit' 'Fit the whole diagram in the window (Ctrl+0)' { $cv = $DgUI.Canvas; $cv.UserView = $false; $cv.ZoomToFit() })
+    $stText = New-Object System.Windows.Forms.Label
+    $stText.Dock = 'Fill'; $stText.AutoSize = $false; $stText.AutoEllipsis = $true; $stText.TextAlign = 'MiddleLeft'; $stText.ForeColor = $C.Dim; $stText.BackColor = $C.Panel; $stText.Font = $FontSmall
+    $stText.Padding = New-Object System.Windows.Forms.Padding((Px 12), 0, 0, 0)
+    $status.Controls.Add($stText); $status.Controls.Add($zoomBar)
+    $DgUI.StatusText = $stText
 
     # middle: canvas
     $cv = New-Object DgCanvas
     $cv.Dock = 'Fill'; $cv.UiScale = $Scale * $TextZoom; $cv.Font = $FontMain
+    $cv.ZoomBar = $false                       # the zoom controls are in the status bar, so nothing sits on top of the legend
     $DgUI.Canvas = $cv
-    $cv.add_SelectionChanged({ Update-DiagramProps })
+    $cv.add_SelectionChanged({ Update-DiagramProps; Update-DiagramStatus })
+    $cv.add_ViewChanged({ Update-DiagramStatus })
+    $cv.add_KeyDown({
+        param($src, $e)
+        if ($e.Control -or $e.Alt -or $e.Handled) { return }
+        switch ($e.KeyCode) { 'V' { Set-DiagramTool 0 } 'H' { Set-DiagramTool 1 } 'M' { Set-DiagramTool 2 } 'L' { Set-DiagramTool 3 } 'Escape' { if (-not $DgUI.Full) { Set-DiagramTool 0 } } }
+    })
     $cv.add_Moved({
         param($src, $e)
         $t = $DgUI.Text
@@ -29855,9 +30157,17 @@ function Show-DiagramStudio([string]$Text = '') {
     })
     $cv.ContextMenuStrip = $cm
 
-    $f.Controls.Add($cv); $f.Controls.Add($right); $f.Controls.Add($left); $f.Controls.Add($top)
-    $DgUI.FullPanels = @($right, $left, $top); $DgUI.Full = $false
+    # the two side panels can be dragged wider / narrower, and hidden from the command bar
+    $splitL = New-Object System.Windows.Forms.Splitter -Property @{ Dock = 'Left'; Width = (Px 5); BackColor = $C.Panel; MinSize = (Px 240); MinExtra = (Px 260) }
+    $splitR = New-Object System.Windows.Forms.Splitter -Property @{ Dock = 'Right'; Width = (Px 5); BackColor = $C.Panel; MinSize = (Px 220); MinExtra = (Px 260) }
+    $splitL.add_SplitterMoved({ $DgUI.LeftUser = $true })
+    $f.Controls.Add($cv); $f.Controls.Add($splitR); $f.Controls.Add($right); $f.Controls.Add($splitL); $f.Controls.Add($left); $f.Controls.Add($status); $f.Controls.Add($top)
+    $DgUI.Left = $left; $DgUI.SplitL = $splitL; $DgUI.SplitR = $splitR; $DgUI.LeftUser = $false
+    $DgUI.ShowLeft = $true; $DgUI.ShowRight = $true
+    $DgUI.FullPanels = @($right, $left, $top, $status, $splitL, $splitR); $DgUI.Full = $false
     $cv.BringToFront()
+    $f.add_Resize({ Update-DgBarLayout })
+    Update-DgBarLayout; Set-DiagramPanels; Set-DiagramMode $true; Set-DiagramTool 0
 
     $DgUI.ColorTimer = New-TbDebounce 500 { if ($DgUI.Form) { Set-DiagramColors } }
     $DgUI.TypeTimer = New-TbDebounce 380 {
@@ -29873,12 +30183,14 @@ function Show-DiagramStudio([string]$Text = '') {
         if ($e.Control -and $e.KeyCode -eq 'Z') { $e.SuppressKeyPress = $true; Undo-Diagram }
         elseif ($e.Control -and $e.KeyCode -eq 'Y') { $e.SuppressKeyPress = $true; Redo-Diagram }
         elseif ($e.Control -and $e.KeyCode -eq 'S') { $e.SuppressKeyPress = $true; Save-DiagramNow }
+        elseif ($e.Control -and $e.KeyCode -eq 'D1') { $e.SuppressKeyPress = $true; $DgUI.ShowLeft = -not $DgUI.ShowLeft; Set-DiagramPanels }
+        elseif ($e.Control -and $e.KeyCode -eq 'D2') { $e.SuppressKeyPress = $true; $DgUI.ShowRight = -not $DgUI.ShowRight; Set-DiagramPanels }
         elseif ($e.KeyCode -eq 'F11') { $e.SuppressKeyPress = $true; Set-DiagramFullscreen (-not $DgUI.Full) }
         elseif ($e.KeyCode -eq 'Escape' -and $DgUI.Full) { $e.SuppressKeyPress = $true; Set-DiagramFullscreen $false }
     })
     Register-DiagramDrop $f
     $f.add_FormClosing({ Save-DiagramPropEdits; $DgUI.TypeTimer.Stop(); $t = $DgUI.Editor.Text; if ($t -cne $DgUI.Text) { $DgUI.Text = $t }; Save-DiagramFile })
-    $f.add_FormClosed({ foreach ($k in 'TypeTimer', 'ColorTimer', 'SaveTimer', 'PropTimer') { if ($DgUI[$k]) { $DgUI[$k].Dispose(); $DgUI[$k] = $null } }; $DgUI.Form = $null; $DgUI.Canvas = $null; $DgUI.Props = $null; $DgUI.List = $null; $DgUI.Folders = $null; $DgUI.ModeSet = $false })
+    $f.add_FormClosed({ foreach ($k in 'TypeTimer', 'ColorTimer', 'SaveTimer', 'PropTimer') { if ($DgUI[$k]) { $DgUI[$k].Dispose(); $DgUI[$k] = $null } }; $DgUI.Form = $null; $DgUI.Canvas = $null; $DgUI.Props = $null; $DgUI.List = $null; $DgUI.Folders = $null; $DgUI.ModeSet = $false; $DgUI.FullExit = $null; $DgUI.StatusText = $null })
     Register-ThemedWindow $f
     $f.Show()
     [PowerClipHost]::EnsureShown($f.Handle)
@@ -32242,8 +32554,8 @@ function Show-SqlClient {
 }
 
 
-Register-PaletteCommand 'SQL client' '' $Glyph.Code { Show-SqlClient } 'sql server database query select table er diagram mssql tsql'
-Register-PaletteCommand 'Diagram studio' '' $Glyph.Apps { Show-DiagramStudio } 'diagram flowchart mermaid svg architecture network map draw chart graph org'
+Register-PaletteCommand 'SQL client' '' $Glyph.TSql { Show-SqlClient } 'sql server database query select table er diagram mssql tsql'
+Register-PaletteCommand 'Diagram studio' '' $Glyph.TDiagram { Show-DiagramStudio } 'diagram flowchart mermaid svg architecture network map draw chart graph org'
 
 $ToolGroups = [ordered]@{
     'Clipboard & notes'     = @('Clipboard history', 'Notes', 'Snippets', 'Secrets', 'Paste stack=Paste stack: collect what I copy next')
@@ -32568,7 +32880,7 @@ function Add-JsonTreeChildren($Nodes, $Value, $Steps = @()) {
     }
 }
 
-Register-ToolboxPage 'json' 'JSON, YAML, CSV, XML' $Glyph.Code 'json yaml yml csv tsv tab separated delimited excel xml convert format pretty minify jsonpath tree validate path loop foreach code' {
+Register-ToolboxPage 'json' 'JSON, YAML, CSV, XML' $Glyph.TJson 'json yaml yml csv tsv tab separated delimited excel xml convert format pretty minify jsonpath tree validate path loop foreach code' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $split = New-Object System.Windows.Forms.SplitContainer
@@ -33123,7 +33435,7 @@ function Format-Relative([datetime]$When) {
     if ($span.TotalSeconds -ge 0) { "in $txt" } else { "$txt ago" }
 }
 
-Register-ToolboxPage 'jwt' 'JWT decoder' $Glyph.Lock 'jwt token bearer decode claims expiry signature' {
+Register-ToolboxPage 'jwt' 'JWT decoder' $Glyph.TJwt 'jwt token bearer decode claims expiry signature' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $split = New-Object System.Windows.Forms.SplitContainer
@@ -33222,7 +33534,7 @@ function Update-JwtTool($St) {
 # ======================================================================================
 # Regex tester: live highlighting, groups, replace preview.
 # ======================================================================================
-Register-ToolboxPage 'regex' 'Regex tester' $Glyph.Search 'regular expression regex match replace groups test' {
+Register-ToolboxPage 'regex' 'Regex tester' $Glyph.TRegex 'regular expression regex match replace groups test' {
     param($panel, $st)
     foreach ($kv in (@{ Busy = $false }).GetEnumerator()) { $st[$kv.Key] = $kv.Value }
     $st.Status = New-TbPage $panel
@@ -33648,7 +33960,7 @@ function Update-RegexTool($St) {
 # ======================================================================================
 # Cron: explain an expression and list the next runs.
 # ======================================================================================
-Register-ToolboxPage 'cron' 'Cron expressions' $Glyph.History 'cron schedule crontab next run quartz' {
+Register-ToolboxPage 'cron' 'Cron expressions' $Glyph.TCron 'cron schedule crontab next run quartz' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $st.Runs = New-TbRtb -ReadOnly; $st.Runs.Dock = 'Fill'
@@ -33743,7 +34055,7 @@ function New-TestRow([string[]]$Fields, [int]$Index) {
     $o
 }
 
-Register-ToolboxPage 'gen' 'Generators' $Glyph.Refresh 'generate guid uuid password lorem ipsum test data fake random' {
+Register-ToolboxPage 'gen' 'Generators' $Glyph.TGen 'generate guid uuid password lorem ipsum test data fake random' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $st.Output = New-TbBox -Mono -Multi -ReadOnly
@@ -33862,7 +34174,7 @@ function New-GeneratorOutput($St) {
 # ======================================================================================
 # QR code
 # ======================================================================================
-Register-ToolboxPage 'qr' 'QR code' $Glyph.Apps 'qr code barcode generate image' {
+Register-ToolboxPage 'qr' 'QR code' $Glyph.TQr 'qr code barcode generate image' {
     param($panel, $st)
     foreach ($kv in (@{ Bitmap = $null }).GetEnumerator()) { $st[$kv.Key] = $kv.Value }
     $st.Status = New-TbPage $panel
@@ -33912,7 +34224,7 @@ function Update-QrTool($St) {
 # ======================================================================================
 # Hide secret messages: inside a picture, inside normal text (invisible characters) or at the end of any file.
 # ======================================================================================
-Register-ToolboxPage 'stego' 'Hide secret messages' $Glyph.Lock 'steganography hide secret message picture image png invisible zero width text file watermark' {
+Register-ToolboxPage 'stego' 'Hide secret messages' $Glyph.TStego 'steganography hide secret message picture image png invisible zero width text file watermark' {
     param($panel, $st)
     foreach ($kv in (@{ Image = $null; ImageName = '' }).GetEnumerator()) { $st[$kv.Key] = $kv.Value }
     $st.Status = New-TbPage $panel
@@ -34113,7 +34425,7 @@ function Invoke-StegoRemove($S) {
 # ======================================================================================
 # Log viewer: follow a log file as it grows, filter and colour its lines.
 # ======================================================================================
-Register-ToolboxPage 'log' 'Log viewer' $Glyph.Document 'log tail follow watch file errors filter grep live' {
+Register-ToolboxPage 'log' 'Log viewer' $Glyph.TLog 'log tail follow watch file errors filter grep live' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $v = New-Object DevLogView
@@ -34187,7 +34499,7 @@ function Update-LogStatus($S) {
 # ======================================================================================
 # Subnet calculator: ranges, masks and host counts for IPv4 and IPv6, splitting, "is this IP inside?".
 # ======================================================================================
-Register-ToolboxPage 'subnet' 'Subnet calculator' $Glyph.Network 'subnet cidr netmask ip range network calculator ipv4 ipv6 broadcast hosts' {
+Register-ToolboxPage 'subnet' 'Subnet calculator' $Glyph.TSubnet 'subnet cidr netmask ip range network calculator ipv4 ipv6 broadcast hosts' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $st.Out = New-TbRtb -ReadOnly; $st.Out.Dock = 'Fill'; $st.Out.Font = New-Object System.Drawing.Font('Consolas', (Fz 11))
@@ -34246,7 +34558,7 @@ function Update-SubnetTool($S, [switch]$NewInput) {
 # ======================================================================================
 # DNS lookup: any record type from any DNS server, plus whois.
 # ======================================================================================
-Register-ToolboxPage 'dns' 'DNS lookup & whois' $Glyph.Globe 'dns nslookup dig record mx txt cname ns soa srv ptr caa whois domain registrar' {
+Register-ToolboxPage 'dns' 'DNS lookup & whois' $Glyph.TDns 'dns nslookup dig record mx txt cname ns soa srv ptr caa whois domain registrar' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $tabs = New-TabSet $panel
@@ -34516,11 +34828,11 @@ public static class DevCertTool {
 # ======================================================================================
 # Certificate maker: self-signed certificates (also CAs), signing requests (CSR), open and convert PEM / CER / PFX.
 # ======================================================================================
-Register-ToolboxPage 'certmake' 'Certificate maker' $Glyph.Lock 'certificate self-signed csr pem pfx p12 cer der convert ssl tls https localhost key openssl' {
+Register-ToolboxPage 'certmake' 'Certificate maker' $Glyph.TCertMake 'certificate self-signed csr pem pfx p12 cer der convert ssl tls https localhost key openssl' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     if (-not ('DevCertTool' -as [type])) {           # compiled the first time it's needed (needs .NET 4.7.2+)
-        try { Add-Type -ReferencedAssemblies System.Core, System.Security -TypeDefinition $CertToolSource -ErrorAction Stop } catch { Write-Log "certificate maker: $_" }
+        try { Import-DevCode -Name 'CertTool' -References System.Core, System.Security -Source $CertToolSource } catch { Write-Log "certificate maker: $_" }
     }
     if (-not ('DevCertTool' -as [type])) { Set-TbStatus $st.Status 'This needs .NET Framework 4.7.2 or newer (Windows 10 1803+ has it).' 'error'; return $st }
     $tabs = New-TabSet $panel
@@ -34640,7 +34952,7 @@ function Save-CertAs($S, [string]$Format) {
 # ======================================================================================
 # Screen recorder: record an area of the screen as an animated GIF.
 # ======================================================================================
-Register-ToolboxPage 'record' 'Screen recorder (GIF)' $Glyph.Photo 'screen recorder record gif video capture animation demo bug report' {
+Register-ToolboxPage 'record' 'Screen recorder (GIF)' $Glyph.TRecord 'screen recorder record gif video capture animation demo bug report' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $st.Preview = New-Object System.Windows.Forms.PictureBox
@@ -34703,7 +35015,7 @@ function Start-ScreenRecording($S, [bool]$WholeScreen) {
     if (-not $area) { Show-Toolbox 'record'; return }
     if ($area.Width % 2) { $area.Width-- }; if ($area.Height % 2) { $area.Height-- }
     $fps = [int]$S.Fps.SelectedItem
-    $file = Join-Path ([IO.Path]::GetTempPath()) "DevTools-recording-$((Get-Date).ToString('yyyyMMdd-HHmmss')).gif"
+    $file = Get-WorkFile "recording-$((Get-Date).ToString('yyyyMMdd-HHmmss')).gif"
     $fs = [IO.File]::Create($file)
     $rec = @{ S = $S; Area = $area; File = $file; Stream = $fs; Writer = (New-Object DevGifWriter($fs, $area.Width, $area.Height)); Delay = [int](100 / $fps); Started = Get-Date; Cursor = $S.Cursor.Checked }
     $script:Recording = $rec
@@ -34767,7 +35079,7 @@ $CodeImageBackgrounds = [ordered]@{
     'Purple' = @('#A78BFA', '#4F46E5'); 'Ocean' = @('#22D3EE', '#2563EB'); 'Sunset' = @('#FB923C', '#DB2777'); 'Forest' = @('#34D399', '#047857')
     'Grey' = @('#9CA3AF', '#4B5563'); 'None (transparent)' = @('', '')
 }
-Register-ToolboxPage 'codeimg' 'Code to image' $Glyph.Code 'code image screenshot snippet carbon share picture syntax highlight pretty' {
+Register-ToolboxPage 'codeimg' 'Code to image' $Glyph.TCodeImg 'code image screenshot snippet carbon share picture syntax highlight pretty' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $split = New-Object System.Windows.Forms.SplitContainer
@@ -35086,7 +35398,7 @@ function Complete-ScreenColorPick($Form, [bool]$Pick) {
 # ======================================================================================
 # File hash: MD5 / SHA-1 / SHA-256 / SHA-512, compare with an expected value.
 # ======================================================================================
-Register-ToolboxPage 'hash' 'File hash' $Glyph.Document 'hash checksum md5 sha1 sha256 sha512 file verify download' {
+Register-ToolboxPage 'hash' 'File hash' $Glyph.THash 'hash checksum md5 sha1 sha256 sha512 file verify download' {
     param($panel, $st)
     foreach ($kv in (@{ Job = $null }).GetEnumerator()) { $st[$kv.Key] = $kv.Value }
     $st.Status = New-TbPage $panel
@@ -35175,7 +35487,7 @@ function Update-HashVerdict($St) {
 # ======================================================================================
 # Ports: what is listening / connected, with the process behind it.
 # ======================================================================================
-Register-ToolboxPage 'ports' 'Ports' $Glyph.Network 'ports listening netstat process kill tcp udp who uses port' {
+Register-ToolboxPage 'ports' 'Ports' $Glyph.TPorts 'ports listening netstat process kill tcp udp who uses port' {
     param($panel, $st)
     foreach ($kv in (@{ Rows = @() }).GetEnumerator()) { $st[$kv.Key] = $kv.Value }
     $st.Status = New-TbPage $panel
@@ -35249,7 +35561,7 @@ function Update-PortsList($St, [switch]$Reload) {
 # ======================================================================================
 # Certificates: TLS certificate of a server (expiry, names, chain, protocol).
 # ======================================================================================
-Register-ToolboxPage 'cert' 'Certificates' $Glyph.Lock 'ssl tls certificate https expiry expires chain san check' {
+Register-ToolboxPage 'cert' 'Certificates' $Glyph.TCert 'ssl tls certificate https expiry expires chain san check' {
     param($panel, $st)
     foreach ($kv in (@{ Job = $null }).GetEnumerator()) { $st[$kv.Key] = $kv.Value }
     $st.Status = New-TbPage $panel
@@ -35644,7 +35956,7 @@ function Show-HostDialog($Target) {
     $out
 }
 
-Register-ToolboxPage 'hosts' 'Host monitor' $Glyph.Globe 'monitor uptime ping servers dashboard status up down' {
+Register-ToolboxPage 'hosts' 'Host monitor' $Glyph.THosts 'monitor uptime ping servers dashboard status up down' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $list = New-Object DevBufferedListBox
@@ -35976,7 +36288,7 @@ function Edit-MonitoredHost {
 # ======================================================================================
 # Number bases: decimal / hex / binary / octal, two's complement, bytes, as time / IP / colour.
 # ======================================================================================
-Register-ToolboxPage 'numbers' 'Number bases' $Glyph.Code 'number base convert hex binary octal decimal two complement bits bytes endian' {
+Register-ToolboxPage 'numbers' 'Number bases' $Glyph.TNumbers 'number base convert hex binary octal decimal two complement bits bytes endian' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $st.Output = New-TbRtb -ReadOnly; $st.Output.Dock = 'Fill'
@@ -36052,7 +36364,7 @@ function Format-UnitNumber([double]$V) {
     $r.ToString('#,0.##########', [Globalization.CultureInfo]::InvariantCulture).Replace(',', ' ')
 }
 
-Register-ToolboxPage 'units' 'Units' $Glyph.Refresh 'unit convert length weight data size mb gb mib time speed area volume temperature celsius fahrenheit pressure energy' {
+Register-ToolboxPage 'units' 'Units' $Glyph.TUnits 'unit convert length weight data size mb gb mib time speed area volume temperature celsius fahrenheit pressure energy' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $lv = New-Object System.Windows.Forms.ListView
@@ -36148,7 +36460,7 @@ function ConvertTo-DateTimeOffset([string]$Text, [TimeZoneInfo]$Zone) {
 
 function Format-Offset([TimeSpan]$O) { '{0}{1:00}:{2:00}' -f $(if ($O -lt [TimeSpan]::Zero) { '-' } else { '+' }), [math]::Abs($O.Hours), [math]::Abs($O.Minutes) }
 
-Register-ToolboxPage 'time' 'Time & time zones' $Glyph.History 'time date timestamp unix epoch iso 8601 timezone time zone utc convert world clock' {
+Register-ToolboxPage 'time' 'Time & time zones' $Glyph.TTime 'time date timestamp unix epoch iso 8601 timezone time zone utc convert world clock' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $split = New-Object System.Windows.Forms.SplitContainer
@@ -36276,7 +36588,7 @@ function Save-MarkdownHtml([string]$Markdown, [string]$Name, $Owner) {
     } finally { $script:Modal = $false; $d.Dispose() }
 }
 
-Register-ToolboxPage 'markdown' 'Markdown preview' $Glyph.Document 'markdown md preview render html export readme' {
+Register-ToolboxPage 'markdown' 'Markdown preview' $Glyph.TMarkdown 'markdown md preview render html export readme' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $split = New-Object System.Windows.Forms.SplitContainer
@@ -36313,7 +36625,7 @@ Register-ToolboxPage 'markdown' 'Markdown preview' $Glyph.Document 'markdown md 
     } $bar $Glyph.Save 2)
     [void](New-Button 'Open in browser' 'Show the page in your web browser' {
         $s = $TbUI.Pages['markdown'].State
-        $f = Join-Path ([IO.Path]::GetTempPath()) 'DevTools-markdown-preview.html'
+        $f = Get-WorkFile 'markdown-preview.html'
         [IO.File]::WriteAllText($f, [DevMarkdown]::Page($s.Input.Text, $(if ($s.Name) { $s.Name } else { 'Markdown' }), $false), (New-Object System.Text.UTF8Encoding $false))
         Start-Process $f
     } $bar $Glyph.Globe 2)
@@ -36382,7 +36694,7 @@ function Show-EnvVarDialog([string]$Name = '', [string]$Value = '', [bool]$Syste
     } finally { $script:Modal = $false; $d.Dispose() }
 }
 
-Register-ToolboxPage 'env' 'Environment & PATH' $Glyph.Settings 'environment variables env path edit system user folder missing' {
+Register-ToolboxPage 'env' 'Environment & PATH' $Glyph.TEnv 'environment variables env path edit system user folder missing' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $tabs = New-TabSet $panel
@@ -36574,7 +36886,7 @@ function Save-PathList($St) {
 # ======================================================================================
 # Processes and services.
 # ======================================================================================
-Register-ToolboxPage 'procs' 'Processes & services' $Glyph.Apps 'process task manager kill end memory cpu service start stop restart' {
+Register-ToolboxPage 'procs' 'Processes & services' $Glyph.TProcs 'process task manager kill end memory cpu service start stop restart' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $tabs = New-TabSet $panel
@@ -36835,7 +37147,7 @@ function Update-ClockView {
     if ($s.Laps.Items.Count -ne $Clock.Laps.Count) { $s.Laps.Items.Clear(); foreach ($l in $Clock.Laps) { [void]$s.Laps.Items.Add($l) } }
 }
 
-Register-ToolboxPage 'timer' 'Timer & Pomodoro' $Glyph.History 'timer countdown stopwatch pomodoro focus break alarm lap' {
+Register-ToolboxPage 'timer' 'Timer & Pomodoro' $Glyph.TTimer 'timer countdown stopwatch pomodoro focus break alarm lap' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $st.Laps = New-Object System.Windows.Forms.ListBox
@@ -37019,7 +37331,7 @@ function New-MouseRow($Parent) {
     $r
 }
 
-Register-ToolboxPage 'mouse' 'Mouse mover & clicker' $Glyph.Apps 'mouse mover jiggler keep awake active teams slack idle away status move 0 pixel auto clicker autoclick click' {
+Register-ToolboxPage 'mouse' 'Mouse mover & clicker' $Glyph.TMouse 'mouse mover jiggler keep awake active teams slack idle away status move 0 pixel auto clicker autoclick click' {
     param($panel, $st)
     $st.Status = New-TbPage $panel
     $flow = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -37428,7 +37740,7 @@ function Invoke-GitCommit([switch]$Push) {
         if ([System.Windows.Forms.MessageBox]::Show($GitUI.Form, 'Nothing is staged. Stage all changes and commit them?', 'Git', 'YesNo', 'Question') -ne 'Yes') { return }
         [void](Invoke-Git 'add -A')
     }
-    $tmp = [IO.Path]::GetTempFileName()
+    $tmp = Get-WorkFile ('commit-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.txt')
     [IO.File]::WriteAllText($tmp, $msg, (New-Object System.Text.UTF8Encoding $false))
     try { $r = Invoke-Git "commit $(if ($amend) { '--amend ' })$(if (-not $msg) { '--no-edit' } else { "-F $([DevGit]::Q($tmp))" })" } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
     if ($r.Code -eq 0) { $GitUI.Message.Text = ''; $GitUI.Amend.Checked = $false; Set-GitStatus 'Committed.' $C.Green; Update-GitAll; if ($Push) { Invoke-GitPush } }
@@ -38236,7 +38548,7 @@ function Show-ImageEditor($Item = $null, $Bitmap = $null) {
     [void](New-Button 'Open in Paint' 'Continue in Microsoft Paint' {
         param($src, $e)
         $s = $src.FindForm().Tag
-        $tmp = Join-Path $env:TEMP "devtools-edit-$(Get-Date -Format 'HHmmss').png"
+        $tmp = Get-WorkFile "edit-$(Get-Date -Format 'HHmmss').png"
         $bmp = $s.Editor.Result(); $bmp.Save($tmp, [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
         try { Start-Process mspaint.exe "`"$tmp`"" } catch { Start-Process $tmp }
     } $bottom $Glyph.Edit 2)
@@ -38956,7 +39268,7 @@ function Invoke-Sync([switch]$Quiet) {
             $r = $remoteById[$n.Id]
             if (-not $r -or $n.Modified -gt (Convert-Time $r.Modified).AddSeconds(1)) { & $copyNote $n.Id $NotesDir $rn }
         }
-        foreach ($r in $remoteNotes) { if ($r -and $r.Id -and $dead.ContainsKey([string]$r.Id)) { & $copyNote ([string]$r.Id) (Join-Path $env:TEMP 'devtools-nothing') $rn } }
+        foreach ($r in $remoteNotes) { if ($r -and $r.Id -and $dead.ContainsKey([string]$r.Id)) { & $copyNote ([string]$r.Id) (Join-Path $DataDir 'devtools-nothing') $rn } }
         $idx = foreach ($n in $script:Notes) { Get-NoteIndexEntry $n }
         Write-JsonFile (Join-Path $rn 'index.json') (ConvertTo-Json -InputObject @($idx) -Depth 3)
         $remoteFolders = @(Read-SyncJson (Join-Path $rn 'folders.json'))
@@ -39968,6 +40280,7 @@ $ThemeWatch.Start()
 # Debug builds only (POWERCLIP_DEBUG set at launch): run commands written to data\debug-cmd.ps1, so the UI
 # can be tested without simulated keyboard / mouse input. Output goes to data\debug-out.txt.
 if ($env:POWERCLIP_DEBUG) {
+    foreach ($dup in @(Get-ToolRows | Group-Object Icon | Where-Object { $_.Count -gt 1 })) { Write-Log "icons: these tools share one icon: $(($dup.Group | ForEach-Object Title) -join ', ')" }
     $DebugCmdFile = Join-Path $DataDir 'debug-cmd.ps1'
     $DebugTimer = New-Object System.Windows.Forms.Timer
     $DebugTimer.Interval = 300

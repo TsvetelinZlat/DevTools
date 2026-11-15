@@ -8,6 +8,34 @@ Double-click `DevTools.bat`. A clipboard icon appears in the system tray.
 
 To start it with Windows, turn on **Start with Windows** in Settings (gear icon).
 
+## Portable: nothing to install, nothing in AppData
+
+Copy the folder (`DevTools.bat`, `DevTools.ps1`, `bin\`, and `data\` if you want your things to come along) to any Windows 10 / 11 PC and start it. No installer, no admin rights, no downloads, no environment variables.
+
+- **What it runs on** is already part of Windows: Windows PowerShell 5.1, .NET Framework 4.x and the Segoe icon font. Nothing else is needed.
+- **`bin\`** holds the compiled parts of DevTools (13 small DLLs, under 1 MB together). They are loaded from there, straight from their bytes, so the files are never locked and a "downloaded from the internet" mark on a copied folder doesn't block them.
+- **Nothing is compiled or unpacked into `%TEMP%` / `AppData`.** Earlier versions compiled their C# with `Add-Type` on every start, which writes a DLL into `AppData\Local\Temp` and loads it from there. Where company policy cleans that folder or removes DLLs from the user profile, tools stopped with errors like "The diagram engine couldn't start". That step is gone.
+- **After changing the code** in `DevTools.ps1`, a module whose source changed is rebuilt into `bin\` the next time it's needed (the DLL's version number is a fingerprint of its source). The compiler is the one inside Windows' .NET Framework, and it works inside `bin\` too. To rebuild everything in one go, for example before copying the folder to another PC:
+
+  ```
+  powershell -NoProfile -ExecutionPolicy Bypass -File DevTools.ps1 -Build
+  ```
+- **Scratch files** (the page behind *Open in browser*, a recording before you save it, a picture handed to Paint) go to `data\temp\` and are removed after two days.
+- **Read-only folder** (a share you can't write to): DevTools still starts from the DLLs in `bin\`. Only when a DLL is missing *and* the folder can't be written does it fall back to compiling in memory, and it says so in `data\debug.log`.
+
+What still lives outside the folder, and why:
+
+| What | Why it can't move | What happens if it's cleaned |
+|---|---|---|
+| PowerShell's own start-up cache in `AppData\Local\Microsoft\Windows\PowerShell` | written by Windows PowerShell itself, not by DevTools | nothing; PowerShell recreates it |
+| The Windows account key that unlocks encrypted data without the master password (DPAPI, under `AppData\Roaming\Microsoft\Protect`) | it is the Windows account's key store, the point of "unlock with my Windows account" | you are asked for the master password instead, as on a new PC |
+| The *Start with Windows* shortcut | Windows only looks in the user's Startup folder | DevTools doesn't start by itself until you turn the setting on again |
+| Default backup folder `Documents\DevTools backups` | a backup next to the original isn't a backup; change it in Settings | - |
+
+Optional, only if they are already on the PC (DevTools never installs or downloads them): `git.exe` for the Git window, PostgreSQL / Oracle drivers for the SQL client, VS Code for "open at line", Paint, your web browser.
+
+Limits no script can work around: if company policy blocks PowerShell scripts altogether (AppLocker / WDAC script rules, Constrained Language Mode), DevTools can't start; that needs an exception from IT for the folder.
+
 ## Use
 
 Three shortcuts work everywhere in Windows:
@@ -418,7 +446,12 @@ Diagrams from a few lines of text: architecture maps, flowcharts, org charts and
   - **Groups**: dashed frames.
   - **Links**: right-angled, curved or straight; dashed, thick, two-way, labelled; **animated**, so packets flow along them.
 
-  **Syntax help** (bottom left) lists it all.
+  **Syntax help** (bottom left, or **?** in the command bar) lists it all.
+- **The window**: a command bar on top, the text / data / shapes / saved diagrams on the left, the canvas in the middle, properties on the right, a status bar at the bottom.
+  - **Command bar**: every command has its own icon and a tooltip with its name and shortcut, in groups: file (New, Examples, Import, Save, Export), edit (Undo, Redo, Copy, Paste, Duplicate, Delete), canvas tools, insert (shape, text, re-layout), **Edit / Preview**, view (dark / light, pause, speed) and window (left panel, properties, fullscreen, help). In a narrow window the labels drop away and whole groups move to a second row; nothing overlaps or is cut off.
+  - **Canvas tools** (the active one is highlighted): **Select** (`V`) moves shapes and drags links from a shape's dot; **Pan** (`H`) only moves the view; **Select area** (`M`) drags a box around shapes; **Connect** (`L`) links two shapes by dragging from one to the other. `Esc` goes back to Select.
+  - **Panels**: drag the edge of a side panel to resize it; hide or show them with their buttons or `Ctrl+1` / `Ctrl+2` to give the canvas the room.
+  - **Status bar**: shapes, links and what is selected, what the active tool does, and the zoom (out, 100 %, in, fit). The legend chips at the bottom of the canvas wrap onto as many rows as they need and the diagram is fitted above them.
 - **Charts** live in the same text: `chart column` (or bar, stacked column / bar, line, area, pie, donut, scatter), `x Month`, `y Sales, Costs`, `agg sum` (count, avg, min, max, first), `sort value` (asc, desc), `top 10`, `labels on`, `prefix $` / `suffix %`, then the rows between `data` and `end` (CSV or tab-separated; the first row names the columns). Rows with the same X are combined. Point at a bar, slice or dot for its value; click a legend chip to hide a series. They export like any diagram: PNG, SVG, an interactive page with tooltips and legend.
   ```
   title Monthly sales
@@ -640,13 +673,14 @@ Everything is stored next to the script in `data\`:
 - `vault.dat`: your secrets, encrypted (see Secrets)
 - `keys.dat`: only when data encryption is on - the data key, wrapped for your Windows account and for your master password
 - `snippets.json`, `hosts.json` (host monitor), `colors.json` (recent colours), `api\` (API tester collections, history and environments)
+- `temp\`: scratch files (see Portable above), removed after two days
 - `settings.json`:
   - `Paused`
   - `MaxItems`: how many unpinned clips to keep (default 500; older ones are removed together with their images and files)
   - `MaxFileMB`: size limit for copied files and images (default 10). Anything bigger is not saved. Note attachments have no limit.
   - `MaxTextMB`: size limit for copied text (default 50). Bigger text is not saved. Texts over 256 KB are kept in `data\texts\` so that `history.json` stays small and fast.
 
-Copy the whole folder to a USB stick and your history and notes come with it. Settings > Backup makes zip backups of it.
+Copy the whole folder (with `bin\`) to a USB stick and your history and notes come with it. Settings > Backup makes zip backups of it.
 
 ## Images and files
 
