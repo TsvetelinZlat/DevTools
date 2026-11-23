@@ -58,7 +58,12 @@ function Import-DevCode {
             $cp.GenerateInMemory = $false; $cp.GenerateExecutable = $false; $cp.IncludeDebugInformation = $false
             $cp.OutputAssembly = $dll
             $cp.TempFiles = New-Object System.CodeDom.Compiler.TempFileCollection($script:BinDir, $false)   # the compiler's scratch files: here, not %TEMP%
-            foreach ($r in @('System', 'System.Core') + $References | Select-Object -Unique) { [void]$cp.ReferencedAssemblies.Add("$r.dll") }
+            # .NET Framework's own folder; WPF parts (UI Automation, WindowsBase) are in its WPF subfolder
+            $fw = [Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()
+            foreach ($r in @('System', 'System.Core') + $References | Select-Object -Unique) {
+                $wpf = Join-Path $fw "WPF\$r.dll"
+                [void]$cp.ReferencedAssemblies.Add($(if (-not [IO.File]::Exists((Join-Path $fw "$r.dll")) -and [IO.File]::Exists($wpf)) { $wpf } else { "$r.dll" }))
+            }
             [void]$cp.ReferencedAssemblies.Add([psobject].Assembly.Location)
             $stamp = "[assembly: System.Reflection.AssemblyVersion(""$ver"")]"
             # csc.exe itself puts a scratch file in %TEMP% while it writes the DLL, and fails when that folder is
@@ -129,6 +134,79 @@ using System.Windows.Forms;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 
+// The Windows folder picker with the address bar, search box and navigation pane (the Explorer-style one),
+// used like WinForms' FolderBrowserDialog (Description, SelectedPath, ShowDialog), which shows an old tree.
+[ComImport, Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IDevShellItem {
+    void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+    void GetParent(out IDevShellItem si);
+    void GetDisplayName(uint sigdn, [MarshalAs(UnmanagedType.LPWStr)] out string name);
+    void GetAttributes(uint mask, out uint attribs);
+    void Compare(IDevShellItem si, uint hint, out int order);
+}
+[ComImport, Guid("42f85136-db7e-439c-85f1-e4075d135fc8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IDevFileDialog {
+    [PreserveSig] int Show(IntPtr parent);
+    void SetFileTypes(uint count, IntPtr specs);
+    void SetFileTypeIndex(uint index);
+    void GetFileTypeIndex(out uint index);
+    void Advise(IntPtr sink, out uint cookie);
+    void Unadvise(uint cookie);
+    void SetOptions(uint fos);
+    void GetOptions(out uint fos);
+    void SetDefaultFolder(IDevShellItem si);
+    void SetFolder(IDevShellItem si);
+    void GetFolder(out IDevShellItem si);
+    void GetCurrentSelection(out IDevShellItem si);
+    void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string name);
+    void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string name);
+    void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string title);
+    void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string text);
+    void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string label);
+    void GetResult(out IDevShellItem si);
+}
+[ComImport, Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")] class DevFileOpenDialogCo { }
+
+public class DevFolderDialog : IDisposable {
+    public string Description = "", SelectedPath = "";
+    public bool ShowNewFolderButton = true;          // the new picker always has "New folder"; kept so callers compile
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern int SHCreateItemFromParsingName(string path, IntPtr pbc, [MarshalAs(UnmanagedType.LPStruct)] Guid riid, out IDevShellItem item);
+    [DllImport("user32.dll")] static extern IntPtr GetActiveWindow();
+    const uint FOS_NOCHANGEDIR = 0x8, FOS_PICKFOLDERS = 0x20, FOS_FORCEFILESYSTEM = 0x40, FOS_PATHMUSTEXIST = 0x800;
+
+    public DialogResult ShowDialog() { return ShowDialog(null); }
+    public DialogResult ShowDialog(IWin32Window owner) {
+        IDevFileDialog dlg;
+        try { dlg = (IDevFileDialog)new DevFileOpenDialogCo(); }
+        catch { return Old(owner); }                  // no modern picker (very old Windows): the classic one
+        try {
+            uint opts; dlg.GetOptions(out opts);
+            dlg.SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR);
+            if (!string.IsNullOrEmpty(Description)) dlg.SetTitle(Description);
+            dlg.SetOkButtonLabel("Select folder");
+            string start = SelectedPath;
+            while (!string.IsNullOrEmpty(start) && !System.IO.Directory.Exists(start)) start = System.IO.Path.GetDirectoryName(start);
+            if (!string.IsNullOrEmpty(start)) {
+                IDevShellItem item;
+                if (SHCreateItemFromParsingName(start, IntPtr.Zero, typeof(IDevShellItem).GUID, out item) == 0 && item != null) { dlg.SetFolder(item); Marshal.ReleaseComObject(item); }
+            }
+            int hr = dlg.Show(owner != null ? owner.Handle : GetActiveWindow());
+            if (hr != 0) return DialogResult.Cancel;     // also "cancelled" (0x800704C7)
+            IDevShellItem res; dlg.GetResult(out res);
+            string path; res.GetDisplayName(0x80058000 /* SIGDN_FILESYSPATH */, out path);
+            Marshal.ReleaseComObject(res);
+            if (string.IsNullOrEmpty(path)) return DialogResult.Cancel;
+            SelectedPath = path;
+            return DialogResult.OK;
+        } finally { Marshal.ReleaseComObject(dlg); }
+    }
+    DialogResult Old(IWin32Window owner) {
+        using (var d = new FolderBrowserDialog { Description = Description, SelectedPath = SelectedPath, ShowNewFolderButton = ShowNewFolderButton }) {
+            var r = d.ShowDialog(owner); if (r == DialogResult.OK) SelectedPath = d.SelectedPath; return r;
+        }
+    }
+    public void Dispose() { }
+}
 public class PowerClipHost : NativeWindow {
     [DllImport("user32.dll", SetLastError = true)] private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
     [DllImport("user32.dll")] private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
@@ -7680,7 +7758,9 @@ foreach ($pair in @(
     'TSnippets=E8D2', 'TStack=E81E', 'TJson=E8FD', 'TRegex=E71C', 'TJwt=E8D7', 'TMarkdown=E8A1', 'TNumbers=E8EF', 'TUnits=ECC6', 'TCron=E823', 'TTime=E909',
     'TGen=E8B1', 'TQr=ED14', 'TStego=ED1A', 'TCodeImg=E91B', 'THash=E9D5', 'TLog=E9F9', 'TChains=E71B', 'TTestApi=EC27', 'TDiagram=F003', 'TSql=E80A',
     'TNetTools=E968', 'TDns=E8CE', 'TSubnet=ECA5', 'THosts=E7F4', 'TPorts=E8AC', 'TCert=EB95', 'TCertMake=E83D', 'TEnv=E950', 'TProcs=E9D9', 'TGit=EA3C',
-    'TShot=E722', 'TOcr=E8C1', 'TRecord=E714', 'TTimer=E916', 'TReminder=EA8F', 'TMouse=E962',
+    'TShot=E722', 'TOcr=E8C1', 'TRecord=E714', 'TTimer=E916', 'TReminder=EA8F', 'TMouse=E962', 'TWeb=E977', 'TAuto=E9F5', 'Pointer=E8B0',
+    # Web servers window
+    'WsStop=E71A', 'WsBuild=E90F', 'WsOpenDir=E838', 'WsScan=E8F4',
     # Diagram studio command bar
     'Library=E8F1', 'Import=E8E5', 'Export=E72D', 'Redo=E7A6', 'Duplicate=ECCD', 'Pointer=E8B0', 'Pan=E7C2', 'Area=EF20', 'Link=E71B', 'Shape=F158',
     'Layout=F0E2', 'Contrast=E793', 'FitView=E9A6', 'ZoomIn=E8A3', 'ZoomOut=E71F', 'Fullscreen=E740', 'PaneLeft=E8A0', 'PaneRight=E89F', 'Help=E9CE'
@@ -8149,7 +8229,7 @@ function Show-QuickAddMenu($Bubble) {
         try { if ($d.ShowDialog($form) -eq 'OK') { foreach ($f in $d.FileNames) { Add-QuickLink $f } } } finally { $script:Modal = $false; $d.Dispose() }
     } $Glyph.Document)
     [void](Add-MenuItem $m 'Add a folder...' {
-        $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Folder for quick access'
+        $d = New-Object DevFolderDialog; $d.Description = 'Folder for quick access'
         $script:Modal = $true
         try { if ($d.ShowDialog($form) -eq 'OK') { Add-QuickLink $d.SelectedPath } } finally { $script:Modal = $false; $d.Dispose() }
     } $Glyph.Folder)
@@ -9303,7 +9383,7 @@ function New-PathRow($Parent, [string]$Label, [string]$Value) {
     $row.Controls.Add($tb)
     $b = New-Button 'Browse...' 'Pick a folder (or drop one on the box)' {
         param($src, $e)
-        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg = New-Object DevFolderDialog
         $dlg.ShowNewFolderButton = $false
         $current = $src.Tag.Text.Trim().Trim('"')
         if ($current -and (Test-Path -LiteralPath $current -PathType Container)) { $dlg.SelectedPath = $current }
@@ -14259,7 +14339,7 @@ function Save-ChainStepResponse($Data, $Resp, $Req, [string]$Title) {
 # Every step's last response into one folder (one file per step).
 function Save-ChainResults {
     if (-not $ChainUI.Results.Count) { Set-ChainStatus 'Run the chain first.' $C.Dim; return }
-    $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Folder for the responses (one file per step)'
+    $d = New-Object DevFolderDialog; $d.Description = 'Folder for the responses (one file per step)'
     $script:Modal = $true
     try { if ($d.ShowDialog($ChainUI.Form) -ne 'OK') { return }; $root = $d.SelectedPath } finally { $script:Modal = $false; $d.Dispose() }
     $dir = Join-Path $root ((($ChainUI.Current.Name -replace '[\\/:*?"<>|]', '_').Trim()) + ' ' + (Get-Date).ToString('yyyyMMdd-HHmmss'))
@@ -32557,16 +32637,3087 @@ function Show-SqlClient {
 Register-PaletteCommand 'SQL client' '' $Glyph.TSql { Show-SqlClient } 'sql server database query select table er diagram mssql tsql'
 Register-PaletteCommand 'Diagram studio' '' $Glyph.TDiagram { Show-DiagramStudio } 'diagram flowchart mermaid svg architecture network map draw chart graph org'
 
+# The web servers engine (process runner, process trees, ports, health checks, folder scan): compiled the first time it is needed.
+$WebSource = @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+
+// One site process that DevTools started (or found running again): its output, exit and log file.
+public class DevSiteRun {
+    public int Pid;
+    public DateTime Started;
+    public volatile bool Exited;
+    public int ExitCode;
+    public bool Attached;                 // found running from an earlier DevTools: its output can't be read
+    public string LogFile = "";
+    public int Dropped;                   // lines dropped because nobody read them (more than 20000 waiting)
+    Process proc;
+    StreamWriter log;
+    readonly object gate = new object();
+    readonly List<string> pending = new List<string>();
+
+    // Lines start with a marker: ' ' output, '!' error output, '#' a note from DevTools.
+    public static DevSiteRun Start(string exe, string args, string dir, string[] envKeys, string[] envValues, string logFile) {
+        var psi = new ProcessStartInfo(exe, args ?? "");
+        psi.WorkingDirectory = dir; psi.UseShellExecute = false; psi.CreateNoWindow = true;
+        psi.RedirectStandardOutput = true; psi.RedirectStandardError = true; psi.RedirectStandardInput = true;
+        psi.StandardOutputEncoding = new UTF8Encoding(false); psi.StandardErrorEncoding = new UTF8Encoding(false);
+        for (int i = 0; i < envKeys.Length; i++) {
+            if (envValues[i] == null) psi.EnvironmentVariables.Remove(envKeys[i]); else psi.EnvironmentVariables[envKeys[i]] = envValues[i];
+        }
+        var r = new DevSiteRun();
+        r.OpenLog(logFile);
+        r.Add("#" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  > " + exe + " " + args);
+        var p = new Process();
+        p.StartInfo = psi; p.EnableRaisingEvents = true;
+        p.OutputDataReceived += (s, e) => { if (e.Data != null) r.Add(" " + e.Data); };
+        p.ErrorDataReceived += (s, e) => { if (e.Data != null) r.Add("!" + e.Data); };
+        p.Exited += (s, e) => { r.OnExit(p); };
+        try { p.Start(); }
+        catch { r.CloseLog(); throw; }
+        r.proc = p; r.Pid = p.Id;
+        try { r.Started = p.StartTime; } catch { r.Started = DateTime.Now; }
+        p.BeginOutputReadLine(); p.BeginErrorReadLine();
+        return r;
+    }
+
+    // A process from an earlier DevTools run, if it is still the same one (same start time).
+    public static DevSiteRun Attach(int pid, DateTime started, string logFile) {
+        Process p;
+        try { p = Process.GetProcessById(pid); } catch { return null; }
+        try { if (Math.Abs((p.StartTime - started).TotalSeconds) > 2) return null; } catch { return null; }
+        var r = new DevSiteRun();
+        r.Attached = true; r.Pid = pid; r.Started = p.StartTime; r.proc = p;
+        r.OpenLog(logFile);
+        p.EnableRaisingEvents = true;
+        p.Exited += (s, e) => { r.OnExit(p); };
+        if (p.HasExited) r.OnExit(p);
+        return r;
+    }
+
+    void OpenLog(string logFile) {
+        if (string.IsNullOrEmpty(logFile)) return;
+        try {
+            Directory.CreateDirectory(Path.GetDirectoryName(logFile));
+            if (File.Exists(logFile) && new FileInfo(logFile).Length > 5L * 1024 * 1024) {
+                string old = logFile + ".old";
+                if (File.Exists(old)) File.Delete(old);
+                File.Move(logFile, old);
+            }
+            log = new StreamWriter(new FileStream(logFile, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete), new UTF8Encoding(false));
+            log.AutoFlush = true;
+            LogFile = logFile;
+        } catch { log = null; }
+    }
+
+    void OnExit(Process p) {
+        if (Exited) return;
+        try { ExitCode = p.ExitCode; } catch { ExitCode = -1; }
+        try { p.WaitForExit(2000); } catch { }      // lets the last output lines arrive
+        Add("#" + DateTime.Now.ToString("HH:mm:ss") + "  The process ended (exit code " + ExitCode + ").");
+        Exited = true;
+        CloseLog();
+    }
+
+    public void Add(string line) {
+        lock (gate) {
+            if (pending.Count >= 20000) { pending.RemoveAt(0); Dropped++; }
+            pending.Add(line);
+            if (log != null) {
+                try { log.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff") + (line.Length > 0 && line[0] == '!' ? " ERR " : line.Length > 0 && line[0] == '#' ? " --- " : "     ") + (line.Length > 0 ? line.Substring(1) : "")); } catch { }
+            }
+        }
+    }
+
+    public string[] Drain() {
+        lock (gate) {
+            if (pending.Count == 0) return new string[0];
+            var a = pending.ToArray(); pending.Clear(); return a;
+        }
+    }
+
+    void CloseLog() { lock (gate) { if (log != null) { try { log.Dispose(); } catch { } log = null; } } }
+
+    // Ends the process and everything it started (dotnet run / watch start the site as a child process).
+    public void Kill() {
+        DevProcTree.KillTree(Pid, Started);
+        if (Attached && proc != null) { try { if (proc.HasExited) OnExit(proc); } catch { } }
+    }
+}
+
+// Processes as a tree (parent -> children), from a Toolhelp snapshot: no WMI, fast.
+public static class DevProcTree {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct PROCESSENTRY32 {
+        public uint dwSize, cntUsage, th32ProcessID; public IntPtr th32DefaultHeapID; public uint th32ModuleID, cntThreads, th32ParentProcessID;
+        public int pcPriClassBase; public uint dwFlags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32FirstW")] static extern bool First(IntPtr snap, ref PROCESSENTRY32 e);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32NextW")] static extern bool Next(IntPtr snap, ref PROCESSENTRY32 e);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+
+    public static Dictionary<int, int> Parents() {
+        var d = new Dictionary<int, int>();
+        IntPtr snap = CreateToolhelp32Snapshot(2, 0);
+        if (snap == IntPtr.Zero || snap == new IntPtr(-1)) return d;
+        try {
+            var e = new PROCESSENTRY32(); e.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+            if (First(snap, ref e)) do { d[(int)e.th32ProcessID] = (int)e.th32ParentProcessID; } while (Next(snap, ref e));
+        } finally { CloseHandle(snap); }
+        return d;
+    }
+
+    static DateTime StartOf(int pid) { try { using (var p = Process.GetProcessById(pid)) return p.StartTime; } catch { return DateTime.MaxValue; } }
+
+    // The root and all its descendants (a child must have started after its parent: PIDs get reused).
+    public static List<int> Tree(int root, DateTime rootStart, Dictionary<int, int> parents) {
+        var list = new List<int>();
+        if (parents == null) parents = Parents();
+        if (!parents.ContainsKey(root)) return list;
+        list.Add(root);
+        var kids = new Dictionary<int, List<int>>();
+        foreach (var kv in parents) { if (kv.Key == kv.Value) continue; List<int> l; if (!kids.TryGetValue(kv.Value, out l)) kids[kv.Value] = l = new List<int>(); l.Add(kv.Key); }
+        for (int i = 0; i < list.Count; i++) {
+            List<int> ch; if (!kids.TryGetValue(list[i], out ch)) continue;
+            DateTime after = rootStart == DateTime.MinValue ? DateTime.MinValue : rootStart.AddSeconds(-1);         // MinValue: no start time known
+            foreach (int c in ch) if (!list.Contains(c) && StartOf(c) >= after) list.Add(c);
+        }
+        return list;
+    }
+
+    public static void KillTree(int root, DateTime rootStart) {
+        var t = Tree(root, rootStart, null);
+        for (int i = t.Count - 1; i >= 0; i--) { try { using (var p = Process.GetProcessById(t[i])) p.Kill(); } catch { } }
+    }
+}
+
+// CPU and memory of a process tree, sampled now and then.
+public class DevTreeMeter {
+    public int Root; public DateTime RootStart;
+    public double Cpu; public long Memory; public int Count;
+    public int[] Pids = new int[0];
+    public string AppName = "";            // the process that is the site itself (the deepest one), e.g. MySite
+    public int AppPid;
+    TimeSpan lastCpu; DateTime lastAt = DateTime.MinValue;
+    public DevTreeMeter(int root, DateTime rootStart) { Root = root; RootStart = rootStart; }
+    public void Update(Dictionary<int, int> parents) {
+        var t = DevProcTree.Tree(Root, RootStart, parents);
+        Pids = t.ToArray(); Count = t.Count;
+        TimeSpan cpu = TimeSpan.Zero; long mem = 0;
+        foreach (int pid in t) {
+            try { using (var p = Process.GetProcessById(pid)) { cpu += p.TotalProcessorTime; mem += p.WorkingSet64; if (pid == t[t.Count - 1]) { AppName = p.ProcessName; AppPid = pid; } } } catch { }
+        }
+        var now = DateTime.Now;
+        if (lastAt != DateTime.MinValue) {
+            double wall = (now - lastAt).TotalMilliseconds;
+            if (wall > 0) Cpu = Math.Max(0, Math.Min(100, (cpu - lastCpu).TotalMilliseconds / wall / Environment.ProcessorCount * 100));
+        }
+        lastCpu = cpu; lastAt = now; Memory = mem;
+    }
+}
+
+// Listening TCP ports and the process that owns each one.
+public static class DevListen {
+    [DllImport("iphlpapi.dll", SetLastError = true)] static extern uint GetExtendedTcpTable(IntPtr table, ref int size, bool order, int af, int cls, uint reserved);
+    static int Port(uint raw) { return (int)(((raw & 0xFF) << 8) | ((raw >> 8) & 0xFF)); }
+    public static Dictionary<int, int> Listeners() {
+        var d = new Dictionary<int, int>();
+        foreach (int af in new[] { 2, 23 }) {
+            int size = 0;
+            GetExtendedTcpTable(IntPtr.Zero, ref size, false, af, 3 /* listeners, with pid */, 0);
+            for (int attempt = 0; attempt < 4 && size > 0; attempt++) {
+                IntPtr buf = Marshal.AllocHGlobal(size);
+                try {
+                    uint r = GetExtendedTcpTable(buf, ref size, false, af, 3, 0);
+                    if (r == 122) continue;
+                    if (r != 0) break;
+                    int n = Marshal.ReadInt32(buf);
+                    int rowSize = af == 2 ? 24 : 56;
+                    for (int k = 0; k < n; k++) {
+                        IntPtr row = buf + 4 + k * rowSize;
+                        int port = af == 2 ? Port((uint)Marshal.ReadInt32(row + 8)) : Port((uint)Marshal.ReadInt32(row + 20));
+                        int pid = af == 2 ? Marshal.ReadInt32(row + 20) : Marshal.ReadInt32(row + 52);
+                        if (!d.ContainsKey(port)) d[port] = pid;
+                    }
+                    break;
+                } finally { Marshal.FreeHGlobal(buf); }
+            }
+        }
+        return d;
+    }
+}
+
+// One HTTP check at a time, on a worker thread; the window reads the result when it is there.
+public class DevProbe {
+    public volatile bool Busy;
+    public int Code; public long Ms; public string Error = ""; public DateTime At = DateTime.MinValue;
+    static DevProbe() {
+        try { ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072 | (SecurityProtocolType)12288; }
+        catch { try { ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; } catch { } }
+    }
+    public void Begin(string url, int timeoutMs) {
+        if (Busy) return;
+        Busy = true;
+        ThreadPool.QueueUserWorkItem(delegate {
+            var sw = Stopwatch.StartNew(); int code = 0; string err = "";
+            try {
+                var rq = (HttpWebRequest)WebRequest.Create(url);
+                rq.Method = "GET"; rq.Timeout = timeoutMs; rq.ReadWriteTimeout = timeoutMs; rq.AllowAutoRedirect = false; rq.Proxy = null; rq.KeepAlive = false;
+                rq.UserAgent = "DevTools web servers";
+                rq.ServerCertificateValidationCallback = delegate { return true; };     // local development certificates
+                using (var rs = (HttpWebResponse)rq.GetResponse()) code = (int)rs.StatusCode;
+            } catch (WebException ex) {
+                var rs = ex.Response as HttpWebResponse;
+                if (rs != null) { code = (int)rs.StatusCode; rs.Close(); }
+                else err = ex.Status == WebExceptionStatus.Timeout ? "no answer within " + (timeoutMs / 1000) + " s" : ex.Status == WebExceptionStatus.ConnectFailure ? "nothing listening" : ex.Message;
+            } catch (Exception ex) { err = ex.Message; }
+            Ms = sw.ElapsedMilliseconds; Code = code; Error = err; At = DateTime.Now; Busy = false;
+        });
+    }
+}
+
+// Finds websites in a folder: ASP.NET Core projects, published apps and classic ASP.NET sites.
+public class DevWebFound { public string Kind = "", Path = "", Dir = "", Name = "", Framework = "", Url = "", Script = ""; public int Port; }
+
+// Where a text box is scrolled to (first visible line), so new log lines can be added without moving the view.
+public static class DevRtb {
+    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+    public static int FirstVisible(IntPtr h) { return (int)SendMessage(h, 0xCE /* EM_GETFIRSTVISIBLELINE */, IntPtr.Zero, IntPtr.Zero); }
+    public static void ScrollLines(IntPtr h, int lines) { if (lines != 0) SendMessage(h, 0xB6 /* EM_LINESCROLL */, IntPtr.Zero, new IntPtr(lines)); }
+}
+
+public static class DevWebScan {
+    static readonly HashSet<string> Skip = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "bin", "obj", "node_modules", ".git", ".vs", ".vscode", ".idea", "packages", "wwwroot", "TestResults", ".svn" };
+    const string WebAppGuid = "349C5851-65DF-11DA-9384-00065B846F21";
+
+    public static List<DevWebFound> Find(string root, int maxDepth) {
+        var list = new List<DevWebFound>();
+        int visited = 0;
+        Walk(root, 0, maxDepth, list, ref visited);
+        return list;
+    }
+
+    static string Read(string f) { try { return File.ReadAllText(f); } catch { return ""; } }
+
+    static readonly string[][] NodeKinds = {
+        new[] { "next", "Next.js", "3000" }, new[] { "nuxt", "Nuxt", "3000" }, new[] { "@sveltejs/kit", "SvelteKit", "5173" }, new[] { "@remix-run/dev", "Remix", "3000" },
+        new[] { "astro", "Astro", "4321" }, new[] { "gatsby", "Gatsby", "8000" }, new[] { "@angular/core", "Angular", "4200" }, new[] { "react-scripts", "React", "3000" },
+        new[] { "vite", "Vite", "5173" }, new[] { "@nestjs/core", "NestJS", "3000" }, new[] { "express", "Express", "3000" }, new[] { "fastify", "Fastify", "3000" },
+        new[] { "koa", "Koa", "3000" }, new[] { "http-server", "http-server", "8080" }, new[] { "serve", "serve", "3000" } };
+
+    static DevWebFound Node(string pkg, string dir) {
+        string t = Read(pkg);
+        var scripts = Regex.Match(t, @"""scripts""\s*:\s*\{([^}]*)\}", RegexOptions.Singleline);
+        if (!scripts.Success) return null;
+        string script = "", line = "";
+        foreach (var name in new[] { "dev", "start", "serve" }) {
+            var m = Regex.Match(scripts.Groups[1].Value, @"""" + name + @"""\s*:\s*""((?:[^""\\]|\\.)*)""");
+            if (m.Success) { script = name; line = m.Groups[1].Value; break; }
+        }
+        if (script.Length == 0) return null;
+        string fw = "", defPort = "0";
+        foreach (var k in NodeKinds) {
+            if (Regex.IsMatch(t, @"""" + Regex.Escape(k[0]) + @"""\s*:")) { fw = k[1]; defPort = k[2]; break; }
+        }
+        if (fw.Length == 0) return null;                 // a package.json for tooling, not a website
+        var pm = Regex.Match(line, @"(?:^|\s)(?:-p|--port)[\s=]+(\d{2,5})\b");
+        if (!pm.Success) pm = Regex.Match(line, @"\bPORT=(\d{2,5})\b");
+        var nm = Regex.Match(t, @"""name""\s*:\s*""([^""]+)""");
+        return new DevWebFound { Kind = "node", Path = pkg, Dir = dir, Name = nm.Success ? nm.Groups[1].Value : Path.GetFileName(dir), Framework = fw, Script = script, Port = int.Parse(pm.Success ? pm.Groups[1].Value : defPort) };
+    }
+
+    static void Walk(string dir, int depth, int maxDepth, List<DevWebFound> list, ref int visited) {
+        if (++visited > 20000 || list.Count >= 500) return;
+        string[] files;
+        try { files = Directory.GetFiles(dir); } catch { return; }
+        bool anyProject = false;
+        foreach (var f in files) {
+            string ext = Path.GetExtension(f).ToLowerInvariant();
+            if (ext != ".csproj" && ext != ".fsproj" && ext != ".vbproj") continue;
+            anyProject = true;
+            string t = Read(f);
+            var fw = Regex.Match(t, @"<TargetFrameworks?>\s*([^<;]+)", RegexOptions.IgnoreCase);
+            if (Regex.IsMatch(t, @"Microsoft\.NET\.Sdk\.(Web|BlazorWebAssembly)\b", RegexOptions.IgnoreCase) || Regex.IsMatch(t, @"<FrameworkReference\s+Include\s*=\s*""Microsoft\.AspNetCore\.App""", RegexOptions.IgnoreCase)) {
+                list.Add(new DevWebFound { Kind = "project", Path = f, Dir = dir, Name = Path.GetFileNameWithoutExtension(f), Framework = fw.Success ? fw.Groups[1].Value.Trim() : "" });
+            } else if (t.IndexOf(WebAppGuid, StringComparison.OrdinalIgnoreCase) >= 0) {
+                var url = Regex.Match(t, @"<IISUrl>\s*([^<]+)", RegexOptions.IgnoreCase);
+                var v = Regex.Match(t, @"<TargetFrameworkVersion>\s*([^<]+)", RegexOptions.IgnoreCase);
+                list.Add(new DevWebFound { Kind = "iisexpress", Path = dir, Dir = dir, Name = Path.GetFileNameWithoutExtension(f), Framework = v.Success ? ".NET Framework " + v.Groups[1].Value.Trim().TrimStart('v') : ".NET Framework", Url = url.Success ? url.Groups[1].Value.Trim() : "" });
+            }
+        }
+        if (anyProject) return;                      // a project folder: its subfolders are its own code
+        foreach (var f in files) {
+            if (!f.EndsWith(".runtimeconfig.json", StringComparison.OrdinalIgnoreCase)) continue;
+            string t = Read(f);
+            if (t.IndexOf("Microsoft.AspNetCore.App", StringComparison.OrdinalIgnoreCase) < 0) continue;
+            string name = Path.GetFileName(f); name = name.Substring(0, name.Length - ".runtimeconfig.json".Length);
+            string dll = Path.Combine(dir, name + ".dll"), exe = Path.Combine(dir, name + ".exe");
+            bool self = t.IndexOf("includedFrameworks", StringComparison.OrdinalIgnoreCase) >= 0;
+            string target = self && File.Exists(exe) ? exe : File.Exists(dll) ? dll : File.Exists(exe) ? exe : "";
+            if (target.Length == 0) continue;
+            var fw = Regex.Match(t, @"""tfm""\s*:\s*""([^""]+)""", RegexOptions.IgnoreCase);
+            list.Add(new DevWebFound { Kind = "published", Path = target, Dir = dir, Name = name, Framework = (fw.Success ? fw.Groups[1].Value : "") + (self ? " self-contained" : "") });
+            return;
+        }
+        // A Node web front end (Next.js, Vite, React, Angular, Express ...): run with npm run dev / start.
+        string pkg = Path.Combine(dir, "package.json");
+        if (File.Exists(pkg)) {
+            var found = Node(pkg, dir);
+            if (found != null) { list.Add(found); return; }
+        }
+        if (File.Exists(Path.Combine(dir, "web.config")) && Directory.Exists(Path.Combine(dir, "bin"))) {
+            bool dlls = false; try { dlls = Directory.GetFiles(Path.Combine(dir, "bin"), "*.dll").Length > 0; } catch { }
+            if (dlls) { list.Add(new DevWebFound { Kind = "iisexpress", Path = dir, Dir = dir, Name = Path.GetFileName(dir), Framework = ".NET Framework" }); return; }
+        }
+        if (depth >= maxDepth) return;
+        string[] dirs;
+        try { dirs = Directory.GetDirectories(dir); } catch { return; }
+        Array.Sort(dirs, StringComparer.OrdinalIgnoreCase);
+        foreach (var d in dirs) {
+            string n = Path.GetFileName(d);
+            if (Skip.Contains(n) || n.StartsWith(".")) continue;
+            try { if ((File.GetAttributes(d) & FileAttributes.ReparsePoint) != 0) continue; } catch { continue; }
+            Walk(d, depth + 1, maxDepth, list, ref visited);
+        }
+    }
+}
+'@
+
+# ======================================================================================
+# Web servers: many .NET websites from one window. Open a folder and every site in it is found (ASP.NET Core
+# projects, published apps, classic ASP.NET for IIS Express); give each its ports, environment and options;
+# start / stop / restart them one by one or all together; see their status, CPU, memory, response and log.
+# The list is saved in data\webservers.json, each site's output in data\weblogs\<id>.log.
+# DevTools installs nothing: it uses the dotnet.exe (and IIS Express) already on the PC.
+# ======================================================================================
+$WsFile    = Join-Path $DataDir 'webservers.json'
+$WsRunFile = Join-Path $DataDir 'webservers-running.json'
+$WsLogDir  = Join-Path $DataDir 'weblogs'
+$WsUI = @{ Form = $null; Sites = (New-Object System.Collections.Generic.List[object]); Rt = @{}; Loaded = $false; Timer = $null; Tick = 0
+           Cfg = [ordered]@{ StopOnExit = $true; Notify = $true; Every = 10 }; DotNet = $null; ListIds = $null; Building = $false }
+$WsFields = [ordered]@{ Id = ''; Name = ''; Kind = 'project'; Path = ''; Dir = ''; Group = ''; Framework = ''; Port = 0; HttpsPort = 0; AllHosts = $false
+                        Env = 'Development'; Vars = ''; Args = ''; Config = 'Debug'; Watch = $false; Profile = ''; Command = ''; Health = '/'; AutoStart = $false; AutoRestart = $true }
+$WsKinds = [ordered]@{ project = 'Project'; published = 'Published'; iisexpress = 'IIS Express'; custom = 'Command' }
+$WsStates = @{
+    stopped = @('Stopped', 'Dim'); starting = @('Starting', 'Yellow'); building = @('Building', 'Yellow'); running = @('Running', 'Green')
+    errors = @('Errors', 'Orange'); noanswer = @('Not responding', 'Orange'); crashed = @('Crashed', 'Red'); failed = @("Couldn't start", 'Red')
+    stopping = @('Stopping', 'Yellow'); elsewhere = @('Running elsewhere', 'Accent'); missing = @('Files missing', 'Red')
+}
+
+function Initialize-WebServers {
+    if (-not ('DevSiteRun' -as [type])) {
+        try { Import-DevCode -Name 'Web' -Source $WebSource }
+        catch { Write-Log "web servers: $_"; [void][System.Windows.Forms.MessageBox]::Show("The web server engine couldn't start:`n$($_.Exception.Message)", 'Web servers'); return $false }
+    }
+    if (-not $WsUI.Loaded) {
+        $WsUI.Loaded = $true
+        Import-WebSites
+        $WsUI.SaveTimer = New-TbDebounce 700 { Save-WebSites }
+        Restore-WebRunning
+    }
+    if (-not $WsUI.Timer) {
+        $t = New-Object System.Windows.Forms.Timer
+        $t.Interval = 1000
+        $t.add_Tick({ try { Update-WebRuntime } catch { Write-Log "web servers tick: $_" } })
+        $WsUI.Timer = $t; $t.Start()
+    }
+    $true
+}
+
+function New-WebSite($From) {
+    $o = [ordered]@{}
+    foreach ($k in $WsFields.Keys) { $o[$k] = $WsFields[$k] }
+    if ($From -is [System.Collections.IDictionary]) { foreach ($k in @($From.Keys)) { if ($o.Contains($k)) { $o[$k] = $From[$k] } } }
+    elseif ($From) { foreach ($p in $From.PSObject.Properties) { if ($o.Contains($p.Name) -and $null -ne $p.Value) { $o[$p.Name] = $p.Value } } }
+    foreach ($k in 'Port', 'HttpsPort') { $o[$k] = [int]$o[$k] }
+    foreach ($k in 'AllHosts', 'Watch', 'AutoStart', 'AutoRestart') { $o[$k] = [bool]$o[$k] }
+    if (-not $o.Id) { $o.Id = [guid]::NewGuid().ToString('N').Substring(0, 8) }
+    if (-not $o.Name) { $o.Name = [IO.Path]::GetFileNameWithoutExtension([string]$o.Path) }
+    [pscustomobject]$o
+}
+
+function Import-WebSites {
+    $WsUI.Sites.Clear()
+    if (-not (Test-Path -LiteralPath $WsFile)) { return }
+    try {
+        $j = (Read-DataText $WsFile) | ConvertFrom-Json
+        foreach ($s in @($j.Sites)) { if ($s) { $WsUI.Sites.Add((New-WebSite $s)) } }
+        if ($j.Settings) { foreach ($k in @($WsUI.Cfg.Keys)) { if ($null -ne $j.Settings.$k) { $WsUI.Cfg[$k] = $j.Settings.$k } } }
+    } catch { Write-Log "web servers: couldn't read the list: $_" }
+}
+
+function Save-WebSites {
+    try { Write-JsonFile $WsFile (ConvertTo-Json -InputObject ([ordered]@{ Sites = $WsUI.Sites.ToArray(); Settings = $WsUI.Cfg }) -Depth 5) }
+    catch { Write-Log "web servers: couldn't save: $_" }
+}
+function Request-WebSave { if ($WsUI.SaveTimer) { $WsUI.SaveTimer.Stop(); $WsUI.SaveTimer.Start() } else { Save-WebSites } }
+
+# Which processes are ours, so a site still running after DevTools closed unexpectedly is found again.
+function Save-WebRunning {
+    $m = [ordered]@{}
+    foreach ($s in $WsUI.Sites) { $rt = $WsUI.Rt[$s.Id]; if ($rt -and $rt.Proc -and -not $rt.Proc.Exited) { $m[$s.Id] = @{ Pid = $rt.Proc.Pid; Started = $rt.Proc.Started.ToString('o') } } }
+    try { if ($m.Count) { Write-JsonFile $WsRunFile (ConvertTo-Json -InputObject $m) } elseif (Test-Path -LiteralPath $WsRunFile) { Remove-Item -LiteralPath $WsRunFile -Force } } catch { }
+}
+function Restore-WebRunning {
+    if (-not (Test-Path -LiteralPath $WsRunFile)) { return }
+    try {
+        $j = (Read-DataText $WsRunFile) | ConvertFrom-Json
+        foreach ($s in $WsUI.Sites) {
+            $e = $j.($s.Id); if (-not $e) { continue }
+            $r = [DevSiteRun]::Attach([int]$e.Pid, [datetime]::Parse($e.Started, [Globalization.CultureInfo]::InvariantCulture, 'RoundtripKind').ToLocalTime(), (Get-WebLogFile $s))
+            if ($r) {
+                $rt = Get-WebRt $s
+                Set-WebProc $s $r
+                Add-WebLine $s "#Found running from before DevTools restarted (PID $($r.Pid)). Its output since then can't be shown; Stop and Start it to see the log again."
+            }
+        }
+    } catch { Write-Log "web servers: $_" }
+}
+
+function Get-WebLogFile($S) { Join-Path $WsLogDir "$($S.Id).log" }
+
+function Get-WebRt($S) {
+    $rt = $WsUI.Rt[$S.Id]
+    if (-not $rt) {
+        $rt = @{ Proc = $null; Meter = $null; Probe = $null; State = 'stopped'; Detail = ''; Since = $null; Stopping = $false; Ended = $true; RestartPending = $false; RestartAt = $null
+                 Crashes = (New-Object System.Collections.Generic.List[datetime]); Lines = (New-Object System.Collections.Generic.List[string]); Ports = @(); LastProbe = [datetime]::MinValue; ProbeSeen = [datetime]::MinValue; Build = $null; Ext = $null }
+        $WsUI.Rt[$S.Id] = $rt
+    }
+    $rt
+}
+
+function Set-WebProc($S, $Run) {
+    $rt = Get-WebRt $S
+    $rt.Proc = $Run; $rt.Ended = $false; $rt.Stopping = $false; $rt.Since = $Run.Started
+    $rt.Meter = New-Object DevTreeMeter($Run.Pid, $Run.Started)
+    $rt.Probe = New-Object DevProbe
+    $rt.LastProbe = [datetime]::MinValue; $rt.ProbeSeen = [datetime]::MinValue; $rt.Ports = @()
+    Set-WebState $S 'starting' $(if ($S.Kind -eq 'project') { 'building and starting' } else { 'starting' })
+}
+
+function Set-WebState($S, [string]$State, [string]$Detail = '') {
+    $rt = Get-WebRt $S
+    $was = $rt.State
+    $rt.State = $State; $rt.Detail = $Detail
+    if ($was -ne $State) {
+        if ($WsUI.Cfg.Notify -and $was -eq 'running' -and $State -in 'crashed', 'noanswer', 'errors' -and -not ($WsUI.Form -and $WsUI.Form.ContainsFocus)) {
+            try { $tray.ShowBalloonTip(5000, 'Web servers', "$($S.Name): $($WsStates[$State][0].ToLower())$(if ($Detail) { " - $Detail" })", 'Warning') } catch { }
+        }
+        if ($State -in 'running', 'crashed', 'noanswer', 'errors', 'failed') { Add-WebLine $S "#$(Get-Date -Format 'HH:mm:ss')  $($WsStates[$State][0])$(if ($Detail) { ": $Detail" })" }
+        if ($was -eq 'running' -and $State -in 'crashed', 'noanswer', 'errors') { try { Invoke-AutoSiteDown $S $WsStates[$State][0].ToLower() } catch { Write-Log "automation site trigger: $_" } }
+    }
+}
+
+# A line for the site's log view (also kept when the window is closed).
+function Add-WebLine($S, [string]$Line) {
+    $rt = Get-WebRt $S
+    $rt.Lines.Add($Line)
+    if ($rt.Lines.Count -gt 4000) { $rt.Lines.RemoveRange(0, 1000); if ($WsUI.LogId -eq $S.Id) { $WsUI.LogDirty = $true } }
+    if ($WsUI.LogId -eq $S.Id -and $WsUI.Log) { [void]$WsUI.LogQueue.Add($Line) }
+}
+
+function Get-DotNetExe {
+    if ($WsUI.DotNet -and [IO.File]::Exists($WsUI.DotNet)) { return $WsUI.DotNet }
+    $list = New-Object System.Collections.Generic.List[string]
+    if ($env:DOTNET_ROOT) { $list.Add($env:DOTNET_ROOT) }
+    foreach ($d in ([string]$env:PATH -split ';')) { if ($d.Trim()) { $list.Add($d.Trim().Trim('"')) } }
+    foreach ($b in $env:ProgramFiles, ${env:ProgramFiles(x86)}) { if ($b) { $list.Add((Join-Path $b 'dotnet')) } }
+    if ($env:LOCALAPPDATA) { $list.Add((Join-Path $env:LOCALAPPDATA 'Microsoft\dotnet')) }
+    foreach ($d in $list) { try { $x = [IO.Path]::Combine($d, 'dotnet.exe'); if ([IO.File]::Exists($x)) { $WsUI.DotNet = $x; return $x } } catch { } }
+    $null
+}
+function Get-DotNetSdks {
+    $dn = Get-DotNetExe; if (-not $dn) { return @() }
+    $d = Join-Path (Split-Path -Parent $dn) 'sdk'
+    try { @([IO.Directory]::GetDirectories($d) | ForEach-Object { [IO.Path]::GetFileName($_) } | Where-Object { $_ -match '^\d' }) } catch { @() }
+}
+function Get-IisExpressExe {
+    foreach ($b in $env:ProgramFiles, ${env:ProgramFiles(x86)}) { if ($b) { $x = Join-Path $b 'IIS Express\iisexpress.exe'; if ([IO.File]::Exists($x)) { return $x } } }
+    $null
+}
+
+function Get-WebUrls($S) {
+    $h = if ($S.AllHosts) { '*' } else { 'localhost' }
+    $u = @()
+    if ($S.Port -gt 0) { $u += "http://${h}:$($S.Port)" }
+    if ($S.HttpsPort -gt 0 -and $S.Kind -ne 'iisexpress') { $u += "https://${h}:$($S.HttpsPort)" }
+    $u
+}
+
+# The address to open / check: the ports set for the site, or (launch profile, no port set) the ones it listens on.
+function Get-WebBaseUrl($S) {
+    $rt = $WsUI.Rt[$S.Id]
+    if (-not $S.Profile -or -not $rt -or -not $rt.Ports.Count) {
+        if ($S.Port -gt 0) { return "http://localhost:$($S.Port)" }
+        if ($S.HttpsPort -gt 0) { return "https://localhost:$($S.HttpsPort)" }
+    }
+    if ($rt -and $rt.Ports.Count) {
+        $p = @($rt.Ports)
+        if ($S.HttpsPort -gt 0 -and $p -contains $S.HttpsPort -and $p.Count -eq 1) { return "https://localhost:$($p[0])" }
+        return "http://localhost:$($p[0])"
+    }
+    ''
+}
+
+function Get-WebQuote([string]$X) { if ($X -match '[\s"]' -or -not $X) { '"' + ($X -replace '"', '\"') + '"' } else { $X } }
+
+# The command that starts the site: @{ Exe; Args; Dir; Env } or @{ Error }.
+function Get-WebCommand($S) {
+    $urls = @(Get-WebUrls $S) -join ';'
+    $envs = [ordered]@{}
+    if ($S.Env) { $envs['ASPNETCORE_ENVIRONMENT'] = $S.Env; $envs['DOTNET_ENVIRONMENT'] = $S.Env }
+    if ($urls) { $envs['ASPNETCORE_URLS'] = $urls }
+    if ($S.Port -gt 0) { $envs['PORT'] = [string]$S.Port }
+    $envs['DOTNET_NOLOGO'] = '1'
+    if ($S.Watch) { $envs['DOTNET_WATCH_SUPPRESS_EMOJIS'] = '1' }       # the log font has no emoji
+    foreach ($line in ([string]$S.Vars -split "`r?`n")) { if ($line -match '^\s*([^=#\s][^=]*?)\s*=(.*)$') { $envs[$Matches[1]] = $Matches[2].Trim() } }
+    $urlArg = if ($urls) { " --urls $(Get-WebQuote $urls)" } else { '' }
+    $extra = if ([string]$S.Args) { " $($S.Args.Trim())" } else { '' }
+    switch ($S.Kind) {
+        'project' {
+            $dn = Get-DotNetExe; if (-not $dn) { return @{ Error = '.NET (dotnet.exe) is not on this PC. DevTools installs nothing; install the .NET SDK to run projects.' } }
+            if (-not (Get-DotNetSdks).Count) { return @{ Error = "Only the .NET runtime is on this PC, not the SDK, so projects can't be built. Publish the site and add the published folder instead." } }
+            if (-not [IO.File]::Exists($S.Path)) { return @{ Error = "The project file isn't there any more: $($S.Path)" } }
+            $prof = if ($S.Profile) { "--launch-profile $(Get-WebQuote $S.Profile)" } else { '--no-launch-profile' }
+            $cfg = if ($S.Config) { " -c $($S.Config)" } else { '' }
+            $a = if ($S.Watch) { "watch --non-interactive --project $(Get-WebQuote $S.Path) run $prof$cfg" } else { "run --project $(Get-WebQuote $S.Path) $prof$cfg" }
+            if ("$urlArg$extra") { $a += " --$urlArg$extra" }
+            return @{ Exe = $dn; Args = $a; Dir = (Split-Path -Parent $S.Path); Env = $envs }
+        }
+        'published' {
+            if (-not [IO.File]::Exists($S.Path)) { return @{ Error = "The app isn't there any more: $($S.Path)" } }
+            if ($S.Path -like '*.exe') { return @{ Exe = $S.Path; Args = "$urlArg$extra".Trim(); Dir = (Split-Path -Parent $S.Path); Env = $envs } }
+            $dn = Get-DotNetExe; if (-not $dn) { return @{ Error = '.NET (dotnet.exe) is not on this PC. DevTools installs nothing; install the ASP.NET Core runtime, or publish the site self-contained.' } }
+            return @{ Exe = $dn; Args = "$(Get-WebQuote $S.Path)$urlArg$extra"; Dir = (Split-Path -Parent $S.Path); Env = $envs }
+        }
+        'iisexpress' {
+            $ie = Get-IisExpressExe; if (-not $ie) { return @{ Error = 'IIS Express is not on this PC (it comes with Visual Studio). DevTools installs nothing.' } }
+            if ($S.Port -le 0) { return @{ Error = 'Set an HTTP port for this site: IIS Express needs one.' } }
+            $dir = ([string]$S.Path).TrimEnd('\')
+            if (-not [IO.Directory]::Exists($dir)) { return @{ Error = "The folder isn't there any more: $dir" } }
+            return @{ Exe = $ie; Args = "/path:$(Get-WebQuote $dir) /port:$($S.Port) /systray:false$extra"; Dir = $dir; Env = $envs }
+        }
+        default {
+            $cmd = ([string]$S.Command).Trim()
+            if (-not $cmd) { return @{ Error = 'Type the command that starts this site (Command, on the right).' } }
+            $cmd = $cmd.Replace('{port}', [string]$S.Port).Replace('{httpsport}', [string]$S.HttpsPort).Replace('{urls}', $urls)
+            if ($cmd -match '^\s*"([^"]+)"\s*(.*)$' -or $cmd -match '^\s*(\S+)\s*(.*)$') { $exe = $Matches[1]; $rest = $Matches[2] }
+            $dir = if ($S.Dir) { $S.Dir } else { Split-Path -Parent $S.Path }
+            if (-not $dir -or -not [IO.Directory]::Exists($dir)) { return @{ Error = 'Set the working folder for this command.' } }
+            if (-not [IO.Path]::IsPathRooted($exe)) {
+                $local = Join-Path $dir $exe
+                if ([IO.File]::Exists($local)) { $exe = $local }
+                else { $found = Get-Command $exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($found) { $exe = $found.Source } }
+            }
+            if ($exe -match '\.(cmd|bat)$') { $rest = "/d /c `"$(Get-WebQuote $exe) $rest`""; $exe = Join-Path $env:SystemRoot 'System32\cmd.exe' }
+            return @{ Exe = $exe; Args = "$rest$extra".Trim(); Dir = $dir; Env = $envs }
+        }
+    }
+}
+
+function Get-WebCommandText($S) {
+    $c0 = Get-WebCommand $S
+    if ($c0.Error) { return $c0.Error }
+    $vars = foreach ($k in $c0.Env.Keys) { if ($k -notin 'DOTNET_NOLOGO', 'DOTNET_WATCH_SUPPRESS_EMOJIS') { "set $k=$($c0.Env[$k])" } }
+    (@("cd /d $(Get-WebQuote $c0.Dir)") + @($vars) + "$(Get-WebQuote $c0.Exe) $($c0.Args)") -join "`r`n"
+}
+
+# Which saved site (or other program) already uses one of this site's ports. '' = free.
+function Get-WebPortClash($S, $Listen) {
+    foreach ($p in @($S.Port, $S.HttpsPort | Where-Object { $_ -gt 0 })) {
+        foreach ($o in $WsUI.Sites) {
+            if ($o.Id -eq $S.Id) { continue }
+            $ort = $WsUI.Rt[$o.Id]
+            if (($o.Port -eq $p -or $o.HttpsPort -eq $p) -and $ort -and $ort.Proc -and -not $ort.Proc.Exited) { return "port $p is used by $($o.Name), which is running" }
+        }
+        if ($Listen -and $Listen.ContainsKey($p)) {
+            $procId = $Listen[$p]
+            $name = try { (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch { '?' }
+            return "port $p is already in use by $name (PID $procId)"
+        }
+    }
+    ''
+}
+
+# A site's port served by a program DevTools didn't start: the listening process, and the launcher above it
+# (dotnet watch / dotnet run / npm), so that stopping it ends the whole thing. $null = nothing outside.
+function Get-WebOutsideOwner($S, $Listen = $null) {
+    if (-not $Listen) { $Listen = [DevListen]::Listeners() }
+    $ours = @{}
+    foreach ($o in $WsUI.Sites) { $r = $WsUI.Rt[$o.Id]; if ($r -and $r.Proc -and -not $r.Proc.Exited) { $ours[$r.Proc.Pid] = 1; if ($r.Meter) { foreach ($x in $r.Meter.Pids) { $ours[$x] = 1 } } } }
+    $port = 0; $procId = 0
+    foreach ($pt in @($S.Port, $S.HttpsPort | Where-Object { $_ -gt 0 })) { if ($Listen.ContainsKey($pt) -and -not $ours.ContainsKey($Listen[$pt])) { $port = $pt; $procId = $Listen[$pt]; break } }
+    if (-not $procId) { return $null }
+    $all = @{}
+    try { foreach ($x in Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, CommandLine -ErrorAction Stop) { $all[[int]$x.ProcessId] = $x } } catch { }
+    $me = $all[$procId]
+    $root = $procId
+    for ($i = 0; $i -lt 6; $i++) {
+        $up = $all[[int]$all[$root].ParentProcessId]
+        if (-not $up -or $up.ProcessId -eq $PID) { break }
+        $nm = ([string]$up.Name).ToLowerInvariant(); $cl = [string]$up.CommandLine
+        if ($nm -in 'dotnet.exe', 'node.exe' -or ($nm -eq 'cmd.exe' -and $cl -match '\s/[dsc]\b.*\s/c\s|\s/c\s')) { $root = [int]$up.ProcessId } else { break }
+    }
+    $rc = [string]$all[$root].CommandLine
+    $how = if ($rc -match '\bwatch\b' -and $all[$root].Name -eq 'dotnet.exe') { 'dotnet watch' } elseif ($rc -match '\brun\b' -and $all[$root].Name -eq 'dotnet.exe') { 'dotnet run' }
+           elseif ($rc -match 'npm-cli\.js"?\s+(run\s+\S+|start)') { "npm $($Matches[1])" } elseif ($all[$root].Name) { [IO.Path]::GetFileNameWithoutExtension($all[$root].Name) } else { '' }
+    $name = if ($me -and $me.Name) { [IO.Path]::GetFileNameWithoutExtension($me.Name) } else { '?' }
+    [pscustomobject]@{ Port = $port; Pid = $procId; Root = $root; Name = $name; How = $how
+                       Text = "$name (PID $procId$(if ($root -ne $procId -and $how) { ", started by $how, PID $root" }))" }
+}
+
+# Port ranges Windows keeps for itself (Hyper-V, WSL, Docker reserve blocks of ports, and the blocks move after a
+# restart). A site can't listen there ("access forbidden"). Read with netsh (part of Windows) at most once a minute.
+function Get-WebReservedPorts {
+    if ($WsUI.Reserved -and ((Get-Date) - $WsUI.ReservedAt).TotalSeconds -lt 60) { return $WsUI.Reserved }
+    $list = New-Object System.Collections.Generic.List[int[]]
+    try {
+        $out = & (Join-Path $env:SystemRoot 'System32\netsh.exe') int ipv4 show excludedportrange protocol=tcp 2>$null
+        foreach ($l in $out) { if ($l -match '^\s*(\d+)\s+(\d+)') { $list.Add([int[]]@([int]$Matches[1], [int]$Matches[2])) } }
+    } catch { }
+    $WsUI.Reserved = $list; $WsUI.ReservedAt = Get-Date
+    $list
+}
+function Get-WebReservedRange([int]$Port) { foreach ($r in (Get-WebReservedPorts)) { if ($Port -ge $r[0] -and $Port -le $r[1]) { return "$($r[0])-$($r[1])" } }; '' }
+
+function Get-FreeWebPort([int]$From = 5101, [int[]]$Not = @()) {
+    $used = @{}
+    foreach ($s in $WsUI.Sites) { foreach ($p in $s.Port, $s.HttpsPort) { if ($p -gt 0) { $used[[int]$p] = 1 } } }
+    foreach ($p in $Not) { $used[$p] = 1 }
+    $l = [DevListen]::Listeners()
+    $res = Get-WebReservedPorts
+    for ($p = $From; $p -lt 65000; $p++) {
+        if ($used.ContainsKey($p) -or $l.ContainsKey($p)) { continue }
+        $skip = $false; foreach ($r in $res) { if ($p -ge $r[0] -and $p -le $r[1]) { $p = $r[1]; $skip = $true; break } }
+        if (-not $skip) { return $p }
+    }
+    0
+}
+
+# ---- start / stop -------------------------------------------------------------------------------------
+function Start-WebSite($S, [switch]$Quiet) {
+    if (-not (Initialize-WebServers)) { return }
+    $rt = Get-WebRt $S
+    if ($rt.Proc -and -not $rt.Proc.Exited) { return }
+    if ($rt.Build -and -not $rt.Build.Exited) { Add-WebLine $S '#It is being built; start it when the build is done.'; return }
+    $rt.RestartAt = $null
+    $cmd = Get-WebCommand $S
+    if ($cmd.Error) { Set-WebState $S 'failed' $cmd.Error; Add-WebLine $S "#$($cmd.Error)"; Update-WebView; return }
+    $listen = [DevListen]::Listeners()
+    $out = Get-WebOutsideOwner $S $listen
+    $mineClash = Get-WebPortClash $S $null                     # another saved site that runs from here
+    if ($out -and -not $mineClash) {
+        # the port is served by something DevTools didn't start - most often this same site, started in a terminal or the IDE
+        $same = $out.Name -like "*$([IO.Path]::GetFileNameWithoutExtension([string]$S.Path))*" -or $out.Name -eq $S.Name -or $out.How -match 'dotnet|npm'
+        $q = "$($S.Name): port $($out.Port) is already in use by $($out.Text), which wasn't started from DevTools.`n`n" +
+             $(if ($same) { 'Stop that one and start the site from here (with the settings on the right)?' } else { 'Stop that program and start the site here?' })
+        if ($Quiet -or [System.Windows.Forms.MessageBox]::Show($WsUI.Form, $q, 'Web servers', 'YesNo', 'Question') -ne 'Yes') {
+            $rt.Ext = $out.Pid; Set-WebState $S 'elsewhere' $out.Text
+            Add-WebLine $S "#Not started: port $($out.Port) is in use by $($out.Text)."
+            Update-WebView; return
+        }
+        Add-WebLine $S "#$(Get-Date -Format 'HH:mm:ss')  Stopping $($out.Text)..."
+        [DevProcTree]::KillTree($out.Root, [datetime]::MinValue)
+        if ($out.Root -ne $out.Pid) { [DevProcTree]::KillTree($out.Pid, [datetime]::MinValue) }
+        for ($i = 0; $i -lt 30 -and ([DevListen]::Listeners()).ContainsKey($out.Port); $i++) { Start-Sleep -Milliseconds 200 }
+        $listen = [DevListen]::Listeners()
+    }
+    $clash = Get-WebPortClash $S $listen
+    if (-not $clash) { foreach ($pt in @($S.Port, $S.HttpsPort | Where-Object { $_ -gt 0 })) { $rr = Get-WebReservedRange $pt; if ($rr) { $clash = "port $pt is reserved by Windows (ports $rr are kept for Hyper-V / WSL / Docker; the range can move after a restart)"; break } } }
+    if ($clash) { Set-WebState $S 'failed' $clash; Add-WebLine $S "#Not started: $clash. Pick another port (Free port, on the right)."; Update-WebView; return }
+    $keys = [string[]]@($cmd.Env.Keys); $vals = [string[]]@(foreach ($k in $keys) { [string]$cmd.Env[$k] })
+    try { $r = [DevSiteRun]::Start($cmd.Exe, $cmd.Args, $cmd.Dir, $keys, $vals, (Get-WebLogFile $S)) }
+    catch { $why = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }; Set-WebState $S 'failed' $why; Add-WebLine $S "#Couldn't start $($cmd.Exe): $why"; Update-WebView; return }
+    Set-WebProc $S $r
+    Save-WebRunning
+    Update-WebView
+}
+
+function Stop-WebSite($S, [switch]$Restart) {
+    $rt = Get-WebRt $S
+    $rt.RestartAt = $null
+    if ($rt.Proc -and -not $rt.Proc.Exited) {
+        $rt.Stopping = $true; $rt.RestartPending = [bool]$Restart
+        Set-WebState $S 'stopping'
+        Add-WebLine $S "#$(Get-Date -Format 'HH:mm:ss')  Stopping (ends the process and the ones it started)..."
+        $rt.Proc.Kill()
+    } elseif ($Restart) { Start-WebSite $S }
+    elseif ($rt.State -eq 'elsewhere') {
+        $out = Get-WebOutsideOwner $S
+        if ($out -and [System.Windows.Forms.MessageBox]::Show($WsUI.Form, "$($S.Name) wasn't started from DevTools: port $($out.Port) is served by $($out.Text).`n`nStop it?", 'Web servers', 'YesNo', 'Warning') -eq 'Yes') {
+            Add-WebLine $S "#$(Get-Date -Format 'HH:mm:ss')  Stopping $($out.Text)..."
+            [DevProcTree]::KillTree($out.Root, [datetime]::MinValue)
+            if ($out.Root -ne $out.Pid) { [DevProcTree]::KillTree($out.Pid, [datetime]::MinValue) }
+        }
+    } elseif ($rt.State -in 'failed', 'crashed') { Set-WebState $S 'stopped' }
+    Update-WebView
+}
+
+function Invoke-WebBuild($S) {
+    if ($S.Kind -ne 'project') { return }
+    $rt = Get-WebRt $S
+    if (($rt.Proc -and -not $rt.Proc.Exited) -or ($rt.Build -and -not $rt.Build.Exited)) { Set-WebStatus "Stop $($S.Name) first: a running site keeps its files locked." $C.Yellow; return }
+    $dn = Get-DotNetExe; if (-not $dn) { Set-WebStatus '.NET (dotnet.exe) is not on this PC.' $C.Red; return }
+    try { $rt.Build = [DevSiteRun]::Start($dn, "build $(Get-WebQuote $S.Path) -c $(if ($S.Config) { $S.Config } else { 'Debug' }) -nologo", (Split-Path -Parent $S.Path), [string[]]@('DOTNET_NOLOGO'), [string[]]@('1'), (Get-WebLogFile $S)) }
+    catch { Set-WebStatus "Couldn't build: $(if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message })" $C.Red; return }
+    Set-WebState $S 'building' 'dotnet build'
+    Update-WebView
+}
+
+# ---- once a second: output, exits, health checks, CPU / memory, ports ---------------------------------
+function Update-WebRuntime {
+    $WsUI.Tick++
+    $now = Get-Date
+    $listen = $null; $parents = $null
+    if ($WsUI.Tick % 2 -eq 0 -or $WsUI.Form) { $listen = [DevListen]::Listeners() }
+    $metrics = $WsUI.Tick % 2 -eq 0
+    if ($metrics) { $parents = [DevProcTree]::Parents() }
+    $ours = @{}
+    foreach ($S in $WsUI.Sites.ToArray()) {
+        $rt = $WsUI.Rt[$S.Id]; if (-not $rt) { continue }
+        if ($rt.Proc -and -not $rt.Proc.Exited -and $rt.Meter) { foreach ($x in $rt.Meter.Pids) { $ours[$x] = $S.Id }; $ours[$rt.Proc.Pid] = $S.Id }
+    }
+    $changed = $false
+    foreach ($S in $WsUI.Sites.ToArray()) {
+        $rt = Get-WebRt $S
+        foreach ($run in @($rt.Proc, $rt.Build)) { if ($run) { foreach ($l in $run.Drain()) { Add-WebLine $S $l } } }
+        # a build that ended
+        if ($rt.Build -and $rt.Build.Exited -and $rt.State -eq 'building') {
+            if ($rt.Build.ExitCode -eq 0) { Set-WebState $S 'stopped' 'built'; Add-WebLine $S '#Build succeeded.' } else { Set-WebState $S 'failed' 'the build failed (see the log)' }
+            $rt.Build = $null; $changed = $true
+        }
+        # the process ended
+        if ($rt.Proc -and $rt.Proc.Exited -and -not $rt.Ended) {
+            $rt.Ended = $true; $changed = $true
+            $ran = ($now - $rt.Since).TotalSeconds
+            if ($rt.Stopping) { Set-WebState $S 'stopped' }
+            else {
+                $code = $rt.Proc.ExitCode
+                Set-WebState $S 'crashed' "exit code $code after $(Format-WebSpan ($now - $rt.Since))"
+                for ($i = $rt.Crashes.Count - 1; $i -ge 0; $i--) { if (($now - $rt.Crashes[$i]).TotalMinutes -gt 10) { $rt.Crashes.RemoveAt($i) } }
+                $rt.Crashes.Add($now)
+                if ($S.AutoRestart -and $ran -lt 20) { Add-WebLine $S '#It stopped while starting, so it is not restarted by itself. The reason is in the lines above.' }
+                elseif ($S.AutoRestart -and $rt.Crashes.Count -le 3) { $rt.RestartAt = $now.AddSeconds(3); Add-WebLine $S "#Restarting in 3 seconds (crash $($rt.Crashes.Count) of at most 3 in 10 minutes)." }
+                elseif ($S.AutoRestart) { Add-WebLine $S '#It crashed 3 times in 10 minutes, so it is not restarted again by itself.' }
+            }
+            if ($rt.RestartPending) { $rt.RestartPending = $false; Start-WebSite $S -Quiet }
+            Save-WebRunning
+        }
+        if ($rt.RestartAt -and $now -ge $rt.RestartAt) { $rt.RestartAt = $null; Start-WebSite $S -Quiet; $changed = $true }
+        $alive = $rt.Proc -and -not $rt.Proc.Exited
+        if ($alive) {
+            if ($metrics -and $rt.Meter) { $rt.Meter.Update($parents) }
+            if ($listen -and $rt.Meter) {
+                $mine = @{}; foreach ($x in $rt.Meter.Pids) { $mine[$x] = 1 }; $mine[$rt.Proc.Pid] = 1
+                $rt.Ports = @($listen.Keys | Where-Object { $mine.ContainsKey($listen[$_]) } | Sort-Object)
+            }
+            # health: once the site listens, ask it for the health path; until then it is starting (dotnet run builds first)
+            $base = Get-WebBaseUrl $S
+            $port = if ($base -match ':(\d+)$') { [int]$Matches[1] } else { 0 }
+            $listening = $port -gt 0 -and ($rt.Ports -contains $port -or ($S.Kind -eq 'iisexpress' -and $listen -and $listen.ContainsKey($port)))      # IIS Express serves through Windows (http.sys, PID 4)
+            if ($rt.Probe.At -gt $rt.ProbeSeen) {
+                $rt.ProbeSeen = $rt.Probe.At; $changed = $true
+                $p = $rt.Probe
+                if ($p.Code -gt 0 -and $p.Code -lt 500) { Set-WebState $S 'running' "HTTP $($p.Code)  $($p.Ms) ms" }
+                elseif ($p.Code -ge 500) { Set-WebState $S 'errors' "HTTP $($p.Code) on $(if ($S.Health) { $S.Health } else { '/' })" }
+                elseif ($rt.State -ne 'starting') { Set-WebState $S 'noanswer' $p.Error }
+            }
+            if (-not $base) {
+                if ($rt.State -eq 'starting' -and ($now - $rt.Since).TotalSeconds -gt 8) { Set-WebState $S 'running' 'no port to check'; $changed = $true }
+            } elseif ($listening) {
+                $every = if ($rt.State -in 'starting', 'noanswer', 'errors') { 2 } else { [Math]::Max(3, [int]$WsUI.Cfg.Every) }
+                if (-not $rt.Probe.Busy -and ($now - $rt.LastProbe).TotalSeconds -ge $every) {
+                    $path = [string]$S.Health; if (-not $path) { $path = '/' }; if (-not $path.StartsWith('/')) { $path = "/$path" }
+                    $rt.Probe.Begin("$base$path", $(if ($rt.State -eq 'starting') { 30000 } else { 10000 })); $rt.LastProbe = $now
+                }
+            } elseif ($listen -and $rt.State -in 'running', 'errors') { Set-WebState $S 'noanswer' "nothing listening on port $port"; $changed = $true }
+            elseif ($listen -and $rt.State -eq 'starting' -and ($now - $rt.Since).TotalMinutes -gt 3) { Set-WebState $S 'noanswer' "still not listening on port $port after 3 minutes"; $changed = $true }
+        } elseif ($listen -and $rt.State -in 'stopped', 'elsewhere', 'failed', 'missing') {
+            # not run from here: is something else serving its port? Are its files still there?
+            $ext = $null
+            foreach ($p in @($S.Port, $S.HttpsPort | Where-Object { $_ -gt 0 })) { if ($listen.ContainsKey($p) -and -not $ours.ContainsKey($listen[$p])) { $ext = $listen[$p]; break } }
+            if ($ext) { if ($rt.State -ne 'elsewhere' -or $rt.Ext -ne $ext) { $rt.Ext = $ext; $out = Get-WebOutsideOwner $S $listen; Set-WebState $S 'elsewhere' $(if ($out) { "$($out.Text) - Start or Restart takes it over" } else { "PID $ext" }); $changed = $true } }
+            elseif ($rt.State -eq 'elsewhere') { $rt.Ext = $null; Set-WebState $S 'stopped'; $changed = $true }
+            elseif ($WsUI.Tick % 10 -eq 0 -and $rt.State -in 'stopped', 'missing') {
+                $there = if ($S.Kind -in 'project', 'published') { [IO.File]::Exists($S.Path) } elseif ($S.Kind -eq 'iisexpress') { [IO.Directory]::Exists(([string]$S.Path).TrimEnd('\')) } else { $true }
+                if (-not $there -and $rt.State -ne 'missing') { Set-WebState $S 'missing' $S.Path; $changed = $true } elseif ($there -and $rt.State -eq 'missing') { Set-WebState $S 'stopped'; $changed = $true }
+            }
+        }
+    }
+    if ($WsUI.Form) { Update-WebView -Light }
+}
+
+# ---- the window --------------------------------------------------------------------------------------
+function Format-WebSpan([TimeSpan]$T) {
+    if ($T.TotalSeconds -lt 60) { return "$([int]$T.TotalSeconds) s" }
+    if ($T.TotalHours -lt 1) { return "$([int][Math]::Floor($T.TotalMinutes)) min" }
+    if ($T.TotalDays -lt 1) { return "$([int][Math]::Floor($T.TotalHours)) h $($T.Minutes) min" }
+    "$([int][Math]::Floor($T.TotalDays)) d $($T.Hours) h"
+}
+
+function Get-WebRow($S) {
+    $rt = Get-WebRt $S
+    $alive = $rt.Proc -and -not $rt.Proc.Exited
+    $st = $WsStates[$rt.State]; if (-not $st) { $st = @($rt.State, 'Dim') }
+    $addr = if ($S.Profile -and $alive -and $rt.Ports.Count) { @($rt.Ports) -join ', ' }
+            elseif ($S.Port -or $S.HttpsPort) { @($S.Port, $S.HttpsPort | Where-Object { $_ -gt 0 }) -join ', ' }
+            elseif ($alive -and $rt.Ports.Count) { @($rt.Ports) -join ', ' } else { '' }
+    if ($S.HttpsPort -gt 0 -and $addr -and -not ($S.Profile -and $alive)) { $addr = $addr -replace "\b$($S.HttpsPort)\b", "$($S.HttpsPort) https" }
+    $kind = $WsKinds[$S.Kind]; if ($S.Framework) { $kind += "  $($S.Framework)" }
+    $procId = if ($alive) { if ($rt.Meter -and $rt.Meter.AppPid) { $rt.Meter.AppPid } else { $rt.Proc.Pid } } elseif ($rt.State -eq 'elsewhere') { $rt.Ext } else { '' }
+    @($st[0], $S.Name, $kind, $addr, [string]$procId,
+      $(if ($alive -and $rt.Meter) { '{0:0}%' -f $rt.Meter.Cpu } else { '' }),
+      $(if ($alive -and $rt.Meter -and $rt.Meter.Memory) { '{0:N0} MB' -f ($rt.Meter.Memory / 1MB) } else { '' }),
+      $(if ($alive -and $rt.Since) { Format-WebSpan ((Get-Date) - $rt.Since) } else { '' }),
+      $rt.Detail)
+}
+
+function Get-WebSelected { if ($WsUI.List -and $WsUI.List.SelectedItems.Count) { @($WsUI.List.SelectedItems | ForEach-Object { $_.Tag }) } else { @() } }
+
+function Set-WebStatus([string]$Text, $Color = $null) {
+    if (-not $WsUI.StatusText) { return }
+    $WsUI.StatusText.Text = $Text; $WsUI.StatusText.ForeColor = if ($Color) { $Color } else { $C.Dim }
+    $WsUI.StatusUntil = (Get-Date).AddSeconds(8)
+}
+
+function Update-WebView([switch]$Light) {
+    if (-not $WsUI.Form) { return }
+    $lv = $WsUI.List
+    $q = $WsUI.Filter.Text.Trim()
+    $sites = @($WsUI.Sites | Where-Object { -not $q -or $_.Name -like "*$q*" -or [string]$_.Port -eq $q -or [string]$_.HttpsPort -eq $q -or $_.Group -like "*$q*" -or $_.Path -like "*$q*" })
+    $ids = (@($sites | ForEach-Object { "$($_.Id)/$($_.Group)" }) -join ',')
+    if (-not $Light -or $ids -ne $WsUI.ListIds) {
+        $sel = @(Get-WebSelected | ForEach-Object Id)
+        $WsUI.Building = $true
+        $lv.BeginUpdate(); $lv.Items.Clear(); $lv.Groups.Clear()
+        $groups = @{}
+        foreach ($g in @($sites | ForEach-Object { if ($_.Group) { $_.Group } else { 'Sites' } } | Sort-Object -Unique)) { $groups[$g] = $lv.Groups.Add($g, $g) }
+        $lv.ShowGroups = $groups.Count -gt 1          # a heading per folder, once there is more than one
+        foreach ($s in @($sites | Sort-Object Group, Name)) {
+            $vals = Get-WebRow $s
+            $it = New-Object System.Windows.Forms.ListViewItem([string]$vals[0])
+            for ($i = 1; $i -lt $vals.Count; $i++) { [void]$it.SubItems.Add([string]$vals[$i]) }
+            $it.Tag = $s; $it.Name = $s.Id
+            $it.Group = $groups[$(if ($s.Group) { $s.Group } else { 'Sites' })]
+            [void]$lv.Items.Add($it)
+            if ($sel -contains $s.Id) { $it.Selected = $true }
+        }
+        $lv.EndUpdate()
+        $WsUI.ListIds = $ids
+        $WsUI.Building = $false
+        if (-not $lv.Items.Count) { $WsUI.Empty.Visible = $true; $WsUI.Empty.BringToFront() } else { $WsUI.Empty.Visible = $false }
+    } else {
+        foreach ($it in $lv.Items) {
+            $vals = Get-WebRow $it.Tag
+            $dirty = $false
+            for ($i = 0; $i -lt $vals.Count; $i++) { if ($it.SubItems[$i].Text -cne [string]$vals[$i]) { $it.SubItems[$i].Text = [string]$vals[$i]; $dirty = $true } }
+            if ($dirty) { $lv.Invalidate($it.Bounds) }
+        }
+    }
+    # buttons follow the selection
+    $selS = @(Get-WebSelected)
+    $anyRun = @($selS | Where-Object { $r = $WsUI.Rt[$_.Id]; $r -and $r.Proc -and -not $r.Proc.Exited }).Count -gt 0
+    $anyStop = @($selS | Where-Object { $r = $WsUI.Rt[$_.Id]; -not ($r -and $r.Proc -and -not $r.Proc.Exited) }).Count -gt 0
+    $WsUI.BtnStart.Enabled = $anyStop; $WsUI.BtnStop.Enabled = $anyRun -or @($selS | Where-Object { $WsUI.Rt[$_.Id].State -eq 'elsewhere' }).Count; $WsUI.BtnRestart.Enabled = $selS.Count -gt 0
+    foreach ($b in $WsUI.SelOnly) { $b.Enabled = $selS.Count -gt 0 }
+    $WsUI.BtnBuild.Enabled = @($selS | Where-Object Kind -eq 'project').Count -gt 0
+    # status bar
+    if (-not $WsUI.StatusUntil -or (Get-Date) -gt $WsUI.StatusUntil) {
+        $counts = @{}; foreach ($s in $WsUI.Sites) { $k = (Get-WebRt $s).State; $counts[$k] = 1 + [int]$counts[$k] }
+        $parts = @("$($WsUI.Sites.Count) sites")
+        foreach ($k in 'running', 'starting', 'building', 'errors', 'noanswer', 'crashed', 'failed', 'elsewhere', 'missing') { if ($counts[$k]) { $parts += "$($counts[$k]) $($WsStates[$k][0].ToLower())" } }
+        $dn = Get-DotNetExe
+        $sdk = @(Get-DotNetSdks)
+        $right = if ($dn) { "dotnet: $(Split-Path -Parent $dn)$(if ($sdk.Count) { "  (SDK $($sdk[-1]))" } else { '  (runtime only)' })" } else { 'dotnet.exe not found: only published self-contained apps and IIS Express sites can run' }
+        $WsUI.StatusText.Text = ($parts -join "  $Dot  ") + "        $right"; $WsUI.StatusText.ForeColor = $C.Dim
+    }
+    if ($WsUI.Props) { foreach ($cx in $WsUI.Props.Controls) { if ($cx -is [System.Windows.Forms.ComboBox] -and $cx.DropDownStyle -eq 'DropDown' -and -not $cx.Focused -and $cx.SelectionLength) { $cx.SelectionLength = 0 } } }
+    # log
+    Update-WebLog
+}
+
+function Update-WebLog {
+    $box = $WsUI.Log; if (-not $box) { return }
+    $sel = @(Get-WebSelected)
+    $id = if ($sel.Count -eq 1) { $sel[0].Id } else { $null }
+    if ($id -ne $WsUI.LogId -or $WsUI.LogDirty) {
+        $WsUI.LogId = $id; $WsUI.LogDirty = $false; $WsUI.LogQueue.Clear()
+        $box.Clear()
+        $WsUI.LogTitle.Text = if ($id) { "Log  $Dot  $($sel[0].Name)" } elseif ($sel.Count) { 'Log  (select one site)' } else { 'Log  (select a site)' }
+        if ($id) { Write-WebLogLines (Get-WebRt $sel[0]).Lines }
+        return
+    }
+    if ($WsUI.LogQueue.Count) { $lines = $WsUI.LogQueue.ToArray(); $WsUI.LogQueue.Clear(); Write-WebLogLines $lines }
+}
+
+function Write-WebLogLines($Lines) {
+    $box = $WsUI.Log
+    $errorsOnly = $WsUI.ErrorsOnly.Checked
+    # where the reader is: the new lines are added at the end without moving the view, unless Follow is on
+    # and the view is at the end (scrolling up pauses following, scrolling back down resumes it)
+    $first = [DevRtb]::FirstVisible($box.Handle)
+    $total = $box.GetLineFromCharIndex($box.TextLength) + 1
+    $rows = [Math]::Max(1, [int]($box.ClientSize.Height / [Math]::Max(1, $box.Font.Height)))
+    $atEnd = $first + $rows -ge $total - 1
+    $selStart = $box.SelectionStart; $selLen = $box.SelectionLength
+    $removed = 0
+    [PowerClipTheme]::Redraw($box.Handle, $false)
+    try {
+        foreach ($l in $Lines) {
+            if (-not $l) { continue }
+            $mark = $l[0]; $t = $l.Substring(1)
+            $col = if ($mark -eq '!') { $C.Red } elseif ($mark -eq '#') { $C.Accent }
+                   elseif ($t -match '^\s*(fail|crit|error)\b|^\s*Unhandled exception|Exception:|^\s+at \S+\(|error [A-Z]{2,4}\d{3,5}') { $C.Red }
+                   elseif ($t -match '^\s*warn\b|warning [A-Z]{2,4}\d{3,5}') { $C.Yellow }
+                   elseif ($t -match '^\s*(info|dbug|trce):') { $C.Dim } else { $C.Fore }
+            if ($errorsOnly -and $col -ne $C.Red -and $col -ne $C.Yellow -and $col -ne $C.Accent) { continue }
+            $box.SelectionStart = $box.TextLength; $box.SelectionLength = 0; $box.SelectionColor = $col
+            $box.AppendText($t + "`n")
+        }
+        if ($box.GetLineFromCharIndex($box.TextLength) -gt 6000) {
+            $cut = $box.GetFirstCharIndexFromLine(1500)
+            $box.Select(0, $cut); $box.ReadOnly = $false; $box.SelectedText = ''; $box.ReadOnly = $true
+            $removed = 1500; $selStart -= $cut; if ($selStart -lt 0) { $selLen = [Math]::Max(0, $selLen + $selStart); $selStart = 0 }
+        }
+        if ($WsUI.Follow.Checked -and $atEnd) { $box.SelectionStart = $box.TextLength; $box.SelectionLength = 0; $box.ScrollToCaret() }
+        else {
+            $box.Select($selStart, $selLen)
+            [DevRtb]::ScrollLines($box.Handle, [Math]::Max(0, $first - $removed) - [DevRtb]::FirstVisible($box.Handle))
+        }
+    } finally { [PowerClipTheme]::Redraw($box.Handle, $true); $box.Invalidate() }
+}
+
+# ---- the settings of the selected site (right) ----------------------------------------------------------
+# The width a field may take in the settings panel (it follows the panel when the window or the divider moves).
+function Get-WsPropWidth { [Math]::Max((Px 150), $WsUI.Props.Width - $WsUI.Props.Padding.Horizontal - [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth - (Px 6)) }
+
+function Add-WsField($Panel, [string]$Label, $Control, [int]$Width = 300, [string]$Tip = '') {
+    $l = New-TbLabel $Panel $Label -Dim
+    $l.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 10), 0, (Px 2))
+    $l.MaximumSize = New-Object System.Drawing.Size((Get-WsPropWidth), 0)
+    if ($Width -gt 0) { $Control.Width = [Math]::Min((Px ($Width * $TextZoom)), (Get-WsPropWidth)) }
+    $Control.Margin = New-Object System.Windows.Forms.Padding((Px 2), 0, 0, 0)
+    if ($Tip) { $tooltip.SetToolTip($Control, $Tip); $tooltip.SetToolTip($l, $Tip) }
+    $Panel.Controls.Add($Control)
+    $Control
+}
+
+# A box bound to one property of the site being edited.
+function New-WsBox([string]$Prop, [switch]$Multi, [switch]$Number, [string]$Cue = '') {
+    $b = New-TbBox -Multi:$Multi
+    if ($Cue) { $b.AccessibleDescription = $Cue; $b.add_HandleCreated({ param($src, $e) [PowerClipHost]::SetCueBanner($src.Handle, $src.AccessibleDescription) }) }
+    $s = $WsUI.Editing
+    $b.Text = if ($Number) { if ($s.$Prop -gt 0) { [string]$s.$Prop } else { '' } } else { [string]$s.$Prop }
+    if ($Multi) { $b.Height = Px 74; $b.ScrollBars = 'Vertical'; $b.WordWrap = $false }
+    $b.Tag = @{ Prop = $Prop; Number = [bool]$Number }
+    $b.add_TextChanged({
+        param($src, $e)
+        if ($WsUI.Building -or -not $WsUI.Editing) { return }
+        $v = $src.Text
+        if ($src.Tag.Number) { $n = 0; if ($v.Trim() -and -not [int]::TryParse($v.Trim(), [ref]$n)) { $src.ForeColor = $C.Red; return }; $src.ForeColor = $C.Fore; $v = $n }
+        Set-WebProp $src.Tag.Prop $v
+    })
+    $b
+}
+function New-WsCheck($Parent, [string]$Prop, [string]$Text, [string]$Tip = '') {
+    $cb = New-CheckBox $Parent $Text ([bool]$WsUI.Editing.$Prop) $Tip
+    $cb.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 9), 0, 0)
+    $cb.Tag = $Prop
+    $cb.add_CheckedChanged({ param($src, $e) if (-not $WsUI.Building -and $WsUI.Editing) { Set-WebProp $src.Tag $src.Checked } })
+    $cb
+}
+function New-WsCombo([string]$Prop, [string[]]$Items, [string]$Value, [switch]$Editable) {
+    $cx = New-Object System.Windows.Forms.ComboBox
+    $cx.DropDownStyle = if ($Editable) { 'DropDown' } else { 'DropDownList' }
+    $cx.FlatStyle = 'Flat'; $cx.BackColor = $C.Bg; $cx.ForeColor = $C.Fore
+    foreach ($i in $Items) { [void]$cx.Items.Add($i) }
+    if ($Editable) { $cx.Text = $Value } else { $ix = [array]::IndexOf($Items, $Value); $cx.SelectedIndex = [Math]::Max(0, $ix) }
+    $cx.Tag = $Prop
+    $handler = { param($src, $e) if (-not $WsUI.Building -and $WsUI.Editing) { Set-WebProp $src.Tag $(if ($src.Tag -eq 'Profile' -and $src.SelectedIndex -eq 0 -and $src.Text -like '(*') { '' } else { $src.Text }) } }
+    $cx.add_SelectedIndexChanged($handler)
+    if ($Editable) { $cx.add_TextChanged($handler) }
+    $cx
+}
+
+function Set-WebProp([string]$Prop, $Value) {
+    $s = $WsUI.Editing; if (-not $s) { return }
+    if ($s.$Prop -ceq $Value) { return }
+    $s.$Prop = $Value
+    Request-WebSave
+    if ($WsUI.CmdView) { $WsUI.CmdView.Text = Get-WebCommandText $s }
+    $rt = Get-WebRt $s
+    if ($rt.Proc -and -not $rt.Proc.Exited -and $Prop -notin 'Name', 'Group', 'AutoStart', 'AutoRestart', 'Health') { $WsUI.Applies.Visible = $true }
+    if ($Prop -in 'Name', 'Group', 'Port', 'HttpsPort') { Update-WebView }
+}
+
+function Read-LaunchProfiles([string]$ProjectDir) {
+    $f = Join-Path $ProjectDir 'Properties\launchSettings.json'
+    if (-not [IO.File]::Exists($f)) { return @() }
+    try {
+        $t = [IO.File]::ReadAllText($f) -replace '(?m)^\s*//.*$', ''
+        $j = $t | ConvertFrom-Json
+        @(foreach ($p in $j.profiles.PSObject.Properties) { [pscustomobject]@{ Name = $p.Name; Command = [string]$p.Value.commandName; Urls = [string]$p.Value.applicationUrl; Env = $p.Value.environmentVariables } })
+    } catch { @() }
+}
+
+function Update-WebProps {
+    $p = $WsUI.Props; if (-not $p) { return }
+    $sel = @(Get-WebSelected)
+    $key = (@($sel | ForEach-Object Id) -join ',')
+    if ($key -eq $WsUI.PropKey) { return }
+    $WsUI.PropKey = $key
+    $WsUI.Building = $true
+    $p.SuspendLayout()
+    foreach ($ctl in @($p.Controls)) { $p.Controls.Remove($ctl); $ctl.Dispose() }
+    $WsUI.Editing = if ($sel.Count -eq 1) { $sel[0] } else { $null }
+    $WsUI.CmdView = $null
+    $s = $WsUI.Editing
+    if (-not $s) {
+        New-TbLabel $p $(if ($sel.Count) { "$($sel.Count) sites selected" } else { 'Web servers' }) -Title | Out-Null
+        $hint = New-TbLabel $p $(if ($sel.Count) { 'Start, Stop and Restart work on all of them. Select one site to change its settings.' } else { "Open a folder: every website in it is found and added - ASP.NET Core projects, published apps (.dll / .exe) and classic ASP.NET sites (IIS Express). Or add one with Add site.`n`nSelect a site to set its ports, environment and options. Everything is saved by itself." }) -Dim
+        $hint.MaximumSize = New-Object System.Drawing.Size((Get-WsPropWidth), 0)
+        $hd = New-TbLabel $p 'For all sites' -Title; $hd.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 22), 0, 0)
+        foreach ($o in @(@('StopOnExit', 'Stop them when DevTools exits', 'Off: they keep running, and DevTools finds them again when it starts'), @('Notify', 'Notify me when a site crashes', 'A Windows notification when a running site crashes or stops answering, while this window is not in front'))) {
+            $cb = New-CheckBox $p $o[1] ([bool]$WsUI.Cfg[$o[0]]) $o[2]; $cb.Tag = $o[0]; $cb.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 9), 0, 0)
+            $cb.add_CheckedChanged({ param($src, $e) $WsUI.Cfg[$src.Tag] = $src.Checked; Request-WebSave })
+        }
+        $ev = New-TbNumber $p ([int]$WsUI.Cfg.Every) 3 600
+        $l2 = New-TbLabel $p 'Check each running site every (seconds)' -Dim; $p.Controls.SetChildIndex($l2, $p.Controls.GetChildIndex($ev))
+        $ev.add_ValueChanged({ param($src, $e) $WsUI.Cfg.Every = [int]$src.Value; Request-WebSave })
+    } else {
+        New-TbLabel $p $s.Name -Title | Out-Null
+        $what = New-TbLabel $p "$($WsKinds[$s.Kind])$(if ($s.Framework) { "  $Dot  $($s.Framework)" })`n$($s.Path)" -Dim
+        $what.MaximumSize = New-Object System.Drawing.Size((Get-WsPropWidth), 0)
+        $WsUI.Applies = New-TbLabel $p 'It is running: changes take effect when you restart it.' ; $WsUI.Applies.ForeColor = $C.Yellow; $WsUI.Applies.Visible = $false
+        $WsUI.Applies.MaximumSize = New-Object System.Drawing.Size((Get-WsPropWidth), 0)
+        [void](Add-WsField $p 'Name' (New-WsBox 'Name'))
+        [void](Add-WsField $p 'Folder (group in the list)' (New-WsCombo 'Group' @($WsUI.Sites | ForEach-Object Group | Where-Object { $_ } | Sort-Object -Unique) $s.Group -Editable))
+        if ($s.Kind -eq 'custom') {
+            [void](Add-WsField $p 'Command  ({port} {httpsport} {urls} are filled in)' (New-WsBox 'Command' -Cue 'e.g.  npm run dev   or   MyApp.exe --port {port}'))
+            [void](Add-WsField $p 'Working folder' (New-WsBox 'Dir'))
+        }
+        # ports
+        $row = New-Object System.Windows.Forms.FlowLayoutPanel
+        $row.AutoSize = $true; $row.WrapContents = $false; $row.BackColor = $p.BackColor; $row.Margin = New-Object System.Windows.Forms.Padding(0, (Px 8), 0, 0)
+        foreach ($pp in @(@('Port', 'HTTP port'), @('HttpsPort', 'HTTPS port'))) {
+            if ($pp[0] -eq 'HttpsPort' -and $s.Kind -eq 'iisexpress') { continue }
+            $col = New-Object System.Windows.Forms.FlowLayoutPanel
+            $col.AutoSize = $true; $col.FlowDirection = 'TopDown'; $col.WrapContents = $false; $col.BackColor = $p.BackColor; $col.Margin = New-Object System.Windows.Forms.Padding(0, 0, (Px 8), 0)
+            $lb = New-TbLabel $col $pp[1] -Dim; $lb.Margin = New-Object System.Windows.Forms.Padding((Px 2), 0, 0, (Px 2))
+            $bx = New-WsBox $pp[0] -Number -Cue 'none'; $bx.Width = Px (86 * $TextZoom); $bx.Margin = New-Object System.Windows.Forms.Padding((Px 2), 0, 0, 0); $col.Controls.Add($bx)
+            $WsUI["Box$($pp[0])"] = $bx
+            $row.Controls.Add($col)
+        }
+        $fp = New-Button '' 'Free port: pick an HTTP port that no other saved site uses and nothing on this PC listens on' {
+            $e0 = $WsUI.Editing; if (-not $e0) { return }
+            $np = Get-FreeWebPort 5101 @($e0.HttpsPort); $WsUI.BoxPort.Text = [string]$np
+        } $row $Glyph.Refresh 2
+        $fp.Margin = New-Object System.Windows.Forms.Padding(0, ($lb.Height + (Px 2)), 0, 0); $fp.AccessibleName = 'Free port'
+        $p.Controls.Add($row)
+        if ($s.Kind -ne 'iisexpress') { [void](New-WsCheck $p 'AllHosts' 'Reachable from other PCs' 'Off: only this PC can open it (localhost). On: it listens on all addresses, so other PCs on the network can open it too (Windows Firewall may ask once).') }
+        if ($s.Kind -eq 'project') {
+            $profiles = @(Read-LaunchProfiles (Split-Path -Parent $s.Path) | Where-Object { $_.Command -eq 'Project' })
+            $items = @('(none - use the ports and settings here)') + @($profiles | ForEach-Object Name)
+            [void](Add-WsField $p 'Launch profile (Properties\launchSettings.json)' (New-WsCombo 'Profile' $items $(if ($s.Profile) { $s.Profile } else { $items[0] })) 300 'A profile brings its own address and environment variables. The ports set here still win when they are set.')
+            [void](Add-WsField $p 'Configuration' (New-WsCombo 'Config' @('Debug', 'Release') $s.Config) 140)
+            [void](New-WsCheck $p 'Watch' 'Hot reload (dotnet watch)' 'Runs the site with dotnet watch: saved edits to .cs, .cshtml, .razor and static files are applied while it runs, without a restart.')
+        }
+        if ($s.Kind -ne 'iisexpress') { [void](Add-WsField $p 'Environment (ASPNETCORE_ENVIRONMENT)' (New-WsCombo 'Env' @('Development', 'Staging', 'Production') $s.Env -Editable) 200) }
+        [void](Add-WsField $p 'More environment variables  (one NAME=value per line)' (New-WsBox 'Vars' -Multi) 300 'e.g.  ConnectionStrings__Default=Server=.;Database=Shop;Trusted_Connection=True')
+        [void](Add-WsField $p 'Extra arguments' (New-WsBox 'Args' -Cue 'passed to the site, e.g. --seed') 300)
+        [void](Add-WsField $p 'Health check path' (New-WsBox 'Health' -Cue '/') 200 'The address asked every few seconds to see that the site answers, e.g. /health. An answer below 500 counts as running.')
+        [void](New-WsCheck $p 'AutoStart' 'Start it when DevTools starts')
+        [void](New-WsCheck $p 'AutoRestart' 'Restart it if it crashes' 'At most 3 times in 10 minutes. A site that stops while it is still starting (a build error, a bad setting) is not restarted.')
+        $cl = New-TbLabel $p 'The command DevTools runs' -Dim; $cl.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 14), 0, (Px 2))
+        $cv = New-TbBox -Mono -Multi -ReadOnly
+        $cv.Width = Get-WsPropWidth; $cv.Height = Px 96; $cv.WordWrap = $true; $cv.ScrollBars = 'Vertical'; $cv.Font = New-Object System.Drawing.Font('Consolas', (Fz 8.5))
+        $cv.Text = Get-WebCommandText $s; $cv.Margin = New-Object System.Windows.Forms.Padding((Px 2), 0, 0, 0)
+        $p.Controls.Add($cv); $WsUI.CmdView = $cv
+        $tooltip.SetToolTip($cv, 'The same command, ready to paste into a Command Prompt')
+        $rt = Get-WebRt $s
+        if ($rt.Proc -and -not $rt.Proc.Exited) {
+            $since = $rt.Proc.Started
+            New-TbLabel $p "Running since $($since.ToString('HH:mm:ss'))  $Dot  PID $($rt.Proc.Pid)$(if ($rt.Proc.Attached) { '  (found again)' })" -Dim | Out-Null
+        }
+    }
+    $p.ResumeLayout()
+    foreach ($cx in @($p.Controls | Where-Object { $_ -is [System.Windows.Forms.ComboBox] -and $_.DropDownStyle -eq 'DropDown' })) { $cx.SelectionLength = 0 }
+    $WsUI.PropBuiltW = $p.Width
+    $WsUI.Building = $false
+}
+
+# ---- adding sites ---------------------------------------------------------------------------------------
+function Add-WebFound($Found, [string]$Group) {
+    $s = New-WebSite @{ Name = $Found.Name; Kind = $Found.Kind; Path = $Found.Path; Dir = $Found.Dir; Group = $Group; Framework = $Found.Framework }
+    if ($Found.Kind -eq 'node') {
+        # a Node front end: npm runs its own script, which usually names its port already
+        $s.Kind = 'custom'; $s.Command = "npm run $($Found.Script)"; $s.Env = ''; $s.Port = [int]$Found.Port
+        $leaf = Split-Path -Leaf $Found.Dir
+        $s.Name = if ($leaf -match '^(web|app|client|frontend|front-end|ui|site|www)$') { "$(Split-Path -Leaf (Split-Path -Parent $Found.Dir)) $leaf ($($Found.Framework))" } else { "$($Found.Name) ($($Found.Framework))" }
+    }
+    if ($Found.Kind -eq 'project') {
+        $prof = Read-LaunchProfiles $Found.Dir | Where-Object { $_.Command -eq 'Project' } | Select-Object -First 1
+        if ($prof) {
+            foreach ($u in ($prof.Urls -split ';')) { if ($u -match '^http://[^:/]+:(\d+)') { $s.Port = [int]$Matches[1] } elseif ($u -match '^https://[^:/]+:(\d+)') { $s.HttpsPort = [int]$Matches[1] } }
+            if ($prof.Env) {
+                $vars = @()
+                foreach ($e in $prof.Env.PSObject.Properties) {
+                    if ($e.Name -eq 'ASPNETCORE_ENVIRONMENT') { $s.Env = [string]$e.Value } elseif ($e.Name -ne 'ASPNETCORE_URLS') { $vars += "$($e.Name)=$($e.Value)" }
+                }
+                $s.Vars = $vars -join "`r`n"
+            }
+        }
+    } elseif ($Found.Kind -eq 'iisexpress' -and $Found.Url -match ':(\d+)') { $s.Port = [int]$Matches[1] }
+    if ($Found.Kind -eq 'published') { $s.Env = 'Production' }
+    # every site gets its own port
+    $taken = @{}; foreach ($o in $WsUI.Sites) { foreach ($pt in $o.Port, $o.HttpsPort) { if ($pt -gt 0) { $taken[[int]$pt] = $o.Name } } }
+    if ($s.Port -le 0 -or $taken.ContainsKey($s.Port)) { $s.Port = Get-FreeWebPort 5101 @($s.HttpsPort) }
+    if ($s.HttpsPort -gt 0 -and $taken.ContainsKey($s.HttpsPort)) { $s.HttpsPort = Get-FreeWebPort 7101 @($s.Port) }
+    $WsUI.Sites.Add($s)
+    $s
+}
+
+function Add-WebFolder([string]$Folder = '') {
+    if (-not $Folder) {
+        $d = New-Object DevFolderDialog
+        $d.Description = 'The folder with your websites (DevTools looks in its subfolders too)'
+        $d.ShowNewFolderButton = $false
+        if ($WsUI.LastFolder) { $d.SelectedPath = $WsUI.LastFolder }
+        $script:Modal = $true
+        try { if ($d.ShowDialog($WsUI.Form) -ne 'OK') { return }; $Folder = $d.SelectedPath } finally { $script:Modal = $false; $d.Dispose() }
+    }
+    $WsUI.LastFolder = $Folder
+    $old = [System.Windows.Forms.Cursor]::Current; [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::WaitCursor
+    try { $found = @([DevWebScan]::Find($Folder, 6)) } finally { [System.Windows.Forms.Cursor]::Current = $old }
+    if (-not $found.Count) { Set-WebStatus "No websites found in $Folder (looked for ASP.NET Core projects, published apps and classic ASP.NET sites, 6 folders deep)." $C.Yellow; return }
+    $group = Split-Path -Leaf $Folder; if (-not $group) { $group = $Folder }
+    $known = @{}; foreach ($o in $WsUI.Sites) { $known[([string]$o.Path).ToLowerInvariant()] = 1 }
+    $new = @()
+    foreach ($fd in $found) { if (-not $known.ContainsKey($fd.Path.ToLowerInvariant())) { $new += Add-WebFound $fd $group } }
+    Save-WebSites
+    Update-WebView
+    if ($new.Count) { Select-WebSite $new[0] }
+    Set-WebStatus "Found $($found.Count) site$(if ($found.Count -ne 1) { 's' }) in $Folder$(if ($new.Count -ne $found.Count) { ", $($new.Count) new" }). Each has its own port; check them on the right." $C.Green
+}
+
+function Add-WebSiteFile {
+    $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    [void](Add-MenuItem $m 'A project or a published app (.csproj, .dll, .exe)...' {
+        $d = New-Object System.Windows.Forms.OpenFileDialog
+        $d.Filter = 'Websites (*.csproj;*.fsproj;*.vbproj;*.dll;*.exe)|*.csproj;*.fsproj;*.vbproj;*.dll;*.exe|All files|*.*'
+        $script:Modal = $true
+        try { if ($d.ShowDialog($WsUI.Form) -ne 'OK') { return }; $path = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
+        $dir = Split-Path -Parent $path
+        $fd = @([DevWebScan]::Find($dir, 0)) | Where-Object { $_.Path -eq $path } | Select-Object -First 1
+        if (-not $fd) {
+            $kind = if ($path -match '\.(cs|fs|vb)proj$') { 'project' } else { 'published' }
+            $fd = [pscustomobject]@{ Kind = $kind; Path = $path; Dir = $dir; Name = [IO.Path]::GetFileNameWithoutExtension($path); Framework = ''; Url = '' }
+        }
+        $s = Add-WebFound $fd 'Sites'; Save-WebSites; Update-WebView; Select-WebSite $s
+    } $Glyph.Document)
+    [void](Add-MenuItem $m 'A classic ASP.NET site folder (IIS Express)...' {
+        $d = New-Object DevFolderDialog; $d.Description = 'The site folder (with web.config)'
+        $script:Modal = $true
+        try { if ($d.ShowDialog($WsUI.Form) -ne 'OK') { return }; $dir = $d.SelectedPath } finally { $script:Modal = $false; $d.Dispose() }
+        $s = Add-WebFound ([pscustomobject]@{ Kind = 'iisexpress'; Path = $dir; Dir = $dir; Name = (Split-Path -Leaf $dir); Framework = '.NET Framework'; Url = '' }) 'Sites'; Save-WebSites; Update-WebView; Select-WebSite $s
+    } $Glyph.Folder)
+    [void](Add-MenuItem $m 'Any command (Node, Python, an .exe ...)' {
+        $s = New-WebSite @{ Name = 'New site'; Kind = 'custom'; Dir = $(if ($WsUI.LastFolder) { $WsUI.LastFolder } else { '' }); Group = 'Sites'; Env = '' }
+        $s.Port = Get-FreeWebPort 5101
+        $WsUI.Sites.Add($s); Save-WebSites; Update-WebView; Select-WebSite $s
+    } $Glyph.Code)
+    $m.Show($WsUI.BtnAdd, (New-Object System.Drawing.Point(0, $WsUI.BtnAdd.Height)))
+}
+
+function Select-WebSite($S) {
+    $lv = $WsUI.List
+    foreach ($it in $lv.Items) { $it.Selected = ($it.Tag.Id -eq $S.Id) }
+    $it = $lv.Items[$S.Id]; if ($it) { $it.EnsureVisible(); $it.Focused = $true }
+}
+
+function Remove-WebSites {
+    $sel = @(Get-WebSelected); if (-not $sel.Count) { return }
+    $running = @($sel | Where-Object { $r = $WsUI.Rt[$_.Id]; $r -and $r.Proc -and -not $r.Proc.Exited })
+    $msg = if ($sel.Count -eq 1) { "Remove $($sel[0].Name) from the list?" } else { "Remove these $($sel.Count) sites from the list?" }
+    if ($running.Count) { $msg += "`n`n$($running.Count) of them $(if ($running.Count -eq 1) { 'is' } else { 'are' }) running and will be stopped." }
+    $msg += "`n`nTheir files are not touched."
+    if ([System.Windows.Forms.MessageBox]::Show($WsUI.Form, $msg, 'Web servers', 'YesNo', 'Question') -ne 'Yes') { return }
+    foreach ($s in $sel) {
+        $r = $WsUI.Rt[$s.Id]; if ($r -and $r.Proc -and -not $r.Proc.Exited) { $r.Stopping = $true; $r.Proc.Kill() }
+        [void]$WsUI.Sites.Remove($s); $WsUI.Rt.Remove($s.Id)
+    }
+    Save-WebSites; Save-WebRunning
+    $WsUI.PropKey = '?'; Update-WebView; Update-WebProps
+}
+
+function Open-WebInBrowser($S) {
+    $u = Get-WebBaseUrl $S
+    if (-not $u) { Set-WebStatus "$($S.Name) has no port set." $C.Yellow; return }
+    Start-Process $u
+}
+
+function Show-WebSiteMenu($Menu) {
+    $Menu.Items.Clear()
+    $sel = @(Get-WebSelected); if (-not $sel.Count) { return }
+    $one = if ($sel.Count -eq 1) { $sel[0] } else { $null }
+    [void](Add-MenuItem $Menu 'Start' { foreach ($s in @(Get-WebSelected)) { Start-WebSite $s } } $Glyph.Play 'Ctrl+R')
+    [void](Add-MenuItem $Menu 'Stop' { foreach ($s in @(Get-WebSelected)) { Stop-WebSite $s } } $Glyph.WsStop 'Ctrl+T')
+    [void](Add-MenuItem $Menu 'Restart' { foreach ($s in @(Get-WebSelected)) { Stop-WebSite $s -Restart } } $Glyph.Refresh 'Ctrl+Shift+R')
+    [void]$Menu.Items.Add('-')
+    if ($one) {
+        [void](Add-MenuItem $Menu 'Open in the browser' { Open-WebInBrowser (@(Get-WebSelected)[0]) } $Glyph.Globe 'Enter')
+        [void](Add-MenuItem $Menu 'Copy the address' { $u = Get-WebBaseUrl (@(Get-WebSelected)[0]); if ($u) { Copy-TbText $u } } $Glyph.Copy)
+        [void](Add-MenuItem $Menu 'Show in Explorer' { $s = @(Get-WebSelected)[0]; $t = if ($s.Kind -eq 'iisexpress') { $s.Path } else { $s.Path }; if ([IO.File]::Exists($t)) { Start-Process explorer.exe "/select,`"$t`"" } elseif ([IO.Directory]::Exists($t)) { Start-Process explorer.exe "`"$t`"" } elseif ($s.Dir) { Start-Process explorer.exe "`"$($s.Dir)`"" } } $Glyph.WsOpenDir)
+        if ($one.Kind -eq 'project') { [void](Add-MenuItem $Menu 'Build (dotnet build)' { Invoke-WebBuild (@(Get-WebSelected)[0]) } $Glyph.WsBuild) }
+        [void](Add-MenuItem $Menu 'Copy the command' { Copy-TbText (Get-WebCommandText (@(Get-WebSelected)[0])) } $Glyph.Code)
+        [void](Add-MenuItem $Menu 'Open the log file' { $f = Get-WebLogFile (@(Get-WebSelected)[0]); if ([IO.File]::Exists($f)) { Start-Process notepad.exe "`"$f`"" } else { Set-WebStatus 'No log file yet: it is written once the site has run.' } } $Glyph.Document)
+        [void](Add-MenuItem $Menu 'Duplicate' {
+            $s = @(Get-WebSelected)[0]
+            $n = New-WebSite $s; $n.Id = [guid]::NewGuid().ToString('N').Substring(0, 8); $n.Name = "$($s.Name) (copy)"
+            $n.Port = Get-FreeWebPort 5101; if ($n.HttpsPort -gt 0) { $n.HttpsPort = Get-FreeWebPort 7101 @($n.Port) }; $n.AutoStart = $false
+            $WsUI.Sites.Add($n); Save-WebSites; Update-WebView; Select-WebSite $n
+        } $Glyph.Copy)
+    }
+    [void]$Menu.Items.Add('-')
+    [void](Add-MenuItem $Menu 'Remove from the list...' { Remove-WebSites } $Glyph.Delete 'Del')
+}
+
+function Export-WebSites {
+    $d = New-Object System.Windows.Forms.SaveFileDialog
+    $d.Filter = 'Web server list (*.devsites.json)|*.devsites.json'; $d.FileName = 'websites.devsites.json'
+    $script:Modal = $true
+    try { if ($d.ShowDialog($WsUI.Form) -ne 'OK') { return }; $path = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
+    [IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject ([ordered]@{ DevToolsWebServers = 1; Sites = $WsUI.Sites.ToArray() }) -Depth 5), (New-Object Text.UTF8Encoding $false))
+    Set-WebStatus "Saved $($WsUI.Sites.Count) sites to $path" $C.Green
+}
+function Import-WebSitesFile {
+    $d = New-Object System.Windows.Forms.OpenFileDialog
+    $d.Filter = 'Web server list (*.devsites.json)|*.devsites.json|All files|*.*'
+    $script:Modal = $true
+    try { if ($d.ShowDialog($WsUI.Form) -ne 'OK') { return }; $path = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
+    try { $j = [IO.File]::ReadAllText($path) | ConvertFrom-Json } catch { Set-WebStatus "That isn't a web server list: $($_.Exception.Message)" $C.Red; return }
+    $known = @{}; foreach ($o in $WsUI.Sites) { $known[([string]$o.Path).ToLowerInvariant()] = 1 }
+    $n = 0
+    foreach ($x in @($j.Sites)) {
+        if (-not $x -or $known.ContainsKey(([string]$x.Path).ToLowerInvariant())) { continue }
+        $s = New-WebSite $x; $s.Id = [guid]::NewGuid().ToString('N').Substring(0, 8)
+        $WsUI.Sites.Add($s); $n++
+    }
+    Save-WebSites; Update-WebView
+    Set-WebStatus "Added $n site$(if ($n -ne 1) { 's' }) from $([IO.Path]::GetFileName($path))." $C.Green
+}
+
+function New-WsBtn($Group, [string]$Icon, [string]$Name, [string]$Tip, [scriptblock]$OnClick, [switch]$Label, [int]$Variant = 2) {
+    $b = New-Button $(if ($Label -or -not $IconFontName) { $Name } else { '' }) $Tip $OnClick $Group $Icon $Variant
+    $b.Margin = New-Object System.Windows.Forms.Padding((Px 1), 0, (Px 1), 0)
+    $b.AccessibleName = $Name; $b.AccessibleDescription = $Tip; $b.Soft = $true
+    if ($Label -and $IconFontName -and $WsUI.BarHost -and $Group.Parent -eq $WsUI.BarHost) { $WsUI.BarLabelled.Add($b) }
+    $b
+}
+
+# Sizes that follow the window: the command bar drops its labels when narrow (names stay in the tooltips),
+# the properties take about a quarter of the width and the log about 40% of the height (until dragged).
+function Update-WsLayout {
+    $f = $WsUI.Form; if (-not $f -or $f.WindowState -eq 'Minimized') { return }
+    if (-not $WsUI.BarFull) { $sum = $WsUI.Bar.Padding.Horizontal; foreach ($g in $WsUI.Bar.Controls) { $sum += $g.PreferredSize.Width + $g.Margin.Horizontal }; $WsUI.BarFull = $sum }
+    $compact = $f.ClientSize.Width -lt $WsUI.BarFull
+    if ($WsUI.BarCompact -ne $compact) { $WsUI.BarCompact = $compact; foreach ($b in $WsUI.BarLabelled) { if ($b -ne $WsUI.BtnStart) { $b.Text = if ($compact) { '' } else { $b.AccessibleName } } } }
+    $rw = [Math]::Max((Px 290), [Math]::Min((Px (370 * $TextZoom)), [int]($f.ClientSize.Width * 0.27)))
+    if ($WsUI.Props.Width -ne $rw) { $WsUI.Props.Width = $rw }
+    if (-not $WsUI.LogUser) { $lh = [Math]::Max((Px 140), [int]($WsUI.LogPanel.Parent.ClientSize.Height * 0.4)); if ($WsUI.LogPanel.Height -ne $lh) { $WsUI.LogPanel.Height = $lh } }
+}
+
+function Show-WebServers([string]$Folder = '') {
+    Hide-Picker
+    if (-not (Initialize-WebServers)) { return }
+    if ($WsUI.Form) {
+        if ($WsUI.Form.WindowState -eq 'Minimized') { $WsUI.Form.WindowState = 'Normal' }
+        $WsUI.Form.Activate()
+        if ($Folder) { Add-WebFolder $Folder }
+        return
+    }
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'Web servers'; $f.Icon = $IconActive
+    $f.Size = New-Object System.Drawing.Size((Px 1460), (Px 900)); $f.MinimumSize = New-Object System.Drawing.Size((Px 980), (Px 600))
+    $f.StartPosition = 'CenterScreen'; $f.BackColor = $C.Panel; $f.ForeColor = $C.Fore; $f.Font = $FontMain; $f.KeyPreview = $true
+    $WsUI.Form = $f
+    $WsUI.SelOnly = New-Object System.Collections.Generic.List[object]
+    $WsUI.LogQueue = New-Object System.Collections.Generic.List[string]
+
+    # top: command bar
+    $top = New-Object System.Windows.Forms.FlowLayoutPanel
+    $top.Dock = 'Top'; $top.AutoSize = $true; $top.AutoSizeMode = 'GrowAndShrink'; $top.WrapContents = $true; $top.BackColor = $C.Panel
+    $top.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 6))
+    $WsUI.BarHost = $top; $WsUI.BarLabelled = New-Object System.Collections.Generic.List[object]; $WsUI.BarCompact = $null
+    $g = New-DgBarGroup $top -First
+    [void](New-WsBtn $g $Glyph.WsScan 'Open folder' 'Open a folder: every website in it and its subfolders is added (ASP.NET Core projects, published apps, classic ASP.NET)' { Add-WebFolder } -Label)
+    $WsUI.BtnAdd = New-WsBtn $g $Glyph.Add 'Add site' 'Add one site: a project, a published app, a classic ASP.NET folder or any command' { Add-WebSiteFile } -Label
+    $g = New-DgBarGroup $top
+    $WsUI.BtnStart = New-WsBtn $g $Glyph.Play 'Start' 'Start the selected sites (Ctrl+R)' { foreach ($s in @(Get-WebSelected)) { Start-WebSite $s } } -Label -Variant 1
+    $WsUI.BtnStop = New-WsBtn $g $Glyph.WsStop 'Stop' 'Stop the selected sites (Ctrl+T)' { foreach ($s in @(Get-WebSelected)) { Stop-WebSite $s } } -Label
+    $WsUI.BtnRestart = New-WsBtn $g $Glyph.Refresh 'Restart' 'Restart the selected sites (Ctrl+Shift+R)' { foreach ($s in @(Get-WebSelected)) { Stop-WebSite $s -Restart } } -Label
+    $g = New-DgBarGroup $top
+    [void](New-WsBtn $g $Glyph.Lightning 'Start all' 'Start every site in the list (the ones shown, when the list is filtered)' { foreach ($it in @($WsUI.List.Items)) { Start-WebSite $it.Tag } } -Label)
+    [void](New-WsBtn $g $Glyph.Power 'Stop all' 'Stop every site that runs from here' { foreach ($s in $WsUI.Sites.ToArray()) { Stop-WebSite $s } } -Label)
+    $g = New-DgBarGroup $top
+    $WsUI.SelOnly.Add((New-WsBtn $g $Glyph.Globe 'Open in browser' 'Open the selected site in the web browser (Enter)' { foreach ($s in @(Get-WebSelected)) { Open-WebInBrowser $s } }))
+    $WsUI.SelOnly.Add((New-WsBtn $g $Glyph.WsOpenDir 'Show in Explorer' 'Show the site''s files in Explorer' { $s = @(Get-WebSelected)[0]; if ($s) { $t = $s.Path; if ([IO.File]::Exists($t)) { Start-Process explorer.exe "/select,`"$t`"" } elseif ([IO.Directory]::Exists($t)) { Start-Process explorer.exe "`"$t`"" } } }))
+    $WsUI.BtnBuild = New-WsBtn $g $Glyph.WsBuild 'Build' 'Build the selected project (dotnet build); the output goes to its log' { foreach ($s in @(Get-WebSelected)) { Invoke-WebBuild $s } }
+    $WsUI.SelOnly.Add((New-WsBtn $g $Glyph.Delete 'Remove' 'Remove the selected sites from the list (Del). Their files are not touched.' { Remove-WebSites }))
+    $g = New-DgBarGroup $top
+    $sm = New-WsBtn $g $Glyph.Send 'Share' 'Save the list to a file for a colleague or another PC, or add sites from such a file' {
+        $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+        [void](Add-MenuItem $m 'Save the list to a file...' { Export-WebSites } $Glyph.Save)
+        [void](Add-MenuItem $m 'Add sites from a file...' { Import-WebSitesFile } $Glyph.Open)
+        $m.Show($this, (New-Object System.Drawing.Point(0, $this.Height)))
+    }
+    $fbar = New-Object System.Windows.Forms.FlowLayoutPanel
+    $fbar.Dock = 'Top'; $fbar.AutoSize = $true; $fbar.WrapContents = $false; $fbar.BackColor = $C.Bg; $fbar.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 4))
+    $WsUI.Filter = New-TbBox -Cue 'Filter: name, port or folder  (Ctrl+F)'
+    $WsUI.Filter.Width = Px (300 * $TextZoom); $WsUI.Filter.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 0)
+    $WsUI.Filter.add_TextChanged({ Update-WebView })
+    $fbar.Controls.Add($WsUI.Filter)
+
+    # bottom: status bar
+    $status = New-Object System.Windows.Forms.Label
+    $status.Dock = 'Bottom'; $status.Height = Px 30; $status.AutoSize = $false; $status.AutoEllipsis = $true; $status.TextAlign = 'MiddleLeft'
+    $status.BackColor = $C.Panel; $status.ForeColor = $C.Dim; $status.Font = $FontSmall; $status.Padding = New-Object System.Windows.Forms.Padding((Px 12), 0, 0, 0)
+    $WsUI.StatusText = $status
+
+    # right: settings of the selected site
+    $right = New-Object System.Windows.Forms.FlowLayoutPanel
+    $right.Dock = 'Right'; $right.Width = Px (360 * $TextZoom); $right.FlowDirection = 'TopDown'; $right.WrapContents = $false; $right.AutoScroll = $true
+    $right.BackColor = $C.Bg; $right.Padding = New-Object System.Windows.Forms.Padding((Px 14), (Px 10), (Px 8), (Px 14))
+    $WsUI.Props = $right
+    $WsUI.PropResize = New-TbDebounce 200 { if ($WsUI.Props -and $WsUI.Props.Width -ne $WsUI.PropBuiltW) { $WsUI.PropKey = '?'; Update-WebProps } }
+    $right.add_SizeChanged({ if ($WsUI.PropResize) { $WsUI.PropResize.Stop(); $WsUI.PropResize.Start() } })
+    $splitR = New-Object System.Windows.Forms.Splitter -Property @{ Dock = 'Right'; Width = (Px 5); BackColor = $C.Panel; MinSize = (Px 280); MinExtra = (Px 420) }
+
+    # middle: the sites over the log of the selected one
+    $mid = New-Object System.Windows.Forms.Panel
+    $mid.Dock = 'Fill'; $mid.BackColor = $C.Bg
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.BorderStyle = 'None'; $lv.HideSelection = $false; $lv.OwnerDraw = $true
+    $lv.BackColor = $C.Bg; $lv.ForeColor = $C.Fore
+    # widths: what a column would like, and the least it may get (numbers never get cut)
+    $WsUI.ColW   = @(118, 150, 118, 92, 62, 50, 78, 70, 160)
+    $WsUI.ColMin = @(88, 84, 52, 50, 56, 42, 66, 56, 64)
+    $ci = 0; foreach ($cn in 'Status', 'Site', 'Type', 'Ports', 'PID', 'CPU', 'Memory', 'Up', 'Response') { [void]$lv.Columns.Add($cn, (Px ($WsUI.ColW[$ci++] * $TextZoom))) }
+    # the columns always fill the list: a wider list gives the extra to Response; a narrower one takes it
+    # from the text columns (Response, Type, Site, Ports) down to their least width, never from the numbers
+    $lv.add_Resize({
+        param($src, $e)
+        $want = @($WsUI.ColW | ForEach-Object { Px ($_ * $TextZoom) }); $min = @($WsUI.ColMin | ForEach-Object { Px ($_ * $TextZoom) })
+        $avail = $src.ClientSize.Width - 2
+        if ($avail -lt 200) { return }
+        $w = @($want)
+        $over = ($w | Measure-Object -Sum).Sum - $avail
+        if ($over -lt 0) { $w[8] -= $over }
+        else { foreach ($i in 8, 2, 1, 3, 0, 7) { if ($over -le 0) { break }; $cut = [Math]::Min($over, $w[$i] - $min[$i]); $w[$i] -= $cut; $over -= $cut } }
+        for ($i = 0; $i -lt $w.Count; $i++) { if ($src.Columns[$i].Width -ne $w[$i]) { $src.Columns[$i].Width = $w[$i] } }
+    })
+    $lv.add_DrawColumnHeader({ param($src, $e) $e.DrawDefault = $true })
+    $lv.add_DrawItem({ param($src, $e) })
+    $lv.add_DrawSubItem({
+        param($src, $e)
+        $g2 = $e.Graphics; $r = $e.Bounds
+        $sel = $e.Item.Selected
+        $back = if ($sel) { [PowerClipTheme]::Mix($C.Accent, $C.Bg, $(if ($src.Focused) { 0.62 } else { 0.78 })) } else { $C.Bg }
+        $bb = New-Object System.Drawing.SolidBrush $back; $g2.FillRectangle($bb, $r); $bb.Dispose()
+        $x = $r.X + (Px 6)
+        $fore = $C.Fore
+        if ($e.ColumnIndex -eq 0) {
+            $rt = $WsUI.Rt[$e.Item.Tag.Id]; $stc = if ($rt -and $WsStates[$rt.State]) { $WsStates[$rt.State][1] } else { 'Dim' }
+            $dot = $C[$stc]; if (-not $dot) { $dot = $C.Dim }
+            $g2.SmoothingMode = 'AntiAlias'
+            $d = Px 9; $db = New-Object System.Drawing.SolidBrush $dot
+            $g2.FillEllipse($db, [float]($x + (Px 2)), [float]($r.Y + ($r.Height - $d) / 2), [float]$d, [float]$d); $db.Dispose()
+            $x += Px 20
+            $fore = if ($stc -eq 'Dim') { $C.Dim } else { $dot }
+        } elseif ($e.ColumnIndex -ge 2 -and $e.ColumnIndex -ne 3) { $fore = $C.Dim }
+        $tr = New-Object System.Drawing.Rectangle($x, $r.Y, [Math]::Max(0, $r.Right - $x - (Px 4)), $r.Height)
+        $fnt = if ($e.ColumnIndex -eq 1) { $WsUI.BoldFont } else { $src.Font }
+
+        [System.Windows.Forms.TextRenderer]::DrawText($g2, $e.SubItem.Text, $fnt, $tr, $fore, $TextFlags)
+    })
+    $WsUI.BoldFont = New-Object System.Drawing.Font($FontMain, [System.Drawing.FontStyle]::Bold)
+    $lv.add_SelectedIndexChanged({ if ($WsUI.Building) { return }; Update-WebProps; Update-WebView -Light })
+    $lv.add_DoubleClick({ $s = @(Get-WebSelected)[0]; if ($s) { $r = $WsUI.Rt[$s.Id]; if ($r -and $r.Proc -and -not $r.Proc.Exited) { Open-WebInBrowser $s } else { Start-WebSite $s } } })
+    $lv.add_KeyDown({
+        param($src, $e)
+        if ($e.KeyCode -eq 'Delete') { $e.Handled = $true; Remove-WebSites }
+        elseif ($e.KeyCode -eq 'Return') { $e.Handled = $true; foreach ($s in @(Get-WebSelected)) { Open-WebInBrowser $s } }
+        elseif ($e.Control -and $e.KeyCode -eq 'A') { $e.Handled = $true; foreach ($it in $src.Items) { $it.Selected = $true } }
+    })
+    $cm = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+    $cm.add_Opening({ param($src, $e) Show-WebSiteMenu $src; if (-not $src.Items.Count) { $e.Cancel = $true } })
+    $lv.ContextMenuStrip = $cm
+    $WsUI.List = $lv
+    $empty = New-Object System.Windows.Forms.Label
+    $empty.Text = "No websites yet.`n`nOpen folder adds every site in a folder and its subfolders.`nAdd site adds one project, published app, classic ASP.NET folder or command."
+    $empty.AutoSize = $false; $empty.Dock = 'Fill'; $empty.TextAlign = 'MiddleCenter'; $empty.ForeColor = $C.Dim; $empty.BackColor = $C.Bg
+    $WsUI.Empty = $empty
+
+    $logp = New-Object System.Windows.Forms.Panel
+    $logp.Dock = 'Bottom'; $logp.Height = Px 300; $logp.BackColor = $C.Bg
+    $WsUI.Log = New-TbRtb -ReadOnly; $WsUI.Log.Dock = 'Fill'; $WsUI.Log.Font = New-Object System.Drawing.Font('Consolas', (Fz 9.5))
+    $logp.Controls.Add($WsUI.Log)
+    $lbar = New-Object System.Windows.Forms.FlowLayoutPanel
+    $lbar.Dock = 'Top'; $lbar.AutoSize = $true; $lbar.WrapContents = $true; $lbar.BackColor = $C.Panel; $lbar.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 3), (Px 8), (Px 3))
+    $WsUI.LogTitle = New-TbLabel $lbar 'Log' -Title; $WsUI.LogTitle.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 6), (Px 16), 0)
+    [void](New-WsBtn $lbar $Glyph.Clear 'Clear' 'Clear the log view (the log file keeps everything)' { $s = @(Get-WebSelected); if ($s.Count -eq 1) { (Get-WebRt $s[0]).Lines.Clear() }; $WsUI.Log.Clear() } -Label)
+    [void](New-WsBtn $lbar $Glyph.Copy 'Copy' 'Copy the log' { Copy-TbText $WsUI.Log.Text } -Label)
+    [void](New-WsBtn $lbar $Glyph.Document 'Log file' 'Open the whole log file (data\weblogs)' { $s = @(Get-WebSelected); if ($s.Count -eq 1) { $lf = Get-WebLogFile $s[0]; if ([IO.File]::Exists($lf)) { Start-Process notepad.exe "`"$lf`"" } else { Set-WebStatus 'No log file yet: it is written once the site has run.' } } } -Label)
+    $WsUI.Follow = New-CheckBox $lbar 'Follow' $true 'Keep the newest lines in view while you are at the end of the log. Scroll up to read (or to take a screenshot) and it stays where you are; scroll back to the end and it follows again.'
+    $WsUI.Follow.add_CheckedChanged({ if ($WsUI.Follow.Checked -and $WsUI.Log) { $WsUI.Log.SelectionStart = $WsUI.Log.TextLength; $WsUI.Log.ScrollToCaret() } })
+    $WsUI.ErrorsOnly = New-CheckBox $lbar 'Errors and warnings only' $false
+    $WsUI.ErrorsOnly.add_CheckedChanged({ $WsUI.LogDirty = $true; Update-WebLog })
+    $logp.Controls.Add($lbar)
+    $splitB = New-Object System.Windows.Forms.Splitter -Property @{ Dock = 'Bottom'; Height = (Px 5); BackColor = $C.Panel; MinSize = (Px 120); MinExtra = (Px 150) }
+    $mid.Controls.Add($lv); $mid.Controls.Add($empty); $mid.Controls.Add($fbar); $mid.Controls.Add($splitB); $mid.Controls.Add($logp)
+
+    $f.Controls.Add($mid); $f.Controls.Add($splitR); $f.Controls.Add($right); $f.Controls.Add($status); $f.Controls.Add($top)
+    $WsUI.LogPanel = $logp; $WsUI.LogUser = $false; $WsUI.Bar = $top; $WsUI.BarFull = 0
+    $splitB.add_SplitterMoved({ $WsUI.LogUser = $true })
+    $f.add_Resize({ Update-WsLayout })
+    $f.add_KeyDown({
+        param($src, $e)
+        if ($e.Control -and $e.Shift -and $e.KeyCode -eq 'R') { $e.SuppressKeyPress = $true; foreach ($s in @(Get-WebSelected)) { Stop-WebSite $s -Restart } }
+        elseif ($e.Control -and $e.KeyCode -eq 'R') { $e.SuppressKeyPress = $true; foreach ($s in @(Get-WebSelected)) { Start-WebSite $s } }
+        elseif ($e.Control -and $e.KeyCode -eq 'T') { $e.SuppressKeyPress = $true; foreach ($s in @(Get-WebSelected)) { Stop-WebSite $s } }
+        elseif ($e.Control -and $e.KeyCode -eq 'F') { $e.SuppressKeyPress = $true; $WsUI.Filter.Focus() }
+        elseif ($e.KeyCode -eq 'F5') { $e.SuppressKeyPress = $true; Update-WebView }
+    })
+    $f.add_FormClosed({
+        Save-WebSites
+        if ($WsUI.PropResize) { $WsUI.PropResize.Dispose() }
+        foreach ($k in 'Form', 'List', 'Props', 'Log', 'LogTitle', 'StatusText', 'Filter', 'Editing', 'CmdView', 'Applies', 'Empty', 'PropResize', 'LogPanel', 'Bar', 'BarHost') { $WsUI[$k] = $null }
+        $WsUI.BarFull = 0; $WsUI.BarCompact = $null
+        $WsUI.LogId = $null; $WsUI.PropKey = $null; $WsUI.ListIds = $null
+    })
+    Register-ThemedWindow $f
+    $f.Show()
+    [PowerClipHost]::EnsureShown($f.Handle)
+    Update-WsLayout
+    Update-WebView
+    if ($WsUI.List.Items.Count) { $WsUI.List.Items[0].Selected = $true }
+    Update-WebProps
+    if ($Folder) { Add-WebFolder $Folder }
+}
+
+# DevTools is closing: stop the sites started here (or remember them, to find them again at the next start).
+function Stop-WebSitesOnExit {
+    if (-not $WsUI.Loaded) { return }
+    if ($WsUI.Cfg.StopOnExit) {
+        foreach ($s in $WsUI.Sites.ToArray()) { $r = $WsUI.Rt[$s.Id]; if ($r -and $r.Proc -and -not $r.Proc.Exited) { $r.Stopping = $true; try { $r.Proc.Kill() } catch { } } }
+        try { if (Test-Path -LiteralPath $WsRunFile) { Remove-Item -LiteralPath $WsRunFile -Force } } catch { }
+    } else { Save-WebRunning }
+    Save-WebSites
+}
+
+# At start: the sites marked "Start it when DevTools starts", and the ones still running from before.
+function Start-WebSitesAtLaunch {
+    if (-not (Test-Path -LiteralPath $WsFile) -and -not (Test-Path -LiteralPath $WsRunFile)) { return }
+    $raw = try { Read-DataText $WsFile } catch { '' }
+    if ($raw -notmatch '"AutoStart"\s*:\s*true' -and -not (Test-Path -LiteralPath $WsRunFile)) { return }
+    if (-not (Initialize-WebServers)) { return }
+    foreach ($s in @($WsUI.Sites | Where-Object AutoStart)) { Start-WebSite $s -Quiet }
+}
+
+Register-PaletteCommand 'Web servers' '' $Glyph.TWeb { Show-WebServers } 'web server site sites iis kestrel asp.net aspnet core dotnet run watch localhost port start stop restart launch host hosting status'
+Register-PaletteCommand 'Web servers: start all' '' $Glyph.TWeb { if (Initialize-WebServers) { foreach ($s in $WsUI.Sites.ToArray()) { Start-WebSite $s -Quiet } } } 'web sites start run all'
+Register-PaletteCommand 'Web servers: stop all' '' $Glyph.TWeb { if (Initialize-WebServers) { foreach ($s in $WsUI.Sites.ToArray()) { Stop-WebSite $s } } } 'web sites stop kill all'
+
+# The automation engine (windows, UI Automation, keys and clicks, commands, folder watching): compiled when first needed.
+$AutoSource = @'
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Windows.Automation;
+
+// ---- Windows on the desktop: list, find, bring to front, move --------------------------------------------
+public class DevWinInfo {
+    public IntPtr Handle; public string Title = "", Process = "", Path = ""; public int Pid;
+    public Rectangle Bounds; public string State = "normal";
+    public override string ToString() { return Title + "  (" + Process + ")"; }
+}
+
+public static class DevWin {
+    delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc fn, IntPtr l);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr h);
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hgt, uint flags);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
+    [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int value, int size);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr h, int flags, StringBuilder s, ref int size);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+
+    static readonly Dictionary<int, string[]> procCache = new Dictionary<int, string[]>();
+
+    static string[] ProcOf(int pid) {
+        string[] v;
+        if (procCache.TryGetValue(pid, out v)) return v;
+        string name = "", path = "";
+        try { using (var p = Process.GetProcessById(pid)) name = p.ProcessName; } catch { }
+        IntPtr h = OpenProcess(0x1000 /* QUERY_LIMITED_INFORMATION */, false, pid);
+        if (h != IntPtr.Zero) { try { var sb = new StringBuilder(1024); int n = sb.Capacity; if (QueryFullProcessImageName(h, 0, sb, ref n)) path = sb.ToString(); } finally { CloseHandle(h); } }
+        v = new[] { name, path };
+        if (procCache.Count > 2000) procCache.Clear();
+        procCache[pid] = v;
+        return v;
+    }
+
+    static DevWinInfo Info(IntPtr h) {
+        int len = GetWindowTextLength(h);
+        var sb = new StringBuilder(len + 2); GetWindowText(h, sb, sb.Capacity);
+        uint pid; GetWindowThreadProcessId(h, out pid);
+        RECT r; GetWindowRect(h, out r);
+        var pr = ProcOf((int)pid);
+        return new DevWinInfo { Handle = h, Title = sb.ToString(), Pid = (int)pid, Process = pr[0], Path = pr[1], Bounds = Rectangle.FromLTRB(r.L, r.T, r.R, r.B), State = IsIconic(h) ? "minimized" : IsZoomed(h) ? "maximized" : "normal" };
+    }
+
+    // Top-level windows a person would call "a window": visible, with a title, not a tool window, not hidden by the system.
+    public static List<DevWinInfo> List() {
+        var list = new List<DevWinInfo>();
+        EnumWindows((h, l) => {
+            if (!IsWindowVisible(h) || GetWindowTextLength(h) == 0) return true;
+            int ex = GetWindowLong(h, -20);
+            if ((ex & 0x80) != 0 && (ex & 0x40000) == 0) return true;           // WS_EX_TOOLWINDOW without WS_EX_APPWINDOW
+            if (GetWindow(h, 4 /* GW_OWNER */) != IntPtr.Zero && (ex & 0x40000) == 0) return true;
+            int cloaked; if (DwmGetWindowAttribute(h, 14, out cloaked, 4) == 0 && cloaked != 0) return true;
+            list.Add(Info(h));
+            return true;
+        }, IntPtr.Zero);
+        return list;
+    }
+
+    static Regex Like(string pattern) {
+        return new Regex(Regex.Escape(pattern).Replace("\\*", ".*").Replace("\\?", "."), RegexOptions.IgnoreCase);
+    }
+    // Title contains the text (* and ? work as wildcards); process name without .exe. Either may be empty.
+    public static bool Matches(DevWinInfo w, string title, string process) {
+        if (!string.IsNullOrEmpty(process)) {
+            string p = process.Trim(); if (p.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) p = p.Substring(0, p.Length - 4);
+            if (!string.Equals(w.Process, p, StringComparison.OrdinalIgnoreCase)) return false;
+        }
+        if (!string.IsNullOrEmpty(title) && !Like(title.Trim()).IsMatch(w.Title)) return false;
+        return true;
+    }
+    public static DevWinInfo Find(string title, string process) {
+        if (string.IsNullOrEmpty(title) && string.IsNullOrEmpty(process)) return null;
+        foreach (var w in List()) if (Matches(w, title, process)) return w;      // EnumWindows goes front to back: the topmost match wins
+        return null;
+    }
+
+    // Brings a window to the front. Windows only lets the app the user works in do that, so DevTools joins the
+    // input of the current foreground window for a moment (no keys are sent).
+    public static bool Focus(IntPtr h) {
+        if (!IsWindow(h)) return false;
+        if (IsIconic(h)) ShowWindow(h, 9 /* SW_RESTORE */);
+        IntPtr fg = GetForegroundWindow();
+        uint dummy; uint fgThread = GetWindowThreadProcessId(fg, out dummy), me = GetCurrentThreadId();
+        bool attached = fgThread != 0 && fgThread != me && AttachThreadInput(me, fgThread, true);
+        try { BringWindowToTop(h); SetForegroundWindow(h); }
+        finally { if (attached) AttachThreadInput(me, fgThread, false); }
+        return GetForegroundWindow() == h;
+    }
+    public static bool IsFront(IntPtr h) { return GetForegroundWindow() == h; }
+    public static IntPtr Front() { return GetForegroundWindow(); }
+
+    public static void Place(IntPtr h, int x, int y, int w, int hgt, string state) {
+        if (!IsWindow(h)) return;
+        ShowWindow(h, 9 /* SW_RESTORE */);
+        if (w > 0 && hgt > 0) SetWindowPos(h, IntPtr.Zero, x, y, w, hgt, 0x0004 | 0x0010 /* NOZORDER | NOACTIVATE */);
+        if (state == "maximized") ShowWindow(h, 3); else if (state == "minimized") ShowWindow(h, 6);
+    }
+    public static void SetState(IntPtr h, string state) {
+        if (state == "maximized") ShowWindow(h, 3); else if (state == "minimized") ShowWindow(h, 6); else if (state == "normal") ShowWindow(h, 9);
+    }
+    public static void Close(IntPtr h) { PostMessage(h, 0x10 /* WM_CLOSE */, IntPtr.Zero, IntPtr.Zero); }
+    public static bool Exists(IntPtr h) { return IsWindow(h); }
+
+    public static DevWinInfo At(int x, int y) {
+        IntPtr h = WindowFromPoint(new POINT { X = x, Y = y });
+        if (h == IntPtr.Zero) return null;
+        IntPtr root = GetAncestor(h, 2 /* GA_ROOT */);
+        return Info(root != IntPtr.Zero ? root : h);
+    }
+}
+
+// ---- Keystrokes and clicks (SendInput, like a person typing). DryRun records instead of sending (tests). ------
+public static class DevKeys {
+    [StructLayout(LayoutKind.Sequential)] struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr dwExtraInfo; }
+    [StructLayout(LayoutKind.Sequential)] struct KEYBDINPUT { public ushort wVk, wScan; public uint dwFlags, time; public IntPtr dwExtraInfo; }
+    [StructLayout(LayoutKind.Explicit)] struct UNION { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; }
+    [StructLayout(LayoutKind.Sequential)] struct INPUT { public uint type; public UNION u; }
+    [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint n, INPUT[] a, int size);
+    [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
+    const uint KEYUP = 0x2, UNICODE = 0x4, EXTENDED = 0x1;
+
+    public static bool DryRun;
+    public static readonly StringBuilder DryLog = new StringBuilder();
+
+    static INPUT Key(ushort vk, bool up) {
+        var i = new INPUT { type = 1 }; i.u.ki.wVk = vk;
+        bool ext = (vk >= 0x21 && vk <= 0x2E) || vk == 0x5B || vk == 0x5C || vk == 0x6F || vk == 0x90;      // arrows, Home/End, PgUp/PgDn, Ins/Del, Win, NumPad /, NumLock
+        i.u.ki.dwFlags = (up ? KEYUP : 0) | (ext ? EXTENDED : 0);
+        return i;
+    }
+    static void Send(List<INPUT> a) { if (a.Count == 0) return; SendInput((uint)a.Count, a.ToArray(), Marshal.SizeOf(typeof(INPUT))); }
+
+    public static void Text(string s) {
+        if (string.IsNullOrEmpty(s)) return;
+        if (DryRun) { DryLog.Append("[text:" + s + "]"); return; }
+        var a = new List<INPUT>();
+        foreach (char ch in s.Replace("\r\n", "\n")) {
+            if (ch == '\n') { a.Add(Key(0x0D, false)); a.Add(Key(0x0D, true)); continue; }
+            if (ch == '\t') { a.Add(Key(0x09, false)); a.Add(Key(0x09, true)); continue; }
+            var d = new INPUT { type = 1 }; d.u.ki.wScan = ch; d.u.ki.dwFlags = UNICODE;
+            var u = new INPUT { type = 1 }; u.u.ki.wScan = ch; u.u.ki.dwFlags = UNICODE | KEYUP;
+            a.Add(d); a.Add(u);
+        }
+        Send(a);
+    }
+
+    static readonly Dictionary<string, ushort> Names = new Dictionary<string, ushort>(StringComparer.OrdinalIgnoreCase) {
+        {"enter",0x0D},{"return",0x0D},{"tab",0x09},{"esc",0x1B},{"escape",0x1B},{"space",0x20},{"backspace",0x08},{"bksp",0x08},{"delete",0x2E},{"del",0x2E},
+        {"insert",0x2D},{"ins",0x2D},{"home",0x24},{"end",0x23},{"pageup",0x21},{"pgup",0x21},{"pagedown",0x22},{"pgdn",0x22},{"up",0x26},{"down",0x28},
+        {"left",0x25},{"right",0x27},{"apps",0x5D},{"menu",0x5D},{"printscreen",0x2C},{"capslock",0x14},{"pause",0x13},
+        {"ctrl",0x11},{"control",0x11},{"alt",0x12},{"shift",0x10},{"win",0x5B},{"plus",0xBB},{"minus",0xBD},{"comma",0xBC},{"period",0xBE}
+    };
+    // "Ctrl+Shift+S", "Enter", "F5", "Alt+Tab", "Win+D" -> virtual keys; null when it isn't a key combination.
+    public static ushort[] Parse(string spec) {
+        if (string.IsNullOrWhiteSpace(spec)) return null;
+        var keys = new List<ushort>();
+        foreach (var raw in spec.Split('+')) {
+            string p = raw.Trim(); if (p.Length == 0) return null;
+            ushort vk;
+            if (Names.TryGetValue(p, out vk)) { keys.Add(vk); continue; }
+            if (p.Length == 1 && char.IsLetterOrDigit(p[0])) { keys.Add((ushort)char.ToUpperInvariant(p[0])); continue; }
+            var f = Regex.Match(p, @"^[Ff]([1-9]|1[0-9]|2[0-4])$"); if (f.Success) { keys.Add((ushort)(0x6F + int.Parse(f.Groups[1].Value))); continue; }
+            var n = Regex.Match(p, @"^(?i:numpad)([0-9])$"); if (n.Success) { keys.Add((ushort)(0x60 + int.Parse(n.Groups[1].Value))); continue; }
+            return null;
+        }
+        return keys.ToArray();
+    }
+    public static bool Combo(string spec, int times) {
+        var k = Parse(spec); if (k == null) return false;
+        if (DryRun) { DryLog.Append("[keys:" + spec + (times > 1 ? " x" + times : "") + "]"); return true; }
+        for (int t = 0; t < Math.Max(1, times); t++) {
+            var a = new List<INPUT>();
+            foreach (var vk in k) a.Add(Key(vk, false));
+            for (int i = k.Length - 1; i >= 0; i--) a.Add(Key(k[i], true));
+            Send(a);
+            if (times > 1) Thread.Sleep(15);
+        }
+        return true;
+    }
+
+    public static void Click(int x, int y, string button, bool twice) {
+        if (DryRun) { DryLog.Append("[click:" + x + "," + y + " " + button + (twice ? " double" : "") + "]"); return; }
+        SetCursorPos(x, y);
+        uint dn = button == "right" ? 0x8u : button == "middle" ? 0x20u : 0x2u, up = dn << 1;
+        var a = new List<INPUT>();
+        for (int i = 0; i < (twice ? 2 : 1); i++) {
+            var d = new INPUT { type = 0 }; d.u.mi.dwFlags = dn; a.Add(d);
+            var u = new INPUT { type = 0 }; u.u.mi.dwFlags = up; a.Add(u);
+        }
+        Send(a);
+    }
+
+    // True while the person is holding a key or a mouse button: typing then waits, so keys don't get mixed up.
+    public static bool UserBusy() {
+        foreach (int vk in new[] { 0x01, 0x02, 0x10, 0x11, 0x12, 0x5B }) if ((GetAsyncKeyState(vk) & 0x8000) != 0) return true;
+        return false;
+    }
+}
+
+// ---- UI Automation: find a button / field / menu by its name in a window, and press, fill or read it. -------
+// Runs on its own thread, so a slow or hung app never freezes DevTools.
+public class DevUiaOp {
+    public volatile bool Done;
+    public string Error = "", Result = "", How = "";
+    public Rectangle Bounds = Rectangle.Empty;
+}
+
+public class DevUiaPick { public string Name = "", Type = "", Id = "", Window = "", Process = ""; public int X, Y, RelX, RelY; }
+
+public static class DevUia {
+    static string TypeName(ControlType t) { if (t == null) return ""; string n = t.ProgrammaticName; int i = n.LastIndexOf('.'); return i >= 0 ? n.Substring(i + 1) : n; }
+
+    static AutomationElement FindIn(AutomationElement root, string name, string type, string id) {
+        Condition c = Condition.TrueCondition;
+        if (!string.IsNullOrEmpty(id)) c = new PropertyCondition(AutomationElement.AutomationIdProperty, id);
+        else if (!string.IsNullOrEmpty(name)) c = new PropertyCondition(AutomationElement.NameProperty, name, PropertyConditionFlags.IgnoreCase);
+        var all = root.FindAll(TreeScope.Descendants, c);
+        AutomationElement best = null;
+        foreach (AutomationElement e in all) {
+            if (!string.IsNullOrEmpty(type) && !string.Equals(TypeName(e.Current.ControlType), type, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!e.Current.IsOffscreen) return e;
+            if (best == null) best = e;
+        }
+        if (best != null || string.IsNullOrEmpty(name) || !string.IsNullOrEmpty(id)) return best;
+        // no exact name: the first element whose name contains it (e.g. "Save" finds "Save changes")
+        int seen = 0;
+        foreach (AutomationElement e in root.FindAll(TreeScope.Descendants, Condition.TrueCondition)) {
+            if (++seen > 8000) break;
+            string n = e.Current.Name ?? "";
+            if (n.IndexOf(name, StringComparison.OrdinalIgnoreCase) < 0) continue;
+            if (!string.IsNullOrEmpty(type) && !string.Equals(TypeName(e.Current.ControlType), type, StringComparison.OrdinalIgnoreCase)) continue;
+            return e;
+        }
+        return null;
+    }
+
+    static Rectangle Box(AutomationElement e) {
+        var r = e.Current.BoundingRectangle;
+        if (r.IsEmpty || double.IsInfinity(r.Width)) return Rectangle.Empty;
+        return new Rectangle((int)r.X, (int)r.Y, (int)r.Width, (int)r.Height);
+    }
+
+    // action: press | set | read | focus | exists
+    public static DevUiaOp Begin(IntPtr window, string name, string type, string id, string action, string value, int timeoutMs) {
+        var op = new DevUiaOp();
+        var t = new Thread(() => {
+            var until = DateTime.Now.AddMilliseconds(Math.Max(500, timeoutMs));
+            try {
+                AutomationElement el = null;
+                while (true) {
+                    try { el = FindIn(AutomationElement.FromHandle(window), name, type, id); } catch (ElementNotAvailableException) { el = null; }
+                    if (el != null || DateTime.Now > until) break;
+                    Thread.Sleep(300);
+                }
+                if (el == null) { op.Error = "\"" + (string.IsNullOrEmpty(id) ? name : id) + "\" was not found in the window"; return; }
+                op.Bounds = Box(el);
+                object pat;
+                switch (action) {
+                    case "press":
+                        if (el.TryGetCurrentPattern(InvokePattern.Pattern, out pat)) { ((InvokePattern)pat).Invoke(); op.How = "pressed"; }
+                        else if (el.TryGetCurrentPattern(TogglePattern.Pattern, out pat)) { ((TogglePattern)pat).Toggle(); op.How = "toggled"; }
+                        else if (el.TryGetCurrentPattern(SelectionItemPattern.Pattern, out pat)) { ((SelectionItemPattern)pat).Select(); op.How = "selected"; }
+                        else if (el.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out pat)) { ((ExpandCollapsePattern)pat).Expand(); op.How = "opened"; }
+                        else op.How = "click";          // nothing to press: the caller clicks the middle of it
+                        break;
+                    case "set":
+                        if (el.TryGetCurrentPattern(ValuePattern.Pattern, out pat) && !((ValuePattern)pat).Current.IsReadOnly) { ((ValuePattern)pat).SetValue(value ?? ""); op.How = "filled"; }
+                        else { try { el.SetFocus(); } catch { } op.How = "type"; }       // the caller types into it
+                        break;
+                    case "read":
+                        if (el.TryGetCurrentPattern(ValuePattern.Pattern, out pat)) op.Result = ((ValuePattern)pat).Current.Value;
+                        else if (el.TryGetCurrentPattern(TextPattern.Pattern, out pat)) op.Result = ((TextPattern)pat).DocumentRange.GetText(100000);
+                        else op.Result = el.Current.Name;
+                        op.How = "read";
+                        break;
+                    case "focus": el.SetFocus(); op.How = "focused"; break;
+                    default: op.How = "found"; break;
+                }
+            } catch (Exception ex) { op.Error = ex.Message; }
+            finally { op.Done = true; }
+        });
+        t.IsBackground = true; t.SetApartmentState(ApartmentState.MTA); t.Start();
+        return op;
+    }
+
+    // What is under the mouse pointer: for the "Pick" buttons (point at a button, wait 3 seconds).
+    public static DevUiaPick At(int x, int y) {
+        var p = new DevUiaPick { X = x, Y = y };
+        var w = DevWin.At(x, y);
+        if (w != null) { p.Window = w.Title; p.Process = w.Process; p.RelX = x - w.Bounds.X; p.RelY = y - w.Bounds.Y; }
+        var t = new Thread(() => {
+            try {
+                var el = AutomationElement.FromPoint(new System.Windows.Point(x, y));
+                if (el != null) { p.Name = el.Current.Name ?? ""; p.Type = TypeName(el.Current.ControlType); p.Id = el.Current.AutomationId ?? ""; }
+            } catch { }
+        });
+        t.IsBackground = true; t.SetApartmentState(ApartmentState.MTA); t.Start(); t.Join(4000);
+        return p;
+    }
+}
+
+// ---- A command run in the background, with its output ------------------------------------------------------
+public class DevAutoProc {
+    public volatile bool Done; public int ExitCode; public string Error = "";
+    readonly ConcurrentQueue<string> lines = new ConcurrentQueue<string>();
+    Process p;
+    public static DevAutoProc Start(string file, string args, string dir, bool hidden) {
+        var r = new DevAutoProc();
+        try {
+            var psi = new ProcessStartInfo(file, args ?? "") { UseShellExecute = false, CreateNoWindow = hidden, WorkingDirectory = string.IsNullOrEmpty(dir) ? Environment.CurrentDirectory : dir };
+            if (hidden) { psi.RedirectStandardOutput = true; psi.RedirectStandardError = true; psi.RedirectStandardInput = true; psi.StandardOutputEncoding = Encoding.UTF8; psi.StandardErrorEncoding = Encoding.UTF8; }
+            var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            if (hidden) {
+                p.OutputDataReceived += (s, e) => { if (e.Data != null) r.lines.Enqueue(e.Data); };
+                p.ErrorDataReceived += (s, e) => { if (e.Data != null) r.lines.Enqueue("!" + e.Data); };
+            }
+            p.Exited += (s, e) => { try { p.WaitForExit(); r.ExitCode = p.ExitCode; } catch { } r.Done = true; };
+            p.Start(); r.p = p;
+            if (hidden) { p.BeginOutputReadLine(); p.BeginErrorReadLine(); p.StandardInput.Close(); }
+        } catch (Exception ex) { r.Error = ex.Message; r.Done = true; }
+        return r;
+    }
+    public string[] Drain() { var l = new List<string>(); string s; while (lines.TryDequeue(out s)) l.Add(s); return l.ToArray(); }
+    public void Kill() { try { if (p != null && !p.HasExited) p.Kill(); } catch { } }
+}
+
+// ---- New files in a folder (for "when a file appears"): reported once they are completely written ---------
+public class DevFolderWatch : IDisposable {
+    readonly FileSystemWatcher w;
+    readonly ConcurrentDictionary<string, DateTime> seen = new ConcurrentDictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+    public string Error = "";
+    public DevFolderWatch(string folder, string filter, bool subfolders) {
+        try {
+            w = new FileSystemWatcher(folder, string.IsNullOrEmpty(filter) ? "*" : filter) { IncludeSubdirectories = subfolders, NotifyFilter = NotifyFilters.FileName | NotifyFilters.Size | NotifyFilters.LastWrite, InternalBufferSize = 64 * 1024 };
+            w.Created += (s, e) => seen[e.FullPath] = DateTime.Now;
+            w.Renamed += (s, e) => seen[e.FullPath] = DateTime.Now;
+            w.EnableRaisingEvents = true;
+        } catch (Exception ex) { Error = ex.Message; }
+    }
+    // Files that appeared and can now be opened on their own (a download or copy has finished).
+    public string[] Ready() {
+        var ready = new List<string>();
+        foreach (var kv in seen.ToArray()) {
+            string f = kv.Key;
+            if (!File.Exists(f)) { if ((DateTime.Now - kv.Value).TotalMinutes > 2) { DateTime d; seen.TryRemove(f, out d); } continue; }
+            string ext = Path.GetExtension(f).ToLowerInvariant();
+            if (ext == ".crdownload" || ext == ".part" || ext == ".tmp" || ext == ".partial" || Path.GetFileName(f).StartsWith("~$")) continue;
+            if ((DateTime.Now - kv.Value).TotalMilliseconds < 800) continue;
+            try { using (new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.None)) { } } catch { continue; }
+            DateTime x; seen.TryRemove(f, out x); ready.Add(f);
+        }
+        return ready.ToArray();
+    }
+    public void Dispose() { if (w != null) { w.EnableRaisingEvents = false; w.Dispose(); } }
+}
+
+// ---- Does an address answer? (for "wait until the site answers") ------------------------------------------
+public class DevAutoHttp {
+    public volatile bool Done; public int Code; public string Error = "";
+    public static DevAutoHttp Begin(string url, int timeoutMs) {
+        var r = new DevAutoHttp();
+        ThreadPool.QueueUserWorkItem(delegate {
+            try {
+                try { ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; } catch { }
+                var rq = (HttpWebRequest)WebRequest.Create(url);
+                rq.Timeout = timeoutMs; rq.AllowAutoRedirect = false; rq.Proxy = null; rq.KeepAlive = false;
+                rq.ServerCertificateValidationCallback = delegate { return true; };
+                using (var rs = (HttpWebResponse)rq.GetResponse()) r.Code = (int)rs.StatusCode;
+            } catch (WebException ex) { var rs = ex.Response as HttpWebResponse; if (rs != null) { r.Code = (int)rs.StatusCode; rs.Close(); } else r.Error = ex.Message; }
+            catch (Exception ex) { r.Error = ex.Message; }
+            r.Done = true;
+        });
+        return r;
+    }
+}
+'@
+
+# ======================================================================================
+# Automation: routines - a list of steps (open, run, start sites, wait, bring a window forward, press a button,
+# fill a field, type, keys, clipboard, window layout, fill a form from a table, move files, git pull, notify)
+# that run with a click, a hotkey, at a time, when DevTools starts, when a window opens or closes, when a file
+# appears, when something is copied or when a website goes down. Plus window layouts.
+# Nothing here hooks the keyboard or mouse, and nothing is scheduled in Windows: DevTools' own timer runs it.
+# Saved in data\automation.json.
+# ======================================================================================
+$AuFile = Join-Path $DataDir 'automation.json'
+$AuUI = @{ Loaded = $false; Routines = (New-Object System.Collections.Generic.List[object]); Layouts = (New-Object System.Collections.Generic.List[object])
+           Runs = (New-Object System.Collections.Generic.List[object]); Timer = $null; Tick = 0; Form = $null; Building = $false
+           Watchers = @{}; WinSeen = @{}; HotkeyIds = @{}; InputOwner = $null; EscOn = $false; Log = (New-Object System.Collections.Generic.List[string]) }
+
+# Every step kind: its label, an icon, and its fields: name = label | kind | default | choices / help.
+# Field kinds: text, multi, number, bool, choice, keys, window (Title + Process), file, folder, site, routine, layout.
+$AuSteps = [ordered]@{
+    open      = @{ Label = 'Open a program, file, folder or web address'; Icon = 'Open'; Fields = @(
+                    @('Target', 'Program, file, folder or address', 'file', ''), @('Args', 'Arguments (for a program)', 'text', ''),
+                    @('Dir', 'Start in (folder)', 'folder', ''), @('WaitTitle', 'Then wait for a window whose title contains', 'text', ''),
+                    @('Timeout', 'Wait at most (seconds)', 'number', 60)) }
+    run       = @{ Label = 'Run a command'; Icon = 'Code'; Fields = @(
+                    @('Command', 'Command', 'multi', ''), @('Shell', 'Run it with', 'choice', 'Command Prompt', @('Command Prompt', 'PowerShell')),
+                    @('Dir', 'In folder', 'folder', ''), @('Wait', 'Wait until it finishes (its output goes to the log)', 'bool', $true),
+                    @('Timeout', 'Wait at most (seconds)', 'number', 600)) }
+    site      = @{ Label = 'Start, stop or restart websites'; Icon = 'TWeb'; Fields = @(
+                    @('Action', 'What', 'choice', 'Start', @('Start', 'Stop', 'Restart', 'Wait until running')),
+                    @('Sites', 'Sites (names or folders from Web servers, comma-separated; * = all)', 'site', ''),
+                    @('WaitRunning', 'Wait until they answer', 'bool', $true), @('Timeout', 'Wait at most (seconds)', 'number', 180)) }
+    wait      = @{ Label = 'Wait'; Icon = 'TTimer'; Fields = @(
+                    @('For', 'Wait for', 'choice', 'Seconds', @('Seconds', 'A window to open', 'A window to close', 'An address to answer', 'A file to exist', 'Text on the screen')),
+                    @('Seconds', 'Seconds', 'number', 5), @('Window', 'Window', 'window', ''), @('Url', 'Address (http://...)', 'text', ''),
+                    @('Path', 'File (wildcards * work)', 'file', ''), @('Text', 'Text to see on the screen (in the window above, or anywhere)', 'text', ''),
+                    @('Timeout', 'Wait at most (seconds)', 'number', 120)) }
+    focus     = @{ Label = 'Bring a window to the front'; Icon = 'View'; Fields = @(
+                    @('Window', 'Window', 'window', ''), @('State', 'And make it', 'choice', 'as it is', @('as it is', 'maximized', 'normal', 'minimized')),
+                    @('Timeout', 'Wait for it at most (seconds)', 'number', 10)) }
+    press     = @{ Label = 'Press a button or menu item (by its name)'; Icon = 'Lightning'; Fields = @(
+                    @('Window', 'In window', 'window', ''), @('Element', 'Button / item name (Pick shows it)', 'element', ''),
+                    @('Type', 'Kind (Button, MenuItem, CheckBox ..., optional)', 'text', ''), @('Id', 'Automation id (optional, most exact)', 'text', ''),
+                    @('Timeout', 'Wait for it at most (seconds)', 'number', 10)) }
+    fill      = @{ Label = 'Fill a field (by its name)'; Icon = 'Edit'; Fields = @(
+                    @('Window', 'In window', 'window', ''), @('Element', 'Field name (Pick shows it)', 'element', ''),
+                    @('Id', 'Automation id (optional)', 'text', ''), @('Value', 'Text  ({date} {clipboard} {file} ... work)', 'multi', ''),
+                    @('Timeout', 'Wait for it at most (seconds)', 'number', 10)) }
+    type      = @{ Label = 'Type text and keys'; Icon = 'Text'; Fields = @(
+                    @('Window', 'Into window (brought to the front first; empty = the one in front)', 'window', ''),
+                    @('Text', 'Text. Keys in braces: {Enter} {Tab} {Tab 3} {Ctrl+S} {Wait:500}', 'multi', '')) }
+    keys      = @{ Label = 'Press keys'; Icon = 'Toolbox'; Fields = @(
+                    @('Window', 'In window (empty = the one in front)', 'window', ''), @('Keys', 'Keys, e.g. Ctrl+S, Enter, Alt+F4, F5', 'keys', ''),
+                    @('Times', 'How many times', 'number', 1)) }
+    click     = @{ Label = 'Click at a place in a window'; Icon = 'Pointer'; Fields = @(
+                    @('Window', 'Window (empty = the screen)', 'window', ''), @('X', 'X (from the window''s left edge)', 'number', 0), @('Y', 'Y (from its top edge)', 'number', 0),
+                    @('Button', 'Button', 'choice', 'left', @('left', 'right', 'double')), @('Pick', 'Pick the place', 'point', '')) }
+    clipboard = @{ Label = 'Put text on the clipboard'; Icon = 'Copy'; Fields = @(, @('Text', 'Text  ({date} {file} ... work)', 'multi', '')) }
+    layout    = @{ Label = 'Arrange windows (a saved layout)'; Icon = 'Apps'; Fields = @(@('Layout', 'Layout', 'layout', ''), @('StartMissing', 'Start the programs that are not open', 'bool', $true)) }
+    table     = @{ Label = 'Fill a form for each row of a table'; Icon = 'Library'; Fields = @(
+                    @('Window', 'Into window', 'window', ''),
+                    @('Rows', 'Rows: paste from Excel (first row = column names)', 'multi', ''),
+                    @('Template', 'For each row type: {row:Column} and keys, e.g. {row:Name}{Tab}{row:Email}{Enter}', 'multi', ''),
+                    @('Pause', 'Pause after each row (milliseconds)', 'number', 1000)) }
+    file      = @{ Label = 'Move, copy or rename a file'; Icon = 'Folder'; Fields = @(
+                    @('Action', 'What', 'choice', 'Move', @('Move', 'Copy', 'Rename')), @('From', 'File  ({file} = the one that started the routine)', 'file', '{file}'),
+                    @('To', 'To folder (Move / Copy)', 'folder', ''), @('Name', 'New name  ({name} {ext} {date:yyyy-MM-dd} work; empty = keep)', 'text', '')) }
+    gitpull   = @{ Label = 'Git pull every repository in a folder'; Icon = 'TGit'; Fields = @(@('Folder', 'Folder', 'folder', ''), @('Depth', 'Look this many folders deep', 'number', 2)) }
+    notify    = @{ Label = 'Show a notification'; Icon = 'TReminder'; Fields = @(@('Title', 'Title', 'text', 'DevTools'), @('Text', 'Text', 'multi', '')) }
+    routine   = @{ Label = 'Run another routine'; Icon = 'Refresh'; Fields = @(@('Routine', 'Routine', 'routine', ''), @('Wait', 'Wait until it finishes', 'bool', $true)) }
+}
+$AuTriggers = [ordered]@{
+    hotkey    = @{ Label = 'A shortcut key, anywhere'; Fields = @(, @('Keys', 'Shortcut, e.g. Ctrl+Alt+1', 'keys', '')) }
+    time      = @{ Label = 'At a time of day'; Fields = @(@('At', 'Time (HH:mm)', 'text', '09:00'), @('Days', 'Days', 'choice', 'Every day', @('Every day', 'Monday to Friday', 'Weekend', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'))) }
+    every     = @{ Label = 'Every few minutes'; Fields = @(@('Minutes', 'Every (minutes)', 'number', 30), @('From', 'Only between (HH:mm, optional)', 'text', ''), @('To', 'and (HH:mm)', 'text', '')) }
+    start     = @{ Label = 'When DevTools starts'; Fields = @() }
+    window    = @{ Label = 'When a window opens or closes'; Fields = @(@('Window', 'Window', 'window', ''), @('When', 'When it', 'choice', 'opens', @('opens', 'closes'))) }
+    file      = @{ Label = 'When a file appears in a folder'; Fields = @(@('Folder', 'Folder', 'folder', ''), @('Filter', 'Files like (e.g. *.pdf, empty = all)', 'text', ''), @('Sub', 'Also in subfolders', 'bool', $false)) }
+    clipboard = @{ Label = 'When copied text matches'; Fields = @(, @('Pattern', 'Text contains, or a regular expression in /slashes/', 'text', '')) }
+    site      = @{ Label = 'When a website crashes or stops answering'; Fields = @(, @('Site', 'Site (from Web servers; empty = any)', 'site', '')) }
+}
+
+function Initialize-Automation {
+    if (-not ('DevWin' -as [type])) {
+        try { Import-DevCode -Name 'Auto' -References System.Core, System.Drawing, UIAutomationClient, UIAutomationTypes, WindowsBase -Source $AutoSource }
+        catch { Write-Log "automation: $_"; [void][System.Windows.Forms.MessageBox]::Show("The automation engine couldn't start:`n$($_.Exception.Message)", 'Automation'); return $false }
+    }
+    if (-not $AuUI.Loaded) {
+        $AuUI.Loaded = $true
+        Import-Automation
+        $AuUI.SaveTimer = New-TbDebounce 700 { Save-Automation }
+        Update-AutoTriggers
+    }
+    if (-not $AuUI.Timer) {
+        $t = New-Object System.Windows.Forms.Timer
+        $t.Interval = 250
+        $t.add_Tick({ try { Update-AutoEngine } catch { Write-Log "automation tick: $_" } })
+        $AuUI.Timer = $t; $t.Start()
+    }
+    $true
+}
+
+function New-AutoItem([hashtable]$Defs, [string]$Kind, $From = $null) {
+    $o = [ordered]@{ Kind = $Kind; On = $true }
+    foreach ($f in $Defs[$Kind].Fields) { $o[$f[0]] = $f[3] }
+    if ($From) { foreach ($p in $From.PSObject.Properties) { if ($p.Name -ne 'Kind') { $o[$p.Name] = $p.Value } } }
+    [pscustomobject]$o
+}
+function New-AutoRoutine($From = $null) {
+    $r = [pscustomobject][ordered]@{ Id = [guid]::NewGuid().ToString('N').Substring(0, 8); Name = 'New routine'; On = $true; StopOnError = $true; NotifyDone = $false
+                                     Steps = (New-Object System.Collections.Generic.List[object]); Triggers = (New-Object System.Collections.Generic.List[object]); LastRun = ''; LastResult = '' }
+    if ($From) {
+        foreach ($k in 'Id', 'Name', 'On', 'StopOnError', 'NotifyDone', 'LastRun', 'LastResult') { if ($null -ne $From.$k) { $r.$k = $From.$k } }
+        foreach ($s in @($From.Steps)) { if ($s -and $AuSteps.Contains([string]$s.Kind)) { $r.Steps.Add((New-AutoItem $AuSteps $s.Kind $s)) } }
+        foreach ($t in @($From.Triggers)) { if ($t -and $AuTriggers.Contains([string]$t.Kind)) { $r.Triggers.Add((New-AutoItem $AuTriggers $t.Kind $t)) } }
+    }
+    $r
+}
+
+function Import-Automation {
+    $AuUI.Routines.Clear(); $AuUI.Layouts.Clear()
+    if (-not (Test-Path -LiteralPath $AuFile)) { return }
+    try {
+        $j = (Read-DataText $AuFile) | ConvertFrom-Json
+        foreach ($r in @($j.Routines)) { if ($r) { $AuUI.Routines.Add((New-AutoRoutine $r)) } }
+        foreach ($l in @($j.Layouts)) { if ($l) { $AuUI.Layouts.Add($l) } }
+    } catch { Write-Log "automation: couldn't read the routines: $_" }
+}
+function Save-Automation {
+    $data = [ordered]@{
+        Routines = @(foreach ($r in $AuUI.Routines.ToArray()) { [ordered]@{ Id = $r.Id; Name = $r.Name; On = $r.On; StopOnError = $r.StopOnError; NotifyDone = $r.NotifyDone; LastRun = $r.LastRun; LastResult = $r.LastResult; Steps = $r.Steps.ToArray(); Triggers = $r.Triggers.ToArray() } })
+        Layouts  = $AuUI.Layouts.ToArray()
+    }
+    try { Write-JsonFile $AuFile (ConvertTo-Json -InputObject $data -Depth 8) } catch { Write-Log "automation: couldn't save: $_" }
+}
+function Request-AutoSave { if ($AuUI.SaveTimer) { $AuUI.SaveTimer.Stop(); $AuUI.SaveTimer.Start() } else { Save-Automation } }
+
+# ---- text with placeholders -------------------------------------------------------------------------------
+# Snippet placeholders ({date} {time} {guid} {clipboard} {user} {computer} {input:Question}) plus the ones of a run:
+# {file} {name} {ext} {folder} (the file that started it), {row:Column} (Fill a form), {copied} (the copied text).
+function Expand-AutoText([string]$Text, $Ctx) {
+    if (-not $Text) { return '' }
+    $t = $Text
+    if ($Ctx) {
+        $f = [string]$Ctx.File
+        $t = [regex]::Replace($t, '\{(file|name|ext|folder|copied|site)\}', {
+            param($m)
+            switch ($m.Groups[1].Value.ToLower()) {
+                'file' { $f } 'name' { if ($f) { [IO.Path]::GetFileNameWithoutExtension($f) } } 'ext' { if ($f) { [IO.Path]::GetExtension($f) } }
+                'folder' { if ($f) { [IO.Path]::GetDirectoryName($f) } } 'copied' { [string]$Ctx.Copied } 'site' { [string]$Ctx.Site }
+            }
+        }, 'IgnoreCase')
+        if ($Ctx.Row) { $row = $Ctx.Row; $t = [regex]::Replace($t, '\{row:([^}]+)\}', { param($m) $k = $m.Groups[1].Value.Trim(); if ($row.Contains($k)) { [string]$row[$k] } else { '' } }, 'IgnoreCase') }
+    }
+    $x = Expand-Snippet $t
+    if ($null -eq $x) { throw 'cancelled (a question was not answered)' }
+    $x
+}
+
+# Text with {Enter} {Tab 3} {Ctrl+S} {Wait:500} -> a list of actions: @('text', '...') @('keys', 'Ctrl+S', 3) @('wait', 500)
+function Split-AutoKeys([string]$Text) {
+    $ops = New-Object System.Collections.Generic.List[object]
+    $pos = 0
+    foreach ($m in [regex]::Matches($Text, '\{(Wait:(\d+)|([A-Za-z0-9+]+)(?:\s+(\d+))?)\}')) {
+        if ($m.Groups[2].Success) { $isKey = $true } else { $isKey = $null -ne [DevKeys]::Parse($m.Groups[3].Value) }
+        if (-not $isKey) { continue }                                     # e.g. {Hello} stays text
+        if ($m.Index -gt $pos) { $ops.Add(@('text', $Text.Substring($pos, $m.Index - $pos))) }
+        if ($m.Groups[2].Success) { $ops.Add(@('wait', [int]$m.Groups[2].Value)) }
+        else { $ops.Add(@('keys', $m.Groups[3].Value, $(if ($m.Groups[4].Success) { [int]$m.Groups[4].Value } else { 1 }))) }
+        $pos = $m.Index + $m.Length
+    }
+    if ($pos -lt $Text.Length) { $ops.Add(@('text', $Text.Substring($pos))) }
+    $ops
+}
+
+# A window setting is "Title|process" (either part may be empty), e.g. "Inbox|outlook" or "|notepad".
+function Split-AutoWindow([string]$W) { $p = ([string]$W) -split '\|', 2; @{ Title = $p[0].Trim(); Process = $(if ($p.Count -gt 1) { $p[1].Trim() } else { '' }) } }
+function Find-AutoWindow([string]$W) { $x = Split-AutoWindow $W; if (-not $x.Title -and -not $x.Process) { return $null }; [DevWin]::Find($x.Title, $x.Process) }
+function Format-AutoWindow([string]$W) { $x = Split-AutoWindow $W; if (-not $x.Title -and -not $x.Process) { return 'the window in front' }; (@($(if ($x.Title) { """$($x.Title)""" }), $(if ($x.Process) { $x.Process })) | Where-Object { $_ }) -join ' in ' }
+
+# One line describing a step or a trigger, for the lists.
+function Get-AutoStepText($S) {
+    $w = { param($v) Format-AutoWindow $v }
+    switch ($S.Kind) {
+        'open'      { "Open $($S.Target)$(if ($S.Args) { " $($S.Args)" })$(if ($S.WaitTitle) { ", wait for '$($S.WaitTitle)'" })" }
+        'run'       { "Run: $(([string]$S.Command -split "`n")[0])$(if (-not $S.Wait) { '  (don''t wait)' })" }
+        'site'      { "$($S.Action) website$(if ($S.Sites -notmatch ',') { '' } else { 's' }): $(if ($S.Sites -eq '*' -or -not $S.Sites) { 'all' } else { $S.Sites })" }
+        'wait'      { switch ($S.For) { 'Seconds' { "Wait $($S.Seconds) s" } 'A window to open' { "Wait for $(& $w $S.Window)" } 'A window to close' { "Wait until $(& $w $S.Window) closes" } 'An address to answer' { "Wait until $($S.Url) answers" } 'A file to exist' { "Wait for the file $($S.Path)" } default { "Wait until ""$($S.Text)"" is on the screen" } } }
+        'focus'     { "Bring $(& $w $S.Window) to the front$(if ($S.State -ne 'as it is') { ", $($S.State)" })" }
+        'press'     { "Press ""$($S.Element)""$(if ($S.Type) { " ($($S.Type))" }) in $(& $w $S.Window)" }
+        'fill'      { "Fill ""$($S.Element)"" with ""$(([string]$S.Value -split "`n")[0])""" }
+        'type'      { "Type ""$(([string]$S.Text -replace "`r?`n", ' ').Substring(0, [Math]::Min(60, ([string]$S.Text).Length)))""$(if ($S.Window) { " into $(& $w $S.Window)" })" }
+        'keys'      { "Press $($S.Keys)$(if ([int]$S.Times -gt 1) { " x$($S.Times)" })$(if ($S.Window) { " in $(& $w $S.Window)" })" }
+        'click'     { "$(if ($S.Button -eq 'double') { 'Double-click' } elseif ($S.Button -eq 'right') { 'Right-click' } else { 'Click' }) at $($S.X), $($S.Y)$(if ($S.Window) { " in $(& $w $S.Window)" })" }
+        'clipboard' { "Copy ""$(([string]$S.Text -split "`n")[0])""" }
+        'layout'    { "Arrange windows: $($S.Layout)" }
+        'table'     { $n = [Math]::Max(0, @(([string]$S.Rows -split "`r?`n") | Where-Object { $_.Trim() }).Count - 1); "Fill a form for each of $n rows$(if ($S.Window) { " in $(& $w $S.Window)" })" }
+        'file'      { "$($S.Action) $($S.From)$(if ($S.Action -ne 'Rename' -and $S.To) { " to $($S.To)" })$(if ($S.Name) { " as $($S.Name)" })" }
+        'gitpull'   { "Git pull every repository in $($S.Folder)" }
+        'notify'    { "Notify: $($S.Text)" }
+        'routine'   { "Run the routine ""$($S.Routine)""" }
+        default     { $S.Kind }
+    }
+}
+function Get-AutoTriggerText($T) {
+    switch ($T.Kind) {
+        'hotkey' { "Shortcut $($T.Keys)" } 'time' { "At $($T.At), $($T.Days.ToLower())" }
+        'every' { "Every $($T.Minutes) min$(if ($T.From -and $T.To) { ", $($T.From)-$($T.To)" })" } 'start' { 'When DevTools starts' }
+        'window' { "When $(Format-AutoWindow $T.Window) $($T.When)" } 'file' { "When a file$(if ($T.Filter) { " ($($T.Filter))" }) appears in $($T.Folder)" }
+        'clipboard' { "When copied text matches $($T.Pattern)" } 'site' { "When $(if ($T.Site) { $T.Site } else { 'a website' }) goes down" }
+        default { $T.Kind }
+    }
+}
+
+# ---- running ------------------------------------------------------------------------------------------------
+function Add-AutoLog([string]$Text, $Run = $null) {
+    $line = "$(Get-Date -Format 'HH:mm:ss')  $(if ($Run) { "$($Run.R.Name): " })$Text"
+    $AuUI.Log.Add($line); if ($AuUI.Log.Count -gt 3000) { $AuUI.Log.RemoveRange(0, 500) }
+    if ($AuUI.LogBox) { $AuUI.LogQueue.Add($line) }
+}
+
+function Start-AutoRoutine($R, [hashtable]$Ctx = @{}, [string]$Why = 'by hand', [int]$From = 0, [switch]$Only) {
+    if (-not (Initialize-Automation)) { return $null }
+    if (@($AuUI.Runs.ToArray() | Where-Object { $_.R.Id -eq $R.Id -and -not $_.Done }).Count) { Add-AutoLog "already running - not started again ($Why)" @{ R = $R }; return $null }
+    $run = @{ R = $R; I = $From; Only = [bool]$Only; Ctx = $Ctx; Op = $null; Wait = $null; Queue = $null; Done = $false; Failed = ''; Started = Get-Date; Why = $Why; Child = $null; StepStart = $null }
+    $AuUI.Runs.Add($run)
+    Add-AutoLog "started ($Why)" $run
+    Update-AutoView
+    $run
+}
+
+function Stop-AutoRuns([string]$Why = 'stopped') {
+    foreach ($run in $AuUI.Runs.ToArray()) { if (-not $run.Done) { if ($run.Op -is [DevAutoProc]) { $run.Op.Kill() }; Complete-AutoRun $run $Why } }
+}
+
+function Complete-AutoRun($Run, [string]$Failed = '') {
+    if ($Run.Done) { return }
+    $Run.Done = $true; $Run.Failed = $Failed
+    if ($AuUI.InputOwner -eq $Run) { $AuUI.InputOwner = $null }
+    $took = [int]((Get-Date) - $Run.Started).TotalSeconds
+    $Run.R.LastRun = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+    $Run.R.LastResult = if ($Failed) { "failed at step $($Run.I + 1): $Failed" } else { "done in $took s" }
+    Add-AutoLog $(if ($Failed) { "STOPPED at step $($Run.I + 1): $Failed" } else { "finished ($took s)" }) $Run
+    if ($Failed -and $Run.Why -ne 'by hand' -and $Failed -ne 'stopped') { try { $tray.ShowBalloonTip(5000, "Routine failed: $($Run.R.Name)", "Step $($Run.I + 1): $Failed", 'Warning') } catch { } }
+    elseif (-not $Failed -and $Run.R.NotifyDone) { try { $tray.ShowBalloonTip(3000, 'Routine finished', $Run.R.Name, 'Info') } catch { } }
+    Request-AutoSave
+    Update-AutoView
+}
+
+# A step that sends real keys or clicks waits for its turn (one at a time), and for the person to let go of
+# the keyboard and mouse, so nothing gets mixed up. Esc stops everything while it types.
+function Request-AutoInput($Run) {
+    if ($AuUI.InputOwner -and $AuUI.InputOwner -ne $Run -and -not $AuUI.InputOwner.Done) { return $false }
+    if ([DevKeys]::UserBusy()) { return $false }
+    $AuUI.InputOwner = $Run
+    if (-not $AuUI.EscOn) { $AuUI.EscOn = $clipHost.AddHotkey(299, 0, [uint32][System.Windows.Forms.Keys]::Escape) }
+    $true
+}
+
+# Runs one step, or starts it. Returns $true when it is done. A step that takes time sets $Run.Op (something
+# running on another thread), $Run.Wait (a condition checked every tick) or $Run.Queue (keys still to type).
+function Invoke-AutoStep($Run, $S) {
+    $ctx = $Run.Ctx
+    $to = [Math]::Max(1, [int]$S.Timeout)
+    switch ($S.Kind) {
+        'open' {
+            $target = Expand-AutoText $S.Target $ctx
+            if (-not $target) { throw 'nothing to open' }
+            $p = @{ FilePath = $target; ErrorAction = 'Stop' }
+            if ($S.Args) { $p.ArgumentList = Expand-AutoText $S.Args $ctx }
+            if ($S.Dir) { $p.WorkingDirectory = Expand-AutoText $S.Dir $ctx }
+            Start-Process @p
+            if ($S.WaitTitle) { $Run.Wait = @{ Kind = 'window'; W = "$($S.WaitTitle)|"; Until = (Get-Date).AddSeconds($to); What = "a window ""$($S.WaitTitle)""" }; return $false }
+            return $true
+        }
+        'run' {
+            $cmd = Expand-AutoText $S.Command $ctx
+            $dir = if ($S.Dir) { Expand-AutoText $S.Dir $ctx } else { $env:USERPROFILE }
+            if ($S.Shell -eq 'PowerShell') { $exe = (Get-Process -Id $PID).Path; $args0 = "-NoProfile -ExecutionPolicy Bypass -Command $(Get-WebQuote $cmd)" }
+            else { $exe = Join-Path $env:SystemRoot 'System32\cmd.exe'; $args0 = "/d /c $($cmd -replace "`r?`n", ' & ')" }
+            $op = [DevAutoProc]::Start($exe, $args0, $dir, [bool]$S.Wait)
+            if ($op.Error) { throw $op.Error }
+            if (-not $S.Wait) { return $true }
+            $Run.Op = $op; $Run.OpUntil = (Get-Date).AddSeconds($to); return $false
+        }
+        'site' {
+            if (-not (Initialize-WebServers)) { throw 'the web servers engine is not available' }
+            $names = @(([string]$S.Sites -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            $sites = @($WsUI.Sites.ToArray() | Where-Object { $site = $_; -not $names.Count -or $names -contains '*' -or @($names | Where-Object { $site.Name -like $_ -or $site.Group -like $_ }).Count })
+            if (-not $sites.Count) { throw "no website called ""$($S.Sites)"" in Web servers" }
+            foreach ($site in $sites) {
+                switch ($S.Action) { 'Start' { Start-WebSite $site -Quiet } 'Stop' { Stop-WebSite $site } 'Restart' { Stop-WebSite $site -Restart } }
+            }
+            if ($S.Action -eq 'Stop' -or (-not $S.WaitRunning -and $S.Action -ne 'Wait until running')) { return $true }
+            $Run.Wait = @{ Kind = 'sites'; Ids = @($sites | ForEach-Object Id); Until = (Get-Date).AddSeconds($to); What = 'the websites to answer' }
+            return $false
+        }
+        'wait' {
+            $until = (Get-Date).AddSeconds($to)
+            switch ($S.For) {
+                'Seconds'              { $Run.Wait = @{ Kind = 'time'; Until = (Get-Date).AddSeconds([double]$S.Seconds); NoFail = $true } }
+                'A window to open'     { $Run.Wait = @{ Kind = 'window'; W = $S.Window; Until = $until; What = Format-AutoWindow $S.Window } }
+                'A window to close'    { $Run.Wait = @{ Kind = 'nowindow'; W = $S.Window; Until = $until; What = "$(Format-AutoWindow $S.Window) to close" } }
+                'An address to answer' { $Run.Wait = @{ Kind = 'url'; Url = (Expand-AutoText $S.Url $ctx); Until = $until; What = "$($S.Url) to answer"; Probe = $null } }
+                'A file to exist'      { $Run.Wait = @{ Kind = 'file'; Path = (Expand-AutoText $S.Path $ctx); Until = $until; What = "the file $($S.Path)" } }
+                default                { $Run.Wait = @{ Kind = 'text'; Text = (Expand-AutoText $S.Text $ctx); W = $S.Window; Until = $until; What = """$($S.Text)"" on the screen"; Next = [datetime]::MinValue } }
+            }
+            return $false
+        }
+        'focus' { $Run.Wait = @{ Kind = 'focus'; W = $S.Window; State = $S.State; Until = (Get-Date).AddSeconds($to); What = Format-AutoWindow $S.Window }; return $false }
+        'press' {
+            $win = Find-AutoWindow $S.Window
+            if (-not $win) { $Run.Wait = @{ Kind = 'window'; W = $S.Window; Until = (Get-Date).AddSeconds($to); What = Format-AutoWindow $S.Window; Then = 'retry' }; return $false }
+            $Run.Op = [DevUia]::Begin($win.Handle, (Expand-AutoText $S.Element $ctx), $S.Type, $S.Id, 'press', '', $to * 1000); $Run.OpKind = 'press'; $Run.OpW = $S.Window; return $false
+        }
+        'fill' {
+            $win = Find-AutoWindow $S.Window
+            if (-not $win) { $Run.Wait = @{ Kind = 'window'; W = $S.Window; Until = (Get-Date).AddSeconds($to); What = Format-AutoWindow $S.Window; Then = 'retry' }; return $false }
+            $Run.FillText = Expand-AutoText $S.Value $ctx
+            $Run.Op = [DevUia]::Begin($win.Handle, (Expand-AutoText $S.Element $ctx), '', $S.Id, 'set', $Run.FillText, $to * 1000); $Run.OpKind = 'fill'; $Run.OpW = $S.Window; return $false
+        }
+        'type' {
+            $ops = Split-AutoKeys (Expand-AutoText $S.Text $ctx)
+            $Run.Queue = @{ Ops = $ops; At = 0; W = $S.Window; NextAt = [datetime]::MinValue }
+            return $false
+        }
+        'keys' {
+            if ($null -eq [DevKeys]::Parse($S.Keys)) { throw "''$($S.Keys)'' is not a key combination (e.g. Ctrl+S, Enter, F5)" }
+            $ops = New-Object System.Collections.Generic.List[object]; $ops.Add(@('keys', $S.Keys, [Math]::Max(1, [int]$S.Times)))
+            $Run.Queue = @{ Ops = $ops; At = 0; W = $S.Window; NextAt = [datetime]::MinValue }
+            return $false
+        }
+        'click' { $Run.Queue = @{ Ops = @(, @('click', [int]$S.X, [int]$S.Y, $S.Button)); At = 0; W = $S.Window; NextAt = [datetime]::MinValue }; return $false }
+        'clipboard' { $script:IgnoreUntil = (Get-Date).AddMilliseconds(400); [System.Windows.Forms.Clipboard]::SetText((Expand-AutoText $S.Text $ctx)); return $true }
+        'layout' { $l = $AuUI.Layouts.ToArray() | Where-Object { $_.Name -eq $S.Layout } | Select-Object -First 1; if (-not $l) { throw "there is no layout called ""$($S.Layout)""" }; Restore-AutoLayout $l ([bool]$S.StartMissing) $Run; return $false }
+        'table' {
+            $lines = @(([string]$S.Rows -split "`r?`n") | Where-Object { $_.Trim() })
+            if ($lines.Count -lt 2) { throw 'the table needs a row of column names and at least one row' }
+            $sep = if ($lines[0].Contains("`t")) { "`t" } elseif ($lines[0].Contains(';')) { ';' } else { ',' }
+            $cols = @($lines[0].Split($sep) | ForEach-Object { $_.Trim().Trim('"') })
+            $ops = New-Object System.Collections.Generic.List[object]
+            for ($i = 1; $i -lt $lines.Count; $i++) {
+                $cells = $lines[$i].Split($sep); $row = @{}
+                for ($c = 0; $c -lt $cols.Count; $c++) { $row[$cols[$c]] = if ($c -lt $cells.Count) { $cells[$c].Trim().Trim('"') } else { '' } }
+                $ops.Add(@('row', $i, ($lines.Count - 1)))
+                $rc = @{ Row = $row; File = $ctx.File; Copied = $ctx.Copied }
+                foreach ($o in Split-AutoKeys (Expand-AutoText $S.Template $rc)) { $ops.Add($o) }
+                $ops.Add(@('wait', [Math]::Max(0, [int]$S.Pause)))
+            }
+            $Run.Queue = @{ Ops = $ops; At = 0; W = $S.Window; NextAt = [datetime]::MinValue; RefocusEachRow = $true }
+            return $false
+        }
+        'file' {
+            $from = Expand-AutoText $S.From $ctx
+            if (-not $from -or -not [IO.File]::Exists($from)) { throw "the file isn't there: $from" }
+            $fc = @{ File = $from }
+            $name = if ($S.Name) { (Expand-AutoText $S.Name $fc) } else { [IO.Path]::GetFileName($from) }
+            if (-not [IO.Path]::HasExtension($name) -and [IO.Path]::HasExtension($from) -and $S.Name -notmatch '\{ext\}') { $name += [IO.Path]::GetExtension($from) }
+            $dir = if ($S.Action -eq 'Rename' -or -not $S.To) { [IO.Path]::GetDirectoryName($from) } else { Expand-AutoText $S.To $ctx }
+            if (-not [IO.Directory]::Exists($dir)) { [void][IO.Directory]::CreateDirectory($dir) }
+            $dest = Join-Path $dir $name
+            $n = 1; $base = [IO.Path]::GetFileNameWithoutExtension($name); $ext = [IO.Path]::GetExtension($name)
+            while ([IO.File]::Exists($dest) -and $dest -ne $from) { $n++; $dest = Join-Path $dir "$base ($n)$ext" }      # never overwrites
+            if ($S.Action -eq 'Copy') { [IO.File]::Copy($from, $dest) } elseif ($dest -ne $from) { [IO.File]::Move($from, $dest) }
+            $ctx.File = $dest
+            Add-AutoLog "  $($S.Action.ToLower())d to $dest" $Run
+            return $true
+        }
+        'gitpull' {
+            $git = Get-GitExe; if (-not $git) { throw 'git is not installed on this PC' }
+            $root = Expand-AutoText $S.Folder $ctx
+            $repos = @(Get-ChildItem -LiteralPath $root -Directory -Recurse -Depth ([Math]::Max(0, [int]$S.Depth)) -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq '.git' } | ForEach-Object { $_.Parent.FullName })
+            if ([IO.Directory]::Exists((Join-Path $root '.git'))) { $repos = @($root) + $repos }
+            if (-not $repos.Count) { throw "no git repositories in $root" }
+            $cmds = ($repos | ForEach-Object { "echo === $_ & ""$git"" -C ""$_"" pull --ff-only" }) -join ' & '
+            $Run.Op = [DevAutoProc]::Start((Join-Path $env:SystemRoot 'System32\cmd.exe'), "/d /c $cmds", $root, $true); $Run.OpUntil = (Get-Date).AddMinutes(30)
+            return $false
+        }
+        'notify' { $tray.ShowBalloonTip(6000, (Expand-AutoText $S.Title $ctx), (Expand-AutoText $S.Text $ctx), 'Info'); return $true }
+        'routine' {
+            $r2 = $AuUI.Routines.ToArray() | Where-Object { $_.Name -eq $S.Routine } | Select-Object -First 1
+            if (-not $r2) { throw "there is no routine called ""$($S.Routine)""" }
+            if ($r2.Id -eq $Run.R.Id) { throw 'a routine cannot run itself' }
+            $child = Start-AutoRoutine $r2 @{ File = $ctx.File; Copied = $ctx.Copied } "from $($Run.R.Name)"
+            if ($S.Wait -and $child) { $Run.Child = $child; return $false }
+            return $true
+        }
+    }
+    throw "unknown step $($S.Kind)"
+}
+
+# A wait condition: $true = met, $false = keep waiting.
+function Test-AutoWait($Run) {
+    $w = $Run.Wait
+    switch ($w.Kind) {
+        'time'     { return (Get-Date) -ge $w.Until }
+        'window'   { return $null -ne (Find-AutoWindow $w.W) }
+        'nowindow' { return $null -eq (Find-AutoWindow $w.W) }
+        'file'     { $d = [IO.Path]::GetDirectoryName($w.Path); $n = [IO.Path]::GetFileName($w.Path); if (-not $d -or -not [IO.Directory]::Exists($d)) { return $false }; $hit = @([IO.Directory]::GetFiles($d, $n)); if ($hit.Count) { $Run.Ctx.File = $hit[0] }; return $hit.Count -gt 0 }
+        'url'      { if ($w.Probe -and $w.Probe.Done) { if ($w.Probe.Code -gt 0 -and $w.Probe.Code -lt 500) { return $true }; $w.Probe = $null }; if (-not $w.Probe) { $w.Probe = [DevAutoHttp]::Begin($w.Url, 5000) }; return $false }
+        'sites'    { foreach ($id in $w.Ids) { $rt = $WsUI.Rt[$id]; if (-not $rt -or $rt.State -ne 'running') { if ($rt -and $rt.State -in 'crashed', 'failed') { throw "a website could not start: $($rt.Detail)" }; return $false } }; return $true }
+        'focus'    {
+            $win = Find-AutoWindow $w.W
+            if (-not $win) { return $false }
+            [void][DevWin]::Focus($win.Handle)
+            if ($w.State -and $w.State -ne 'as it is') { [DevWin]::SetState($win.Handle, $w.State) }
+            return $true
+        }
+        'text'     {
+            if ((Get-Date) -lt $w.Next) { return $false }
+            $w.Next = (Get-Date).AddSeconds(2)
+            $area = if ($w.W) { $win = Find-AutoWindow $w.W; if (-not $win -or $win.State -eq 'minimized') { return $false }; $win.Bounds } else { [System.Windows.Forms.SystemInformation]::VirtualScreen }
+            if ($area.Width -lt 8 -or $area.Height -lt 8) { return $false }
+            $bmp = New-Object System.Drawing.Bitmap $area.Width, $area.Height
+            try { $g = [System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($area.Location, [System.Drawing.Point]::Empty, $area.Size); $g.Dispose(); $txt = Get-ImageText $bmp } finally { $bmp.Dispose() }
+            return $txt -match [regex]::Escape($w.Text)
+        }
+        'layout'   { return (Step-AutoLayout $Run) }
+    }
+    $true
+}
+
+# Types / presses / clicks the queued actions, a few per tick, as long as it is this run's turn.
+function Step-AutoQueue($Run) {
+    $q = $Run.Queue
+    if ((Get-Date) -lt $q.NextAt) { return $false }
+    if (-not (Request-AutoInput $Run)) { return $false }
+    # the target window must be in front (it is brought there; typing into the wrong window is worse than waiting)
+    if ($q.W) {
+        $win = Find-AutoWindow $q.W
+        if (-not $win) { if (-not $q.Missing) { $q.Missing = (Get-Date).AddSeconds(10) }; if ((Get-Date) -gt $q.Missing) { throw "$(Format-AutoWindow $q.W) is not open" }; return $false }
+        if (-not [DevWin]::IsFront($win.Handle)) {
+            [void][DevWin]::Focus($win.Handle)
+            if (-not [DevWin]::IsFront($win.Handle)) { if (-not $q.NoFront) { $q.NoFront = (Get-Date).AddSeconds(5) }; if ((Get-Date) -gt $q.NoFront) { throw "$(Format-AutoWindow $q.W) could not be brought to the front" }; return $false }
+            $q.NextAt = (Get-Date).AddMilliseconds(150); return $false          # give it a moment to take the keyboard
+        }
+        $q.Win = $win
+    }
+    $sent = 0
+    while ($q.At -lt $q.Ops.Count -and $sent -lt 20) {
+        $o = $q.Ops[$q.At]; $q.At++
+        switch ($o[0]) {
+            'text'  { [DevKeys]::Text($o[1]) }
+            'keys'  { [void][DevKeys]::Combo($o[1], [int]$o[2]) }
+            'wait'  { $q.NextAt = (Get-Date).AddMilliseconds([int]$o[1]); return $false }
+            'row'   { Add-AutoLog "  row $($o[1]) of $($o[2])" $Run }
+            'click' {
+                $x = [int]$o[1]; $y = [int]$o[2]
+                if ($q.Win -and -not $q.Abs) { $x += $q.Win.Bounds.X; $y += $q.Win.Bounds.Y }
+                [DevKeys]::Click($x, $y, $(if ($o[3] -eq 'right') { 'right' } else { 'left' }), ($o[3] -eq 'double'))
+            }
+        }
+        $sent++
+    }
+    if ($q.At -ge $q.Ops.Count) { return $true }
+    $false
+}
+
+# The engine: 4 times a second it moves every running routine on; once a second it checks the triggers.
+function Update-AutoEngine {
+    if ($AuUI.InTick) { return }
+    $AuUI.InTick = $true
+    try { Update-AutoEngineCore } finally { $AuUI.InTick = $false }
+}
+function Update-AutoEngineCore {
+    $AuUI.Tick++
+    foreach ($run in $AuUI.Runs.ToArray()) {
+        if ($run.Done) { continue }
+        try { Step-AutoRun $run } catch { Write-Log "automation step: $_"; $msg = $_.Exception.Message; if ($run.R.StopOnError -or $run.Only) { Complete-AutoRun $run $msg } else { Add-AutoLog "step $($run.I + 1) failed: $msg - going on" $run; Clear-AutoStepState $run; $run.I++ } }
+    }
+    for ($i = $AuUI.Runs.Count - 1; $i -ge 0; $i--) { if ($AuUI.Runs[$i].Done -and ((Get-Date) - $AuUI.Runs[$i].Started).TotalSeconds -gt 1) { $AuUI.Runs.RemoveAt($i) } }
+    if ($AuUI.EscOn -and -not ($AuUI.InputOwner -and -not $AuUI.InputOwner.Done)) { $clipHost.RemoveHotkey(299); $AuUI.EscOn = $false; $AuUI.InputOwner = $null }
+    if ($AuUI.Tick % 4 -eq 0) { Test-AutoTriggers }
+    if ($AuUI.Form) { Update-AutoRunLog }
+}
+
+function Clear-AutoStepState($Run) { $Run.Op = $null; $Run.Wait = $null; $Run.Queue = $null; $Run.Child = $null; $Run.StepStart = $null; if ($AuUI.InputOwner -eq $Run) { $AuUI.InputOwner = $null } }
+
+function Step-AutoRun($Run) {
+    for ($guard = 0; $guard -lt 10; $guard++) {
+        $steps = $Run.R.Steps
+        if ($Run.Child) { if (-not $Run.Child.Done) { return }; $f = $Run.Child.Failed; Clear-AutoStepState $Run; if ($f) { throw "the routine it ran failed: $f" }; Complete-AutoStep $Run; continue }
+        if ($Run.Op) {
+            $op = $Run.Op
+            if ($op -is [DevAutoProc]) {
+                foreach ($l in $op.Drain()) { Add-AutoLog "  $(if ($l.StartsWith('!')) { $l.Substring(1) } else { $l })" $Run }
+                if (-not $op.Done) { if ((Get-Date) -gt $Run.OpUntil) { $op.Kill(); throw 'it took too long (stopped)' }; return }
+                Clear-AutoStepState $Run
+                if ($op.Error) { throw $op.Error }
+                if ($op.ExitCode -ne 0) { throw "it ended with exit code $($op.ExitCode)" }
+                Complete-AutoStep $Run; continue
+            }
+            if (-not $op.Done) { return }
+            Clear-AutoStepState $Run
+            if ($op.Error) { throw $op.Error }
+            if ($op.How -eq 'click' -and -not $op.Bounds.IsEmpty) {             # nothing to "press": click its middle
+                $Run.Queue = @{ Ops = @(, @('click', ($op.Bounds.X + [int]($op.Bounds.Width / 2)), ($op.Bounds.Y + [int]($op.Bounds.Height / 2)), 'left')); At = 0; W = $Run.OpW; Abs = $true; NextAt = [datetime]::MinValue }
+                continue
+            }
+            if ($op.How -eq 'type') { $Run.Queue = @{ Ops = (Split-AutoKeys ("{Ctrl+A}" + $Run.FillText)); At = 0; W = $Run.OpW; Abs = $true; NextAt = [datetime]::MinValue }; continue }
+            Add-AutoLog "  $($op.How)" $Run
+            Complete-AutoStep $Run; continue
+        }
+        if ($Run.Queue) { if (-not (Step-AutoQueue $Run)) { return }; Clear-AutoStepState $Run; Complete-AutoStep $Run; continue }
+        if ($Run.Wait) {
+            if (Test-AutoWait $Run) { $then = $Run.Wait.Then; Clear-AutoStepState $Run; if ($then -ne 'retry') { Complete-AutoStep $Run }; continue }
+            if ((Get-Date) -gt $Run.Wait.Until -and -not $Run.Wait.NoFail) { throw "gave up waiting for $($Run.Wait.What)" }
+            return
+        }
+        if ($Run.I -ge $steps.Count -or ($Run.Only -and $Run.OnlyDone)) { Complete-AutoRun $Run; return }
+        $s = $steps[$Run.I]
+        if (-not $s.On -and -not $Run.Only) { $Run.I++; continue }
+        if (-not $Run.StepStart) { $Run.StepStart = Get-Date; Add-AutoLog "step $($Run.I + 1): $(Get-AutoStepText $s)" $Run; Update-AutoView -Light }
+        if (Invoke-AutoStep $Run $s) { Complete-AutoStep $Run; continue }
+        return
+    }
+}
+function Complete-AutoStep($Run) { $Run.StepStart = $null; if ($Run.Only) { $Run.OnlyDone = $true } else { $Run.I++ } }
+
+# ---- triggers -------------------------------------------------------------------------------------------------
+# Shortcut keys and folder watchers follow the saved routines; called after every change.
+function Update-AutoTriggers {
+    foreach ($id in @($AuUI.HotkeyIds.Keys)) { $clipHost.RemoveHotkey([int]$id) }
+    $AuUI.HotkeyIds = @{}; $AuUI.HotkeyFailed = @()
+    $id = 300
+    $want = @{}
+    foreach ($r in $AuUI.Routines.ToArray()) {
+        if (-not $r.On) { continue }
+        foreach ($t in $r.Triggers.ToArray()) {
+            if (-not $t.On) { continue }
+            if ($t.Kind -eq 'hotkey' -and $t.Keys) {
+                $p = ConvertFrom-HotkeyText $t.Keys
+                if ($p -and $clipHost.AddHotkey($id, $p.Mods, $p.Key)) { $AuUI.HotkeyIds[$id] = $r.Id; $id++ } else { $AuUI.HotkeyFailed += "$($t.Keys) ($($r.Name))" }
+            } elseif ($t.Kind -eq 'file' -and $t.Folder) { $want["$($t.Folder)|$($t.Filter)|$([bool]$t.Sub)"] = $t }
+        }
+    }
+    foreach ($k in @($AuUI.Watchers.Keys)) { if (-not $want.ContainsKey($k)) { $AuUI.Watchers[$k].Dispose(); $AuUI.Watchers.Remove($k) } }
+    foreach ($k in $want.Keys) {
+        if ($AuUI.Watchers.ContainsKey($k)) { continue }
+        $t = $want[$k]
+        if (-not [IO.Directory]::Exists($t.Folder)) { continue }
+        $w = New-Object DevFolderWatch($t.Folder, $t.Filter, [bool]$t.Sub)
+        if ($w.Error) { Write-Log "automation: can't watch $($t.Folder): $($w.Error)" } else { $AuUI.Watchers[$k] = $w }
+    }
+}
+
+function Get-AutoTriggered([string]$Kind) {
+    foreach ($r in $AuUI.Routines.ToArray()) { if ($r.On) { foreach ($t in $r.Triggers.ToArray()) { if ($t.On -and $t.Kind -eq $Kind) { [pscustomobject]@{ R = $r; T = $t } } } } }
+}
+
+function Test-AutoTriggers {
+    $now = Get-Date
+    # at a time / every few minutes
+    foreach ($x in @(Get-AutoTriggered 'time')) {
+        $at = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact([string]$x.T.At, 'H:mm', [Globalization.CultureInfo]::InvariantCulture, 'None', [ref]$at)) { continue }
+        $when = $now.Date.Add($at.TimeOfDay)
+        $dayOk = switch ($x.T.Days) { 'Every day' { $true } 'Monday to Friday' { $now.DayOfWeek -notin 'Saturday', 'Sunday' } 'Weekend' { $now.DayOfWeek -in 'Saturday', 'Sunday' } default { [string]$now.DayOfWeek -eq $x.T.Days } }
+        $key = "$($x.R.Id)|time|$($x.T.At)|$($now.ToString('yyyyMMdd'))"
+        if ($dayOk -and $now -ge $when -and $now -lt $when.AddMinutes(2) -and -not $AuUI.WinSeen.ContainsKey($key)) { $AuUI.WinSeen[$key] = 1; [void](Start-AutoRoutine $x.R @{} "at $($x.T.At)") }
+    }
+    foreach ($x in @(Get-AutoTriggered 'every')) {
+        $m = [Math]::Max(1, [int]$x.T.Minutes)
+        $key = "$($x.R.Id)|every"
+        $last = $AuUI.WinSeen[$key]
+        if (-not $last) { $AuUI.WinSeen[$key] = $now; continue }          # the first run is one interval after DevTools starts
+        if (($now - $last).TotalMinutes -lt $m) { continue }
+        $AuUI.WinSeen[$key] = $now
+        if ($x.T.From -and $x.T.To) {
+            $f = [datetime]::MinValue; $t2 = [datetime]::MinValue
+            if ([datetime]::TryParseExact($x.T.From, 'H:mm', [Globalization.CultureInfo]::InvariantCulture, 'None', [ref]$f) -and [datetime]::TryParseExact($x.T.To, 'H:mm', [Globalization.CultureInfo]::InvariantCulture, 'None', [ref]$t2)) {
+                if ($now.TimeOfDay -lt $f.TimeOfDay -or $now.TimeOfDay -gt $t2.TimeOfDay) { continue }
+            }
+        }
+        [void](Start-AutoRoutine $x.R @{} "every $m min")
+    }
+    # a window opens / closes (looked at every 2 seconds)
+    $wins = @(Get-AutoTriggered 'window')
+    if ($wins.Count -and $AuUI.Tick % 8 -eq 0) {
+        $list = [DevWin]::List()
+        foreach ($x in $wins) {
+            $p = Split-AutoWindow $x.T.Window
+            $there = @($list | Where-Object { [DevWin]::Matches($_, $p.Title, $p.Process) }).Count -gt 0
+            $key = "$($x.R.Id)|win|$($x.T.Window)"
+            if ($AuUI.WinSeen.ContainsKey($key)) {
+                $was = $AuUI.WinSeen[$key]
+                if (-not $was -and $there -and $x.T.When -eq 'opens') { [void](Start-AutoRoutine $x.R @{} "$(Format-AutoWindow $x.T.Window) opened") }
+                if ($was -and -not $there -and $x.T.When -eq 'closes') { [void](Start-AutoRoutine $x.R @{} "$(Format-AutoWindow $x.T.Window) closed") }
+            }
+            $AuUI.WinSeen[$key] = $there
+        }
+    }
+    # a file appears
+    foreach ($x in @(Get-AutoTriggered 'file')) {
+        $w = $AuUI.Watchers["$($x.T.Folder)|$($x.T.Filter)|$([bool]$x.T.Sub)"]; if (-not $w) { continue }
+        if (-not $AuUI.FileReady) { $AuUI.FileReady = @{} }
+        $k = "$($x.T.Folder)|$($x.T.Filter)|$([bool]$x.T.Sub)"
+        if (-not $AuUI.FileReady.ContainsKey($k) -or $AuUI.FileReady[$k].Tick -ne $AuUI.Tick) { $AuUI.FileReady[$k] = @{ Tick = $AuUI.Tick; Files = @($w.Ready()) } }
+        foreach ($f in $AuUI.FileReady[$k].Files) { [void](Start-AutoRoutine $x.R @{ File = $f } "new file $([IO.Path]::GetFileName($f))") }
+    }
+}
+
+# From the clipboard listener (DevTools' own; nothing extra hooks the clipboard).
+function Invoke-AutoClipboard([string]$Text) {
+    if (-not $AuUI.Loaded -or -not $Text) { return }
+    foreach ($x in @(Get-AutoTriggered 'clipboard')) {
+        $p = [string]$x.T.Pattern; if (-not $p) { continue }
+        $hit = if ($p.Length -gt 2 -and $p.StartsWith('/') -and $p.EndsWith('/')) { try { $Text -match $p.Substring(1, $p.Length - 2) } catch { $false } } else { $Text.IndexOf($p, [StringComparison]::OrdinalIgnoreCase) -ge 0 }
+        if ($hit) { [void](Start-AutoRoutine $x.R @{ Copied = $Text } 'copied text matched') }
+    }
+}
+# From Web servers, when a running site crashes or stops answering.
+function Invoke-AutoSiteDown($S, [string]$State) {
+    if (-not $AuUI.Loaded) { return }
+    foreach ($x in @(Get-AutoTriggered 'site')) {
+        if ($x.T.Site -and $S.Name -notlike $x.T.Site -and $S.Group -notlike $x.T.Site) { continue }
+        [void](Start-AutoRoutine $x.R @{ Site = $S.Name } "$($S.Name) $State")
+    }
+}
+# From the global shortcut handler.
+function Invoke-AutoHotkey([int]$Id) {
+    if ($Id -eq 299) { Stop-AutoRuns 'stopped with Esc'; try { $tray.ShowBalloonTip(2000, 'Automation', 'Stopped (Esc).', 'Info') } catch { }; return }
+    $rid = $AuUI.HotkeyIds[$Id]; $r = $AuUI.Routines.ToArray() | Where-Object Id -eq $rid | Select-Object -First 1
+    if ($r) { [void](Start-AutoRoutine $r @{} 'shortcut key') }
+}
+
+# At start: load the routines when one has a trigger, and run the ones that start with DevTools.
+function Start-AutomationAtLaunch {
+    if (-not (Test-Path -LiteralPath $AuFile)) { return }
+    $raw = try { Read-DataText $AuFile } catch { '' }
+    if ($raw -notmatch '"Kind"\s*:\s*"(hotkey|time|every|start|window|file|clipboard|site)"') { return }
+    if (-not (Initialize-Automation)) { return }
+    foreach ($x in @(Get-AutoTriggered 'start')) { [void](Start-AutoRoutine $x.R @{} 'DevTools started') }
+}
+
+# ---- window layouts --------------------------------------------------------------------------------------------
+function Save-AutoLayout([string]$Name, $Windows) {
+    $l = [pscustomobject]@{ Name = $Name; Windows = @(foreach ($w in $Windows) { [pscustomobject]@{ Title = $w.Title; Process = $w.Process; Path = $w.Path; X = $w.Bounds.X; Y = $w.Bounds.Y; W = $w.Bounds.Width; H = $w.Bounds.Height; State = $w.State } }) }
+    $old = $AuUI.Layouts.ToArray() | Where-Object { $_.Name -eq $Name }
+    foreach ($o in @($old)) { [void]$AuUI.Layouts.Remove($o) }
+    $AuUI.Layouts.Add($l); Save-Automation
+}
+# Puts each saved window back. A window is matched by its program and then by title words; a missing program
+# is started (when asked), and placed once its window shows up (waits up to 30 s).
+function Restore-AutoLayout($Layout, [bool]$StartMissing, $Run = $null) {
+    $pending = New-Object System.Collections.Generic.List[object]
+    $used = @{}
+    $list = [DevWin]::List()
+    foreach ($w in @($Layout.Windows)) {
+        $cands = @($list | Where-Object { $_.Process -eq $w.Process -and -not $used.ContainsKey($_.Handle) })
+        $best = @($cands | Where-Object { $_.Title -eq $w.Title }) + @($cands | Where-Object { $_.Title -ne $w.Title }) | Select-Object -First 1
+        if ($best) { $used[$best.Handle] = 1; [DevWin]::Place($best.Handle, $w.X, $w.Y, $w.W, $w.H, $w.State) }
+        elseif ($StartMissing -and $w.Path -and [IO.File]::Exists($w.Path)) { try { Start-Process -FilePath $w.Path -ErrorAction Stop; $pending.Add($w) } catch { } }
+    }
+    if ($Run) { $Run.Wait = @{ Kind = 'layout'; Pending = $pending; Until = (Get-Date).AddSeconds(30); NoFail = $true; Used = $used } }
+}
+function Step-AutoLayout($Run) {
+    $w0 = $Run.Wait
+    if (-not $w0.Pending.Count) { return $true }
+    $list = [DevWin]::List()
+    foreach ($w in $w0.Pending.ToArray()) {
+        $hit = $list | Where-Object { $_.Process -eq $w.Process -and -not $w0.Used.ContainsKey($_.Handle) } | Select-Object -First 1
+        if ($hit) { $w0.Used[$hit.Handle] = 1; [DevWin]::Place($hit.Handle, $w.X, $w.Y, $w.W, $w.H, $w.State); [void]$w0.Pending.Remove($w) }
+    }
+    return $w0.Pending.Count -eq 0 -or (Get-Date) -gt $w0.Until
+}
+
+# ---- the window ----------------------------------------------------------------------------------------------
+function Get-AutoSelected { if ($AuUI.List -and $AuUI.List.SelectedItems.Count) { $AuUI.List.SelectedItems[0].Tag } else { $null } }
+function Get-AutoSelStep { if ($AuUI.Steps -and $AuUI.Steps.SelectedItems.Count) { [int]$AuUI.Steps.SelectedItems[0].Tag } else { -1 } }
+
+function Update-AutoView([switch]$Light) {
+    if (-not $AuUI.Form) { return }
+    $lv = $AuUI.List
+    $running = @{}; foreach ($run in $AuUI.Runs.ToArray()) { if (-not $run.Done) { $running[$run.R.Id] = $run } }
+    $ids = ($AuUI.Routines.ToArray() | ForEach-Object Id) -join ','
+    $AuUI.Building = $true
+    try {
+        if ($ids -ne $AuUI.ListIds) {
+            $sel = Get-AutoSelected
+            $lv.BeginUpdate(); $lv.Items.Clear()
+            foreach ($r in $AuUI.Routines.ToArray()) {
+                $it = New-Object System.Windows.Forms.ListViewItem($r.Name); [void]$it.SubItems.Add(''); [void]$it.SubItems.Add('')
+                $it.Tag = $r; $it.Checked = [bool]$r.On; [void]$lv.Items.Add($it)
+                if ($sel -and $sel.Id -eq $r.Id) { $it.Selected = $true }
+            }
+            $lv.EndUpdate(); $AuUI.ListIds = $ids
+            if (-not $lv.SelectedItems.Count -and $lv.Items.Count) { $lv.Items[0].Selected = $true }
+        }
+        foreach ($it in $lv.Items) {
+            $r = $it.Tag; $run = $running[$r.Id]
+            $trig = (@($r.Triggers.ToArray() | Where-Object On | ForEach-Object { Get-AutoTriggerText $_ }) -join '; '); if (-not $trig) { $trig = 'by hand' }
+            $last = if ($run) { "running: step $($run.I + 1) of $($r.Steps.Count)" } elseif ($r.LastRun) { "$($r.LastRun)  $($r.LastResult)" } else { '' }
+            foreach ($pair in @(@(0, $r.Name), @(1, $trig), @(2, $last))) { if ($it.SubItems[$pair[0]].Text -cne $pair[1]) { $it.SubItems[$pair[0]].Text = $pair[1] } }
+            if ($it.Checked -ne [bool]$r.On) { $it.Checked = [bool]$r.On }
+            $it.ForeColor = if ($run) { $C.Accent } elseif ($r.LastResult -like 'failed*') { $C.Red } elseif (-not $r.On) { $C.Dim } else { $C.Fore }
+        }
+    } finally { $AuUI.Building = $false }
+    Update-AutoSteps
+    if (-not $Light) { Update-AutoProps }
+    $n = $running.Count
+    $AuUI.Status.Text = if ($n) { "$n running  $Dot  Esc stops a routine while it types or clicks  $Dot  Stop all ends them" } else { "$($AuUI.Routines.Count) routines  $Dot  $(@($AuUI.Routines.ToArray() | Where-Object { $_.On -and $_.Triggers.Count }).Count) start by themselves$(if ($AuUI.HotkeyFailed.Count) { "  $Dot  shortcut taken by another app: $($AuUI.HotkeyFailed -join ', ')" })" }
+    $AuUI.Status.ForeColor = if ($AuUI.HotkeyFailed.Count -and -not $n) { $C.Yellow } else { $C.Dim }
+}
+
+function Update-AutoSteps {
+    $lv = $AuUI.Steps; $r = Get-AutoSelected
+    $run = if ($r) { $AuUI.Runs.ToArray() | Where-Object { $_.R.Id -eq $r.Id -and -not $_.Done } | Select-Object -First 1 }
+    $key = if ($r) { "$($r.Id)|" + (($r.Steps.ToArray() | ForEach-Object { "$($_.On)$(Get-AutoStepText $_)" }) -join '|') } else { '' }
+    $AuUI.Building = $true
+    try {
+        if ($key -ne $AuUI.StepsKey) {
+            $si = Get-AutoSelStep
+            $lv.BeginUpdate(); $lv.Items.Clear()
+            if ($r) { for ($i = 0; $i -lt $r.Steps.Count; $i++) { $s = $r.Steps[$i]; $it = New-Object System.Windows.Forms.ListViewItem([string]($i + 1)); [void]$it.SubItems.Add((Get-AutoStepText $s)); $it.Tag = $i; $it.Checked = [bool]$s.On; [void]$lv.Items.Add($it) } }
+            $lv.EndUpdate(); $AuUI.StepsKey = $key
+            if ($si -ge 0 -and $si -lt $lv.Items.Count) { $lv.Items[$si].Selected = $true }
+            $AuUI.NoSteps.Visible = $r -and -not $r.Steps.Count; if ($AuUI.NoSteps.Visible) { $AuUI.NoSteps.BringToFront() }
+        }
+        foreach ($it in $lv.Items) {
+            $i = [int]$it.Tag; $on = $run -and $run.I -eq $i
+            $want = if ($on) { $C.Accent } elseif (-not $r.Steps[$i].On) { $C.Dim } else { $C.Fore }
+            if ($it.ForeColor -ne $want) { $it.ForeColor = $want }
+            $f = if ($on) { $AuUI.BoldFont } else { $lv.Font }; if ($it.Font -ne $f) { $it.Font = $f }
+        }
+    } finally { $AuUI.Building = $false }
+}
+
+function Update-AutoRunLog {
+    if (-not $AuUI.LogBox -or -not $AuUI.LogQueue.Count) { return }
+    $box = $AuUI.LogBox
+    foreach ($l in $AuUI.LogQueue.ToArray()) {
+        $box.SelectionStart = $box.TextLength; $box.SelectionLength = 0
+        $box.SelectionColor = if ($l -match 'STOPPED|failed|gave up') { $C.Red } elseif ($l -match ': (started|finished)') { $C.Accent } elseif ($l -match '^\S+\s{3}') { $C.Dim } else { $C.Fore }
+        $box.AppendText("$l`n")
+    }
+    $AuUI.LogQueue.Clear()
+    $box.SelectionStart = $box.TextLength; $box.ScrollToCaret()
+}
+
+function Update-AutoProps {
+    $p = $AuUI.Props; $r = Get-AutoSelected
+    $key = if ($r) { "$($r.Id)|$($r.Triggers.Count)|" + (($r.Triggers.ToArray() | ForEach-Object { "$($_.On)$(Get-AutoTriggerText $_)" }) -join '|') } else { '' }
+    if ($key -eq $AuUI.PropKey) { return }
+    $AuUI.PropKey = $key
+    $AuUI.Building = $true
+    $p.SuspendLayout()
+    foreach ($ctl in @($p.Controls)) { $p.Controls.Remove($ctl); $ctl.Dispose() }
+    $wid = [Math]::Max((Px 160), $p.Width - $p.Padding.Horizontal - [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth - (Px 6))
+    if (-not $r) {
+        New-TbLabel $p 'Automation' -Title | Out-Null
+        $h = New-TbLabel $p "A routine is a list of steps: open programs and addresses, run commands, start websites, wait for something, press buttons and fill fields by their name, type, arrange windows, fill a form for each row of a table, move new files.`n`nIt runs with Run, from the command palette, with a shortcut, at a time, when DevTools starts, when a window opens, when a file appears, when you copy something or when a website goes down.`n`nNew routine starts one." -Dim
+        $h.MaximumSize = New-Object System.Drawing.Size($wid, 0)
+    } else {
+        New-TbLabel $p 'Routine' -Title | Out-Null
+        $l = New-TbLabel $p 'Name' -Dim; $l.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 8), 0, (Px 2))
+        $nb = New-TbBox; $nb.Text = $r.Name; $nb.Width = $wid; $nb.Margin = New-Object System.Windows.Forms.Padding((Px 2), 0, 0, 0); $p.Controls.Add($nb)
+        $nb.add_TextChanged({ param($src, $e) if ($AuUI.Building) { return }; $x = Get-AutoSelected; if ($x -and $src.Text.Trim()) { $x.Name = $src.Text.Trim(); Request-AutoSave; Update-AutoView -Light } })
+        $tl = New-TbLabel $p 'Starts by itself' -Title; $tl.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 18), 0, (Px 2))
+        if (-not $r.Triggers.Count) { $x0 = New-TbLabel $p 'Only by hand: Run, the command palette ("Run: ...") or another routine.' -Dim; $x0.MaximumSize = New-Object System.Drawing.Size($wid, 0) }
+        for ($i = 0; $i -lt $r.Triggers.Count; $i++) {
+            $t = $r.Triggers[$i]
+            $row = New-Object System.Windows.Forms.FlowLayoutPanel
+            $row.AutoSize = $true; $row.WrapContents = $false; $row.BackColor = $p.BackColor; $row.Margin = New-Object System.Windows.Forms.Padding(0, (Px 2), 0, 0)
+            $cb = New-CheckBox $row (Get-AutoTriggerText $t) ([bool]$t.On); $cb.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 6), 0, 0); $cb.Tag = $i; $cb.MaximumSize = New-Object System.Drawing.Size(($wid - (Px 70)), 0)
+            $cb.add_CheckedChanged({ param($src, $e) if ($AuUI.Building) { return }; $x = Get-AutoSelected; $x.Triggers[[int]$src.Tag].On = $src.Checked; Request-AutoSave; Update-AutoTriggers; Update-AutoView })
+            $eb = New-Button '' 'Change this trigger' { $x = Get-AutoSelected; $ix = [int]$this.Tag; if (Show-AutoItemDialog $AuTriggers $x.Triggers[$ix] 'Trigger') { Request-AutoSave; Update-AutoTriggers; $AuUI.PropKey = '?'; Update-AutoView } } $row $Glyph.Edit 2
+            $eb.Tag = $i
+            $db = New-Button '' 'Remove this trigger' { $x = Get-AutoSelected; $x.Triggers.RemoveAt([int]$this.Tag); Request-AutoSave; Update-AutoTriggers; $AuUI.PropKey = '?'; Update-AutoView } $row $Glyph.Delete 2
+            $db.Tag = $i
+            $p.Controls.Add($row)
+        }
+        $ab = New-Button 'Add a trigger' 'When this routine should start by itself' {
+            $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+            foreach ($k in $AuTriggers.Keys) { $it = Add-MenuItem $m $AuTriggers[$k].Label { param($src, $e) $x = Get-AutoSelected; $t = New-AutoItem $AuTriggers $src.Tag; if ($t.PSObject.Properties.Count -le 2 -or (Show-AutoItemDialog $AuTriggers $t 'Trigger')) { $x.Triggers.Add($t); Request-AutoSave; Update-AutoTriggers; $AuUI.PropKey = '?'; Update-AutoView } } ''; $it.Tag = $k }
+            $m.Show($this, (New-Object System.Drawing.Point(0, $this.Height)))
+        } $p $Glyph.Add 2
+        $ab.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, 0)
+        $ol = New-TbLabel $p 'Options' -Title; $ol.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 18), 0, (Px 2))
+        foreach ($o in @(@('StopOnError', 'Stop at the first step that fails', 'Off: a failed step is noted in the log and the next one runs'), @('NotifyDone', 'Notify me when it finishes', 'A failure is always notified when it started by itself'))) {
+            $cb = New-CheckBox $p $o[1] ([bool]$r.($o[0])) $o[2]; $cb.Tag = $o[0]; $cb.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 8), 0, 0)
+            $cb.add_CheckedChanged({ param($src, $e) if ($AuUI.Building) { return }; $x = Get-AutoSelected; $x.($src.Tag) = $src.Checked; Request-AutoSave })
+        }
+        $hl = New-TbLabel $p "Placeholders in steps: {date} {time} {clipboard} {input:Question}, and {file} {name} {ext} {folder} for the file that started it, {copied} for the copied text, {row:Column} in a form." -Dim
+        $hl.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 18), 0, 0); $hl.MaximumSize = New-Object System.Drawing.Size($wid, 0)
+    }
+    $p.ResumeLayout()
+    $AuUI.Building = $false
+}
+
+# ---- one dialog for every step and trigger: its fields come from $AuSteps / $AuTriggers ----------------------
+# Which fields a choice shows (the others are hidden).
+$AuShow = @{
+    'wait.For' = @{ 'Seconds' = @('Seconds'); 'A window to open' = @('Window', 'Timeout'); 'A window to close' = @('Window', 'Timeout'); 'An address to answer' = @('Url', 'Timeout'); 'A file to exist' = @('Path', 'Timeout'); 'Text on the screen' = @('Text', 'Window', 'Timeout') }
+    'file.Action' = @{ 'Move' = @('From', 'To', 'Name'); 'Copy' = @('From', 'To', 'Name'); 'Rename' = @('From', 'Name') }
+    'site.Action' = @{ 'Start' = @('Sites', 'WaitRunning', 'Timeout'); 'Restart' = @('Sites', 'WaitRunning', 'Timeout'); 'Stop' = @('Sites'); 'Wait until running' = @('Sites', 'Timeout') }
+}
+
+function New-AutoDialogBar($Form, [string]$OkText = 'Save') {
+    $strip = New-Object System.Windows.Forms.Panel
+    $strip.Dock = 'Bottom'; $strip.Height = Px 52; $strip.BackColor = $C.Panel
+    $row = New-Object System.Windows.Forms.FlowLayoutPanel
+    $row.Dock = 'Right'; $row.AutoSize = $true; $row.AutoSizeMode = 'GrowAndShrink'; $row.WrapContents = $false; $row.BackColor = $C.Panel; $row.Padding = New-Object System.Windows.Forms.Padding(0, (Px 9), (Px 10), 0)
+    [void](New-Button 'Cancel' '' { $this.FindForm().DialogResult = 'Cancel' } $row '' 0)
+    [void](New-Button $OkText '' { $this.FindForm().DialogResult = 'OK' } $row $Glyph.Save 1)
+    $strip.Controls.Add($row)
+    $Form.Controls.Add($strip)
+}
+
+function Show-AutoItemDialog([System.Collections.IDictionary]$Defs, $Item, [string]$What) {
+    $def = $Defs[$Item.Kind]
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = "$What  -  $($def.Label)"; $f.Icon = $IconActive; $f.StartPosition = 'CenterParent'; $f.BackColor = $C.Bg; $f.ForeColor = $C.Fore; $f.Font = $FontMain
+    $f.FormBorderStyle = 'Sizable'; $f.MinimizeBox = $false; $f.MaximizeBox = $false; $f.ShowInTaskbar = $false; $f.KeyPreview = $true
+    $f.Size = New-Object System.Drawing.Size((Px (560 * $TextZoom)), (Px 560)); $f.MinimumSize = New-Object System.Drawing.Size((Px 420), (Px 260))
+    $body = New-Object System.Windows.Forms.FlowLayoutPanel
+    $body.Dock = 'Fill'; $body.FlowDirection = 'TopDown'; $body.WrapContents = $false; $body.AutoScroll = $true; $body.BackColor = $C.Bg
+    $body.Padding = New-Object System.Windows.Forms.Padding((Px 16), (Px 10), (Px 10), (Px 10))
+    $wid = $f.ClientSize.Width - $body.Padding.Horizontal - [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth - (Px 10)
+    $ctl = @{}; $rows = @{}
+    $st = @{ Ctl = $ctl; Rows = $rows; Item = $Item; Kind = $Item.Kind; Form = $f }
+    $f.Tag = $st
+    foreach ($fd in $def.Fields) {
+        $name = $fd[0]; $label = $fd[1]; $kind = $fd[2]
+        $row = New-Object System.Windows.Forms.FlowLayoutPanel
+        $row.AutoSize = $true; $row.FlowDirection = 'TopDown'; $row.WrapContents = $false; $row.BackColor = $C.Bg; $row.Margin = New-Object System.Windows.Forms.Padding(0, (Px 6), 0, 0)
+        $rows[$name] = $row
+        $val = $Item.$name
+        if ($kind -eq 'bool') {
+            $cb = New-CheckBox $row $label ([bool]$val); $cb.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 4), 0, 0); $ctl[$name] = $cb
+            $body.Controls.Add($row); continue
+        }
+        if ($kind -ne 'point') { $l = New-TbLabel $row $label -Dim; $l.Margin = New-Object System.Windows.Forms.Padding((Px 2), 0, 0, (Px 2)); $l.MaximumSize = New-Object System.Drawing.Size($wid, 0) }
+        $line = New-Object System.Windows.Forms.FlowLayoutPanel
+        $line.AutoSize = $true; $line.WrapContents = $false; $line.BackColor = $C.Bg; $line.Margin = New-Object System.Windows.Forms.Padding(0)
+        $row.Controls.Add($line)
+        $boxW = $wid - $(if ($kind -in 'window', 'element', 'file', 'folder') { Px 96 } else { 0 })
+        switch ($kind) {
+            'choice' {
+                $cx = New-Object System.Windows.Forms.ComboBox; $cx.DropDownStyle = 'DropDownList'; $cx.FlatStyle = 'Flat'; $cx.BackColor = $C.Bg; $cx.ForeColor = $C.Fore; $cx.Width = [Math]::Min($wid, (Px 300))
+                foreach ($o in $fd[4]) { [void]$cx.Items.Add($o) }; $cx.SelectedIndex = [Math]::Max(0, [array]::IndexOf([string[]]$fd[4], [string]$val))
+                $cx.Tag = "$($Item.Kind).$name"
+                $cx.add_SelectedIndexChanged({ param($src, $e) Update-AutoDialogShow $src.FindForm().Tag })
+                $line.Controls.Add($cx); $ctl[$name] = $cx
+            }
+            { $_ -in 'site', 'routine', 'layout', 'window' } {
+                $cx = New-Object System.Windows.Forms.ComboBox; $cx.DropDownStyle = 'DropDown'; $cx.FlatStyle = 'Flat'; $cx.BackColor = $C.Bg; $cx.ForeColor = $C.Fore; $cx.Width = $boxW
+                $items = switch ($kind) {
+                    'site' { if (Initialize-WebServers) { @('*') + @($WsUI.Sites.ToArray() | ForEach-Object Name) + @($WsUI.Sites.ToArray() | ForEach-Object Group | Where-Object { $_ } | Sort-Object -Unique) } }
+                    'routine' { @($AuUI.Routines.ToArray() | ForEach-Object Name) }
+                    'layout' { @($AuUI.Layouts.ToArray() | ForEach-Object Name) }
+                    'window' { @([DevWin]::List() | Where-Object { $_.Pid -ne $PID } | ForEach-Object { "$($_.Title)|$($_.Process)" }) }
+                }
+                foreach ($o in @($items | Where-Object { $_ } | Select-Object -Unique)) { [void]$cx.Items.Add($o) }
+                $cx.Text = [string]$val
+                $line.Controls.Add($cx); $ctl[$name] = $cx
+                if ($kind -eq 'window') {
+                    $tooltip.SetToolTip($cx, 'Title|program. Title: part of the window title (* works as a wildcard), e.g. "Inbox*". Program: its .exe name, e.g. outlook. Either part may be empty. Pick: point at the window.')
+                    $pb = New-Button 'Pick' 'Point at the window within 3 seconds (no click needed)' { Start-AutoPick $this.FindForm().Tag 'window' } $line $Glyph.Pointer 2
+                    $cx.Width = $wid - $pb.GetPreferredSize([System.Drawing.Size]::Empty).Width - (Px 8)
+                }
+            }
+            'element' {
+                $tb = New-TbBox; $tb.Text = [string]$val; $tb.Width = $boxW; $line.Controls.Add($tb); $ctl[$name] = $tb
+                $pb = New-Button 'Pick' 'Point at the button or field within 3 seconds (no click needed): its name, kind, id and window are filled in' { Start-AutoPick $this.FindForm().Tag 'element' } $line $Glyph.Pointer 2
+                $tb.Width = $wid - $pb.GetPreferredSize([System.Drawing.Size]::Empty).Width - (Px 8)
+            }
+            'point' {
+                $pb = New-Button 'Pick the place' 'Point at the place within 3 seconds (no click needed): the window and the position in it are filled in' { Start-AutoPick $this.FindForm().Tag 'point' } $line $Glyph.Pointer 2
+            }
+            'keys' {
+                $tb = New-TbBox -Cue 'press the keys'; $tb.Text = [string]$val; $tb.Width = [Math]::Min($wid, (Px 260)); $tb.ShortcutsEnabled = $false
+                $tb.add_KeyDown({ param($src, $e) $e.SuppressKeyPress = $true; if ($e.KeyCode -in 'Back', 'Delete' -and -not $e.Modifiers) { $src.Text = ''; return }; $k = Get-HotkeyText $e; if ($k -and $k -notmatch '\+$') { $src.Text = $k } })
+                $line.Controls.Add($tb); $ctl[$name] = $tb
+            }
+            { $_ -in 'file', 'folder' } {
+                $tb = New-TbBox; $tb.Text = [string]$val; $tb.Width = $boxW; $line.Controls.Add($tb); $ctl[$name] = $tb
+                $bb = New-Button '...' $(if ($kind -eq 'file') { 'Choose a file' } else { 'Choose a folder' }) {
+                    $t = $this.Tag
+                    if ($t.Kind -eq 'folder') { $d = New-Object DevFolderDialog; $d.SelectedPath = $t.Box.Text; if ($d.ShowDialog($this.FindForm()) -eq 'OK') { $t.Box.Text = $d.SelectedPath } }
+                    else { $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Filter = 'All files|*.*'; try { if ($t.Box.Text -and [IO.File]::Exists($t.Box.Text)) { $d.InitialDirectory = Split-Path -Parent $t.Box.Text } } catch { }; if ($d.ShowDialog($this.FindForm()) -eq 'OK') { $t.Box.Text = $d.FileName }; $d.Dispose() }
+                } $line '' 2
+                $bb.Tag = @{ Kind = $kind; Box = $tb }
+                $tb.Width = $wid - $bb.GetPreferredSize([System.Drawing.Size]::Empty).Width - (Px 8)
+            }
+            default {
+                $tb = New-TbBox -Multi:($kind -eq 'multi'); $tb.Text = [string]$val; $tb.Width = $wid
+                if ($kind -eq 'multi') { $tb.Height = Px $(if ($Item.Kind -in 'table', 'run') { 120 } else { 80 }); $tb.ScrollBars = 'Vertical'; $tb.Font = New-Object System.Drawing.Font('Consolas', (Fz 9.5)) }
+                if ($kind -eq 'number') { $tb.Width = Px (110 * $TextZoom) }
+                $line.Controls.Add($tb); $ctl[$name] = $tb
+            }
+        }
+        $body.Controls.Add($row)
+    }
+    $st.PickLabel = New-TbLabel $body '' -Dim; $st.PickLabel.ForeColor = $C.Accent; $st.PickLabel.MaximumSize = New-Object System.Drawing.Size($wid, 0)
+    $f.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Escape') { $src.DialogResult = 'Cancel' } elseif ($e.Control -and $e.KeyCode -eq 'Return') { $src.DialogResult = 'OK' } })
+    $f.Controls.Add($body)
+    New-AutoDialogBar $f
+    Update-AutoDialogShow $st
+    Register-ThemedWindow $f
+    $script:Modal = $true
+    try { $res = $f.ShowDialog($AuUI.Form) } finally { $script:Modal = $false; if ($st.Timer) { $st.Timer.Dispose() } }
+    if ($res -ne 'OK') { $f.Dispose(); return $false }
+    foreach ($fd in $def.Fields) {
+        $c0 = $ctl[$fd[0]]; if (-not $c0) { continue }
+        $v = if ($c0 -is [System.Windows.Forms.CheckBox]) { $c0.Checked } elseif ($fd[2] -eq 'number') { $n = 0.0; if ([double]::TryParse($c0.Text.Trim(), [ref]$n)) { $n } else { $fd[3] } } else { $c0.Text }
+        $Item.($fd[0]) = $v
+    }
+    $f.Dispose()
+    $true
+}
+
+function Update-AutoDialogShow($St) {
+    foreach ($k in $AuShow.Keys) {
+        $kind, $field = $k -split '\.', 2
+        if ($kind -ne $St.Kind -or -not $St.Ctl[$field]) { continue }
+        $show = $AuShow[$k][[string]$St.Ctl[$field].SelectedItem]
+        if (-not $show) { continue }
+        foreach ($n in $St.Rows.Keys) { if ($n -ne $field -and ($AuShow.Values | ForEach-Object { $_.Values } | ForEach-Object { $_ }) -contains $n -or $n -in @($AuShow[$k].Values | ForEach-Object { $_ })) { $St.Rows[$n].Visible = $show -contains $n } }
+    }
+}
+
+# Pick: a 3-second countdown, then whatever is under the mouse pointer. No click and no hook: DevTools only
+# asks Windows what is at that point.
+function Start-AutoPick($St, [string]$Mode) {
+    if ($St.Timer) { $St.Timer.Dispose() }
+    $St.Count = 3; $St.Mode = $Mode
+    $St.PickLabel.Text = "Point at it now...  3"
+    $t = New-Object System.Windows.Forms.Timer; $t.Interval = 1000; $t.Tag = $St; $St.Timer = $t
+    $t.add_Tick({
+        param($src, $e)
+        $s = $src.Tag; $s.Count--
+        if ($s.Count -gt 0) { $s.PickLabel.Text = "Point at it now...  $($s.Count)"; return }
+        $src.Stop()
+        $pt = [System.Windows.Forms.Cursor]::Position
+        $p = [DevUia]::At($pt.X, $pt.Y)
+        if ($p.Process -and $p.Process -eq [IO.Path]::GetFileNameWithoutExtension((Get-Process -Id $PID).Path)) { $s.PickLabel.Text = 'That was DevTools itself: point at the other program''s window.'; return }
+        $win = "$($p.Window)|$($p.Process)"
+        if ($s.Ctl['Window']) { $s.Ctl['Window'].Text = $win }
+        switch ($s.Mode) {
+            'element' {
+                if ($s.Ctl['Element']) { $s.Ctl['Element'].Text = $p.Name }
+                if ($s.Ctl['Type']) { $s.Ctl['Type'].Text = $p.Type }
+                if ($s.Ctl['Id']) { $s.Ctl['Id'].Text = $p.Id }
+                $s.PickLabel.Text = if ($p.Name -or $p.Id) { "Found: $(if ($p.Name) { "'$($p.Name)'" } else { "id $($p.Id)" }) ($($p.Type)) in $($p.Process)." } else { "Found a $($p.Type) without a name in $($p.Process). Use Click at a place instead." }
+            }
+            'point' {
+                if ($s.Ctl['X']) { $s.Ctl['X'].Text = [string]$p.RelX }; if ($s.Ctl['Y']) { $s.Ctl['Y'].Text = [string]$p.RelY }
+                $s.PickLabel.Text = "Picked: $($p.RelX), $($p.RelY) in ""$($p.Window)"" ($($p.Process))."
+            }
+            default { $s.PickLabel.Text = "Picked: ""$($p.Window)"" ($($p.Process)). Shorten the title (or use * ) if it changes, e.g. with the file name." }
+        }
+    })
+    $t.Start()
+}
+
+# ---- window layouts dialog --------------------------------------------------------------------------------------
+function Show-AutoLayouts {
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'Window layouts'; $f.Icon = $IconActive; $f.StartPosition = 'CenterParent'; $f.BackColor = $C.Bg; $f.ForeColor = $C.Fore; $f.Font = $FontMain
+    $f.Size = New-Object System.Drawing.Size((Px (620 * $TextZoom)), (Px 480)); $f.MinimizeBox = $false; $f.ShowInTaskbar = $false
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.HideSelection = $false; $lv.BorderStyle = 'None'; $lv.BackColor = $C.Bg; $lv.ForeColor = $C.Fore
+    [void]$lv.Columns.Add('Layout', (Px (170 * $TextZoom))); [void]$lv.Columns.Add('Windows', (Px (380 * $TextZoom)))
+    $fill = { $lv.Items.Clear(); foreach ($l in $AuUI.Layouts.ToArray()) { $it = New-Object System.Windows.Forms.ListViewItem($l.Name); [void]$it.SubItems.Add((@($l.Windows | ForEach-Object Process | Select-Object -Unique) -join ', ')); $it.Tag = $l; [void]$lv.Items.Add($it) } }.GetNewClosure()
+    & $fill
+    $bar = New-Object System.Windows.Forms.FlowLayoutPanel
+    $bar.Dock = 'Top'; $bar.AutoSize = $true; $bar.BackColor = $C.Panel; $bar.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 6))
+    [void](New-Button 'Save the open windows...' 'Remember where your windows are now, under a name' {
+        $wins = @([DevWin]::List() | Where-Object { $_.Pid -ne $PID -and $_.Process -notin 'ApplicationFrameHost', 'TextInputHost', 'SystemSettings' })
+        $d = New-Object System.Windows.Forms.Form
+        $d.Text = 'Save a window layout'; $d.StartPosition = 'CenterParent'; $d.BackColor = $C.Bg; $d.ForeColor = $C.Fore; $d.Font = $FontMain; $d.Size = New-Object System.Drawing.Size((Px (560 * $TextZoom)), (Px 460)); $d.ShowInTaskbar = $false
+        $cl = New-Object System.Windows.Forms.CheckedListBox; $cl.Dock = 'Fill'; $cl.BackColor = $C.Bg; $cl.ForeColor = $C.Fore; $cl.BorderStyle = 'None'; $cl.CheckOnClick = $true
+        foreach ($w in $wins) { [void]$cl.Items.Add("$($w.Title)   ($($w.Process), $($w.State))", $true) }
+        $top = New-Object System.Windows.Forms.FlowLayoutPanel; $top.Dock = 'Top'; $top.AutoSize = $true; $top.BackColor = $C.Bg; $top.Padding = New-Object System.Windows.Forms.Padding((Px 8))
+        New-TbLabel $top 'Name' -Dim | Out-Null
+        $nb = New-TbBox; $nb.Width = Px 260; $nb.Text = "Layout $($AuUI.Layouts.Count + 1)"; $top.Controls.Add($nb)
+        $d.Controls.Add($cl); $d.Controls.Add($top)
+        New-AutoDialogBar $d
+        Register-ThemedWindow $d
+        if ($d.ShowDialog($this.FindForm()) -eq 'OK' -and $nb.Text.Trim()) {
+            $chosen = @(for ($i = 0; $i -lt $wins.Count; $i++) { if ($cl.GetItemChecked($i)) { $wins[$i] } })
+            if ($chosen.Count) { Save-AutoLayout $nb.Text.Trim() $chosen }
+        }
+        $d.Dispose()
+        & $fill
+    }.GetNewClosure() $bar $Glyph.Save 1)
+    [void](New-Button 'Arrange now' 'Put the windows of the selected layout where they were saved' { $l = @($lv.SelectedItems)[0]; if ($l) { if (Initialize-Automation) { $r = New-AutoRoutine; $r.Name = "Layout $($l.Tag.Name)"; $r.Steps.Add((New-AutoItem $AuSteps 'layout' ([pscustomobject]@{ Layout = $l.Tag.Name; StartMissing = $true }))); [void](Start-AutoRoutine $r @{} 'Window layouts') } } }.GetNewClosure() $bar $Glyph.Apps 2)
+    [void](New-Button 'Delete' 'Delete the selected layout' { $l = @($lv.SelectedItems)[0]; if ($l) { [void]$AuUI.Layouts.Remove($l.Tag); Save-Automation; & $fill } }.GetNewClosure() $bar $Glyph.Delete 2)
+    $hint = New-Object System.Windows.Forms.Label; $hint.Dock = 'Bottom'; $hint.AutoSize = $false; $hint.Height = Px 46; $hint.ForeColor = $C.Dim; $hint.BackColor = $C.Bg; $hint.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 4), (Px 8), 0)
+    $hint.Text = 'A layout puts each program''s window back where it was (and starts the ones that are closed). Use it in a routine with the step "Arrange windows", e.g. with a shortcut key.'
+    $f.Controls.Add($lv); $f.Controls.Add($bar); $f.Controls.Add($hint)
+    Register-ThemedWindow $f
+    $script:Modal = $true
+    try { [void]$f.ShowDialog($AuUI.Form) } finally { $script:Modal = $false; $f.Dispose() }
+    $AuUI.StepsKey = $null
+}
+
+function Export-AutoRoutines {
+    $d = New-Object System.Windows.Forms.SaveFileDialog; $d.Filter = 'Routines (*.devroutines.json)|*.devroutines.json'; $d.FileName = 'routines.devroutines.json'
+    $script:Modal = $true
+    try { if ($d.ShowDialog($AuUI.Form) -ne 'OK') { return }; $path = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
+    Save-Automation
+    [IO.File]::WriteAllText($path, (Read-DataText $AuFile), (New-Object Text.UTF8Encoding $false))
+    Add-AutoLog "saved $($AuUI.Routines.Count) routines and $($AuUI.Layouts.Count) layouts to $path"
+}
+function Import-AutoRoutines {
+    $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Filter = 'Routines (*.devroutines.json)|*.devroutines.json|All files|*.*'
+    $script:Modal = $true
+    try { if ($d.ShowDialog($AuUI.Form) -ne 'OK') { return }; $path = $d.FileName } finally { $script:Modal = $false; $d.Dispose() }
+    try { $j = [IO.File]::ReadAllText($path) | ConvertFrom-Json } catch { Add-AutoLog "that file isn't a routines file: $($_.Exception.Message)"; return }
+    $n = 0
+    foreach ($r in @($j.Routines)) { if ($r) { $x = New-AutoRoutine $r; $x.Id = [guid]::NewGuid().ToString('N').Substring(0, 8); $x.On = $false; $AuUI.Routines.Add($x); $n++ } }
+    foreach ($l in @($j.Layouts)) { if ($l -and -not ($AuUI.Layouts.ToArray() | Where-Object Name -eq $l.Name)) { $AuUI.Layouts.Add($l) } }
+    Save-Automation; Update-AutoView
+    Add-AutoLog "added $n routines from $([IO.Path]::GetFileName($path)) (switched off: check them, then tick them on)"
+}
+
+function Show-Automation {
+    Hide-Picker
+    if (-not (Initialize-Automation)) { return }
+    if ($AuUI.Form) { if ($AuUI.Form.WindowState -eq 'Minimized') { $AuUI.Form.WindowState = 'Normal' }; $AuUI.Form.Activate(); return }
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'Automation'; $f.Icon = $IconActive
+    $f.Size = New-Object System.Drawing.Size((Px 1400), (Px 860)); $f.MinimumSize = New-Object System.Drawing.Size((Px 960), (Px 580))
+    $f.StartPosition = 'CenterScreen'; $f.BackColor = $C.Panel; $f.ForeColor = $C.Fore; $f.Font = $FontMain; $f.KeyPreview = $true
+    $AuUI.Form = $f; $AuUI.LogQueue = New-Object System.Collections.Generic.List[string]
+    $AuUI.BoldFont = New-Object System.Drawing.Font($FontMain, [System.Drawing.FontStyle]::Bold)
+
+    $top = New-Object System.Windows.Forms.FlowLayoutPanel
+    $top.Dock = 'Top'; $top.AutoSize = $true; $top.AutoSizeMode = 'GrowAndShrink'; $top.WrapContents = $true; $top.BackColor = $C.Panel
+    $top.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 6), (Px 8), (Px 6))
+    $g = New-DgBarGroup $top -First
+    [void](New-WsBtn $g $Glyph.Add 'New routine' 'A new routine' { $r = New-AutoRoutine; $AuUI.Routines.Add($r); Save-Automation; $AuUI.ListIds = $null; Update-AutoView; foreach ($it in $AuUI.List.Items) { $it.Selected = $it.Tag -eq $r } } -Label)
+    [void](New-WsBtn $g $Glyph.Copy 'Duplicate' 'A copy of the selected routine' { $r = Get-AutoSelected; if ($r) { $j = ConvertTo-Json -InputObject ([ordered]@{ Name = "$($r.Name) (copy)"; On = $false; StopOnError = $r.StopOnError; NotifyDone = $r.NotifyDone; Steps = $r.Steps.ToArray(); Triggers = $r.Triggers.ToArray() }) -Depth 6; $x = New-AutoRoutine ($j | ConvertFrom-Json); $x.Id = [guid]::NewGuid().ToString('N').Substring(0, 8); $AuUI.Routines.Add($x); Save-Automation; Update-AutoView } })
+    [void](New-WsBtn $g $Glyph.Delete 'Delete' 'Delete the selected routine' { $r = Get-AutoSelected; if ($r -and [System.Windows.Forms.MessageBox]::Show($AuUI.Form, "Delete the routine ""$($r.Name)""?", 'Automation', 'YesNo', 'Question') -eq 'Yes') { [void]$AuUI.Routines.Remove($r); Save-Automation; Update-AutoTriggers; Update-AutoView } })
+    $g = New-DgBarGroup $top
+    [void](New-WsBtn $g $Glyph.Play 'Run' 'Run the selected routine (F5)' { $r = Get-AutoSelected; if ($r) { [void](Start-AutoRoutine $r @{} 'by hand') } } -Label -Variant 1)
+    [void](New-WsBtn $g $Glyph.WsStop 'Stop all' 'Stop every routine that is running (Esc also stops one while it types or clicks)' { Stop-AutoRuns 'stopped' } -Label)
+    $g = New-DgBarGroup $top
+    [void](New-WsBtn $g $Glyph.Apps 'Window layouts' 'Save where your windows are, and put them back with one click or in a routine' { Show-AutoLayouts } -Label)
+    [void](New-WsBtn $g $Glyph.Send 'Share' 'Save the routines to a file, or add routines from one' {
+        $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+        [void](Add-MenuItem $m 'Save the routines to a file...' { Export-AutoRoutines } $Glyph.Save)
+        [void](Add-MenuItem $m 'Add routines from a file...' { Import-AutoRoutines } $Glyph.Open)
+        $m.Show($this, (New-Object System.Drawing.Point(0, $this.Height)))
+    })
+
+    $status = New-Object System.Windows.Forms.Label
+    $status.Dock = 'Bottom'; $status.Height = Px 30; $status.AutoSize = $false; $status.AutoEllipsis = $true; $status.TextAlign = 'MiddleLeft'
+    $status.BackColor = $C.Panel; $status.ForeColor = $C.Dim; $status.Font = $FontSmall; $status.Padding = New-Object System.Windows.Forms.Padding((Px 12), 0, 0, 0)
+    $AuUI.Status = $status
+
+    # left: routines
+    $left = New-Object System.Windows.Forms.Panel; $left.Dock = 'Left'; $left.Width = Px (420 * $TextZoom); $left.BackColor = $C.Bg
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.HideSelection = $false; $lv.BorderStyle = 'None'; $lv.CheckBoxes = $true; $lv.MultiSelect = $false
+    $lv.BackColor = $C.Bg; $lv.ForeColor = $C.Fore
+    [void]$lv.Columns.Add('Routine', (Px (150 * $TextZoom))); [void]$lv.Columns.Add('Starts', (Px (130 * $TextZoom))); [void]$lv.Columns.Add('Last run', (Px (200 * $TextZoom)))
+    $lv.add_ItemChecked({ param($src, $e) if ($AuUI.Building) { return }; $e.Item.Tag.On = $e.Item.Checked; Request-AutoSave; Update-AutoTriggers; Update-AutoView -Light })
+    $lv.add_SelectedIndexChanged({ if ($AuUI.Building) { return }; $AuUI.StepsKey = $null; $AuUI.PropKey = $null; Update-AutoSteps; Update-AutoProps })
+    $lv.add_DoubleClick({ $r = Get-AutoSelected; if ($r) { [void](Start-AutoRoutine $r @{} 'by hand') } })
+    $AuUI.List = $lv
+    $lh = New-Object System.Windows.Forms.Label; $lh.Dock = 'Top'; $lh.Height = Px 28; $lh.Text = '  ROUTINES  (tick = on; double-click runs)'; $lh.Font = $FontSmall; $lh.ForeColor = $C.Accent; $lh.BackColor = $C.Panel; $lh.TextAlign = 'MiddleLeft'
+    $left.Controls.Add($lv); $left.Controls.Add($lh)
+    $splitL = New-Object System.Windows.Forms.Splitter -Property @{ Dock = 'Left'; Width = (Px 5); BackColor = $C.Panel; MinSize = (Px 240); MinExtra = (Px 400) }
+
+    # right: the routine's triggers and options
+    $right = New-Object System.Windows.Forms.FlowLayoutPanel
+    $right.Dock = 'Right'; $right.Width = Px (340 * $TextZoom); $right.FlowDirection = 'TopDown'; $right.WrapContents = $false; $right.AutoScroll = $true
+    $right.BackColor = $C.Bg; $right.Padding = New-Object System.Windows.Forms.Padding((Px 14), (Px 10), (Px 8), (Px 12))
+    $AuUI.Props = $right
+    $splitR = New-Object System.Windows.Forms.Splitter -Property @{ Dock = 'Right'; Width = (Px 5); BackColor = $C.Panel; MinSize = (Px 260); MinExtra = (Px 400) }
+
+    # middle: steps over the run log
+    $mid = New-Object System.Windows.Forms.Panel; $mid.Dock = 'Fill'; $mid.BackColor = $C.Bg
+    $sv = New-Object System.Windows.Forms.ListView
+    $sv.Dock = 'Fill'; $sv.View = 'Details'; $sv.FullRowSelect = $true; $sv.HideSelection = $false; $sv.BorderStyle = 'None'; $sv.CheckBoxes = $true; $sv.MultiSelect = $false; $sv.HeaderStyle = 'None'
+    $sv.BackColor = $C.Bg; $sv.ForeColor = $C.Fore
+    [void]$sv.Columns.Add('#', (Px 44)); [void]$sv.Columns.Add('Step', (Px 1200))
+    $sv.add_ItemChecked({ param($src, $e) if ($AuUI.Building) { return }; $r = Get-AutoSelected; if ($r) { $r.Steps[[int]$e.Item.Tag].On = $e.Item.Checked; Request-AutoSave; $AuUI.StepsKey = $null; Update-AutoSteps } })
+    $sv.add_DoubleClick({ Edit-AutoStep })
+    $sv.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'Delete') { Remove-AutoStep; $e.Handled = $true } elseif ($e.KeyCode -eq 'Return') { Edit-AutoStep; $e.Handled = $true } elseif ($e.Alt -and $e.KeyCode -in 'Up', 'Down') { Move-AutoStep $(if ($e.KeyCode -eq 'Up') { -1 } else { 1 }); $e.Handled = $true } })
+    $AuUI.Steps = $sv
+    $none = New-Object System.Windows.Forms.Label; $none.Dock = 'Fill'; $none.TextAlign = 'MiddleCenter'; $none.ForeColor = $C.Dim; $none.BackColor = $C.Bg; $none.Visible = $false
+    $none.Text = "No steps yet.`nAdd step: open programs, run commands, start websites, wait, press buttons, fill fields, type, arrange windows ..."
+    $AuUI.NoSteps = $none
+    $sbar = New-Object System.Windows.Forms.FlowLayoutPanel
+    $sbar.Dock = 'Top'; $sbar.AutoSize = $true; $sbar.WrapContents = $true; $sbar.BackColor = $C.Bg; $sbar.Padding = New-Object System.Windows.Forms.Padding((Px 6), (Px 6), (Px 6), (Px 4))
+    $sl = New-TbLabel $sbar 'STEPS' -Dim; $sl.ForeColor = $C.Accent; $sl.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 7), (Px 10), 0)
+    [void](New-WsBtn $sbar $Glyph.Add 'Add step' 'Add a step after the selected one' {
+        $m = New-Object System.Windows.Forms.ContextMenuStrip -Property @{ Renderer = $MenuRenderer }
+        foreach ($k in $AuSteps.Keys) { $it = Add-MenuItem $m $AuSteps[$k].Label { param($src, $e) Add-AutoStep $src.Tag } $Glyph[$AuSteps[$k].Icon]; $it.Tag = $k }
+        $m.Show($this, (New-Object System.Drawing.Point(0, $this.Height)))
+    } -Label)
+    [void](New-WsBtn $sbar $Glyph.Edit 'Change' 'Change the selected step (Enter, or double-click it)' { Edit-AutoStep })
+    [void](New-WsBtn $sbar $Glyph.Undo 'Move up' 'Move the step up (Alt+Up)' { Move-AutoStep -1 })
+    [void](New-WsBtn $sbar $Glyph.Redo 'Move down' 'Move the step down (Alt+Down)' { Move-AutoStep 1 })
+    [void](New-WsBtn $sbar $Glyph.Copy 'Duplicate step' 'A copy of the selected step, under it' { $r = Get-AutoSelected; $i = Get-AutoSelStep; if ($r -and $i -ge 0) { $s = $r.Steps[$i]; $c2 = New-AutoItem $AuSteps $s.Kind $s; $r.Steps.Insert($i + 1, $c2); Request-AutoSave; $AuUI.StepsKey = $null; Update-AutoSteps; $AuUI.Steps.Items[$i + 1].Selected = $true } })
+    [void](New-WsBtn $sbar $Glyph.Delete 'Delete step' 'Delete the selected step (Del)' { Remove-AutoStep })
+    [void](New-WsBtn $sbar $Glyph.Lightning 'Try this step' 'Run only the selected step, to see that it works' { $r = Get-AutoSelected; $i = Get-AutoSelStep; if ($r -and $i -ge 0) { [void](Start-AutoRoutine $r @{} 'trying one step' $i -Only) } } -Label)
+    [void](New-WsBtn $sbar $Glyph.Play 'Run from here' 'Run the routine from the selected step on' { $r = Get-AutoSelected; $i = Get-AutoSelStep; if ($r) { [void](Start-AutoRoutine $r @{} 'by hand, from a step' ([Math]::Max(0, $i))) } })
+    $logp = New-Object System.Windows.Forms.Panel; $logp.Dock = 'Bottom'; $logp.Height = Px 230; $logp.BackColor = $C.Bg
+    $AuUI.LogBox = New-TbRtb -ReadOnly; $AuUI.LogBox.Dock = 'Fill'; $AuUI.LogBox.Font = New-Object System.Drawing.Font('Consolas', (Fz 9.5))
+    $lbar = New-Object System.Windows.Forms.FlowLayoutPanel; $lbar.Dock = 'Top'; $lbar.AutoSize = $true; $lbar.BackColor = $C.Panel; $lbar.Padding = New-Object System.Windows.Forms.Padding((Px 8), (Px 3), (Px 8), (Px 3))
+    $ll = New-TbLabel $lbar 'Log' -Title; $ll.Margin = New-Object System.Windows.Forms.Padding((Px 2), (Px 6), (Px 16), 0)
+    [void](New-WsBtn $lbar $Glyph.Clear 'Clear' 'Clear the log' { $AuUI.Log.Clear(); $AuUI.LogBox.Clear() } -Label)
+    [void](New-WsBtn $lbar $Glyph.Copy 'Copy' 'Copy the log' { Copy-TbText $AuUI.LogBox.Text } -Label)
+    $logp.Controls.Add($AuUI.LogBox); $logp.Controls.Add($lbar)
+    $splitB = New-Object System.Windows.Forms.Splitter -Property @{ Dock = 'Bottom'; Height = (Px 5); BackColor = $C.Panel; MinSize = (Px 100); MinExtra = (Px 150) }
+    $mid.Controls.Add($sv); $mid.Controls.Add($none); $mid.Controls.Add($sbar); $mid.Controls.Add($splitB); $mid.Controls.Add($logp)
+
+    $f.Controls.Add($mid); $f.Controls.Add($splitR); $f.Controls.Add($right); $f.Controls.Add($splitL); $f.Controls.Add($left); $f.Controls.Add($status); $f.Controls.Add($top)
+    $f.add_KeyDown({ param($src, $e) if ($e.KeyCode -eq 'F5') { $e.SuppressKeyPress = $true; $r = Get-AutoSelected; if ($r) { [void](Start-AutoRoutine $r @{} 'by hand') } } })
+    $AuUI.Left = $left; $AuUI.LeftUser = $false; $AuUI.RightUser = $false
+    $splitL.add_SplitterMoved({ $AuUI.LeftUser = $true }); $splitR.add_SplitterMoved({ $AuUI.RightUser = $true })
+    $f.add_Resize({ Update-AutoLayoutSizes })
+    $f.add_FormClosed({ Save-Automation; foreach ($k in 'Form', 'List', 'Steps', 'Props', 'LogBox', 'Status', 'NoSteps') { $AuUI[$k] = $null }; $AuUI.ListIds = $null; $AuUI.StepsKey = $null; $AuUI.PropKey = $null })
+    Register-ThemedWindow $f
+    $f.Show()
+    [PowerClipHost]::EnsureShown($f.Handle)
+    foreach ($l in $AuUI.Log.ToArray() | Select-Object -Last 300) { $AuUI.LogQueue.Add($l) }
+    Update-AutoView
+    Update-AutoRunLog
+    Update-AutoLayoutSizes
+}
+
+# The routines (left) and the routine's settings (right) take a share of the width, so the steps in the
+# middle keep room; a dragged divider keeps its place.
+function Update-AutoLayoutSizes {
+    $f = $AuUI.Form; if (-not $f -or $f.WindowState -eq 'Minimized') { return }
+    $w = $f.ClientSize.Width
+    if (-not $AuUI.LeftUser) { $AuUI.Left.Width = [Math]::Max((Px 250), [Math]::Min((Px (400 * $TextZoom)), [int]($w * 0.25))) }
+    if (-not $AuUI.RightUser) { $AuUI.Props.Width = [Math]::Max((Px 250), [Math]::Min((Px (360 * $TextZoom)), [int]($w * 0.23))) }
+    if ($AuUI.Steps -and $AuUI.Steps.Columns.Count -gt 1) { $AuUI.Steps.Columns[1].Width = [Math]::Max((Px 200), $AuUI.Steps.ClientSize.Width - $AuUI.Steps.Columns[0].Width - 4) }
+    if ($AuUI.List -and $AuUI.List.Columns.Count -eq 3) { $lw = $AuUI.List.ClientSize.Width - 4; $AuUI.List.Columns[0].Width = [int]($lw * 0.36); $AuUI.List.Columns[1].Width = [int]($lw * 0.30); $AuUI.List.Columns[2].Width = $lw - $AuUI.List.Columns[0].Width - $AuUI.List.Columns[1].Width }
+    $AuUI.PropKey = '?'; Update-AutoProps
+}
+
+function Add-AutoStep([string]$Kind) {
+    $r = Get-AutoSelected
+    if (-not $r) { $r = New-AutoRoutine; $AuUI.Routines.Add($r); Update-AutoView; foreach ($it in $AuUI.List.Items) { $it.Selected = $it.Tag -eq $r } }
+    $s = New-AutoItem $AuSteps $Kind
+    if (-not (Show-AutoItemDialog $AuSteps $s 'Step')) { return }
+    $i = Get-AutoSelStep
+    $at = if ($i -ge 0) { $i + 1 } else { $r.Steps.Count }
+    $r.Steps.Insert($at, $s)
+    Request-AutoSave; $AuUI.StepsKey = $null; Update-AutoSteps
+    $AuUI.Steps.Items[$at].Selected = $true; $AuUI.Steps.Items[$at].EnsureVisible()
+}
+function Edit-AutoStep { $r = Get-AutoSelected; $i = Get-AutoSelStep; if ($r -and $i -ge 0 -and (Show-AutoItemDialog $AuSteps $r.Steps[$i] 'Step')) { Request-AutoSave; $AuUI.StepsKey = $null; Update-AutoSteps } }
+function Remove-AutoStep { $r = Get-AutoSelected; $i = Get-AutoSelStep; if ($r -and $i -ge 0) { $r.Steps.RemoveAt($i); Request-AutoSave; $AuUI.StepsKey = $null; Update-AutoSteps; if ($AuUI.Steps.Items.Count) { $AuUI.Steps.Items[[Math]::Min($i, $AuUI.Steps.Items.Count - 1)].Selected = $true } } }
+function Move-AutoStep([int]$By) {
+    $r = Get-AutoSelected; $i = Get-AutoSelStep; $j = $i + $By
+    if (-not $r -or $i -lt 0 -or $j -lt 0 -or $j -ge $r.Steps.Count) { return }
+    $s = $r.Steps[$i]; $r.Steps.RemoveAt($i); $r.Steps.Insert($j, $s)
+    Request-AutoSave; $AuUI.StepsKey = $null; Update-AutoSteps; $AuUI.Steps.Items[$j].Selected = $true
+}
+
+Register-PaletteCommand 'Automation' '' $Glyph.TAuto { Show-Automation } 'automation automate routine macro workflow click open type keys schedule trigger task robot fill form layout windows arrange'
+Register-PaletteCommand 'Automation: stop all routines' '' $Glyph.TAuto { if ($AuUI.Loaded) { Stop-AutoRuns 'stopped' } } 'automation stop routines'
+Register-PaletteCommand 'Window layouts' '' $Glyph.TAuto { if (Initialize-Automation) { Show-AutoLayouts } } 'windows arrange layout position monitors restore'
+
 $ToolGroups = [ordered]@{
     'Clipboard & notes'     = @('Clipboard history', 'Notes', 'Snippets', 'Secrets', 'Paste stack=Paste stack: collect what I copy next')
     'Text & data'           = @('Transform=Transform text', 'page:json', 'page:regex', 'page:jwt', 'page:markdown', 'page:numbers', 'page:units', 'page:cron', 'page:time', 'page:gen')
     'Encode & share'        = @('page:qr', 'page:stego', 'page:codeimg')
     'Files'                 = @('Compare', 'Find in files', 'page:hash', 'page:log')
-    'Web & API'             = @('API tester', 'API chains', 'Test API=Test API: start / stop')
+    'Web & API'             = @('API tester', 'API chains', 'Web servers', 'Test API=Test API: start / stop')
     'Data'                  = @('Diagram studio', 'SQL client')
     'Network'               = @('Network tools', 'page:dns', 'page:subnet', 'page:hosts', 'page:ports', 'page:cert', 'page:certmake')
     'System'                = @('page:env', 'page:procs', 'Git')
-    'Screen & productivity' = @('Screenshot=Take a screenshot', 'Text from a picture (OCR)=Copy text from the clipboard picture (OCR)', 'Edit clipboard picture=Edit the picture on the clipboard', 'page:color', 'page:record', 'page:timer', 'Reminder=New reminder...', 'page:mouse')
+    'Screen & productivity' = @('Automation', 'Screenshot=Take a screenshot', 'Text from a picture (OCR)=Copy text from the clipboard picture (OCR)', 'Edit clipboard picture=Edit the picture on the clipboard', 'page:color', 'page:record', 'page:timer', 'Reminder=New reminder...', 'page:mouse')
 }
 
 # One row per tool: Group, Title, Icon, and either Page (a Toolbox page) or Action (opens its own window / does it).
@@ -34836,7 +37987,12 @@ Register-ToolboxPage 'certmake' 'Certificate maker' $Glyph.TCertMake 'certificat
     }
     if (-not ('DevCertTool' -as [type])) { Set-TbStatus $st.Status 'This needs .NET Framework 4.7.2 or newer (Windows 10 1803+ has it).' 'error'; return $st }
     $tabs = New-TabSet $panel
-    $mk = Add-ApiTab $tabs 'Make'; $op = Add-ApiTab $tabs 'Open / convert'
+    $mk = Add-ApiTab $tabs 'Make'; $op = Add-ApiTab $tabs 'Open / convert'; $gd = Add-ApiTab $tabs 'Guide'
+    # guide: how certificates, keys and chains fit together, and the order to merge them in
+    $st.Guide = New-TbRtb -ReadOnly; $st.Guide.Dock = 'Fill'; $st.Guide.WordWrap = $true; $st.Guide.Font = New-Object System.Drawing.Font($UiFont, (Fz 10))
+    $gd.Padding = New-Object System.Windows.Forms.Padding((Px 14), (Px 8), (Px 8), 0)
+    $gd.Controls.Add($st.Guide)
+    Write-CertGuide $st.Guide
     # make
     $st.MakeOut = New-TbRtb -ReadOnly; $st.MakeOut.Dock = 'Fill'
     $mk.Controls.Add($st.MakeOut)
@@ -34886,6 +38042,97 @@ Register-ToolboxPage 'certmake' 'Certificate maker' $Glyph.TCertMake 'certificat
     $st
 }
 
+# The Guide tab. Lines: "# " heading, "> " command or file (fixed-width), "! " warning, "- " point, else text.
+$CertGuideText = @'
+# The pieces
+- Private key: the secret half. It stays with the server and is never sent to anyone. In a .key file (text that starts with -----BEGIN PRIVATE KEY-----, BEGIN RSA PRIVATE KEY or BEGIN EC PRIVATE KEY) or inside a .pfx.
+- Certificate: your names (e.g. shop.example.com) and the public half of the key, signed by an issuer. .crt / .pem are text, .cer / .der usually binary.
+- Signing request (CSR): your public key and names, which you send to a certificate authority (CA). The CA sends back your certificate. The key never leaves your PC.
+- Intermediate certificate(s): the CA's own certificates between yours and the root. The CA sends them with yours, often as "chain", "bundle", "ca-bundle" or "intermediate.crt".
+- Root certificate: the top of the chain. It signs itself and is already trusted by Windows and the browsers, so servers normally don't send it.
+- PFX (.pfx / .p12): one password-protected file holding the private key, your certificate and usually the chain. Windows, IIS and Azure use it.
+
+# How a chain works
+Every certificate names its Issuer. The certificate above it has that name as its Subject and signed it:
+> your site      Subject: CN=shop.example.com   Issuer: CN=Example CA R3
+> intermediate   Subject: CN=Example CA R3       Issuer: CN=Example Root X1
+> root           Subject: CN=Example Root X1     Issuer: CN=Example Root X1   (signs itself)
+A browser walks from your certificate up to a root it trusts. If the server leaves out an intermediate, many clients fail (curl, Java, Android, other servers), even when desktop Chrome works, because Chrome fetches the missing one by itself.
+
+# Merging: the order
+In one PEM file ("full chain"): YOUR certificate first, then the certificate that signed it, then the one that signed that, upwards. Leave the root out (or put it last).
+> fullchain.pem  =  your.crt  +  intermediate.crt  ( + a second intermediate, if the CA gave one)
+Why the order matters: the server sends the file as it is, and the first certificate must be the one that belongs to the private key. With an intermediate first, nginx stops with "key values mismatch" and clients see the wrong name.
+To find the order: open each file in Open / convert and match the Issuer of one to the Subject of the next. The one whose Subject and Issuer are the same is the root.
+Merging with what Windows already has (nothing to install):
+> copy /b your.crt + intermediate.crt fullchain.pem                        (Command Prompt)
+> Get-Content your.crt, intermediate.crt | Set-Content fullchain.pem      (PowerShell)
+! Look at the joins: each -----END CERTIFICATE----- must be followed by -----BEGIN CERTIFICATE----- on a new line. Two of them glued on one line (a file without a final line break) is the most common merging mistake.
+! Never put the private key into a file you hand to others or upload to a CA.
+Only for servers that want everything in one file (HAProxy): certificate, then the intermediates, then the key.
+
+# What each server wants
+- nginx: ssl_certificate = fullchain.pem (yours + intermediates), ssl_certificate_key = your.key
+- Apache 2.4.8+: SSLCertificateFile = fullchain.pem, SSLCertificateKeyFile = your.key (older versions: the intermediates go in SSLCertificateChainFile)
+- IIS / Windows: a .pfx with the key, your certificate and the chain; import it into Local Computer > Personal. A .crt alone has no key and can't be bound to a site.
+- Kestrel (ASP.NET Core): a .pfx (Path + Password), or PEM files: Path = fullchain.pem, KeyPath = your.key
+- Node.js: cert = fullchain.pem, key = your.key
+- HAProxy: one .pem with the certificate, the intermediates and the key
+- Azure App Service / Key Vault: a password-protected .pfx with the full chain
+
+# Key and certificate belong together
+A certificate fits exactly one private key: the one whose public half is inside it. The certificate a CA sends for your CSR only works with the key made together with that CSR, so keep that .key file. If it is lost, make a new CSR and ask the CA to reissue.
+Checking a .pfx with what Windows already has:
+> certutil -dump your.pfx
+It asks for the password and ends with "Encryption test passed" when the key and the certificate match.
+
+# File formats
+- PEM (.pem .crt .cer .key): text between -----BEGIN and -----END lines. One file can hold several certificates (a chain) and a key.
+- DER (.der .cer): binary, exactly one certificate. What Windows shows when you double-click it.
+- PFX / P12 (.pfx .p12): binary, password-protected: key + certificate (+ chain).
+Converting here: open a file in Open / convert, then Save as PEM, CER or PFX.
+! Today that tab reads the first certificate of a PEM file and the main certificate of a PFX. The rest of a chain is not carried over, so merge chains as described above.
+! Save as PFX includes a private key only when the opened file had one (a .pfx). A .crt + .key pair can't be combined into a PFX here yet.
+
+# The Make tab
+- Self-signed certificate: a certificate and its key in one go, for local HTTPS. Save files... writes name.crt, name.key and name.pfx (with the PFX password; empty = no password).
+- Name, Other names and IPs: everything goes into "Subject Alternative Name", the only place browsers look. Put every address you will type there, localhost included.
+- Certificate authority: makes a CA certificate (one that may sign others). Signing other certificates with it can't be done here yet.
+- Signing request (CSR): makes name.csr and name.key. Send the .csr to the CA, keep the .key, then merge the certificate you get back with its intermediates (above).
+- Trusting your own localhost certificate on this PC: double-click the .crt > Install Certificate > Current User > Place all certificates in: Trusted Root Certification Authorities. Only for development; remove it again in certmgr.msc.
+- Valid for: public CAs issue at most about a year now. For local self-signed certificates the 825 days set here are fine; Apple devices refuse more than 825.
+
+# When it doesn't work
+- "unable to get local issuer certificate", "incomplete chain": add the intermediates, in the order above.
+- nginx "key values mismatch": the first certificate in the file isn't the one for this key - the wrong order, or the wrong key.
+- NET::ERR_CERT_COMMON_NAME_INVALID: the address you opened is not among the Other names.
+- NET::ERR_CERT_AUTHORITY_INVALID on a self-signed certificate: it isn't trusted on this PC yet (see "Trusting" above).
+- IIS can't use the certificate, or "a specified logon session does not exist": it was imported without its key. Import the .pfx, not the .crt.
+- Opening a .pfx says the password is wrong: type it in the Password box of Open / convert and open it again.
+'@
+
+function Write-CertGuide($Rtb) {
+    $Rtb.Clear()
+    $body = $Rtb.Font
+    $head = New-Object System.Drawing.Font($UiFont, (Fz 12.5), [System.Drawing.FontStyle]::Bold)
+    $mono = New-Object System.Drawing.Font('Consolas', (Fz 9.5))
+    $first = $true
+    foreach ($line in ($CertGuideText -split "`r?`n")) {
+        $Rtb.SelectionStart = $Rtb.TextLength
+        $Rtb.SelectionIndent = 0; $Rtb.SelectionHangingIndent = 0
+        if ($line -match '^# (.*)') {
+            if (-not $first) { $Rtb.SelectionFont = $body; $Rtb.AppendText("`n"); $Rtb.SelectionStart = $Rtb.TextLength }
+            $Rtb.SelectionFont = $head; $Rtb.SelectionColor = $C.Accent; $Rtb.AppendText($Matches[1] + "`n")
+        }
+        elseif ($line -match '^> (.*)') { $Rtb.SelectionFont = $mono; $Rtb.SelectionColor = $C.Green; $Rtb.SelectionIndent = (Px 18); $Rtb.AppendText($Matches[1] + "`n") }
+        elseif ($line -match '^! (.*)') { $Rtb.SelectionFont = $body; $Rtb.SelectionColor = $C.Yellow; $Rtb.AppendText($Matches[1] + "`n") }
+        elseif ($line -match '^- (.*)') { $Rtb.SelectionFont = $body; $Rtb.SelectionColor = $C.Fore; $Rtb.SelectionIndent = (Px 14); $Rtb.SelectionHangingIndent = (Px 12); $Rtb.AppendText([string][char]0x2022 + ' ' + $Matches[1] + "`n") }
+        elseif ($line.Trim()) { $Rtb.SelectionFont = $body; $Rtb.SelectionColor = $C.Fore; $Rtb.AppendText($line + "`n") }
+        $first = $false
+    }
+    $Rtb.SelectionStart = 0; $Rtb.SelectionLength = 0; $Rtb.ScrollToCaret()
+}
+
 function Invoke-CertMake($S, [bool]$Csr) {
     $cn = $S.Cn.Text.Trim(); if (-not $cn) { $cn = 'localhost' }
     $dns = @($S.Dns.Text -split '[,;\s]+' | Where-Object { $_ }); $ips = @($S.Ips.Text -split '[,;\s]+' | Where-Object { $_ })
@@ -34910,7 +38157,7 @@ function Invoke-CertMake($S, [bool]$Csr) {
 
 function Save-CertFiles($S) {
     if (-not $S.Made) { Set-TbStatus $S.Status 'Make a certificate or CSR first.' 'error'; return }
-    $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Folder for the certificate files'
+    $d = New-Object DevFolderDialog; $d.Description = 'Folder for the certificate files'
     $script:Modal = $true
     try { if ($d.ShowDialog($TbUI.Form) -ne 'OK') { return }; $dir = $d.SelectedPath } finally { $script:Modal = $false; $d.Dispose() }
     $n = Join-Path $dir $S.MadeName; $written = @()
@@ -36745,7 +39992,7 @@ Register-ToolboxPage 'env' 'Environment & PATH' $Glyph.TEnv 'environment variabl
     $st.PathScope = New-TbCombo $pbar @('Your PATH (user)', 'System PATH (needs admin to save)') 250
     [void](New-Button 'Add folder...' 'Add a folder to this PATH' {
         $s = $TbUI.Pages['env'].State
-        $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Folder to add to the PATH'
+        $d = New-Object DevFolderDialog; $d.Description = 'Folder to add to the PATH'
         $script:Modal = $true
         try { if ($d.ShowDialog($TbUI.Form) -eq 'OK') { $s.PathItems.Add($d.SelectedPath); $s.PathDirty = $true; Update-PathList $s ($s.PathItems.Count - 1) } } finally { $script:Modal = $false; $d.Dispose() }
     } $pbar $Glyph.Add 2)
@@ -37825,7 +41072,7 @@ function Show-GitBranchMenu($Menu) {
 function Show-GitCloneDialog {
     $url = Read-GitText 'Clone a repository' 'Repository URL (https://... or git@...)'
     if (-not $url) { return }
-    $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Folder to clone into (a new subfolder is created)'
+    $d = New-Object DevFolderDialog; $d.Description = 'Folder to clone into (a new subfolder is created)'
     $script:Modal = $true
     try { if ($d.ShowDialog($GitUI.Form) -ne 'OK') { return }; $parent = $d.SelectedPath } finally { $script:Modal = $false; $d.Dispose() }
     $name = ($url.Trim().TrimEnd('/') -split '[/:]')[-1] -replace '\.git$', ''
@@ -38035,7 +41282,7 @@ function Show-Git([string]$Folder = '') {
     $GitUI.RepoBox = New-TbCombo $top @() 320
     $GitUI.RepoBox.add_SelectedIndexChanged({ param($src, $e) if (-not $GitUI.Loading -and $src.SelectedItem) { Open-GitRepo ([string]$src.SelectedItem) } })
     [void](New-Button 'Open...' 'Open a folder (a new repository can be created there)' {
-        $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Repository folder'
+        $d = New-Object DevFolderDialog; $d.Description = 'Repository folder'
         if ($GitUI.Repo) { $d.SelectedPath = $GitUI.Repo }
         $script:Modal = $true
         try { if ($d.ShowDialog($GitUI.Form) -eq 'OK') { Open-GitRepo $d.SelectedPath } } finally { $script:Modal = $false; $d.Dispose() }
@@ -39756,7 +43003,7 @@ function Show-Settings {
     $sr = New-Object System.Windows.Forms.FlowLayoutPanel
     $sr.AutoSize = $true; $sr.WrapContents = $false; $sr.BackColor = $C.Card
     [void](New-Button 'Choose folder...' 'A folder both PCs can reach, e.g. in OneDrive or Dropbox' {
-        $d = New-Object System.Windows.Forms.FolderBrowserDialog
+        $d = New-Object DevFolderDialog
         $d.Description = 'Folder to sync through (OneDrive, Dropbox or a network share). DevTools creates DevTools-sync inside it.'
         if ($script:SyncDir) { $d.SelectedPath = $script:SyncDir }
         $script:Modal = $true
@@ -39785,7 +43032,7 @@ function Show-Settings {
     $folderRow = New-Object System.Windows.Forms.FlowLayoutPanel
     $folderRow.AutoSize = $true; $folderRow.WrapContents = $false; $folderRow.BackColor = $C.Card
     [void](New-Button 'Change...' 'Choose the backup folder, e.g. a OneDrive or Dropbox folder to keep a copy in the cloud' {
-        $d = New-Object System.Windows.Forms.FolderBrowserDialog
+        $d = New-Object DevFolderDialog
         $d.Description = 'Folder for DevTools backups (a OneDrive / Dropbox folder keeps a copy in the cloud)'
         $d.SelectedPath = Get-BackupDir
         $script:Modal = $true
@@ -39912,6 +43159,7 @@ function Restart-App {
 function Exit-App {
     Write-Log "exit (restart=$([bool]$script:Restart)): $((Get-PSCallStack | Select-Object -Skip 1 -First 3 | ForEach-Object { $_.Location }) -join ' <- ')"
     $script:Exiting = $true
+    try { Stop-WebSitesOnExit } catch { Write-Log "web servers at exit: $_" }
     try { $clipHost.Release() } catch { }
     $tray.Visible = $false
     $tray.Dispose()
@@ -40275,6 +43523,11 @@ $ReminderTimer = New-Object System.Windows.Forms.Timer
 $ReminderTimer.Interval = 15000
 $ReminderTimer.add_Tick({ Invoke-Reminders })
 $ReminderTimer.Start()
+# Web servers marked "Start it when DevTools starts": a few seconds after start, so DevTools itself comes up first.
+$WebStartTimer = New-Object System.Windows.Forms.Timer
+$WebStartTimer.Interval = 4000
+$WebStartTimer.add_Tick({ $WebStartTimer.Stop(); try { Start-WebSitesAtLaunch } catch { Write-Log "web servers at start: $_" }; try { Start-AutomationAtLaunch } catch { Write-Log "automation at start: $_" } })
+$WebStartTimer.Start()
 $ThemeWatch.Start()
 
 # Debug builds only (POWERCLIP_DEBUG set at launch): run commands written to data\debug-cmd.ps1, so the UI
@@ -40317,6 +43570,7 @@ $clipHost.add_ExtraHotkeyPressed({
         elseif ($id -eq 4) { Start-ScreenCapture }
         elseif ($id -eq 5) { Invoke-PasteNext }
         elseif ($id -eq 6) { Stop-MouseClicker 'Esc' }
+        elseif ($id -ge 299 -and $id -lt 400) { Invoke-AutoHotkey $id }
         elseif ($script:ToolHotkeyIds.ContainsKey([int]$id)) { Invoke-ToolHotkey $script:ToolHotkeyIds[[int]$id] }
     } catch { Write-Log "hotkey $id error: $_" }
 })
@@ -40338,6 +43592,7 @@ $clipHost.add_ClipboardChanged({
         if ($script:CaptureSource -and ($script:IgnoreApps -contains $script:CaptureSource)) { Write-Log "ignored copy from $($script:CaptureSource)"; return }
         $clip = Read-Clipboard
         if (-not $clip) { return }
+        if ($clip.Kind -eq 'text' -and $AuUI.Loaded) { try { Invoke-AutoClipboard $clip.Text } catch { Write-Log "automation clipboard: $_" } }
         switch ($clip.Kind) {
             'text'  { Add-ClipText $clip.Text $clip.Html }
             'files' { Add-ClipFiles $clip.Files }
